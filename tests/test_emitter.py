@@ -2888,3 +2888,178 @@ def test_paged_attention_partial_page(runner):
         assert abs(got - expected) < 0.05, (
             f"dim {d}: got {got}, expected {expected}"
         )
+
+
+# ---------------------------------------------------------------------------
+# Speculative Decoding tests
+# ---------------------------------------------------------------------------
+
+
+@requires_metal
+def test_speculative_decode_partial_accept(runner):
+    """Speculative decoding: draft 4 tokens, target rejects at position 2."""
+    from triton_metal.codegen.msl_emitter import make_speculative_decode_kernel
+    import struct as struct_mod
+
+    n_tokens = 4
+    vocab_size = 32
+
+    msl = make_speculative_decode_kernel(block_size=256)
+    path = runner.compile(msl, "speculative_decode")
+    pipeline = runner.load(path, "speculative_decode")
+
+    # Build probability distributions
+    # Draft and target agree on tokens 0,1; disagree on token 2
+    draft_probs = []
+    target_probs = []
+    draft_tokens = [5, 10, 20, 15]
+
+    for i in range(n_tokens):
+        tok = draft_tokens[i]
+        dp = [0.01] * vocab_size  # uniform-ish background
+        tp = [0.01] * vocab_size
+
+        if i < 2:
+            # Tokens 0,1: target assigns HIGHER prob than draft → always accept
+            dp[tok] = 0.5
+            tp[tok] = 0.8
+        elif i == 2:
+            # Token 2: target assigns MUCH LOWER prob → likely reject
+            dp[tok] = 0.9
+            tp[tok] = 0.01
+        else:
+            # Token 3: would accept but won't reach here
+            dp[tok] = 0.5
+            tp[tok] = 0.9
+
+        # Normalize
+        total_dp = sum(dp)
+        total_tp = sum(tp)
+        dp = [x / total_dp for x in dp]
+        tp = [x / total_tp for x in tp]
+        draft_probs.extend(dp)
+        target_probs.extend(tp)
+
+    # Random values: make token 2 always rejected (rand > p/q ≈ 0.01/0.9 ≈ 0.011)
+    rand_vals = [0.0, 0.0, 0.5, 0.0]  # 0.0 < 1 (accept), 0.0 < 1 (accept), 0.5 > 0.011 (reject)
+
+    dp_buf = runner.make_float_buffer(draft_probs)
+    tp_buf = runner.make_float_buffer(target_probs)
+
+    import Metal
+    dt_buf = runner.device.newBufferWithLength_options_(
+        n_tokens * 4, Metal.MTLResourceStorageModeShared
+    )
+    dt_view = dt_buf.contents().as_buffer(n_tokens * 4)
+    for i, tok in enumerate(draft_tokens):
+        struct_mod.pack_into("I", dt_view, i * 4, tok)
+
+    rv_buf = runner.make_float_buffer(rand_vals)
+
+    na_buf = runner.device.newBufferWithLength_options_(
+        4, Metal.MTLResourceStorageModeShared
+    )
+    adj_buf = runner.make_empty_buffer(vocab_size)
+
+    nt_buf = runner.make_uint_buffer(n_tokens)
+    vs_buf = runner.make_uint_buffer(vocab_size)
+
+    cmd = runner.queue.commandBuffer()
+    enc = cmd.computeCommandEncoder()
+    enc.setComputePipelineState_(pipeline)
+    for i, buf in enumerate([dp_buf, tp_buf, dt_buf, rv_buf, na_buf, adj_buf,
+                              nt_buf, vs_buf]):
+        enc.setBuffer_offset_atIndex_(buf, 0, i)
+    enc.dispatchThreadgroups_threadsPerThreadgroup_(
+        Metal.MTLSizeMake(1, 1, 1),
+        Metal.MTLSizeMake(256, 1, 1),
+    )
+    enc.endEncoding()
+    cmd.commit()
+    cmd.waitUntilCompleted()
+    assert cmd.status() == 4, f"Kernel failed, status={cmd.status()}"
+
+    # Read n_accepted
+    na_view = na_buf.contents().as_buffer(4)
+    n_accepted = struct_mod.unpack_from("I", na_view, 0)[0]
+    assert n_accepted == 2, f"Expected 2 accepted, got {n_accepted}"
+
+    # Read adjusted probs — should be normalized max(0, target - draft) at position 2
+    adj = runner.read_float_buffer(adj_buf, vocab_size)
+    adj_sum = sum(adj)
+    assert abs(adj_sum - 1.0) < 0.01, f"Adjusted probs sum to {adj_sum}, expected ~1.0"
+    # All adjusted values should be >= 0
+    for v in range(vocab_size):
+        assert adj[v] >= -0.001, f"adj[{v}] = {adj[v]} < 0"
+
+
+@requires_metal
+def test_speculative_decode_all_accepted(runner):
+    """Speculative decoding: all 3 draft tokens accepted."""
+    from triton_metal.codegen.msl_emitter import make_speculative_decode_kernel
+    import struct as struct_mod
+
+    n_tokens = 3
+    vocab_size = 16
+
+    msl = make_speculative_decode_kernel(block_size=256)
+    path = runner.compile(msl, "speculative_decode_all")
+    pipeline = runner.load(path, "speculative_decode")
+
+    # Target always assigns higher probability than draft
+    draft_probs = []
+    target_probs = []
+    draft_tokens = [3, 7, 12]
+
+    for i in range(n_tokens):
+        tok = draft_tokens[i]
+        dp = [1.0 / vocab_size] * vocab_size
+        tp = [0.5 / vocab_size] * vocab_size
+        dp[tok] = 0.3
+        tp[tok] = 0.8  # target always higher → ratio > 1 → always accept
+        total_dp = sum(dp)
+        total_tp = sum(tp)
+        dp = [x / total_dp for x in dp]
+        tp = [x / total_tp for x in tp]
+        draft_probs.extend(dp)
+        target_probs.extend(tp)
+
+    rand_vals = [0.5, 0.5, 0.5]  # All < 1.0 (min(1, p/q) = 1 since p > q)
+
+    dp_buf = runner.make_float_buffer(draft_probs)
+    tp_buf = runner.make_float_buffer(target_probs)
+
+    import Metal
+    dt_buf = runner.device.newBufferWithLength_options_(
+        n_tokens * 4, Metal.MTLResourceStorageModeShared
+    )
+    dt_view = dt_buf.contents().as_buffer(n_tokens * 4)
+    for i, tok in enumerate(draft_tokens):
+        struct_mod.pack_into("I", dt_view, i * 4, tok)
+
+    rv_buf = runner.make_float_buffer(rand_vals)
+    na_buf = runner.device.newBufferWithLength_options_(
+        4, Metal.MTLResourceStorageModeShared
+    )
+    adj_buf = runner.make_empty_buffer(vocab_size)
+    nt_buf = runner.make_uint_buffer(n_tokens)
+    vs_buf = runner.make_uint_buffer(vocab_size)
+
+    cmd = runner.queue.commandBuffer()
+    enc = cmd.computeCommandEncoder()
+    enc.setComputePipelineState_(pipeline)
+    for i, buf in enumerate([dp_buf, tp_buf, dt_buf, rv_buf, na_buf, adj_buf,
+                              nt_buf, vs_buf]):
+        enc.setBuffer_offset_atIndex_(buf, 0, i)
+    enc.dispatchThreadgroups_threadsPerThreadgroup_(
+        Metal.MTLSizeMake(1, 1, 1),
+        Metal.MTLSizeMake(256, 1, 1),
+    )
+    enc.endEncoding()
+    cmd.commit()
+    cmd.waitUntilCompleted()
+    assert cmd.status() == 4, f"Kernel failed, status={cmd.status()}"
+
+    na_view = na_buf.contents().as_buffer(4)
+    n_accepted = struct_mod.unpack_from("I", na_view, 0)[0]
+    assert n_accepted == 3, f"Expected 3 accepted (all), got {n_accepted}"

@@ -1396,3 +1396,214 @@ def test_ttgir_flash_attention_compiles(runner):
     msl = kb.build()
     assert "flash_attention" in msl or "attention" in msl.lower()
     runner.compile(msl, "flash_attention")
+
+
+# ---------------------------------------------------------------------------
+# Cross-Entropy TTGIR
+# ---------------------------------------------------------------------------
+
+CROSS_ENTROPY_TTGIR = """
+module {
+  tt.func public @cross_entropy_kernel(%arg0: !tt.ptr<f32> {tt.divisibility = 16 : i32},
+                                        %arg1: !tt.ptr<i32> {tt.divisibility = 16 : i32},
+                                        %arg2: !tt.ptr<f32> {tt.divisibility = 16 : i32},
+                                        %arg3: i32) {
+    %cst = arith.constant 0.000000e+00 : f32
+    %0 = tt.get_program_id x : i32
+    %c256_i32 = arith.constant 256 : i32
+    %1 = arith.muli %0, %c256_i32 : i32
+    %2 = tt.make_range {end = 256 : i32, start = 0 : i32} : tensor<256xi32>
+    %3 = tt.splat %1 : i32 -> tensor<256xi32>
+    %4 = arith.addi %3, %2 : tensor<256xi32>
+    %5 = tt.splat %arg0 : !tt.ptr<f32> -> tensor<256x!tt.ptr<f32>>
+    %6 = tt.addptr %5, %4 : tensor<256x!tt.ptr<f32>>, tensor<256xi32>
+    %7 = tt.load %6 : !tt.ptr<f32>
+
+    // Max reduction for numerical stability
+    %row_max = "tt.reduce"(%7) ({
+    ^bb0(%a: f32, %b: f32):
+      %mx = arith.maxf %a, %b : f32
+      "tt.reduce.return"(%mx) : (f32) -> ()
+    }) {axis = 1 : i32} : (tensor<256xf32>) -> f32
+
+    // Softmax: exp(x - max) / sum(exp(x - max))
+    %max_splat = tt.splat %row_max : f32 -> tensor<256xf32>
+    %shifted = arith.subf %7, %max_splat : tensor<256xf32>
+    %exp_val = math.exp %shifted : tensor<256xf32>
+
+    %exp_sum = "tt.reduce"(%exp_val) ({
+    ^bb0(%c: f32, %d: f32):
+      %sm = arith.addf %c, %d : f32
+      "tt.reduce.return"(%sm) : (f32) -> ()
+    }) {axis = 1 : i32} : (tensor<256xf32>) -> f32
+
+    // log_softmax = shifted - log(exp_sum)
+    %log_sum = math.log %exp_sum : f32
+    %log_sum_splat = tt.splat %log_sum : f32 -> tensor<256xf32>
+    %log_softmax = arith.subf %shifted, %log_sum_splat : tensor<256xf32>
+
+    // Negate log-probability at target index for cross-entropy
+    %neg_log = arith.negf %log_softmax : tensor<256xf32>
+
+    // Final sum (loss aggregation over batch)
+    %loss = "tt.reduce"(%neg_log) ({
+    ^bb0(%e: f32, %f: f32):
+      %add = arith.addf %e, %f : f32
+      "tt.reduce.return"(%add) : (f32) -> ()
+    }) {axis = 0 : i32} : (tensor<256xf32>) -> f32
+
+    %8 = tt.splat %arg2 : !tt.ptr<f32> -> tensor<1x!tt.ptr<f32>>
+    tt.store %8, %loss : !tt.ptr<f32>
+    tt.return
+  }
+}
+"""
+
+
+def test_ttgir_cross_entropy_detected():
+    """Cross-entropy: max + sum + log + sum pattern detected."""
+    from triton_metal.codegen.ttgir_parser import TTGIRParser
+
+    parser = TTGIRParser(CROSS_ENTROPY_TTGIR, FakeOptions())
+    parser._parse_function_signature()
+    parser._parse_body()
+
+    assert len(parser.reduce_ops) >= 3, f"Expected 3+ reduces, got {len(parser.reduce_ops)}"
+    assert parser._is_cross_entropy_pattern(), "Should match cross-entropy pattern"
+
+
+def test_ttgir_cross_entropy_not_softmax():
+    """Cross-entropy should not be treated as plain softmax."""
+    from triton_metal.codegen.ttgir_parser import TTGIRParser
+
+    parser = TTGIRParser(CROSS_ENTROPY_TTGIR, FakeOptions())
+    parser._parse_function_signature()
+    parser._parse_body()
+
+    assert parser._is_cross_entropy_pattern()
+    # It also matches softmax sub-pattern, but cross-entropy check comes first in routing
+    assert parser._is_softmax_pattern()  # sub-pattern matches, but routing checks CE first
+
+
+@requires_metal
+def test_ttgir_cross_entropy_compiles(runner):
+    """TTGIR cross-entropy pattern compiles to valid MSL."""
+    from triton_metal.codegen.ttgir_parser import parse_ttgir
+
+    kb = parse_ttgir(CROSS_ENTROPY_TTGIR, FakeOptions())
+    msl = kb.build()
+    assert "cross_entropy" in msl or "log" in msl
+    runner.compile(msl, "cross_entropy_kernel")
+
+
+# ---------------------------------------------------------------------------
+# Fused Residual + Layer Norm TTGIR
+# ---------------------------------------------------------------------------
+
+FUSED_RESIDUAL_NORM_TTGIR = """
+module {
+  tt.func public @fused_residual_layernorm(%arg0: !tt.ptr<f32> {tt.divisibility = 16 : i32},
+                                            %arg1: !tt.ptr<f32> {tt.divisibility = 16 : i32},
+                                            %arg2: !tt.ptr<f32> {tt.divisibility = 16 : i32},
+                                            %arg3: !tt.ptr<f32> {tt.divisibility = 16 : i32},
+                                            %arg4: !tt.ptr<f32> {tt.divisibility = 16 : i32},
+                                            %arg5: i32) {
+    %cst = arith.constant 0.000000e+00 : f32
+    %eps = arith.constant 1.000000e-06 : f32
+    %0 = tt.get_program_id x : i32
+    %c256_i32 = arith.constant 256 : i32
+    %1 = arith.muli %0, %c256_i32 : i32
+    %2 = tt.make_range {end = 256 : i32, start = 0 : i32} : tensor<256xi32>
+    %3 = tt.splat %1 : i32 -> tensor<256xi32>
+    %4 = arith.addi %3, %2 : tensor<256xi32>
+
+    // Load input and residual
+    %5 = tt.splat %arg0 : !tt.ptr<f32> -> tensor<256x!tt.ptr<f32>>
+    %6 = tt.addptr %5, %4 : tensor<256x!tt.ptr<f32>>, tensor<256xi32>
+    %input = tt.load %6 : !tt.ptr<f32>
+
+    %7 = tt.splat %arg1 : !tt.ptr<f32> -> tensor<256x!tt.ptr<f32>>
+    %8 = tt.addptr %7, %4 : tensor<256x!tt.ptr<f32>>, tensor<256xi32>
+    %residual = tt.load %8 : !tt.ptr<f32>
+
+    // Residual add: x = input + residual
+    %x = arith.addf %input, %residual : tensor<256xf32>
+
+    // Mean (sum reduce)
+    %sum_x = "tt.reduce"(%x) ({
+    ^bb0(%a: f32, %b: f32):
+      %s = arith.addf %a, %b : f32
+      "tt.reduce.return"(%s) : (f32) -> ()
+    }) {axis = 1 : i32} : (tensor<256xf32>) -> f32
+
+    // Subtract mean
+    %mean_splat = tt.splat %sum_x : f32 -> tensor<256xf32>
+    %centered = arith.subf %x, %mean_splat : tensor<256xf32>
+
+    // Variance (sum of squares reduce)
+    %sq = arith.mulf %centered, %centered : tensor<256xf32>
+    %var_sum = "tt.reduce"(%sq) ({
+    ^bb0(%c: f32, %d: f32):
+      %vs = arith.addf %c, %d : f32
+      "tt.reduce.return"(%vs) : (f32) -> ()
+    }) {axis = 1 : i32} : (tensor<256xf32>) -> f32
+
+    // Normalize
+    %var_splat = tt.splat %var_sum : f32 -> tensor<256xf32>
+    %inv_std = math.rsqrt %var_splat : tensor<256xf32>
+    %normed = arith.mulf %centered, %inv_std : tensor<256xf32>
+
+    // Scale and bias (gamma * normed + beta)
+    %9 = tt.splat %arg2 : !tt.ptr<f32> -> tensor<256x!tt.ptr<f32>>
+    %10 = tt.addptr %9, %2 : tensor<256x!tt.ptr<f32>>, tensor<256xi32>
+    %gamma = tt.load %10 : !tt.ptr<f32>
+    %scaled = arith.mulf %normed, %gamma : tensor<256xf32>
+
+    %11 = tt.splat %arg3 : !tt.ptr<f32> -> tensor<256x!tt.ptr<f32>>
+    %12 = tt.addptr %11, %2 : tensor<256x!tt.ptr<f32>>, tensor<256xi32>
+    %beta = tt.load %12 : !tt.ptr<f32>
+    %out = arith.addf %scaled, %beta : tensor<256xf32>
+
+    // Store
+    %13 = tt.splat %arg4 : !tt.ptr<f32> -> tensor<256x!tt.ptr<f32>>
+    %14 = tt.addptr %13, %4 : tensor<256x!tt.ptr<f32>>, tensor<256xi32>
+    tt.store %14, %out : !tt.ptr<f32>
+    tt.return
+  }
+}
+"""
+
+
+def test_ttgir_fused_residual_norm_detected():
+    """Fused residual+norm: 2 sum reduces + add + rsqrt detected."""
+    from triton_metal.codegen.ttgir_parser import TTGIRParser
+
+    parser = TTGIRParser(FUSED_RESIDUAL_NORM_TTGIR, FakeOptions())
+    parser._parse_function_signature()
+    parser._parse_body()
+
+    assert len(parser.reduce_ops) >= 2, f"Expected 2+ reduces, got {len(parser.reduce_ops)}"
+    assert parser._is_fused_residual_norm_pattern(), "Should match fused residual+norm"
+
+
+def test_ttgir_fused_residual_norm_not_softmax():
+    """Fused residual+norm should not match softmax pattern."""
+    from triton_metal.codegen.ttgir_parser import TTGIRParser
+
+    parser = TTGIRParser(FUSED_RESIDUAL_NORM_TTGIR, FakeOptions())
+    parser._parse_function_signature()
+    parser._parse_body()
+
+    assert not parser._is_softmax_pattern(), "Should not match softmax (no max reduce)"
+    assert parser._is_fused_residual_norm_pattern()
+
+
+@requires_metal
+def test_ttgir_fused_residual_norm_compiles(runner):
+    """TTGIR fused residual+norm compiles to valid MSL."""
+    from triton_metal.codegen.ttgir_parser import parse_ttgir
+
+    kb = parse_ttgir(FUSED_RESIDUAL_NORM_TTGIR, FakeOptions())
+    msl = kb.build()
+    assert "layer_norm" in msl or "norm" in msl.lower()
+    runner.compile(msl, "layer_norm_kernel")

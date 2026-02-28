@@ -2319,6 +2319,111 @@ kernel void top_p(
 """
 
 
+def make_speculative_decode_kernel(block_size=256):
+    """Generate a speculative decoding verification kernel.
+
+    Given draft model logits and target model logits for a sequence of
+    speculated tokens, computes acceptance probabilities and determines
+    which tokens to accept using the standard speculative decoding algorithm:
+
+        For each token i:
+            p = target_prob[i][draft_token[i]]
+            q = draft_prob[i][draft_token[i]]
+            accept if random[i] < min(1, p/q)
+
+    If token i is rejected, all subsequent tokens are also rejected.
+    The kernel outputs the number of accepted tokens and the first
+    rejected position's adjusted distribution (target - draft, renormalized)
+    for resampling.
+
+    Layout:
+        draft_probs: [n_tokens, vocab_size] — draft model softmax probs
+        target_probs: [n_tokens, vocab_size] — target model softmax probs
+        draft_tokens: [n_tokens] — token IDs chosen by draft model (uint)
+        rand_vals: [n_tokens] — uniform random values in [0,1] for acceptance
+        n_accepted: [1] — output: number of accepted tokens (uint)
+        adjusted_probs: [vocab_size] — output: resampling dist at rejection point
+        n_tokens: number of speculated tokens
+        vocab_size: vocabulary size
+
+    Dispatch: 1 threadgroup (verification is sequential per-token).
+
+    Args:
+        block_size: Threads per threadgroup.
+    """
+    return f"""#include <metal_stdlib>
+using namespace metal;
+
+kernel void speculative_decode(
+    device const float* draft_probs [[buffer(0)]],
+    device const float* target_probs [[buffer(1)]],
+    device const uint* draft_tokens [[buffer(2)]],
+    device const float* rand_vals [[buffer(3)]],
+    device uint* n_accepted [[buffer(4)]],
+    device float* adjusted_probs [[buffer(5)]],
+    constant uint& n_tokens [[buffer(6)]],
+    constant uint& vocab_size [[buffer(7)]],
+    uint lid [[thread_position_in_threadgroup]]
+) {{
+    const uint BLOCK = {block_size}u;
+
+    // Thread 0 does the sequential acceptance check
+    threadgroup uint accepted_count;
+    if (lid == 0u) {{
+        accepted_count = n_tokens;  // assume all accepted
+        for (uint i = 0u; i < n_tokens; i++) {{
+            uint tok = draft_tokens[i];
+            float p = target_probs[i * vocab_size + tok];
+            float q = draft_probs[i * vocab_size + tok];
+            float ratio = (q > 0.0f) ? (p / q) : 1.0f;
+            float accept_prob = min(1.0f, ratio);
+            if (rand_vals[i] >= accept_prob) {{
+                accepted_count = i;
+                break;
+            }}
+        }}
+        n_accepted[0] = accepted_count;
+    }}
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    uint rej_pos = accepted_count;
+
+    // Compute adjusted distribution at the rejection point
+    // If all accepted (rej_pos == n_tokens), output the target dist at last token
+    uint dist_pos = (rej_pos < n_tokens) ? rej_pos : (n_tokens - 1u);
+
+    // adjusted[v] = max(0, target[v] - draft[v]) then normalize
+    // Each thread handles a slice of the vocab
+    threadgroup float tg_sum[{block_size}];
+    float local_sum = 0.0f;
+    for (uint v = lid; v < vocab_size; v += BLOCK) {{
+        float t = target_probs[dist_pos * vocab_size + v];
+        float d = draft_probs[dist_pos * vocab_size + v];
+        float adj = max(0.0f, t - d);
+        adjusted_probs[v] = adj;
+        local_sum += adj;
+    }}
+    tg_sum[lid] = local_sum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Tree reduction for sum
+    for (uint stride = BLOCK / 2u; stride > 0u; stride >>= 1u) {{
+        if (lid < stride) {{
+            tg_sum[lid] += tg_sum[lid + stride];
+        }}
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }}
+    float total = tg_sum[0];
+
+    // Normalize
+    float inv_total = (total > 0.0f) ? (1.0f / total) : 0.0f;
+    for (uint v = lid; v < vocab_size; v += BLOCK) {{
+        adjusted_probs[v] *= inv_total;
+    }}
+}}
+"""
+
+
 def make_simdgroup_matmul_kernel(dtype="fp32"):
     """Generate a matmul kernel using Apple's simdgroup_matrix hardware.
 

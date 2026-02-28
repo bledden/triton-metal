@@ -50,6 +50,15 @@ from triton_metal.codegen.msl_emitter import (
     make_concat_kernel,
     make_split_kernel,
     make_top_p_kernel,
+    make_paged_attention_kernel,
+    make_multi_head_paged_attention_kernel,
+    make_fp16_kv_attention_kernel,
+    make_fused_residual_norm_kernel,
+    make_speculative_decode_kernel,
+    make_beam_search_kernel,
+    make_fused_mlp_kernel,
+    make_sliding_window_attention_kernel,
+    make_repeat_kv_kernel,
 )
 
 
@@ -937,6 +946,315 @@ def main():
                                         1, 256)
         n_bytes = vocab_size * 4
         print(format_benchmark_result("top_p", result, n_bytes=n_bytes))
+
+    # =========================================================================
+    # Fused Residual + LayerNorm benchmarks
+    # =========================================================================
+    print("\n" + "=" * 60)
+    print("FUSED RESIDUAL + LAYERNORM BENCHMARKS")
+    print("=" * 60)
+
+    for n_cols in [256, 1024, 4096]:
+        n_rows = 128
+        print(f"\n--- {n_rows} rows x {n_cols} cols ---")
+
+        msl = make_fused_residual_norm_kernel(block_size=256)
+        pipeline = compile_and_load(device, msl, "fused_residual_norm")
+
+        total = n_rows * n_cols
+        in_buf = make_float_buffer(device, total, "ramp")
+        res_buf = make_float_buffer(device, total, "small")
+        gamma_buf = make_float_buffer(device, n_cols, "ones")
+        beta_buf = make_float_buffer(device, n_cols, "small")
+        out_buf = make_empty_buffer(device, total)
+        res_out_buf = make_empty_buffer(device, total)
+        ncols_buf = make_uint_buffer(device, n_cols)
+
+        result = bench_custom_dispatch(bench, pipeline,
+                                        [in_buf, res_buf, gamma_buf, beta_buf,
+                                         out_buf, res_out_buf, ncols_buf],
+                                        n_rows, 256)
+        # reads: input + residual + gamma + beta; writes: output + residual_out
+        n_bytes = (total * 4 + n_cols * 2) * 4
+        n_flops = total * 8  # add + mean + var + norm + scale + shift
+        print(format_benchmark_result("fused_res_norm", result,
+                                       n_bytes=n_bytes, n_flops=n_flops))
+
+    # =========================================================================
+    # Paged Attention benchmarks
+    # =========================================================================
+    print("\n" + "=" * 60)
+    print("PAGED ATTENTION BENCHMARKS")
+    print("=" * 60)
+
+    for n_tokens, page_size in [(64, 16), (256, 16), (1024, 16)]:
+        head_dim = 64
+        n_pages = (n_tokens + page_size - 1) // page_size
+        print(f"\n--- tokens={n_tokens}, pages={n_pages}, page_size={page_size} ---")
+
+        msl = make_paged_attention_kernel(head_dim=head_dim, page_size=page_size)
+        pipeline = compile_and_load(device, msl, "paged_attention")
+
+        q_buf = make_float_buffer(device, head_dim, "small")
+        k_buf = make_float_buffer(device, n_pages * page_size * head_dim, "ramp")
+        v_buf = make_float_buffer(device, n_pages * page_size * head_dim, "ramp")
+        # page table: identity mapping for benchmark
+        pt_buf = device.newBufferWithLength_options_(
+            n_pages * 4, Metal.MTLResourceStorageModeShared
+        )
+        pt_view = pt_buf.contents().as_buffer(n_pages * 4)
+        for i in range(n_pages):
+            struct.pack_into("I", pt_view, i * 4, i)
+        out_buf = make_empty_buffer(device, head_dim)
+        sl_buf = make_uint_buffer(device, n_tokens)
+        np_buf = make_uint_buffer(device, n_pages)
+
+        result = bench_custom_dispatch(bench, pipeline,
+                                        [q_buf, k_buf, v_buf, pt_buf, out_buf,
+                                         sl_buf, np_buf],
+                                        1, 256)
+        n_flops = 4 * n_tokens * head_dim
+        n_bytes = (head_dim + 2 * n_tokens * head_dim + head_dim) * 4
+        print(format_benchmark_result("paged_attn", result,
+                                       n_bytes=n_bytes, n_flops=n_flops))
+
+    # =========================================================================
+    # Multi-Head Paged Attention benchmarks
+    # =========================================================================
+    print("\n" + "=" * 60)
+    print("MULTI-HEAD PAGED ATTENTION BENCHMARKS")
+    print("=" * 60)
+
+    for n_tokens, n_heads in [(256, 8), (512, 8)]:
+        head_dim = 64
+        page_size = 16
+        n_pages = (n_tokens + page_size - 1) // page_size
+        print(f"\n--- tokens={n_tokens}, heads={n_heads}, pages={n_pages} ---")
+
+        msl = make_multi_head_paged_attention_kernel(
+            n_heads=n_heads, head_dim=head_dim, page_size=page_size)
+        pipeline = compile_and_load(device, msl, "multi_head_paged_attention")
+
+        q_buf = make_float_buffer(device, n_heads * head_dim, "small")
+        k_buf = make_float_buffer(device, n_pages * page_size * n_heads * head_dim, "ramp")
+        v_buf = make_float_buffer(device, n_pages * page_size * n_heads * head_dim, "ramp")
+        pt_buf = device.newBufferWithLength_options_(
+            n_pages * 4, Metal.MTLResourceStorageModeShared
+        )
+        pt_view = pt_buf.contents().as_buffer(n_pages * 4)
+        for i in range(n_pages):
+            struct.pack_into("I", pt_view, i * 4, i)
+        out_buf = make_empty_buffer(device, n_heads * head_dim)
+        sl_buf = make_uint_buffer(device, n_tokens)
+        np_buf = make_uint_buffer(device, n_pages)
+
+        result = bench_custom_dispatch(bench, pipeline,
+                                        [q_buf, k_buf, v_buf, pt_buf, out_buf,
+                                         sl_buf, np_buf],
+                                        n_heads, 256)
+        n_flops = n_heads * 4 * n_tokens * head_dim
+        n_bytes = (n_heads * head_dim + 2 * n_heads * n_tokens * head_dim +
+                   n_heads * head_dim) * 4
+        print(format_benchmark_result("mh_paged_attn", result,
+                                       n_bytes=n_bytes, n_flops=n_flops))
+
+    # =========================================================================
+    # FP16 KV-Cache Attention benchmarks
+    # =========================================================================
+    print("\n" + "=" * 60)
+    print("FP16 KV-CACHE ATTENTION BENCHMARKS")
+    print("=" * 60)
+
+    for seq_len in [64, 256, 1024]:
+        head_dim = 64
+        print(f"\n--- seq_len={seq_len}, head_dim={head_dim} (K/V in FP16) ---")
+
+        msl = make_fp16_kv_attention_kernel(head_dim=head_dim)
+        pipeline = compile_and_load(device, msl, "fp16_kv_attention")
+
+        q_buf = make_float_buffer(device, head_dim, "small")
+        # K/V in half precision (2 bytes per element)
+        kv_size = seq_len * head_dim
+        k_buf = device.newBufferWithLength_options_(
+            kv_size * 2, Metal.MTLResourceStorageModeShared
+        )
+        k_view = k_buf.contents().as_buffer(kv_size * 2)
+        for i in range(kv_size):
+            struct.pack_into("e", k_view, i * 2, float(i % 100) * 0.01)
+        v_buf = device.newBufferWithLength_options_(
+            kv_size * 2, Metal.MTLResourceStorageModeShared
+        )
+        v_view = v_buf.contents().as_buffer(kv_size * 2)
+        for i in range(kv_size):
+            struct.pack_into("e", v_view, i * 2, float(i % 100) * 0.01)
+        out_buf = make_empty_buffer(device, head_dim)
+        sl_buf = make_uint_buffer(device, seq_len)
+
+        result = bench_custom_dispatch(bench, pipeline,
+                                        [q_buf, k_buf, v_buf, out_buf, sl_buf],
+                                        1, 256)
+        n_flops = 4 * seq_len * head_dim
+        # Q: float32, K/V: float16 (2x bandwidth savings)
+        n_bytes = head_dim * 4 + 2 * kv_size * 2 + head_dim * 4
+        print(format_benchmark_result("fp16_kv_attn", result,
+                                       n_bytes=n_bytes, n_flops=n_flops))
+
+    # =========================================================================
+    # Fused MLP benchmarks
+    # =========================================================================
+    print("\n" + "=" * 60)
+    print("FUSED MLP (SwiGLU) BENCHMARKS")
+    print("=" * 60)
+
+    for n in [65536, 1_000_000, 4_000_000]:
+        print(f"\n--- n = {n:,} ---")
+
+        msl = make_fused_mlp_kernel(block_size=256)
+        pipeline = compile_and_load(device, msl, "fused_mlp")
+
+        gate_buf = make_float_buffer(device, n, "ramp")
+        up_buf = make_float_buffer(device, n, "small")
+        out_buf = make_empty_buffer(device, n)
+        n_buf = make_uint_buffer(device, n)
+
+        result = bench.time_kernel(pipeline, [gate_buf, up_buf, out_buf, n_buf], n)
+        n_bytes = 3 * n * 4  # 2 reads + 1 write
+        n_flops = 5 * n  # silu(4 ops) + mul(1 op)
+        print(format_benchmark_result("fused_mlp", result, n_bytes=n_bytes, n_flops=n_flops))
+
+    # =========================================================================
+    # Sliding Window Attention benchmarks
+    # =========================================================================
+    print("\n" + "=" * 60)
+    print("SLIDING WINDOW ATTENTION BENCHMARKS")
+    print("=" * 60)
+
+    for seq_len, window_size in [(256, 128), (1024, 256), (2048, 512)]:
+        head_dim = 64
+        q_pos = seq_len - 1  # last position
+        print(f"\n--- seq_len={seq_len}, window={window_size}, head_dim={head_dim} ---")
+
+        msl = make_sliding_window_attention_kernel(
+            head_dim=head_dim, window_size=window_size)
+        pipeline = compile_and_load(device, msl, "sliding_window_attention")
+
+        q_buf = make_float_buffer(device, head_dim, "small")
+        k_buf = make_float_buffer(device, seq_len * head_dim, "ramp")
+        v_buf = make_float_buffer(device, seq_len * head_dim, "ramp")
+        out_buf = make_empty_buffer(device, head_dim)
+        qpos_buf = make_uint_buffer(device, q_pos)
+        sl_buf = make_uint_buffer(device, seq_len)
+
+        result = bench_custom_dispatch(bench, pipeline,
+                                        [q_buf, k_buf, v_buf, out_buf,
+                                         qpos_buf, sl_buf],
+                                        1, 256)
+        # Only attends within window
+        actual_window = min(window_size, seq_len)
+        n_flops = 4 * actual_window * head_dim
+        n_bytes = (head_dim + 2 * actual_window * head_dim + head_dim) * 4
+        print(format_benchmark_result("sliding_win_attn", result,
+                                       n_bytes=n_bytes, n_flops=n_flops))
+
+    # =========================================================================
+    # Repeat KV benchmarks
+    # =========================================================================
+    print("\n" + "=" * 60)
+    print("REPEAT KV (GQA HEAD EXPANSION) BENCHMARKS")
+    print("=" * 60)
+
+    for n_kv_heads, n_rep, seq_len in [(8, 4, 256), (8, 4, 1024), (4, 8, 512)]:
+        head_dim = 64
+        n_q_heads = n_kv_heads * n_rep
+        total_in = n_kv_heads * seq_len * head_dim
+        total_out = n_q_heads * seq_len * head_dim
+        print(f"\n--- kv_heads={n_kv_heads}, n_rep={n_rep}, seq={seq_len} ---")
+
+        msl = make_repeat_kv_kernel(block_size=256)
+        pipeline = compile_and_load(device, msl, "repeat_kv")
+
+        in_buf = make_float_buffer(device, total_in, "ramp")
+        out_buf = make_empty_buffer(device, total_out)
+        nkv_buf = make_uint_buffer(device, n_kv_heads)
+        sl_buf = make_uint_buffer(device, seq_len)
+        hd_buf = make_uint_buffer(device, head_dim)
+        nrep_buf = make_uint_buffer(device, n_rep)
+
+        result = bench.time_kernel(pipeline,
+                                    [in_buf, out_buf, nkv_buf, sl_buf, hd_buf, nrep_buf],
+                                    total_out)
+        n_bytes = (total_in + total_out) * 4
+        print(format_benchmark_result("repeat_kv", result, n_bytes=n_bytes))
+
+    # =========================================================================
+    # Beam Search benchmarks
+    # =========================================================================
+    print("\n" + "=" * 60)
+    print("BEAM SEARCH BENCHMARKS")
+    print("=" * 60)
+
+    for beam_width, vocab_size in [(4, 32768), (4, 128000), (8, 32768)]:
+        print(f"\n--- beams={beam_width}, vocab={vocab_size:,} ---")
+
+        msl = make_beam_search_kernel(beam_width=beam_width, block_size=256)
+        pipeline = compile_and_load(device, msl, "beam_search")
+
+        scores_buf = make_float_buffer(device, beam_width, "small")
+        lp_buf = make_float_buffer(device, beam_width * vocab_size, "ramp")
+        out_scores_buf = make_empty_buffer(device, beam_width)
+        out_beam_buf = device.newBufferWithLength_options_(
+            beam_width * 4, Metal.MTLResourceStorageModeShared
+        )
+        out_tok_buf = device.newBufferWithLength_options_(
+            beam_width * 4, Metal.MTLResourceStorageModeShared
+        )
+        vsz_buf = make_uint_buffer(device, vocab_size)
+
+        result = bench_custom_dispatch(bench, pipeline,
+                                        [scores_buf, lp_buf, out_scores_buf,
+                                         out_beam_buf, out_tok_buf, vsz_buf],
+                                        1, 256)
+        n_bytes = (beam_width + beam_width * vocab_size) * 4
+        print(format_benchmark_result("beam_search", result, n_bytes=n_bytes))
+
+    # =========================================================================
+    # Speculative Decoding benchmarks
+    # =========================================================================
+    print("\n" + "=" * 60)
+    print("SPECULATIVE DECODING BENCHMARKS")
+    print("=" * 60)
+
+    for n_tokens, vocab_size in [(4, 32768), (8, 32768), (4, 128000)]:
+        print(f"\n--- draft_tokens={n_tokens}, vocab={vocab_size:,} ---")
+
+        msl = make_speculative_decode_kernel(block_size=256)
+        pipeline = compile_and_load(device, msl, "speculative_decode")
+
+        draft_buf = make_float_buffer(device, n_tokens * vocab_size, "small")
+        target_buf = make_float_buffer(device, n_tokens * vocab_size, "small")
+        # draft token IDs
+        tok_buf = device.newBufferWithLength_options_(
+            n_tokens * 4, Metal.MTLResourceStorageModeShared
+        )
+        tok_view = tok_buf.contents().as_buffer(n_tokens * 4)
+        for i in range(n_tokens):
+            struct.pack_into("I", tok_view, i * 4, i % vocab_size)
+        # random values
+        rand_buf = make_float_buffer(device, n_tokens, "small")
+        # outputs
+        accepted_buf = device.newBufferWithLength_options_(
+            4, Metal.MTLResourceStorageModeShared
+        )
+        adj_buf = make_empty_buffer(device, vocab_size)
+        nt_buf = make_uint_buffer(device, n_tokens)
+        vs_buf = make_uint_buffer(device, vocab_size)
+
+        result = bench_custom_dispatch(bench, pipeline,
+                                        [draft_buf, target_buf, tok_buf, rand_buf,
+                                         accepted_buf, adj_buf, nt_buf, vs_buf],
+                                        1, 256)
+        n_bytes = 2 * n_tokens * vocab_size * 4  # read draft + target probs
+        print(format_benchmark_result("spec_decode", result, n_bytes=n_bytes))
 
     # =========================================================================
     # Summary

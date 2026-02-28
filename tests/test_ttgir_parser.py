@@ -8,66 +8,17 @@ Feeds real TTGIR dumps into the parser and verifies:
 5. (When possible) GPU execution produces correct results
 """
 
-import hashlib
-import os
+import math
 import platform
-import struct
-import subprocess
-import tempfile
 
 import pytest
+
+from tests.conftest import requires_metal
 
 pytestmark = pytest.mark.skipif(
     platform.system() != "Darwin",
     reason="Metal backend requires macOS",
 )
-
-
-def _has_metal_compiler():
-    try:
-        subprocess.check_call(
-            ["xcrun", "-sdk", "macosx", "metal", "--version"],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
-        return True
-    except (subprocess.CalledProcessError, FileNotFoundError):
-        return False
-
-
-requires_compiler = pytest.mark.skipif(
-    not _has_metal_compiler(),
-    reason="Requires Metal compiler",
-)
-
-
-def _compile_msl(msl_src, kernel_name):
-    """Compile MSL to metallib, return path."""
-    cache_dir = os.path.join(tempfile.gettempdir(), "triton_metal_parser_test")
-    os.makedirs(cache_dir, exist_ok=True)
-
-    src_hash = hashlib.sha256(msl_src.encode()).hexdigest()[:16]
-    base = f"{kernel_name}_{src_hash}"
-    metal_path = os.path.join(cache_dir, f"{base}.metal")
-    air_path = os.path.join(cache_dir, f"{base}.air")
-    metallib_path = os.path.join(cache_dir, f"{base}.metallib")
-
-    with open(metal_path, "w") as f:
-        f.write(msl_src)
-
-    result = subprocess.run(
-        ["xcrun", "-sdk", "macosx", "metal", "-c", metal_path,
-         "-o", air_path, "-std=metal3.2", "-O2"],
-        capture_output=True, text=True,
-    )
-    if result.returncode != 0:
-        return None, result.stderr
-    subprocess.check_call(
-        ["xcrun", "-sdk", "macosx", "metallib", air_path,
-         "-o", metallib_path],
-        stderr=subprocess.PIPE,
-    )
-    return metallib_path, None
 
 
 class FakeOptions:
@@ -203,37 +154,34 @@ def test_parse_vecadd_output_detection():
     assert mutable_count == 1, f"Expected 1 mutable arg, got {mutable_count}"
 
 
-@requires_compiler
-def test_parse_vecadd_compiles():
+@requires_metal
+def test_parse_vecadd_compiles(runner):
     """MSL generated from parsed vector add TTGIR compiles."""
     from triton_metal.codegen.ttgir_parser import parse_ttgir
 
     kb = parse_ttgir(VECADD_TTGIR, FakeOptions())
     msl = kb.build()
-    path, error = _compile_msl(msl, "add_kernel")
-    assert path is not None, f"Compilation failed:\n{error}\n\nMSL:\n{msl}"
+    runner.compile(msl, "add_kernel")
 
 
-@requires_compiler
-def test_parse_vecmul_compiles():
+@requires_metal
+def test_parse_vecmul_compiles(runner):
     """MSL generated from parsed multiply TTGIR compiles."""
     from triton_metal.codegen.ttgir_parser import parse_ttgir
 
     kb = parse_ttgir(VECMUL_TTGIR, FakeOptions())
     msl = kb.build()
-    path, error = _compile_msl(msl, "mul_kernel")
-    assert path is not None, f"Compilation failed:\n{error}\n\nMSL:\n{msl}"
+    runner.compile(msl, "mul_kernel")
 
 
-@requires_compiler
-def test_parse_exp_compiles():
+@requires_metal
+def test_parse_exp_compiles(runner):
     """MSL generated from parsed exp TTGIR compiles."""
     from triton_metal.codegen.ttgir_parser import parse_ttgir
 
     kb = parse_ttgir(EXP_TTGIR, FakeOptions())
     msl = kb.build()
-    path, error = _compile_msl(msl, "exp_kernel")
-    assert path is not None, f"Compilation failed:\n{error}\n\nMSL:\n{msl}"
+    runner.compile(msl, "exp_kernel")
 
 
 def test_parse_block_size():
@@ -244,18 +192,15 @@ def test_parse_block_size():
     assert kb.block_size >= 256
 
 
-@requires_compiler
 def test_parse_vecadd_generates_add_op():
     """Parsed vector add MSL contains an addition operation."""
     from triton_metal.codegen.ttgir_parser import parse_ttgir
 
     kb = parse_ttgir(VECADD_TTGIR, FakeOptions())
     msl = kb.build()
-    # The MSL should contain a float addition
     assert "+" in msl or "add" in msl.lower(), f"No addition found in MSL:\n{msl}"
 
 
-@requires_compiler
 def test_parse_vecmul_generates_mul_op():
     """Parsed multiply MSL contains a multiply operation."""
     from triton_metal.codegen.ttgir_parser import parse_ttgir
@@ -265,7 +210,6 @@ def test_parse_vecmul_generates_mul_op():
     assert "*" in msl, f"No multiplication found in MSL:\n{msl}"
 
 
-@requires_compiler
 def test_parse_exp_generates_exp_op():
     """Parsed exp MSL contains an exp() call."""
     from triton_metal.codegen.ttgir_parser import parse_ttgir
@@ -273,3 +217,124 @@ def test_parse_exp_generates_exp_op():
     kb = parse_ttgir(EXP_TTGIR, FakeOptions())
     msl = kb.build()
     assert "exp(" in msl, f"No exp() found in MSL:\n{msl}"
+
+
+# ---------------------------------------------------------------------------
+# GPU execution tests — verify TTGIR-parsed kernels produce correct results
+# ---------------------------------------------------------------------------
+
+@requires_metal
+def test_ttgir_vecadd_gpu(runner):
+    """TTGIR vector add: C = A + B, verified on GPU."""
+    from triton_metal.codegen.ttgir_parser import parse_ttgir
+
+    kb = parse_ttgir(VECADD_TTGIR, FakeOptions())
+    msl = kb.build()
+    n = 512
+
+    metallib = runner.compile(msl, "add_kernel")
+    pipeline = runner.load(metallib, "add_kernel")
+
+    a_data = [float(i) for i in range(n)]
+    b_data = [float(i) * 0.5 for i in range(n)]
+    buf_a = runner.make_float_buffer(a_data)
+    buf_b = runner.make_float_buffer(b_data)
+    buf_c = runner.make_empty_buffer(n)
+    buf_n = runner.make_int_buffer(n)
+
+    runner.run(pipeline, [buf_a, buf_b, buf_c, buf_n], n, block_size=256)
+
+    result = runner.read_float_buffer(buf_c, n)
+    for i in range(n):
+        expected = a_data[i] + b_data[i]
+        assert abs(result[i] - expected) < 1e-5, (
+            f"Mismatch at {i}: got {result[i]}, expected {expected}"
+        )
+
+
+@requires_metal
+def test_ttgir_vecmul_gpu(runner):
+    """TTGIR vector multiply: C = A * B, verified on GPU."""
+    from triton_metal.codegen.ttgir_parser import parse_ttgir
+
+    kb = parse_ttgir(VECMUL_TTGIR, FakeOptions())
+    msl = kb.build()
+    n = 512
+
+    metallib = runner.compile(msl, "mul_kernel")
+    pipeline = runner.load(metallib, "mul_kernel")
+
+    a_data = [float(i) * 0.1 for i in range(n)]
+    b_data = [float(i) * 0.2 for i in range(n)]
+    buf_a = runner.make_float_buffer(a_data)
+    buf_b = runner.make_float_buffer(b_data)
+    buf_c = runner.make_empty_buffer(n)
+    buf_n = runner.make_int_buffer(n)
+
+    runner.run(pipeline, [buf_a, buf_b, buf_c, buf_n], n, block_size=256)
+
+    result = runner.read_float_buffer(buf_c, n)
+    for i in range(n):
+        expected = a_data[i] * b_data[i]
+        tol = max(1e-4, abs(expected) * 1e-6)
+        assert abs(result[i] - expected) < tol, (
+            f"Mismatch at {i}: got {result[i]}, expected {expected}"
+        )
+
+
+@requires_metal
+def test_ttgir_exp_gpu(runner):
+    """TTGIR exp: B = exp(A), verified on GPU."""
+    from triton_metal.codegen.ttgir_parser import parse_ttgir
+
+    kb = parse_ttgir(EXP_TTGIR, FakeOptions())
+    msl = kb.build()
+    n = 256
+
+    metallib = runner.compile(msl, "exp_kernel")
+    pipeline = runner.load(metallib, "exp_kernel")
+
+    # Use small values to avoid overflow
+    a_data = [float(i) * 0.01 for i in range(n)]
+    buf_a = runner.make_float_buffer(a_data)
+    buf_b = runner.make_empty_buffer(n)
+    buf_n = runner.make_int_buffer(n)
+
+    runner.run(pipeline, [buf_a, buf_b, buf_n], n, block_size=256)
+
+    result = runner.read_float_buffer(buf_b, n)
+    for i in range(n):
+        expected = math.exp(a_data[i])
+        assert abs(result[i] - expected) < 1e-4, (
+            f"Mismatch at {i}: got {result[i]}, expected {expected}"
+        )
+
+
+@requires_metal
+def test_ttgir_vecadd_non_aligned(runner):
+    """TTGIR vector add with non-block-aligned size (tests masking)."""
+    from triton_metal.codegen.ttgir_parser import parse_ttgir
+
+    kb = parse_ttgir(VECADD_TTGIR, FakeOptions())
+    msl = kb.build()
+    n = 300  # Not a multiple of 256
+
+    metallib = runner.compile(msl, "add_kernel")
+    pipeline = runner.load(metallib, "add_kernel")
+
+    a_data = [float(i) for i in range(n)]
+    b_data = [1.0] * n
+    # Allocate padded buffers (full block)
+    buf_a = runner.make_float_buffer(a_data + [0.0] * (256 - n % 256))
+    buf_b = runner.make_float_buffer(b_data + [0.0] * (256 - n % 256))
+    buf_c = runner.make_empty_buffer(n + (256 - n % 256))
+    buf_n = runner.make_int_buffer(n)
+
+    runner.run(pipeline, [buf_a, buf_b, buf_c, buf_n], n, block_size=256)
+
+    result = runner.read_float_buffer(buf_c, n)
+    for i in range(n):
+        expected = a_data[i] + b_data[i]
+        assert abs(result[i] - expected) < 1e-5, (
+            f"Mismatch at {i}: got {result[i]}, expected {expected}"
+        )

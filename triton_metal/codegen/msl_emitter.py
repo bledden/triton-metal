@@ -3828,6 +3828,92 @@ kernel void simdgroup_matmul(
 
 
 # ---------------------------------------------------------------------------
+def make_group_norm_kernel(n_groups=32, block_size=256, dtype="fp32", eps=1e-5):
+    """Generate a group normalization kernel.
+
+    Common in diffusion models (Stable Diffusion, DALL-E). Divides channels
+    into groups and normalizes within each group.
+
+    Input layout: [batch, channels, spatial] flattened to [batch, channels * spatial]
+    Each threadgroup handles one (batch, group) pair.
+
+    output = (x - mean) / sqrt(var + eps) * weight + bias
+
+    Args:
+        n_groups: Number of channel groups (typically 32).
+        block_size: Threads per threadgroup.
+        dtype: Data type.
+        eps: Epsilon for numerical stability.
+    """
+    n_simd_groups = (block_size + 31) // 32
+
+    kb = KernelBuilder("group_norm_kernel", block_size=block_size)
+    kb.add_ptr_arg("input", dtype=dtype, const=True)
+    kb.add_ptr_arg("weight", dtype=dtype, const=True)
+    kb.add_ptr_arg("bias", dtype=dtype, const=True)
+    kb.add_ptr_arg("output", dtype=dtype, const=False)
+    kb.add_scalar_arg("n_channels", dtype="u32")
+    kb.add_scalar_arg("spatial_size", dtype="u32")
+
+    kb.declare_threadgroup_array("shared", dtype=dtype, size=n_simd_groups)
+
+    # pid indexes (batch, group) pairs
+    kb._var("channels_per_group", f"n_channels / {n_groups}u", ty="uint")
+    kb._var("group_size", "channels_per_group * spatial_size", ty="uint")
+    kb._var("batch_idx", f"pid / {n_groups}u", ty="uint")
+    kb._var("group_idx", f"pid % {n_groups}u", ty="uint")
+    kb._var("base_offset", "batch_idx * n_channels * spatial_size + group_idx * group_size", ty="uint")
+
+    # Pass 1: Compute sum (for mean)
+    kb._var("sum_val", "0.0f", ty="float")
+    kb.raw_line(f"for (uint i = lid; i < group_size; i += {block_size}u) {{")
+    kb.indent()
+    kb.raw_line("sum_val += float(input[base_offset + i]);")
+    kb.dedent()
+    kb.raw_line("}")
+
+    kb.threadgroup_reduce("sum", "sum_val", "shared", "total_sum")
+
+    # Broadcast mean
+    kb.begin_if("lid == 0")
+    kb.raw_line("shared[0] = total_sum;")
+    kb.end_block()
+    kb.barrier("threadgroup")
+    kb._var("mean_val", "shared[0] / float(group_size)", ty="float")
+
+    # Pass 2: Compute sum of squared diffs (for variance)
+    kb._var("sq_sum", "0.0f", ty="float")
+    kb.raw_line(f"for (uint i = lid; i < group_size; i += {block_size}u) {{")
+    kb.indent()
+    kb._var("diff", "float(input[base_offset + i]) - mean_val", ty="float")
+    kb.raw_line("sq_sum += diff * diff;")
+    kb.dedent()
+    kb.raw_line("}")
+
+    kb.threadgroup_reduce("sum", "sq_sum", "shared", "total_sq")
+
+    # Broadcast variance
+    kb.begin_if("lid == 0")
+    kb.raw_line("shared[0] = total_sq;")
+    kb.end_block()
+    kb.barrier("threadgroup")
+    kb._var("var_val", f"shared[0] / float(group_size)", ty="float")
+    kb._var("inv_std", f"rsqrt(var_val + {eps}f)", ty="float")
+
+    # Pass 3: Normalize with affine transform
+    kb.raw_line(f"for (uint i = lid; i < group_size; i += {block_size}u) {{")
+    kb.indent()
+    # Channel index within the group for weight/bias lookup
+    kb._var("ch_in_group", "i / spatial_size", ty="uint")
+    kb._var("ch_idx", "group_idx * channels_per_group + ch_in_group", ty="uint")
+    kb._var("normalized", "(float(input[base_offset + i]) - mean_val) * inv_std", ty="float")
+    kb.raw_line("output[base_offset + i] = normalized * weight[ch_idx] + bias[ch_idx];")
+    kb.dedent()
+    kb.raw_line("}")
+
+    return kb.build()
+
+
 def make_fused_linear_kernel(has_bias=True):
     """Generate a fused linear layer kernel: output = input @ weight^T + bias.
 

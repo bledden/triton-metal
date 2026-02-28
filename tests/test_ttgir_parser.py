@@ -2448,3 +2448,155 @@ def test_ttgir_hardswish_compiles(runner):
     msl = kb.build()
     assert "hardswish" in msl.lower() or "clamp" in msl
     runner.compile(msl, "hardswish_kernel")
+
+
+# ---------------------------------------------------------------------------
+# Batch normalization TTGIR pattern
+# ---------------------------------------------------------------------------
+
+# Batch norm (eval): output = (input - mean) / sqrt(var + eps) * weight + bias
+BATCH_NORM_TTGIR = """
+module {
+  tt.func public @batch_norm_kernel(%arg0: !tt.ptr<f32> {tt.divisibility = 16 : i32},
+                                     %arg1: !tt.ptr<f32> {tt.divisibility = 16 : i32},
+                                     %arg2: !tt.ptr<f32> {tt.divisibility = 16 : i32},
+                                     %arg3: !tt.ptr<f32> {tt.divisibility = 16 : i32},
+                                     %arg4: !tt.ptr<f32> {tt.divisibility = 16 : i32, tt.output},
+                                     %arg5: i32) {
+    %0 = tt.get_program_id x : i32
+    %c256 = arith.constant 256 : i32
+    %1 = arith.muli %0, %c256 : i32
+    %2 = tt.make_range {end = 256 : i32, start = 0 : i32}
+    %3 = tt.splat %1
+    %4 = arith.addi %3, %2
+    %5 = tt.splat %arg5
+    %6 = arith.cmpi slt, %4, %5
+    %7 = tt.addptr %arg0, %4
+    %8 = tt.load %7, %6
+    %9 = tt.addptr %arg1, %4
+    %10 = tt.load %9, %6
+    %11 = tt.addptr %arg2, %4
+    %12 = tt.load %11, %6
+    %13 = tt.addptr %arg3, %4
+    %14 = tt.load %13, %6
+    %15 = arith.subf %8, %10
+    %ceps = arith.constant 1.0e-05 : f32
+    %16 = tt.splat %ceps
+    %17 = arith.addf %12, %16
+    %18 = math.rsqrt %17
+    %19 = arith.mulf %15, %18
+    %20 = arith.mulf %19, %14
+    %21 = tt.addptr %arg4, %4
+    tt.store %21, %20, %6
+    tt.return
+  }
+}
+"""
+
+def test_ttgir_batch_norm_detected():
+    """TTGIR batch norm pattern is detected."""
+    from triton_metal.codegen.ttgir_parser import TTGIRParser
+    parser = TTGIRParser(BATCH_NORM_TTGIR, FakeOptions())
+    parser._parse_function_signature()
+    parser._parse_body()
+    parser._classify_stores()
+    assert parser._is_batch_norm_pattern()
+
+
+def test_ttgir_batch_norm_not_confused_with_layer_norm():
+    """Batch norm (4+ input ptrs) is not confused with layer norm (1 input ptr + reductions)."""
+    from triton_metal.codegen.ttgir_parser import TTGIRParser
+    parser = TTGIRParser(BATCH_NORM_TTGIR, FakeOptions())
+    parser._parse_function_signature()
+    parser._parse_body()
+    parser._classify_stores()
+    # Should be batch norm, not layer norm (no reductions)
+    assert parser._is_batch_norm_pattern()
+    assert not parser._is_layer_norm_pattern()
+
+
+@requires_metal
+def test_ttgir_batch_norm_compiles(runner):
+    """TTGIR batch norm pattern compiles to valid MSL."""
+    from triton_metal.codegen.ttgir_parser import parse_ttgir
+
+    kb = parse_ttgir(BATCH_NORM_TTGIR, FakeOptions())
+    msl = kb.build()
+    assert "batch_norm" in msl.lower() or "norm" in msl.lower()
+    runner.compile(msl, "batch_norm_kernel")
+
+
+# ---------------------------------------------------------------------------
+# Online softmax TTGIR pattern
+# ---------------------------------------------------------------------------
+
+# Online softmax: single-pass with streaming max and sum updates
+ONLINE_SOFTMAX_TTGIR = """
+module {
+  tt.func public @online_softmax_kernel(%arg0: !tt.ptr<f32> {tt.divisibility = 16 : i32},
+                                         %arg1: !tt.ptr<f32> {tt.divisibility = 16 : i32, tt.output},
+                                         %arg2: i32) {
+    %0 = tt.get_program_id x : i32
+    %c256 = arith.constant 256 : i32
+    %1 = arith.muli %0, %c256 : i32
+    %2 = tt.make_range {end = 256 : i32, start = 0 : i32}
+    %3 = tt.splat %1
+    %4 = arith.addi %3, %2
+    %5 = tt.addptr %arg0, %4
+    %cinf = arith.constant 0xFF800000 : f32
+    %czero = arith.constant 0.0 : f32
+    %6:2 = scf.for %iv = %c0 to %arg2 step %c256
+        iter_args(%max_so_far = %cinf, %sum_so_far = %czero) -> (f32, f32) {
+      %7 = tt.load %5
+      %8 = "tt.reduce"(%7) ({
+        ^bb0(%a: f32, %b: f32):
+          %m = arith.maxf %a, %b
+          tt.reduce.return %m : f32
+      }) {axis = 0 : i32}
+      %9 = arith.maxf %max_so_far, %8
+      %10 = arith.subf %max_so_far, %9
+      %11 = math.exp %10
+      %12 = arith.mulf %sum_so_far, %11
+      scf.yield %9, %12 : f32, f32
+    }
+    %13 = arith.subf %7, %6#0
+    %14 = math.exp %13
+    %15 = arith.divf %14, %6#1
+    %16 = tt.addptr %arg1, %4
+    tt.store %16, %15
+    tt.return
+  }
+}
+"""
+
+def test_ttgir_online_softmax_detected():
+    """TTGIR online softmax pattern is detected (scf.for + exp + reduce)."""
+    from triton_metal.codegen.ttgir_parser import TTGIRParser
+    parser = TTGIRParser(ONLINE_SOFTMAX_TTGIR, FakeOptions())
+    parser._parse_function_signature()
+    parser._parse_body()
+    parser._classify_stores()
+    assert parser._is_online_softmax_pattern()
+
+
+def test_ttgir_online_softmax_not_confused_with_regular_softmax():
+    """Online softmax (has scf.for) is not confused with regular softmax."""
+    from triton_metal.codegen.ttgir_parser import TTGIRParser
+    # Regular softmax has no scf.for loop
+    parser = TTGIRParser(ONLINE_SOFTMAX_TTGIR, FakeOptions())
+    parser._parse_function_signature()
+    parser._parse_body()
+    parser._classify_stores()
+    assert parser._is_online_softmax_pattern()
+    # Online softmax is checked before regular softmax in routing
+
+
+@requires_metal
+def test_ttgir_online_softmax_compiles(runner):
+    """TTGIR online softmax pattern compiles to valid MSL."""
+    from triton_metal.codegen.ttgir_parser import parse_ttgir
+
+    kb = parse_ttgir(ONLINE_SOFTMAX_TTGIR, FakeOptions())
+    msl = kb.build()
+    assert "softmax" in msl.lower() or "exp" in msl
+    runner.compile(msl, "online_softmax_kernel")

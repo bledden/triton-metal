@@ -627,6 +627,9 @@ class TTGIRParser:
         # Beam search: cmp + add + reductions with 2+ output ptrs
         if self.reduce_ops and self._is_beam_search_pattern():
             return self._build_beam_search_kernel(kb, primary_dtype)
+        # Online softmax: reduce in scf.for loop (single-pass streaming)
+        if self.reduce_ops and self._is_online_softmax_pattern():
+            return self._build_online_softmax_kernel(kb, primary_dtype)
         # Softmax: max + sum reductions
         if len(self.reduce_ops) >= 2 and self._is_softmax_pattern():
             return self._build_softmax_kernel(kb, n_arg, primary_dtype)
@@ -653,6 +656,10 @@ class TTGIRParser:
         # Top-K sampling: cmp with 2+ output ptrs (no reductions)
         if self._is_top_k_pattern():
             return self._build_top_k_kernel(kb, primary_dtype)
+
+        # Batch normalization (eval): 4+ input ptrs, sub+mul, no reductions
+        if self._is_batch_norm_pattern():
+            return self._build_batch_norm_kernel(kb, primary_dtype)
 
         # Fused MLP: silu(gate) * up pattern (exp + neg + mul, no reductions)
         if self._is_fused_mlp_pattern():
@@ -1350,6 +1357,56 @@ class TTGIRParser:
         """Generate an activation kernel from the classified pattern."""
         from triton_metal.codegen.msl_emitter import make_activation_kernel
         kb.set_prebuilt_msl(make_activation_kernel(activation=activation))
+        return kb
+
+    def _is_batch_norm_pattern(self):
+        """Check if IR matches a batch normalization (eval mode) pattern.
+
+        Batch norm eval has:
+        - 4+ input pointers (input, running_mean, running_var, weight, optionally bias)
+        - 1 output pointer
+        - sub + mul operations (normalize and scale)
+        - No reductions (uses pre-computed running stats)
+        - No dot ops
+        """
+        if self.reduce_ops or self.dot_ops:
+            return False
+        n_inputs = sum(1 for _, (_, _, is_out) in self.ptr_args.items() if not is_out)
+        n_outputs = sum(1 for _, (_, _, is_out) in self.ptr_args.items() if is_out)
+        if n_inputs < 4 or n_outputs != 1:
+            return False
+        ssa_ops = {v[0] for v in self.ssa_values.values()}
+        has_sub = "sub" in ssa_ops
+        has_mul = "mul" in ssa_ops
+        return has_sub and has_mul
+
+    def _build_batch_norm_kernel(self, kb, primary_dtype):
+        """Generate a batch norm (eval mode) kernel from the pattern."""
+        from triton_metal.codegen.msl_emitter import make_batch_norm_kernel
+        kb.set_prebuilt_msl(make_batch_norm_kernel())
+        return kb
+
+    def _is_online_softmax_pattern(self):
+        """Check if IR matches an online softmax pattern.
+
+        Online softmax has:
+        - scf.for loop (streaming single-pass over data)
+        - exp operation (for softmax normalization)
+        - Reductions (max or sum inside the loop)
+        - 1 input pointer, 1 output pointer
+        """
+        if not self.scf_for_loops:
+            return False
+        ssa_ops = {v[0] for v in self.ssa_values.values()}
+        has_exp = "exp" in ssa_ops
+        n_inputs = sum(1 for _, (_, _, is_out) in self.ptr_args.items() if not is_out)
+        n_outputs = sum(1 for _, (_, _, is_out) in self.ptr_args.items() if is_out)
+        return has_exp and self.reduce_ops and n_inputs == 1 and n_outputs == 1
+
+    def _build_online_softmax_kernel(self, kb, primary_dtype):
+        """Generate an online softmax kernel from the pattern."""
+        from triton_metal.codegen.msl_emitter import make_online_softmax_kernel
+        kb.set_prebuilt_msl(make_online_softmax_kernel())
         return kb
 
     def _find_pre_reduce_op(self, reduce_input_ssa):

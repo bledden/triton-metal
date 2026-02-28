@@ -4499,3 +4499,114 @@ def test_causal_attention_compiles(runner):
 
     msl = make_causal_attention_kernel(n_heads=4, head_dim=32, block_size=128)
     runner.compile(msl, "causal_attention")
+
+
+# ---------------------------------------------------------------------------
+# Group normalization tests
+# ---------------------------------------------------------------------------
+
+@requires_metal
+def test_group_norm_kernel(runner):
+    """Group norm produces correct results for uniform input."""
+    from triton_metal.codegen.msl_emitter import make_group_norm_kernel
+    import Metal
+
+    n_groups = 2
+    channels = 4
+    spatial = 4
+    n = channels * spatial  # 16 elements per batch item
+    eps = 1e-5
+
+    msl = make_group_norm_kernel(n_groups=n_groups, block_size=256, eps=eps)
+    path = runner.compile(msl, "group_norm_kernel")
+    pipeline = runner.load(path, "group_norm_kernel")
+
+    # Input: all 1.0 → mean=1.0, var=0.0, normalized=0.0, output = 0*weight+bias = bias
+    inp_buf = runner.make_float_buffer([1.0] * n)
+    weight_buf = runner.make_float_buffer([2.0] * channels)
+    bias_buf = runner.make_float_buffer([0.5] * channels)
+    out_buf = runner.make_empty_buffer(n)
+    n_channels_buf = runner.make_uint_buffer(channels)
+    spatial_buf = runner.make_uint_buffer(spatial)
+
+    cmd = runner.queue.commandBuffer()
+    enc = cmd.computeCommandEncoderWithDescriptor_(
+        Metal.MTLComputePassDescriptor.computePassDescriptor()
+    )
+    enc.setComputePipelineState_(pipeline)
+    enc.setBuffer_offset_atIndex_(inp_buf, 0, 0)
+    enc.setBuffer_offset_atIndex_(weight_buf, 0, 1)
+    enc.setBuffer_offset_atIndex_(bias_buf, 0, 2)
+    enc.setBuffer_offset_atIndex_(out_buf, 0, 3)
+    enc.setBuffer_offset_atIndex_(n_channels_buf, 0, 4)
+    enc.setBuffer_offset_atIndex_(spatial_buf, 0, 5)
+    # 1 batch * n_groups = 2 threadgroups
+    enc.dispatchThreadgroups_threadsPerThreadgroup_(
+        Metal.MTLSizeMake(n_groups, 1, 1),
+        Metal.MTLSizeMake(256, 1, 1),
+    )
+    enc.endEncoding()
+    cmd.commit()
+    cmd.waitUntilCompleted()
+    assert cmd.status() == 4
+
+    result = runner.read_float_buffer(out_buf, n)
+    # Uniform input → normalized = 0.0, output = 0*weight + bias = 0.5
+    for i, v in enumerate(result):
+        assert abs(v - 0.5) < 0.01, f"i={i}: {v} != 0.5"
+
+
+@requires_metal
+def test_group_norm_varying_input(runner):
+    """Group norm normalizes varying input correctly."""
+    from triton_metal.codegen.msl_emitter import make_group_norm_kernel
+    import Metal
+
+    n_groups = 1
+    channels = 2
+    spatial = 2
+    n = channels * spatial  # 4 elements
+    eps = 1e-5
+
+    msl = make_group_norm_kernel(n_groups=n_groups, block_size=256, eps=eps)
+    path = runner.compile(msl, "group_norm_kernel")
+    pipeline = runner.load(path, "group_norm_kernel")
+
+    # Input: [1, 2, 3, 4] in a single group
+    data = [1.0, 2.0, 3.0, 4.0]
+    inp_buf = runner.make_float_buffer(data)
+    weight_buf = runner.make_float_buffer([1.0] * channels)
+    bias_buf = runner.make_float_buffer([0.0] * channels)
+    out_buf = runner.make_empty_buffer(n)
+    n_channels_buf = runner.make_uint_buffer(channels)
+    spatial_buf = runner.make_uint_buffer(spatial)
+
+    cmd = runner.queue.commandBuffer()
+    enc = cmd.computeCommandEncoderWithDescriptor_(
+        Metal.MTLComputePassDescriptor.computePassDescriptor()
+    )
+    enc.setComputePipelineState_(pipeline)
+    enc.setBuffer_offset_atIndex_(inp_buf, 0, 0)
+    enc.setBuffer_offset_atIndex_(weight_buf, 0, 1)
+    enc.setBuffer_offset_atIndex_(bias_buf, 0, 2)
+    enc.setBuffer_offset_atIndex_(out_buf, 0, 3)
+    enc.setBuffer_offset_atIndex_(n_channels_buf, 0, 4)
+    enc.setBuffer_offset_atIndex_(spatial_buf, 0, 5)
+    enc.dispatchThreadgroups_threadsPerThreadgroup_(
+        Metal.MTLSizeMake(n_groups, 1, 1),
+        Metal.MTLSizeMake(256, 1, 1),
+    )
+    enc.endEncoding()
+    cmd.commit()
+    cmd.waitUntilCompleted()
+    assert cmd.status() == 4
+
+    result = runner.read_float_buffer(out_buf, n)
+    # mean = 2.5, var = 1.25, inv_std = 1/sqrt(1.25+eps)
+    import math
+    mean = 2.5
+    var = sum((x - mean) ** 2 for x in data) / len(data)
+    inv_std = 1.0 / math.sqrt(var + eps)
+    for i in range(n):
+        expected = (data[i] - mean) * inv_std
+        assert abs(result[i] - expected) < 0.01, f"i={i}: {result[i]} != {expected}"

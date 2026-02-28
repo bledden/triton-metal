@@ -145,6 +145,24 @@ def make_float_scalar_buffer(device, value):
     return buf
 
 
+def make_half_buffer(device, n, pattern="ramp"):
+    """Create a float16 (half) buffer. 2 bytes per element."""
+    buf = device.newBufferWithLength_options_(
+        n * 2, Metal.MTLResourceStorageModeShared
+    )
+    view = buf.contents().as_buffer(n * 2)
+    if pattern == "ramp":
+        for i in range(n):
+            struct.pack_into("e", view, i * 2, float(i % 100) * 0.01)
+    elif pattern == "ones":
+        for i in range(n):
+            struct.pack_into("e", view, i * 2, 1.0)
+    elif pattern == "small":
+        for i in range(n):
+            struct.pack_into("e", view, i * 2, float(i % 10) * 0.1)
+    return buf
+
+
 def bench_custom_dispatch(bench, pipeline, buffers, n_groups, block_size,
                           n_warmup=10, n_iters=100):
     """Time a kernel with custom threadgroup dispatch."""
@@ -384,6 +402,40 @@ def main():
         n_flops = 2 * M_dim * N_dim * K_dim
         n_bytes = (M_dim * K_dim + K_dim * N_dim + M_dim * N_dim) * 4
         print(format_benchmark_result("simdgroup_matmul", result,
+                                       n_bytes=n_bytes, n_flops=n_flops))
+
+    # =========================================================================
+    # simdgroup_matrix FP16 matmul benchmarks
+    # =========================================================================
+    print("\n" + "=" * 60)
+    print("SIMDGROUP MATRIX FP16 MATMUL BENCHMARKS (half inputs, float acc)")
+    print("=" * 60)
+
+    for size in [64, 128, 256, 512, 1024]:
+        M_dim, N_dim, K_dim = size, size, size
+        print(f"\n--- {M_dim}x{K_dim} @ {K_dim}x{N_dim} (FP16) ---")
+
+        msl = make_simdgroup_matmul_kernel(dtype="fp16")
+        pipeline = compile_and_load(device, msl, "simdgroup_matmul")
+
+        A_buf = make_half_buffer(device, M_dim * K_dim, "small")
+        B_buf = make_half_buffer(device, K_dim * N_dim, "small")
+        C_buf = make_empty_buffer(device, M_dim * N_dim)  # output is float32
+        M_buf = make_uint_buffer(device, M_dim)
+        N_buf = make_uint_buffer(device, N_dim)
+        K_buf = make_uint_buffer(device, K_dim)
+
+        n_tile_cols = (N_dim + 31) // 32
+        n_tile_rows = (M_dim + 31) // 32
+        n_groups = n_tile_rows * n_tile_cols
+
+        result = bench_custom_dispatch(bench, pipeline,
+                                        [A_buf, B_buf, C_buf, M_buf, N_buf, K_buf],
+                                        n_groups, 128)
+        n_flops = 2 * M_dim * N_dim * K_dim
+        # A/B are half (2 bytes), C is float (4 bytes)
+        n_bytes = (M_dim * K_dim + K_dim * N_dim) * 2 + M_dim * N_dim * 4
+        print(format_benchmark_result("simdgroup_fp16", result,
                                        n_bytes=n_bytes, n_flops=n_flops))
 
     # =========================================================================

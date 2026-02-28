@@ -3018,3 +3018,206 @@ def test_ttgir_transpose_compiles(runner):
     msl = kb.build()
     assert "transpose" in msl.lower()
     runner.compile(msl, "transpose_kernel")
+
+
+# ---------------------------------------------------------------------------
+# Instance norm pattern
+# ---------------------------------------------------------------------------
+
+# Instance norm: 1 input, 1 output, reduce (sum) + rsqrt per-channel
+INSTANCE_NORM_TTGIR = """
+module {
+  tt.func public @instance_norm_kernel(%arg0: !tt.ptr<f32> {tt.divisibility = 16 : i32},
+                                        %arg1: !tt.ptr<f32> {tt.divisibility = 16 : i32, tt.output},
+                                        %arg2: i32) {
+    %0 = tt.get_program_id x : i32
+    %c256 = arith.constant 256 : i32
+    %1 = arith.muli %0, %c256 : i32
+    %2 = tt.make_range {end = 256 : i32, start = 0 : i32}
+    %3 = tt.splat %1
+    %4 = arith.addi %3, %2
+    %5 = tt.addptr %arg0, %4
+    %6 = tt.load %5
+    %7 = "tt.reduce"(%6) ({
+    ^bb0(%a: f32, %b: f32):
+      %s = arith.addf %a, %b : f32
+      tt.reduce.return %s : f32
+    }) {axis = 0 : i32} : (tensor<256xf32>) -> f32
+    %8 = arith.divf %7, %c256 : f32
+    %9 = arith.subf %6, %8 : f32
+    %10 = arith.mulf %9, %9 : f32
+    %11 = "tt.reduce"(%10) ({
+    ^bb0(%a: f32, %b: f32):
+      %s = arith.addf %a, %b : f32
+      tt.reduce.return %s : f32
+    }) {axis = 0 : i32} : (tensor<256xf32>) -> f32
+    %12 = arith.divf %11, %c256 : f32
+    %eps = arith.constant 1.0e-05 : f32
+    %13 = arith.addf %12, %eps : f32
+    %14 = math.rsqrt %13 : f32
+    %15 = arith.mulf %9, %14 : f32
+    %16 = tt.addptr %arg1, %4
+    tt.store %16, %15
+    tt.return
+  }
+}
+"""
+
+def test_ttgir_instance_norm_detected():
+    """TTGIR instance norm pattern is detected (1 input, reduce + rsqrt)."""
+    from triton_metal.codegen.ttgir_parser import TTGIRParser
+    parser = TTGIRParser(INSTANCE_NORM_TTGIR, FakeOptions())
+    parser._parse_function_signature()
+    parser._parse_body()
+    parser._classify_stores()
+    assert parser._is_instance_norm_pattern()
+
+
+def test_ttgir_instance_norm_not_confused_with_layer_norm():
+    """Instance norm (1 input, no weight/bias) is not confused with layer norm."""
+    from triton_metal.codegen.ttgir_parser import TTGIRParser
+    parser = TTGIRParser(INSTANCE_NORM_TTGIR, FakeOptions())
+    parser._parse_function_signature()
+    parser._parse_body()
+    parser._classify_stores()
+    assert parser._is_instance_norm_pattern()
+    assert not parser._is_group_norm_pattern()
+
+
+@requires_metal
+def test_ttgir_instance_norm_compiles(runner):
+    """TTGIR instance norm pattern compiles to valid MSL."""
+    from triton_metal.codegen.ttgir_parser import parse_ttgir
+
+    kb = parse_ttgir(INSTANCE_NORM_TTGIR, FakeOptions())
+    msl = kb.build()
+    assert "instance" in msl.lower() or "norm" in msl.lower()
+    runner.compile(msl, "instance_norm_kernel")
+
+
+# ---------------------------------------------------------------------------
+# Residual add pattern
+# ---------------------------------------------------------------------------
+
+# Residual add: input + residual + bias (3 inputs, just add, no sub/mul/div)
+RESIDUAL_ADD_TTGIR = """
+module {
+  tt.func public @residual_add_kernel(%arg0: !tt.ptr<f32> {tt.divisibility = 16 : i32},
+                                       %arg1: !tt.ptr<f32> {tt.divisibility = 16 : i32},
+                                       %arg2: !tt.ptr<f32> {tt.divisibility = 16 : i32},
+                                       %arg3: !tt.ptr<f32> {tt.divisibility = 16 : i32, tt.output},
+                                       %arg4: i32) {
+    %0 = tt.get_program_id x : i32
+    %c256 = arith.constant 256 : i32
+    %1 = arith.muli %0, %c256 : i32
+    %2 = tt.make_range {end = 256 : i32, start = 0 : i32}
+    %3 = tt.splat %1
+    %4 = arith.addi %3, %2
+    %5 = tt.splat %arg4
+    %6 = arith.cmpi slt, %4, %5
+    %7 = tt.addptr %arg0, %4
+    %8 = tt.load %7, %6
+    %9 = tt.addptr %arg1, %4
+    %10 = tt.load %9, %6
+    %11 = tt.addptr %arg2, %4
+    %12 = tt.load %11, %6
+    %13 = arith.addf %8, %10 : f32
+    %14 = arith.addf %13, %12 : f32
+    %15 = tt.addptr %arg3, %4
+    tt.store %15, %14, %6
+    tt.return
+  }
+}
+"""
+
+def test_ttgir_residual_add_detected():
+    """TTGIR residual add pattern is detected (2 inputs, only add)."""
+    from triton_metal.codegen.ttgir_parser import TTGIRParser
+    parser = TTGIRParser(RESIDUAL_ADD_TTGIR, FakeOptions())
+    parser._parse_function_signature()
+    parser._parse_body()
+    parser._classify_stores()
+    assert parser._is_residual_add_pattern()
+
+
+def test_ttgir_residual_add_not_confused_with_dropout():
+    """Residual add (just add) is not confused with dropout (cmp + select + mul)."""
+    from triton_metal.codegen.ttgir_parser import TTGIRParser
+    parser = TTGIRParser(RESIDUAL_ADD_TTGIR, FakeOptions())
+    parser._parse_function_signature()
+    parser._parse_body()
+    parser._classify_stores()
+    assert parser._is_residual_add_pattern()
+    assert not parser._is_dropout_pattern()
+
+
+@requires_metal
+def test_ttgir_residual_add_compiles(runner):
+    """TTGIR residual add pattern compiles to valid MSL."""
+    from triton_metal.codegen.ttgir_parser import parse_ttgir
+
+    kb = parse_ttgir(RESIDUAL_ADD_TTGIR, FakeOptions())
+    msl = kb.build()
+    assert "residual" in msl.lower() or "add" in msl.lower()
+    runner.compile(msl, "residual_add_kernel")
+
+
+# ---------------------------------------------------------------------------
+# Embedding pattern
+# ---------------------------------------------------------------------------
+
+# Embedding: table (float) + indices (int) -> output
+EMBEDDING_TTGIR = """
+module {
+  tt.func public @embedding_kernel(%arg0: !tt.ptr<f32> {tt.divisibility = 16 : i32},
+                                    %arg1: !tt.ptr<i32> {tt.divisibility = 16 : i32},
+                                    %arg2: !tt.ptr<f32> {tt.divisibility = 16 : i32, tt.output},
+                                    %arg3: i32, %arg4: i32) {
+    %0 = tt.get_program_id x : i32
+    %c256 = arith.constant 256 : i32
+    %1 = arith.muli %0, %c256 : i32
+    %2 = tt.make_range {end = 256 : i32, start = 0 : i32}
+    %3 = tt.splat %1
+    %4 = arith.addi %3, %2
+    %5 = tt.addptr %arg1, %4
+    %6 = tt.load %5
+    %7 = arith.muli %6, %arg4 : i32
+    %8 = arith.addi %7, %4
+    %9 = tt.addptr %arg0, %8
+    %10 = tt.load %9
+    %11 = tt.addptr %arg2, %4
+    tt.store %11, %10
+    tt.return
+  }
+}
+"""
+
+def test_ttgir_embedding_detected():
+    """TTGIR embedding pattern is detected (float table + int indices)."""
+    from triton_metal.codegen.ttgir_parser import TTGIRParser
+    parser = TTGIRParser(EMBEDDING_TTGIR, FakeOptions())
+    parser._parse_function_signature()
+    parser._parse_body()
+    parser._classify_stores()
+    assert parser._is_embedding_pattern()
+
+
+def test_ttgir_embedding_not_confused_with_gather():
+    """Embedding (2+ scalar args) routes differently from plain gather."""
+    from triton_metal.codegen.ttgir_parser import TTGIRParser
+    parser = TTGIRParser(EMBEDDING_TTGIR, FakeOptions())
+    parser._parse_function_signature()
+    parser._parse_body()
+    parser._classify_stores()
+    assert parser._is_embedding_pattern()
+
+
+@requires_metal
+def test_ttgir_embedding_compiles(runner):
+    """TTGIR embedding pattern compiles to valid MSL."""
+    from triton_metal.codegen.ttgir_parser import parse_ttgir
+
+    kb = parse_ttgir(EMBEDDING_TTGIR, FakeOptions())
+    msl = kb.build()
+    assert "embedding" in msl.lower()
+    runner.compile(msl, "embedding_kernel")

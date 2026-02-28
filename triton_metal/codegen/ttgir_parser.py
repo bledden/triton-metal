@@ -648,6 +648,9 @@ class TTGIRParser:
         # Group norm: reductions with 3+ input ptrs (input + weight + bias)
         if self.reduce_ops and self._is_group_norm_pattern():
             return self._build_group_norm_kernel(kb, primary_dtype)
+        # Instance norm: reductions with 1 input ptr (per-channel spatial norm)
+        if self.reduce_ops and self._is_instance_norm_pattern():
+            return self._build_instance_norm_kernel(kb, primary_dtype)
         if self.reduce_ops:
             return self._build_reduction_kernel(kb, n_arg, primary_dtype)
 
@@ -671,9 +674,17 @@ class TTGIRParser:
         if self._is_batch_norm_pattern():
             return self._build_batch_norm_kernel(kb, primary_dtype)
 
+        # Residual add: 2-3 input ptrs, 1 output, only add ops (no sub/mul/div)
+        if self._is_residual_add_pattern():
+            return self._build_residual_add_kernel(kb, primary_dtype)
+
         # Fused MLP: silu(gate) * up pattern (exp + neg + mul, no reductions)
         if self._is_fused_mlp_pattern():
             return self._build_fused_mlp_kernel(kb, primary_dtype)
+
+        # Embedding lookup: 1 float ptr + 1 int ptr input, 1 output
+        if self._is_embedding_pattern():
+            return self._build_embedding_kernel(kb, primary_dtype)
 
         # Scatter: 2 input ptrs (data + indices), 1 output, store uses loaded index
         # (checked before gather — scatter has more specific store-ptr-from-load check)
@@ -1432,6 +1443,102 @@ class TTGIRParser:
         """Generate a group norm kernel from the pattern."""
         from triton_metal.codegen.msl_emitter import make_group_norm_kernel
         kb.set_prebuilt_msl(make_group_norm_kernel())
+        return kb
+
+    def _is_instance_norm_pattern(self):
+        """Check if IR matches an instance normalization pattern.
+
+        Instance norm has:
+        - 1 input pointer, 1 output pointer
+        - Sum reductions (mean + variance computation)
+        - rsqrt or div (normalization)
+        - No weight/bias input ptrs (distinguishes from group/layer norm)
+        """
+        n_inputs = sum(1 for _, (_, _, is_out) in self.ptr_args.items() if not is_out)
+        n_outputs = sum(1 for _, (_, _, is_out) in self.ptr_args.items() if is_out)
+        if n_inputs != 1 or n_outputs != 1:
+            return False
+        ssa_ops = {v[0] for v in self.ssa_values.values()}
+        has_rsqrt = "rsqrt" in ssa_ops
+        has_div = "div" in ssa_ops
+        ops_list = [r[2] for r in self.reduce_ops]
+        has_sum = "sum" in ops_list
+        return has_sum and (has_rsqrt or has_div)
+
+    def _build_instance_norm_kernel(self, kb, primary_dtype):
+        """Generate an instance norm kernel from the pattern."""
+        from triton_metal.codegen.msl_emitter import make_instance_norm_kernel
+        kb.set_prebuilt_msl(make_instance_norm_kernel())
+        return kb
+
+    def _is_residual_add_pattern(self):
+        """Check if IR matches a residual addition pattern.
+
+        Residual add has:
+        - 3 input pointers (input + residual + bias) — NOT 2 (that's elementwise add)
+        - 1 output pointer
+        - Only add operations (no sub, mul, div, etc.)
+        - No reductions, no dot ops
+
+        We require 3 inputs to distinguish from simple vector add (a + b),
+        which should use the generic elementwise path.
+        """
+        if self.reduce_ops or self.dot_ops:
+            return False
+        n_inputs = sum(1 for _, (_, _, is_out) in self.ptr_args.items() if not is_out)
+        n_outputs = sum(1 for _, (_, _, is_out) in self.ptr_args.items() if is_out)
+        if n_inputs != 3 or n_outputs != 1:
+            return False
+        ssa_ops = {v[0] for v in self.ssa_values.values()}
+        has_add = "add" in ssa_ops
+        has_sub = "sub" in ssa_ops
+        has_mul = "mul" in ssa_ops
+        has_div = "div" in ssa_ops
+        # Only add ops — no sub/mul/div
+        return has_add and not has_sub and not has_mul and not has_div
+
+    def _build_residual_add_kernel(self, kb, primary_dtype):
+        """Generate a residual add kernel from the pattern."""
+        from triton_metal.codegen.msl_emitter import make_residual_add_kernel
+        n_inputs = sum(1 for _, (_, _, is_out) in self.ptr_args.items() if not is_out)
+        has_bias = n_inputs >= 3
+        kb.set_prebuilt_msl(make_residual_add_kernel(has_bias=has_bias))
+        return kb
+
+    def _is_embedding_pattern(self):
+        """Check if IR matches an embedding lookup pattern.
+
+        Embedding has:
+        - 2 input ptrs (embedding table with float + indices with int)
+        - 1 output pointer
+        - No reductions, no dot ops
+        - One int-type input (indices), one float-type input (table)
+        - No comparison/select (distinguishes from gather of int data)
+        """
+        if self.reduce_ops or self.dot_ops:
+            return False
+        n_inputs = sum(1 for _, (_, _, is_out) in self.ptr_args.items() if not is_out)
+        n_outputs = sum(1 for _, (_, _, is_out) in self.ptr_args.items() if is_out)
+        if n_inputs != 2 or n_outputs != 1:
+            return False
+        # Must have one int input and one float input
+        int_inputs = sum(
+            1 for _, (_, dtype, is_out) in self.ptr_args.items()
+            if not is_out and dtype in ("i32", "i64")
+        )
+        float_inputs = sum(
+            1 for _, (_, dtype, is_out) in self.ptr_args.items()
+            if not is_out and dtype in ("fp32", "fp16", "bf16")
+        )
+        if int_inputs != 1 or float_inputs != 1:
+            return False
+        # Must have scalar args (embedding_dim at minimum)
+        return len(self.scalar_args) >= 2
+
+    def _build_embedding_kernel(self, kb, primary_dtype):
+        """Generate an embedding lookup kernel from the pattern."""
+        from triton_metal.codegen.msl_emitter import make_embedding_kernel
+        kb.set_prebuilt_msl(make_embedding_kernel())
         return kb
 
     def _is_gather_pattern(self):

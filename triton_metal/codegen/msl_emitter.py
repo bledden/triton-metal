@@ -4844,6 +4844,249 @@ kernel void conv2d_kernel(
     return kb.build()
 
 
+def make_max_pool2d_kernel(kernel_h=2, kernel_w=2, stride_h=2, stride_w=2,
+                           pad_h=0, pad_w=0, block_size=256):
+    """Generate a 2D max pooling kernel.
+
+    Each thread computes one output element by scanning the pooling window.
+    Dispatch: ceil(batch * channels * out_h * out_w / block_size) threadgroups.
+
+    Args:
+        kernel_h, kernel_w: Pooling window size.
+        stride_h, stride_w: Stride.
+        pad_h, pad_w: Zero-padding.
+        block_size: Threads per threadgroup.
+    """
+    msl = f"""#include <metal_stdlib>
+using namespace metal;
+
+kernel void max_pool2d_kernel(
+    device const float* input [[buffer(0)]],
+    device float* output [[buffer(1)]],
+    constant uint& batch_size [[buffer(2)]],
+    constant uint& channels [[buffer(3)]],
+    constant uint& in_h [[buffer(4)]],
+    constant uint& in_w [[buffer(5)]],
+    constant uint& out_h [[buffer(6)]],
+    constant uint& out_w [[buffer(7)]],
+    uint gid [[thread_position_in_grid]]
+) {{
+    uint out_spatial = out_h * out_w;
+    uint out_per_batch = channels * out_spatial;
+    uint total = batch_size * out_per_batch;
+    if (gid >= total) return;
+
+    uint b = gid / out_per_batch;
+    uint rem = gid % out_per_batch;
+    uint c = rem / out_spatial;
+    uint spatial = rem % out_spatial;
+    uint oh = spatial / out_w;
+    uint ow = spatial % out_w;
+
+    float max_val = -INFINITY;
+    for (uint kh = 0; kh < {kernel_h}u; kh++) {{
+        for (uint kw = 0; kw < {kernel_w}u; kw++) {{
+            int ih = int(oh * {stride_h}u + kh) - {pad_h};
+            int iw = int(ow * {stride_w}u + kw) - {pad_w};
+            if (ih >= 0 && ih < int(in_h) && iw >= 0 && iw < int(in_w)) {{
+                uint idx = b * (channels * in_h * in_w) + c * (in_h * in_w) + uint(ih) * in_w + uint(iw);
+                max_val = max(max_val, input[idx]);
+            }}
+        }}
+    }}
+
+    output[gid] = max_val;
+}}
+"""
+    kb = KernelBuilder("max_pool2d_kernel", block_size=block_size)
+    kb.set_prebuilt_msl(msl)
+    return kb.build()
+
+
+def make_avg_pool2d_kernel(kernel_h=2, kernel_w=2, stride_h=2, stride_w=2,
+                           pad_h=0, pad_w=0, block_size=256):
+    """Generate a 2D average pooling kernel.
+
+    Each thread computes one output element by averaging the pooling window.
+
+    Args:
+        kernel_h, kernel_w: Pooling window size.
+        stride_h, stride_w: Stride.
+        pad_h, pad_w: Zero-padding.
+        block_size: Threads per threadgroup.
+    """
+    msl = f"""#include <metal_stdlib>
+using namespace metal;
+
+kernel void avg_pool2d_kernel(
+    device const float* input [[buffer(0)]],
+    device float* output [[buffer(1)]],
+    constant uint& batch_size [[buffer(2)]],
+    constant uint& channels [[buffer(3)]],
+    constant uint& in_h [[buffer(4)]],
+    constant uint& in_w [[buffer(5)]],
+    constant uint& out_h [[buffer(6)]],
+    constant uint& out_w [[buffer(7)]],
+    uint gid [[thread_position_in_grid]]
+) {{
+    uint out_spatial = out_h * out_w;
+    uint out_per_batch = channels * out_spatial;
+    uint total = batch_size * out_per_batch;
+    if (gid >= total) return;
+
+    uint b = gid / out_per_batch;
+    uint rem = gid % out_per_batch;
+    uint c = rem / out_spatial;
+    uint spatial = rem % out_spatial;
+    uint oh = spatial / out_w;
+    uint ow = spatial % out_w;
+
+    float sum_val = 0.0f;
+    uint count = 0;
+    for (uint kh = 0; kh < {kernel_h}u; kh++) {{
+        for (uint kw = 0; kw < {kernel_w}u; kw++) {{
+            int ih = int(oh * {stride_h}u + kh) - {pad_h};
+            int iw = int(ow * {stride_w}u + kw) - {pad_w};
+            if (ih >= 0 && ih < int(in_h) && iw >= 0 && iw < int(in_w)) {{
+                uint idx = b * (channels * in_h * in_w) + c * (in_h * in_w) + uint(ih) * in_w + uint(iw);
+                sum_val += input[idx];
+                count++;
+            }}
+        }}
+    }}
+
+    output[gid] = (count > 0) ? (sum_val / float(count)) : 0.0f;
+}}
+"""
+    kb = KernelBuilder("avg_pool2d_kernel", block_size=block_size)
+    kb.set_prebuilt_msl(msl)
+    return kb.build()
+
+
+def make_index_select_kernel(block_size=256, dtype="fp32"):
+    """Generate an index_select kernel: output[i] = input[indices[i]].
+
+    Gather elements from input at positions specified by indices.
+    More general than the existing gather kernel (which operates on 2D with axis).
+
+    Args:
+        block_size: Threads per threadgroup.
+        dtype: Data type.
+    """
+    msl_type = triton_type_to_msl(dtype)
+    msl = f"""#include <metal_stdlib>
+using namespace metal;
+
+kernel void index_select_kernel(
+    device const {msl_type}* input [[buffer(0)]],
+    device const uint* indices [[buffer(1)]],
+    device {msl_type}* output [[buffer(2)]],
+    constant uint& n_elements [[buffer(3)]],
+    uint gid [[thread_position_in_grid]]
+) {{
+    if (gid >= n_elements) return;
+    output[gid] = input[indices[gid]];
+}}
+"""
+    kb = KernelBuilder("index_select_kernel", block_size=block_size)
+    kb.set_prebuilt_msl(msl)
+    return kb.build()
+
+
+def make_where_kernel(block_size=256, dtype="fp32"):
+    """Generate a where kernel: output[i] = cond[i] ? x[i] : y[i].
+
+    Conditional element-wise selection between two tensors based on a
+    boolean mask. The mask is stored as uint (0 or 1).
+
+    Args:
+        block_size: Threads per threadgroup.
+        dtype: Data type.
+    """
+    msl_type = triton_type_to_msl(dtype)
+    msl = f"""#include <metal_stdlib>
+using namespace metal;
+
+kernel void where_kernel(
+    device const uint* condition [[buffer(0)]],
+    device const {msl_type}* x [[buffer(1)]],
+    device const {msl_type}* y [[buffer(2)]],
+    device {msl_type}* output [[buffer(3)]],
+    constant uint& n_elements [[buffer(4)]],
+    uint gid [[thread_position_in_grid]]
+) {{
+    if (gid >= n_elements) return;
+    output[gid] = condition[gid] ? x[gid] : y[gid];
+}}
+"""
+    kb = KernelBuilder("where_kernel", block_size=block_size)
+    kb.set_prebuilt_msl(msl)
+    return kb.build()
+
+
+def make_clamp_kernel(block_size=256, dtype="fp32"):
+    """Generate a clamp kernel: output[i] = clamp(input[i], min_val, max_val).
+
+    Clips values to [min_val, max_val] range. Used in gradient clipping,
+    ReLU6, and numerical stability.
+
+    Args:
+        block_size: Threads per threadgroup.
+        dtype: Data type.
+    """
+    msl_type = triton_type_to_msl(dtype)
+    msl = f"""#include <metal_stdlib>
+using namespace metal;
+
+kernel void clamp_kernel(
+    device const {msl_type}* input [[buffer(0)]],
+    device {msl_type}* output [[buffer(1)]],
+    constant float& min_val [[buffer(2)]],
+    constant float& max_val [[buffer(3)]],
+    constant uint& n_elements [[buffer(4)]],
+    uint gid [[thread_position_in_grid]]
+) {{
+    if (gid >= n_elements) return;
+    float val = float(input[gid]);
+    val = max(min_val, min(max_val, val));
+    output[gid] = {msl_type}(val);
+}}
+"""
+    kb = KernelBuilder("clamp_kernel", block_size=block_size)
+    kb.set_prebuilt_msl(msl)
+    return kb.build()
+
+
+def make_compare_kernel(op="eq", block_size=256, dtype="fp32"):
+    """Generate an element-wise comparison kernel: output[i] = (a[i] op b[i]) ? 1 : 0.
+
+    Args:
+        op: Comparison operator ("eq", "ne", "lt", "le", "gt", "ge").
+        block_size: Threads per threadgroup.
+        dtype: Data type.
+    """
+    msl_type = triton_type_to_msl(dtype)
+    ops = {"eq": "==", "ne": "!=", "lt": "<", "le": "<=", "gt": ">", "ge": ">="}
+    msl_op = ops[op]
+    msl = f"""#include <metal_stdlib>
+using namespace metal;
+
+kernel void compare_{op}_kernel(
+    device const {msl_type}* a [[buffer(0)]],
+    device const {msl_type}* b [[buffer(1)]],
+    device uint* output [[buffer(2)]],
+    constant uint& n_elements [[buffer(3)]],
+    uint gid [[thread_position_in_grid]]
+) {{
+    if (gid >= n_elements) return;
+    output[gid] = (float(a[gid]) {msl_op} float(b[gid])) ? 1u : 0u;
+}}
+"""
+    kb = KernelBuilder(f"compare_{op}_kernel", block_size=block_size)
+    kb.set_prebuilt_msl(msl)
+    return kb.build()
+
+
 # ---------------------------------------------------------------------------
 # TTGIR integration (requires triton)
 # ---------------------------------------------------------------------------

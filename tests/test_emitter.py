@@ -6561,3 +6561,209 @@ def test_conv2d_gpu(runner):
     for i in range(n_elements):
         assert abs(result[i] - expected[i]) < 1e-3, \
             f"idx {i}: got {result[i]}, expected {expected[i]}"
+
+
+# ---------------------------------------------------------------------------
+# Pooling tests
+# ---------------------------------------------------------------------------
+
+@requires_metal
+def test_max_pool2d_gpu(runner):
+    """Max pool 2x2 stride 2: 1x1x4x4 → 1x1x2x2"""
+    from triton_metal.codegen.msl_emitter import make_max_pool2d_kernel
+
+    batch, channels = 1, 1
+    in_h, in_w = 4, 4
+    out_h, out_w = 2, 2  # 2x2 pool, stride 2, no pad
+
+    msl = make_max_pool2d_kernel(kernel_h=2, kernel_w=2, stride_h=2, stride_w=2)
+    path = runner.compile(msl, "max_pool2d_kernel")
+    pipeline = runner.load(path, "max_pool2d_kernel")
+
+    # Input: 0..15
+    data = [float(i) for i in range(16)]
+    in_buf = runner.make_float_buffer(data)
+    out_buf = runner.make_empty_buffer(batch * channels * out_h * out_w)
+    b_buf = runner.make_uint_buffer(batch)
+    c_buf = runner.make_uint_buffer(channels)
+    ih_buf = runner.make_uint_buffer(in_h)
+    iw_buf = runner.make_uint_buffer(in_w)
+    oh_buf = runner.make_uint_buffer(out_h)
+    ow_buf = runner.make_uint_buffer(out_w)
+
+    n_out = batch * channels * out_h * out_w
+    runner.run(pipeline, [in_buf, out_buf, b_buf, c_buf, ih_buf, iw_buf,
+                          oh_buf, ow_buf], n_out, block_size=256)
+
+    result = runner.read_float_buffer(out_buf, n_out)
+    # Expected: max of each 2x2 block
+    # [0,1,2,3; 4,5,6,7; 8,9,10,11; 12,13,14,15] → max(0,1,4,5)=5, max(2,3,6,7)=7,
+    # max(8,9,12,13)=13, max(10,11,14,15)=15
+    expected = [5.0, 7.0, 13.0, 15.0]
+    for i in range(n_out):
+        assert abs(result[i] - expected[i]) < 1e-3, \
+            f"idx {i}: got {result[i]}, expected {expected[i]}"
+
+
+@requires_metal
+def test_avg_pool2d_gpu(runner):
+    """Avg pool 2x2 stride 2: 1x1x4x4 → 1x1x2x2"""
+    from triton_metal.codegen.msl_emitter import make_avg_pool2d_kernel
+
+    batch, channels = 1, 1
+    in_h, in_w = 4, 4
+    out_h, out_w = 2, 2
+
+    msl = make_avg_pool2d_kernel(kernel_h=2, kernel_w=2, stride_h=2, stride_w=2)
+    path = runner.compile(msl, "avg_pool2d_kernel")
+    pipeline = runner.load(path, "avg_pool2d_kernel")
+
+    data = [float(i) for i in range(16)]
+    in_buf = runner.make_float_buffer(data)
+    out_buf = runner.make_empty_buffer(batch * channels * out_h * out_w)
+    b_buf = runner.make_uint_buffer(batch)
+    c_buf = runner.make_uint_buffer(channels)
+    ih_buf = runner.make_uint_buffer(in_h)
+    iw_buf = runner.make_uint_buffer(in_w)
+    oh_buf = runner.make_uint_buffer(out_h)
+    ow_buf = runner.make_uint_buffer(out_w)
+
+    n_out = batch * channels * out_h * out_w
+    runner.run(pipeline, [in_buf, out_buf, b_buf, c_buf, ih_buf, iw_buf,
+                          oh_buf, ow_buf], n_out, block_size=256)
+
+    result = runner.read_float_buffer(out_buf, n_out)
+    # avg(0,1,4,5)=2.5, avg(2,3,6,7)=4.5, avg(8,9,12,13)=10.5, avg(10,11,14,15)=12.5
+    expected = [2.5, 4.5, 10.5, 12.5]
+    for i in range(n_out):
+        assert abs(result[i] - expected[i]) < 1e-3, \
+            f"idx {i}: got {result[i]}, expected {expected[i]}"
+
+
+# ---------------------------------------------------------------------------
+# Index select and where tests
+# ---------------------------------------------------------------------------
+
+@requires_metal
+def test_index_select_gpu(runner):
+    """index_select: gather elements by index"""
+    from triton_metal.codegen.msl_emitter import make_index_select_kernel
+    import struct
+
+    n = 64
+    msl = make_index_select_kernel(block_size=256)
+    path = runner.compile(msl, "index_select_kernel")
+    pipeline = runner.load(path, "index_select_kernel")
+
+    # Source data: 0..255
+    src_data = [float(i) * 0.5 for i in range(256)]
+    # Indices: reverse order 63..0
+    indices = list(range(n - 1, -1, -1))
+
+    in_buf = runner.make_float_buffer(src_data)
+    idx_buf = runner.device.newBufferWithLength_options_(n * 4, 0)
+    idx_view = idx_buf.contents().as_buffer(n * 4)
+    for i, idx in enumerate(indices):
+        struct.pack_into("I", idx_view, i * 4, idx)
+    out_buf = runner.make_empty_buffer(n)
+    n_buf = runner.make_uint_buffer(n)
+
+    runner.run(pipeline, [in_buf, idx_buf, out_buf, n_buf], n, block_size=256)
+
+    result = runner.read_float_buffer(out_buf, n)
+    for i in range(n):
+        expected = src_data[indices[i]]
+        assert abs(result[i] - expected) < 1e-5, \
+            f"idx {i}: got {result[i]}, expected {expected}"
+
+
+@requires_metal
+def test_where_gpu(runner):
+    """where: conditional select between two tensors"""
+    from triton_metal.codegen.msl_emitter import make_where_kernel
+    import struct
+
+    n = 256
+    msl = make_where_kernel(block_size=256)
+    path = runner.compile(msl, "where_kernel")
+    pipeline = runner.load(path, "where_kernel")
+
+    # Condition: even indices → True, odd → False
+    cond = [1 if i % 2 == 0 else 0 for i in range(n)]
+    x_data = [1.0] * n
+    y_data = [-1.0] * n
+
+    cond_buf = runner.device.newBufferWithLength_options_(n * 4, 0)
+    cond_view = cond_buf.contents().as_buffer(n * 4)
+    for i, c in enumerate(cond):
+        struct.pack_into("I", cond_view, i * 4, c)
+    x_buf = runner.make_float_buffer(x_data)
+    y_buf = runner.make_float_buffer(y_data)
+    out_buf = runner.make_empty_buffer(n)
+    n_buf = runner.make_uint_buffer(n)
+
+    runner.run(pipeline, [cond_buf, x_buf, y_buf, out_buf, n_buf], n, block_size=256)
+
+    result = runner.read_float_buffer(out_buf, n)
+    for i in range(n):
+        expected = 1.0 if cond[i] else -1.0
+        assert abs(result[i] - expected) < 1e-5, \
+            f"idx {i}: got {result[i]}, expected {expected}"
+
+
+# ---------------------------------------------------------------------------
+# Clamp and comparison tests
+# ---------------------------------------------------------------------------
+
+@requires_metal
+def test_clamp_gpu(runner):
+    """clamp: clip values to [min, max] range"""
+    from triton_metal.codegen.msl_emitter import make_clamp_kernel
+
+    n = 256
+    msl = make_clamp_kernel(block_size=256)
+    path = runner.compile(msl, "clamp_kernel")
+    pipeline = runner.load(path, "clamp_kernel")
+
+    data = [float(i) - 128.0 for i in range(n)]  # -128 to 127
+    in_buf = runner.make_float_buffer(data)
+    out_buf = runner.make_empty_buffer(n)
+    min_buf = runner.make_float_scalar_buffer(-50.0)
+    max_buf = runner.make_float_scalar_buffer(50.0)
+    n_buf = runner.make_uint_buffer(n)
+
+    runner.run(pipeline, [in_buf, out_buf, min_buf, max_buf, n_buf], n, block_size=256)
+
+    result = runner.read_float_buffer(out_buf, n)
+    for i in range(n):
+        expected = max(-50.0, min(50.0, data[i]))
+        assert abs(result[i] - expected) < 1e-3, \
+            f"idx {i}: got {result[i]}, expected {expected}"
+
+
+@requires_metal
+def test_compare_lt_gpu(runner):
+    """compare_lt: element-wise less-than comparison"""
+    from triton_metal.codegen.msl_emitter import make_compare_kernel
+    import struct
+
+    n = 256
+    msl = make_compare_kernel(op="lt", block_size=256)
+    path = runner.compile(msl, "compare_lt_kernel")
+    pipeline = runner.load(path, "compare_lt_kernel")
+
+    a_data = [float(i) for i in range(n)]
+    b_data = [128.0] * n  # a < 128 for first 128 elements
+    a_buf = runner.make_float_buffer(a_data)
+    b_buf = runner.make_float_buffer(b_data)
+    out_buf = runner.device.newBufferWithLength_options_(n * 4, 0)
+    n_buf = runner.make_uint_buffer(n)
+
+    runner.run(pipeline, [a_buf, b_buf, out_buf, n_buf], n, block_size=256)
+
+    out_view = out_buf.contents().as_buffer(n * 4)
+    for i in range(n):
+        val = struct.unpack_from("I", out_view, i * 4)[0]
+        expected = 1 if a_data[i] < b_data[i] else 0
+        assert val == expected, \
+            f"idx {i}: got {val}, expected {expected}"

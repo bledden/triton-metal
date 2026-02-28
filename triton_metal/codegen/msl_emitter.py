@@ -707,25 +707,13 @@ def emit_msl(mod, metadata, options):
     Returns:
         MSL source code as a string.
     """
+    from triton_metal.codegen.ttgir_parser import parse_ttgir
+
     ir_text = str(mod)
     kernel_name = _extract_kernel_name(ir_text)
     metadata["name"] = kernel_name
 
-    # TODO: Parse TTGIR and build KernelBuilder from it.
-    # For now, generate a passthrough copy kernel.
-    num_warps = options.num_warps
-    threads_per_tg = num_warps * 32
-
-    kb = KernelBuilder(kernel_name, block_size=threads_per_tg)
-    kb.add_ptr_arg("input", dtype="fp32", const=True)
-    kb.add_ptr_arg("output", dtype="fp32", const=False)
-    kb.add_scalar_arg("n_elements", dtype="u32")
-
-    offsets = kb.make_block_offsets("pid", "offsets")
-    mask = kb.make_mask(offsets, "n_elements", "mask")
-    val = kb.load("input", offsets, mask)
-    kb.store("output", offsets, "input_val", mask)
-
+    kb = parse_ttgir(ir_text, options)
     return kb.build()
 
 

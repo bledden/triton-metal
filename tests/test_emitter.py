@@ -2702,3 +2702,189 @@ def test_rope_attention(runner):
         assert abs(got - expected) < 0.05, (
             f"dim {d}: got {got}, expected {expected}"
         )
+
+
+# ---------------------------------------------------------------------------
+# Paged Attention tests
+# ---------------------------------------------------------------------------
+
+
+@requires_metal
+def test_paged_attention(runner):
+    """Paged attention: KV-cache stored in non-contiguous pages with page table."""
+    from triton_metal.codegen.msl_emitter import make_paged_attention_kernel
+    import struct as struct_mod
+
+    head_dim = 64
+    page_size = 16
+    seq_len = 48  # 3 full pages
+    n_pages = 3
+    # Shuffle physical pages: logical [0,1,2] -> physical [2,0,1]
+    page_table = [2, 0, 1]
+
+    msl = make_paged_attention_kernel(head_dim=head_dim, page_size=page_size)
+    path = runner.compile(msl, "paged_attention")
+    pipeline = runner.load(path, "paged_attention")
+
+    random.seed(7777)
+
+    # Q: [head_dim]
+    q_data = [random.uniform(-0.5, 0.5) for _ in range(head_dim)]
+
+    # K/V pages: [n_physical_pages, page_size, head_dim]
+    # We'll create 3 physical pages
+    n_physical_pages = 3
+    total_page_elems = n_physical_pages * page_size * head_dim
+    k_page_data = [random.uniform(-0.5, 0.5) for _ in range(total_page_elems)]
+    v_page_data = [random.uniform(-0.5, 0.5) for _ in range(total_page_elems)]
+
+    q_buf = runner.make_float_buffer(q_data)
+    k_buf = runner.make_float_buffer(k_page_data)
+    v_buf = runner.make_float_buffer(v_page_data)
+
+    # Page table buffer (uint array)
+    import Metal
+    pt_buf = runner.device.newBufferWithLength_options_(
+        n_pages * 4, Metal.MTLResourceStorageModeShared
+    )
+    pt_view = pt_buf.contents().as_buffer(n_pages * 4)
+    for i, phys in enumerate(page_table):
+        struct_mod.pack_into("I", pt_view, i * 4, phys)
+
+    out_buf = runner.make_empty_buffer(head_dim)
+    sl_buf = runner.make_uint_buffer(seq_len)
+    np_buf = runner.make_uint_buffer(n_pages)
+
+    # Dispatch: 1 threadgroup
+    cmd = runner.queue.commandBuffer()
+    enc = cmd.computeCommandEncoder()
+    enc.setComputePipelineState_(pipeline)
+    for i, buf in enumerate([q_buf, k_buf, v_buf, pt_buf, out_buf,
+                              sl_buf, np_buf]):
+        enc.setBuffer_offset_atIndex_(buf, 0, i)
+    enc.dispatchThreadgroups_threadsPerThreadgroup_(
+        Metal.MTLSizeMake(1, 1, 1),
+        Metal.MTLSizeMake(256, 1, 1),
+    )
+    enc.endEncoding()
+    cmd.commit()
+    cmd.waitUntilCompleted()
+    assert cmd.status() == 4, f"Kernel failed, status={cmd.status()}"
+
+    result = runner.read_float_buffer(out_buf, head_dim)
+
+    # Python reference: reconstruct contiguous K,V from pages
+    scale = 1.0 / math.sqrt(head_dim)
+    scores = []
+    for pos in range(seq_len):
+        page_idx = pos // page_size
+        page_offset = pos % page_size
+        phys_page = page_table[page_idx]
+        k_base = (phys_page * page_size + page_offset) * head_dim
+
+        dot = sum(q_data[d] * k_page_data[k_base + d] for d in range(head_dim))
+        scores.append(dot * scale)
+
+    max_s = max(scores)
+    exp_s = [math.exp(s - max_s) for s in scores]
+    sum_exp = sum(exp_s)
+    attn = [e / sum_exp for e in exp_s]
+
+    for d in range(head_dim):
+        expected = 0.0
+        for pos in range(seq_len):
+            page_idx = pos // page_size
+            page_offset = pos % page_size
+            phys_page = page_table[page_idx]
+            v_base = (phys_page * page_size + page_offset) * head_dim
+            expected += attn[pos] * v_page_data[v_base + d]
+        got = result[d]
+        assert abs(got - expected) < 0.05, (
+            f"dim {d}: got {got}, expected {expected}"
+        )
+
+
+@requires_metal
+def test_paged_attention_partial_page(runner):
+    """Paged attention with a partially filled last page (seq_len not page-aligned)."""
+    from triton_metal.codegen.msl_emitter import make_paged_attention_kernel
+    import struct as struct_mod
+
+    head_dim = 32
+    page_size = 16
+    seq_len = 25  # 1 full page + 9 tokens in second page
+    n_pages = 2
+    page_table = [1, 0]  # Reversed physical order
+
+    msl = make_paged_attention_kernel(head_dim=head_dim, page_size=page_size)
+    path = runner.compile(msl, "paged_attention_partial")
+    pipeline = runner.load(path, "paged_attention")
+
+    random.seed(5555)
+    q_data = [random.uniform(-0.5, 0.5) for _ in range(head_dim)]
+    n_physical_pages = 2
+    total_elems = n_physical_pages * page_size * head_dim
+    k_data = [random.uniform(-0.5, 0.5) for _ in range(total_elems)]
+    v_data = [random.uniform(-0.5, 0.5) for _ in range(total_elems)]
+
+    q_buf = runner.make_float_buffer(q_data)
+    k_buf = runner.make_float_buffer(k_data)
+    v_buf = runner.make_float_buffer(v_data)
+
+    import Metal
+    pt_buf = runner.device.newBufferWithLength_options_(
+        n_pages * 4, Metal.MTLResourceStorageModeShared
+    )
+    pt_view = pt_buf.contents().as_buffer(n_pages * 4)
+    for i, phys in enumerate(page_table):
+        struct_mod.pack_into("I", pt_view, i * 4, phys)
+
+    out_buf = runner.make_empty_buffer(head_dim)
+    sl_buf = runner.make_uint_buffer(seq_len)
+    np_buf = runner.make_uint_buffer(n_pages)
+
+    cmd = runner.queue.commandBuffer()
+    enc = cmd.computeCommandEncoder()
+    enc.setComputePipelineState_(pipeline)
+    for i, buf in enumerate([q_buf, k_buf, v_buf, pt_buf, out_buf,
+                              sl_buf, np_buf]):
+        enc.setBuffer_offset_atIndex_(buf, 0, i)
+    enc.dispatchThreadgroups_threadsPerThreadgroup_(
+        Metal.MTLSizeMake(1, 1, 1),
+        Metal.MTLSizeMake(256, 1, 1),
+    )
+    enc.endEncoding()
+    cmd.commit()
+    cmd.waitUntilCompleted()
+    assert cmd.status() == 4, f"Kernel failed, status={cmd.status()}"
+
+    result = runner.read_float_buffer(out_buf, head_dim)
+
+    # Reference
+    scale = 1.0 / math.sqrt(head_dim)
+    scores = []
+    for pos in range(seq_len):
+        pi = pos // page_size
+        po = pos % page_size
+        pp = page_table[pi]
+        kb = (pp * page_size + po) * head_dim
+        dot = sum(q_data[d] * k_data[kb + d] for d in range(head_dim))
+        scores.append(dot * scale)
+
+    max_s = max(scores)
+    exp_s = [math.exp(s - max_s) for s in scores]
+    sum_exp = sum(exp_s)
+    attn = [e / sum_exp for e in exp_s]
+
+    for d in range(head_dim):
+        expected = 0.0
+        for pos in range(seq_len):
+            pi = pos // page_size
+            po = pos % page_size
+            pp = page_table[pi]
+            vb = (pp * page_size + po) * head_dim
+            expected += attn[pos] * v_data[vb + d]
+        got = result[d]
+        assert abs(got - expected) < 0.05, (
+            f"dim {d}: got {got}, expected {expected}"
+        )

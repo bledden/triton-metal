@@ -1742,6 +1742,132 @@ kernel void batched_kv_decode(
 """
 
 
+def make_paged_attention_kernel(head_dim=64, page_size=16, block_size=256):
+    """Generate a paged attention kernel for variable-length KV-cache.
+
+    Instead of contiguous KV-cache, keys and values are stored in fixed-size
+    pages (blocks) of `page_size` tokens each. A page table maps logical
+    block indices to physical block indices in a shared page pool.
+
+    This is critical for production LLM serving (vLLM-style) where sequences
+    have variable lengths and memory must be managed efficiently.
+
+    Layout:
+        Q: [head_dim] — single query vector for one head
+        K_pages: [n_physical_pages, page_size, head_dim] — KV page pool (keys)
+        V_pages: [n_physical_pages, page_size, head_dim] — KV page pool (values)
+        page_table: [max_pages_per_seq] — maps logical block idx → physical block idx
+        O: [head_dim] — output
+        seq_len: actual sequence length (may not fill last page)
+        n_pages: number of pages for this sequence
+
+    Dispatch: 1 threadgroup per query head.
+
+    Args:
+        head_dim: Dimension per head.
+        page_size: Tokens per page (16 typical for vLLM).
+        block_size: Threads per threadgroup.
+    """
+    n_simdgroups = (block_size + 31) // 32
+    return f"""#include <metal_stdlib>
+using namespace metal;
+
+kernel void paged_attention(
+    device const float* Q [[buffer(0)]],
+    device const float* K_pages [[buffer(1)]],
+    device const float* V_pages [[buffer(2)]],
+    device const uint* page_table [[buffer(3)]],
+    device float* O [[buffer(4)]],
+    constant uint& seq_len [[buffer(5)]],
+    constant uint& n_pages [[buffer(6)]],
+    uint lid [[thread_position_in_threadgroup]],
+    uint sgitg [[simdgroup_index_in_threadgroup]],
+    uint tiisg [[thread_index_in_simdgroup]]
+) {{
+    const uint D = {head_dim}u;
+    const uint PAGE_SIZE = {page_size}u;
+    const uint BLOCK = {block_size}u;
+    const float scale = 1.0f / sqrt(float(D));
+
+    // Phase 1: Compute attention scores over all paged tokens
+    // Each thread handles a subset of token positions
+    float local_max = -INFINITY;
+    for (uint pos = lid; pos < seq_len; pos += BLOCK) {{
+        // Map logical position to physical page + offset
+        uint page_idx = pos / PAGE_SIZE;
+        uint page_offset = pos % PAGE_SIZE;
+        uint phys_page = page_table[page_idx];
+        uint k_base = (phys_page * PAGE_SIZE + page_offset) * D;
+
+        float dot = 0.0f;
+        for (uint d = 0u; d < D; d++) {{
+            dot += Q[d] * K_pages[k_base + d];
+        }}
+        local_max = max(local_max, dot * scale);
+    }}
+
+    // Reduce max across threads
+    float sg_max = simd_max(local_max);
+    threadgroup float shared_max[{n_simdgroups}];
+    if (sgitg == 0u) shared_max[tiisg] = -INFINITY;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tiisg == 0u) shared_max[sgitg] = sg_max;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float rd_max = (tiisg < {n_simdgroups}u) ? shared_max[tiisg] : -INFINITY;
+    float global_max = simd_max(rd_max);
+
+    // Phase 2: Compute exp(score - max) and sum
+    float local_sum = 0.0f;
+    for (uint pos = lid; pos < seq_len; pos += BLOCK) {{
+        uint page_idx = pos / PAGE_SIZE;
+        uint page_offset = pos % PAGE_SIZE;
+        uint phys_page = page_table[page_idx];
+        uint k_base = (phys_page * PAGE_SIZE + page_offset) * D;
+
+        float dot = 0.0f;
+        for (uint d = 0u; d < D; d++) {{
+            dot += Q[d] * K_pages[k_base + d];
+        }}
+        local_sum += exp(dot * scale - global_max);
+    }}
+
+    float sg_sum = simd_sum(local_sum);
+    threadgroup float shared_sum[{n_simdgroups}];
+    if (sgitg == 0u) shared_sum[tiisg] = 0.0f;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tiisg == 0u) shared_sum[sgitg] = sg_sum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float rd_sum = (tiisg < {n_simdgroups}u) ? shared_sum[tiisg] : 0.0f;
+    float global_sum = simd_sum(rd_sum);
+    float inv_sum = 1.0f / global_sum;
+
+    // Phase 3: Weighted V sum — each thread computes one output dimension
+    for (uint d_start = 0u; d_start < D; d_start += BLOCK) {{
+        uint d = d_start + lid;
+        if (d < D) {{
+            float o_val = 0.0f;
+            for (uint pos = 0u; pos < seq_len; pos++) {{
+                uint page_idx = pos / PAGE_SIZE;
+                uint page_offset = pos % PAGE_SIZE;
+                uint phys_page = page_table[page_idx];
+                uint k_base = (phys_page * PAGE_SIZE + page_offset) * D;
+                uint v_base = k_base;  // V_pages same layout as K_pages
+
+                // Recompute attention weight
+                float dot = 0.0f;
+                for (uint dd = 0u; dd < D; dd++) {{
+                    dot += Q[dd] * K_pages[k_base + dd];
+                }}
+                float attn_w = exp(dot * scale - global_max) * inv_sum;
+                o_val += attn_w * V_pages[v_base + d];
+            }}
+            O[d] = o_val;
+        }}
+    }}
+}}
+"""
+
+
 def make_int8_matmul_kernel():
     """Generate a weight-only INT8 quantized matmul kernel.
 

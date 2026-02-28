@@ -2177,3 +2177,274 @@ def test_ttgir_variance_compiles(runner):
     msl = kb.build()
     assert "variance" in msl.lower() or "var" in msl.lower()
     runner.compile(msl, "variance_kernel")
+
+
+# ---------------------------------------------------------------------------
+# Activation function TTGIR patterns
+# ---------------------------------------------------------------------------
+
+# Tanh: output = tanh(input)
+TANH_TTGIR = """
+module {
+  tt.func public @tanh_kernel(%arg0: !tt.ptr<f32> {tt.divisibility = 16 : i32},
+                               %arg1: !tt.ptr<f32> {tt.divisibility = 16 : i32, tt.output},
+                               %arg2: i32) {
+    %0 = tt.get_program_id x : i32
+    %c256 = arith.constant 256 : i32
+    %1 = arith.muli %0, %c256 : i32
+    %2 = tt.make_range {end = 256 : i32, start = 0 : i32}
+    %3 = tt.splat %1
+    %4 = arith.addi %3, %2
+    %5 = tt.splat %arg2
+    %6 = arith.cmpi slt, %4, %5
+    %7 = tt.addptr %arg0, %4
+    %8 = tt.load %7, %6
+    %9 = math.tanh %8
+    %10 = tt.addptr %arg1, %4
+    tt.store %10, %9, %6
+    tt.return
+  }
+}
+"""
+
+# Sigmoid: output = 1 / (1 + exp(-input))
+SIGMOID_TTGIR = """
+module {
+  tt.func public @sigmoid_kernel(%arg0: !tt.ptr<f32> {tt.divisibility = 16 : i32},
+                                  %arg1: !tt.ptr<f32> {tt.divisibility = 16 : i32, tt.output},
+                                  %arg2: i32) {
+    %0 = tt.get_program_id x : i32
+    %c256 = arith.constant 256 : i32
+    %1 = arith.muli %0, %c256 : i32
+    %2 = tt.make_range {end = 256 : i32, start = 0 : i32}
+    %3 = tt.splat %1
+    %4 = arith.addi %3, %2
+    %5 = tt.splat %arg2
+    %6 = arith.cmpi slt, %4, %5
+    %7 = tt.addptr %arg0, %4
+    %8 = tt.load %7, %6
+    %9 = arith.negf %8
+    %10 = math.exp %9
+    %c1 = arith.constant 1.0 : f32
+    %11 = tt.splat %c1
+    %12 = arith.addf %11, %10
+    %13 = arith.divf %11, %12
+    %14 = tt.addptr %arg1, %4
+    tt.store %14, %13, %6
+    tt.return
+  }
+}
+"""
+
+# ELU: output = x > 0 ? x : alpha * (exp(x) - 1)
+ELU_TTGIR = """
+module {
+  tt.func public @elu_kernel(%arg0: !tt.ptr<f32> {tt.divisibility = 16 : i32},
+                              %arg1: !tt.ptr<f32> {tt.divisibility = 16 : i32, tt.output},
+                              %arg2: i32) {
+    %0 = tt.get_program_id x : i32
+    %c256 = arith.constant 256 : i32
+    %1 = arith.muli %0, %c256 : i32
+    %2 = tt.make_range {end = 256 : i32, start = 0 : i32}
+    %3 = tt.splat %1
+    %4 = arith.addi %3, %2
+    %5 = tt.splat %arg2
+    %6 = arith.cmpi slt, %4, %5
+    %7 = tt.addptr %arg0, %4
+    %8 = tt.load %7, %6
+    %c0 = arith.constant 0.0 : f32
+    %9 = tt.splat %c0
+    %10 = arith.cmpf ogt, %8, %9
+    %11 = math.exp %8
+    %c1 = arith.constant 1.0 : f32
+    %12 = tt.splat %c1
+    %13 = arith.subf %11, %12
+    %14 = arith.select %10, %8, %13
+    %15 = tt.addptr %arg1, %4
+    tt.store %15, %14, %6
+    tt.return
+  }
+}
+"""
+
+# Leaky ReLU: output = x > 0 ? x : alpha * x
+LEAKY_RELU_TTGIR = """
+module {
+  tt.func public @leaky_relu_kernel(%arg0: !tt.ptr<f32> {tt.divisibility = 16 : i32},
+                                     %arg1: !tt.ptr<f32> {tt.divisibility = 16 : i32, tt.output},
+                                     %arg2: i32) {
+    %0 = tt.get_program_id x : i32
+    %c256 = arith.constant 256 : i32
+    %1 = arith.muli %0, %c256 : i32
+    %2 = tt.make_range {end = 256 : i32, start = 0 : i32}
+    %3 = tt.splat %1
+    %4 = arith.addi %3, %2
+    %5 = tt.splat %arg2
+    %6 = arith.cmpi slt, %4, %5
+    %7 = tt.addptr %arg0, %4
+    %8 = tt.load %7, %6
+    %c0 = arith.constant 0.0 : f32
+    %9 = tt.splat %c0
+    %10 = arith.cmpf ogt, %8, %9
+    %calpha = arith.constant 0.01 : f32
+    %11 = tt.splat %calpha
+    %12 = arith.mulf %8, %11
+    %13 = arith.select %10, %8, %12
+    %14 = tt.addptr %arg1, %4
+    tt.store %14, %13, %6
+    tt.return
+  }
+}
+"""
+
+# Hardswish: output = x * min(max(x+3, 0), 6) / 6
+HARDSWISH_TTGIR = """
+module {
+  tt.func public @hardswish_kernel(%arg0: !tt.ptr<f32> {tt.divisibility = 16 : i32},
+                                    %arg1: !tt.ptr<f32> {tt.divisibility = 16 : i32, tt.output},
+                                    %arg2: i32) {
+    %0 = tt.get_program_id x : i32
+    %c256 = arith.constant 256 : i32
+    %1 = arith.muli %0, %c256 : i32
+    %2 = tt.make_range {end = 256 : i32, start = 0 : i32}
+    %3 = tt.splat %1
+    %4 = arith.addi %3, %2
+    %5 = tt.splat %arg2
+    %6 = arith.cmpi slt, %4, %5
+    %7 = tt.addptr %arg0, %4
+    %8 = tt.load %7, %6
+    %c3 = arith.constant 3.0 : f32
+    %9 = tt.splat %c3
+    %10 = arith.addf %8, %9
+    %c0 = arith.constant 0.0 : f32
+    %11 = tt.splat %c0
+    %12 = arith.cmpf ogt, %10, %11
+    %13 = arith.select %12, %10, %11
+    %c6 = arith.constant 6.0 : f32
+    %14 = tt.splat %c6
+    %15 = arith.cmpf olt, %13, %14
+    %16 = arith.select %15, %13, %14
+    %17 = arith.mulf %8, %16
+    %18 = arith.divf %17, %14
+    %19 = tt.addptr %arg1, %4
+    tt.store %19, %18, %6
+    tt.return
+  }
+}
+"""
+
+
+def test_ttgir_tanh_detected():
+    """TTGIR tanh activation pattern is detected."""
+    from triton_metal.codegen.ttgir_parser import TTGIRParser
+    parser = TTGIRParser(TANH_TTGIR, FakeOptions())
+    parser._parse_function_signature()
+    parser._parse_body()
+    parser._classify_stores()
+    assert parser._classify_activation() == "tanh"
+
+
+def test_ttgir_sigmoid_detected():
+    """TTGIR sigmoid activation pattern is detected."""
+    from triton_metal.codegen.ttgir_parser import TTGIRParser
+    parser = TTGIRParser(SIGMOID_TTGIR, FakeOptions())
+    parser._parse_function_signature()
+    parser._parse_body()
+    parser._classify_stores()
+    assert parser._classify_activation() == "sigmoid"
+
+
+def test_ttgir_elu_detected():
+    """TTGIR ELU activation pattern is detected."""
+    from triton_metal.codegen.ttgir_parser import TTGIRParser
+    parser = TTGIRParser(ELU_TTGIR, FakeOptions())
+    parser._parse_function_signature()
+    parser._parse_body()
+    parser._classify_stores()
+    assert parser._classify_activation() == "elu"
+
+
+def test_ttgir_leaky_relu_detected():
+    """TTGIR leaky ReLU activation pattern is detected."""
+    from triton_metal.codegen.ttgir_parser import TTGIRParser
+    parser = TTGIRParser(LEAKY_RELU_TTGIR, FakeOptions())
+    parser._parse_function_signature()
+    parser._parse_body()
+    parser._classify_stores()
+    assert parser._classify_activation() == "leaky_relu"
+
+
+def test_ttgir_hardswish_detected():
+    """TTGIR hardswish activation pattern is detected."""
+    from triton_metal.codegen.ttgir_parser import TTGIRParser
+    parser = TTGIRParser(HARDSWISH_TTGIR, FakeOptions())
+    parser._parse_function_signature()
+    parser._parse_body()
+    parser._classify_stores()
+    assert parser._classify_activation() == "hardswish"
+
+
+def test_ttgir_activation_not_confused_with_fused_mlp():
+    """Activation (sigmoid) is NOT confused with fused MLP (needs 2+ inputs)."""
+    from triton_metal.codegen.ttgir_parser import TTGIRParser
+    parser = TTGIRParser(SIGMOID_TTGIR, FakeOptions())
+    parser._parse_function_signature()
+    parser._parse_body()
+    parser._classify_stores()
+    assert not parser._is_fused_mlp_pattern()
+    assert parser._classify_activation() == "sigmoid"
+
+
+@requires_metal
+def test_ttgir_tanh_compiles(runner):
+    """TTGIR tanh activation compiles to valid MSL."""
+    from triton_metal.codegen.ttgir_parser import parse_ttgir
+
+    kb = parse_ttgir(TANH_TTGIR, FakeOptions())
+    msl = kb.build()
+    assert "tanh" in msl
+    runner.compile(msl, "tanh_kernel")
+
+
+@requires_metal
+def test_ttgir_sigmoid_compiles(runner):
+    """TTGIR sigmoid activation compiles to valid MSL."""
+    from triton_metal.codegen.ttgir_parser import parse_ttgir
+
+    kb = parse_ttgir(SIGMOID_TTGIR, FakeOptions())
+    msl = kb.build()
+    assert "sigmoid" in msl.lower() or "exp" in msl
+    runner.compile(msl, "sigmoid_kernel")
+
+
+@requires_metal
+def test_ttgir_elu_compiles(runner):
+    """TTGIR ELU activation compiles to valid MSL."""
+    from triton_metal.codegen.ttgir_parser import parse_ttgir
+
+    kb = parse_ttgir(ELU_TTGIR, FakeOptions())
+    msl = kb.build()
+    assert "elu" in msl.lower() or "exp" in msl
+    runner.compile(msl, "elu_kernel")
+
+
+@requires_metal
+def test_ttgir_leaky_relu_compiles(runner):
+    """TTGIR leaky ReLU activation compiles to valid MSL."""
+    from triton_metal.codegen.ttgir_parser import parse_ttgir
+
+    kb = parse_ttgir(LEAKY_RELU_TTGIR, FakeOptions())
+    msl = kb.build()
+    assert "leaky" in msl.lower() or "select" in msl
+    runner.compile(msl, "leaky_relu_kernel")
+
+
+@requires_metal
+def test_ttgir_hardswish_compiles(runner):
+    """TTGIR hardswish activation compiles to valid MSL."""
+    from triton_metal.codegen.ttgir_parser import parse_ttgir
+
+    kb = parse_ttgir(HARDSWISH_TTGIR, FakeOptions())
+    msl = kb.build()
+    assert "hardswish" in msl.lower() or "clamp" in msl
+    runner.compile(msl, "hardswish_kernel")

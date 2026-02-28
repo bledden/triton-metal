@@ -368,6 +368,14 @@ class TTGIRParser:
                     self.ssa_values[result] = ("mask", m.group(3), m.group(4))
                 continue
 
+            # arith.cmpf (float comparison — used for activation conditionals)
+            if "arith.cmpf" in line:
+                m = re.match(r"%(\w+)\s*=\s*arith\.cmpf\s+(\w+)\s*,\s*(%\w+)\s*,\s*(%\w+)", line)
+                if m:
+                    result = f"%{m.group(1)}"
+                    self.ssa_values[result] = ("mask", m.group(3), m.group(4))
+                continue
+
             # arith.select (ternary: cond ? true_val : false_val)
             if "arith.select" in line:
                 m = re.match(r"%(\w+)\s*=\s*arith\.select\s+(%\w+)\s*,\s*(%\w+)\s*,\s*(%\w+)", line)
@@ -472,7 +480,7 @@ class TTGIRParser:
             for op_name, op_key in [("math.exp", "exp"), ("math.log", "log"),
                                      ("math.sqrt", "sqrt"), ("math.rsqrt", "rsqrt"),
                                      ("math.absf", "abs"), ("math.sin", "sin"),
-                                     ("math.cos", "cos")]:
+                                     ("math.cos", "cos"), ("math.tanh", "tanh")]:
                 if op_name in line:
                     m = re.match(
                         rf"%(\w+)\s*=\s*{re.escape(op_name)}\s+(%\w+)",
@@ -649,6 +657,11 @@ class TTGIRParser:
         # Fused MLP: silu(gate) * up pattern (exp + neg + mul, no reductions)
         if self._is_fused_mlp_pattern():
             return self._build_fused_mlp_kernel(kb, primary_dtype)
+
+        # Activation functions: tanh, sigmoid, elu, leaky_relu, hardswish
+        act = self._classify_activation()
+        if act:
+            return self._build_activation_kernel(kb, act, primary_dtype)
 
         # Standard elementwise pattern
         offsets = kb.make_block_offsets("pid", "offsets")
@@ -1294,6 +1307,49 @@ class TTGIRParser:
         """Generate a beam search kernel from the pattern."""
         from triton_metal.codegen.msl_emitter import make_beam_search_kernel
         kb.set_prebuilt_msl(make_beam_search_kernel())
+        return kb
+
+    def _classify_activation(self):
+        """Classify the activation function from the IR ops.
+
+        Returns the activation name ("tanh", "sigmoid", "elu", "leaky_relu",
+        "hardswish") or None if no activation pattern matches.
+
+        Requirements for activation detection:
+        - No reductions, no dot ops (elementwise only)
+        - 1 input pointer, 1 output pointer
+        """
+        if self.reduce_ops or self.dot_ops:
+            return None
+        n_inputs = sum(1 for _, (_, _, is_out) in self.ptr_args.items() if not is_out)
+        n_outputs = sum(1 for _, (_, _, is_out) in self.ptr_args.items() if is_out)
+        if n_inputs != 1 or n_outputs != 1:
+            return None
+
+        ssa_ops = {v[0] for v in self.ssa_values.values()}
+
+        # tanh: explicit tanh op
+        if "tanh" in ssa_ops:
+            return "tanh"
+        # sigmoid: exp + div (or neg+exp+add+div), no tanh, single input
+        if "exp" in ssa_ops and "div" in ssa_ops and "select" not in ssa_ops:
+            return "sigmoid"
+        # elu: exp + select (x > 0 ? x : alpha*(exp(x)-1))
+        if "exp" in ssa_ops and "select" in ssa_ops:
+            return "elu"
+        # hardswish: select + add + mul + div, no exp
+        if "select" in ssa_ops and "add" in ssa_ops and "div" in ssa_ops and "exp" not in ssa_ops:
+            return "hardswish"
+        # leaky_relu: select + mul, no exp, no div
+        if "select" in ssa_ops and "mul" in ssa_ops and "exp" not in ssa_ops and "div" not in ssa_ops:
+            return "leaky_relu"
+
+        return None
+
+    def _build_activation_kernel(self, kb, activation, primary_dtype):
+        """Generate an activation kernel from the classified pattern."""
+        from triton_metal.codegen.msl_emitter import make_activation_kernel
+        kb.set_prebuilt_msl(make_activation_kernel(activation=activation))
         return kb
 
     def _find_pre_reduce_op(self, reduce_input_ssa):

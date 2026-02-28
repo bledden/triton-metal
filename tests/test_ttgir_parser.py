@@ -273,6 +273,51 @@ module {
 """
 
 
+# Layer norm: two sum reductions (mean + variance), subtract, rsqrt, multiply
+LAYER_NORM_TTGIR = """\
+module {
+  tt.func public @layer_norm_kernel(%arg0: !tt.ptr<f32>, %arg1: !tt.ptr<f32>, %arg2: !tt.ptr<f32>, %arg3: !tt.ptr<f32>, %arg4: i32) {
+    %0 = tt.get_program_id x : i32
+    %c256_i32 = arith.constant 256 : i32
+    %1 = arith.muli %0, %c256_i32 : i32
+    %2 = tt.make_range {end = 256 : i32, start = 0 : i32} : tensor<256xi32>
+    %3 = tt.splat %1 : i32 -> tensor<256xi32>
+    %4 = arith.addi %3, %2 : tensor<256xi32>
+    %5 = tt.splat %arg4 : i32 -> tensor<256xi32>
+    %6 = arith.cmpi slt, %4, %5 : tensor<256xi32>
+    %7 = tt.splat %arg0 : !tt.ptr<f32> -> tensor<256x!tt.ptr<f32>>
+    %8 = tt.addptr %7, %4 : tensor<256x!tt.ptr<f32>>, tensor<256xi32>
+    %cst = arith.constant 0.000000e+00 : f32
+    %9 = tt.splat %cst : f32 -> tensor<256xf32>
+    %10 = tt.load %8, %6, %9 : tensor<256x!tt.ptr<f32>>
+    %mean_sum = "tt.reduce"(%10) ({
+    ^bb0(%arg5: f32, %arg6: f32):
+      %s1 = arith.addf %arg5, %arg6 : f32
+      "tt.reduce.return"(%s1) : (f32) -> ()
+    }) {axis = 0 : i32} : (tensor<256xf32>) -> f32
+    %mean_splat = tt.splat %mean_sum : f32 -> tensor<256xf32>
+    %centered = arith.subf %10, %mean_splat : tensor<256xf32>
+    %sq = arith.mulf %centered, %centered : tensor<256xf32>
+    %var_sum = "tt.reduce"(%sq) ({
+    ^bb0(%arg7: f32, %arg8: f32):
+      %s2 = arith.addf %arg7, %arg8 : f32
+      "tt.reduce.return"(%s2) : (f32) -> ()
+    }) {axis = 0 : i32} : (tensor<256xf32>) -> f32
+    %eps = arith.constant 1.000000e-06 : f32
+    %inv_std = math.rsqrt %var_sum : f32
+    %11 = tt.splat %arg1 : !tt.ptr<f32> -> tensor<256x!tt.ptr<f32>>
+    %12 = tt.addptr %11, %4 : tensor<256x!tt.ptr<f32>>, tensor<256xi32>
+    %gamma_ptr = tt.splat %arg2 : !tt.ptr<f32> -> tensor<256x!tt.ptr<f32>>
+    %gamma_ptrs = tt.addptr %gamma_ptr, %2 : tensor<256x!tt.ptr<f32>>, tensor<256xi32>
+    %gamma = tt.load %gamma_ptrs : tensor<256x!tt.ptr<f32>>
+    %normed = arith.mulf %centered, %gamma : tensor<256xf32>
+    tt.store %12, %normed, %6 : tensor<256x!tt.ptr<f32>>
+    tt.return
+  }
+}
+"""
+
+
 # scf.for loop: accumulates over chunks with a loop structure
 SCF_FOR_TTGIR = """\
 module {
@@ -1094,3 +1139,44 @@ def test_ttgir_rsqrt_gpu(runner):
         assert abs(result[i] - expected) < tol, (
             f"[{i}] got {result[i]}, expected {expected}"
         )
+
+
+# ---------------------------------------------------------------------------
+# Layer norm pattern detection tests
+# ---------------------------------------------------------------------------
+
+def test_ttgir_layer_norm_detected():
+    """Parser detects layer norm pattern (two sum reductions with sub)."""
+    from triton_metal.codegen.ttgir_parser import TTGIRParser
+
+    parser = TTGIRParser(LAYER_NORM_TTGIR, FakeOptions())
+    parser._parse_function_signature()
+    parser._parse_body()
+
+    # Should have 2 reduce ops, both sum
+    assert len(parser.reduce_ops) >= 2
+    ops = [r[2] for r in parser.reduce_ops]
+    assert ops.count("sum") >= 2, f"Expected 2 sum reduces, got {ops}"
+
+
+def test_ttgir_layer_norm_is_not_softmax():
+    """Layer norm should not be detected as softmax."""
+    from triton_metal.codegen.ttgir_parser import TTGIRParser
+
+    parser = TTGIRParser(LAYER_NORM_TTGIR, FakeOptions())
+    parser._parse_function_signature()
+    parser._parse_body()
+
+    assert not parser._is_softmax_pattern(), "Layer norm should not match softmax"
+    assert parser._is_layer_norm_pattern(), "Should match layer norm pattern"
+
+
+@requires_metal
+def test_ttgir_layer_norm_compiles(runner):
+    """TTGIR layer norm pattern compiles to valid MSL."""
+    from triton_metal.codegen.ttgir_parser import parse_ttgir
+
+    kb = parse_ttgir(LAYER_NORM_TTGIR, FakeOptions())
+    msl = kb.build()
+    assert "mean" in msl.lower() or "inv_std" in msl or "var" in msl.lower()
+    runner.compile(msl, "layer_norm_kernel")

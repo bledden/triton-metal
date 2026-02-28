@@ -559,9 +559,11 @@ class TTGIRParser:
         for arg_name in self.scalar_args:
             n_arg = arg_name
 
-        # Check if this is a multi-reduce pattern (softmax) or single reduction
+        # Check if this is a multi-reduce pattern (softmax/layernorm) or single reduction
         if len(self.reduce_ops) >= 2 and self._is_softmax_pattern():
             return self._build_softmax_kernel(kb, n_arg, primary_dtype)
+        if len(self.reduce_ops) >= 2 and self._is_layer_norm_pattern():
+            return self._build_layer_norm_kernel(kb, n_arg, primary_dtype)
         if self.reduce_ops:
             return self._build_reduction_kernel(kb, n_arg, primary_dtype)
 
@@ -670,6 +672,22 @@ class TTGIRParser:
         ops = [r[2] for r in self.reduce_ops]
         return "max" in ops and "sum" in ops
 
+    def _is_layer_norm_pattern(self):
+        """Check if multi-reduce pattern matches layer norm (sum + sum).
+
+        Layer norm has two sum reductions (mean, variance) and operations
+        between them (subtract mean, square). Softmax has max + sum.
+        """
+        if len(self.reduce_ops) < 2:
+            return False
+        ops = [r[2] for r in self.reduce_ops]
+        # Layer norm: two sum reductions (NOT softmax which has max+sum)
+        if ops.count("sum") >= 2 and "max" not in ops:
+            # Check for subtract or rsqrt between/after reductions
+            return ("sub" in [v[0] for v in self.ssa_values.values()]
+                    or "rsqrt" in [v[0] for v in self.ssa_values.values()])
+        return False
+
     def _build_softmax_kernel(self, kb, n_arg, primary_dtype):
         """Generate a fused row-wise softmax kernel.
 
@@ -743,6 +761,105 @@ class TTGIRParser:
         kb.raw_line(f"for (uint i = lid; i < {n_arg}; i += {kb.block_size}u) {{")
         kb.indent()
         kb.raw_line(f"{output_arg}[row_start + i] /= sum_val;")
+        kb.dedent()
+        kb.raw_line("}")
+
+        return kb
+
+    def _build_layer_norm_kernel(self, kb, n_arg, primary_dtype):
+        """Generate a fused layer norm kernel from two sum reductions.
+
+        Detected from 2 tt.reduce sum ops with sub/mul between them.
+        Pattern:
+        1. sum(input)         → mean = sum / n
+        2. sum((x - mean)^2)  → var = sum / n
+        3. output = (x - mean) * rsqrt(var + eps) * gamma + beta
+
+        Each threadgroup processes one row. Gamma/beta are detected from
+        pointer args that are neither the primary input nor the output.
+        """
+        n_simd_groups = (kb.block_size + 31) // 32
+
+        # Find input, output, and parameter pointers
+        input_arg = None
+        output_arg = None
+        param_args = []
+        for arg_name, (idx, dtype, is_output) in self.ptr_args.items():
+            if is_output:
+                output_arg = arg_name
+            elif input_arg is None:
+                input_arg = arg_name
+            else:
+                param_args.append(arg_name)
+
+        if not input_arg or not output_arg or not n_arg:
+            return kb
+
+        # gamma is first param, beta is second (if they exist)
+        gamma_arg = param_args[0] if len(param_args) > 0 else None
+        beta_arg = param_args[1] if len(param_args) > 1 else None
+
+        # Extract epsilon from constants in the IR
+        eps = 1e-6
+        for ssa, val in self.ssa_values.items():
+            if val[0] == "constant":
+                import re as _re
+                m = _re.search(r"([\d.e+-]+)\s*:\s*f32", val[1])
+                if m:
+                    v = float(m.group(1))
+                    if 0 < v < 1e-3:  # looks like an epsilon
+                        eps = v
+
+        # Shared memory for reductions
+        kb.declare_threadgroup_array("shared_mean", dtype=primary_dtype, size=n_simd_groups)
+        kb.declare_threadgroup_array("shared_var", dtype=primary_dtype, size=n_simd_groups)
+
+        # Row base pointer
+        kb._var("row_start", f"pid * {n_arg}", ty="uint")
+
+        # Pass 1: Compute mean
+        kb._var("local_sum", "0.0f", ty="float")
+        kb.raw_line(f"for (uint i = lid; i < {n_arg}; i += {kb.block_size}u) {{")
+        kb.indent()
+        kb.raw_line(f"local_sum += {input_arg}[row_start + i];")
+        kb.dedent()
+        kb.raw_line("}")
+
+        kb.threadgroup_reduce("sum", "local_sum", "shared_mean", "total_sum")
+
+        kb.begin_if("lid == 0")
+        kb.raw_line("shared_mean[0] = total_sum;")
+        kb.end_block()
+        kb.barrier("threadgroup")
+        kb._var("mean_val", f"shared_mean[0] / float({n_arg})", ty="float")
+
+        # Pass 2: Compute variance
+        kb._var("local_var", "0.0f", ty="float")
+        kb.raw_line(f"for (uint i = lid; i < {n_arg}; i += {kb.block_size}u) {{")
+        kb.indent()
+        kb._var("diff", f"{input_arg}[row_start + i] - mean_val", ty="float")
+        kb.raw_line("local_var += diff * diff;")
+        kb.dedent()
+        kb.raw_line("}")
+
+        kb.threadgroup_reduce("sum", "local_var", "shared_var", "total_var")
+
+        kb.begin_if("lid == 0")
+        kb.raw_line("shared_var[0] = total_var;")
+        kb.end_block()
+        kb.barrier("threadgroup")
+        kb._var("var_val", f"shared_var[0] / float({n_arg})", ty="float")
+        kb._var("inv_std", f"rsqrt(var_val + {eps}f)", ty="float")
+
+        # Pass 3: Normalize
+        kb.raw_line(f"for (uint i = lid; i < {n_arg}; i += {kb.block_size}u) {{")
+        kb.indent()
+        if gamma_arg and beta_arg:
+            kb.raw_line(f"{output_arg}[row_start + i] = ({input_arg}[row_start + i] - mean_val) * inv_std * {gamma_arg}[i] + {beta_arg}[i];")
+        elif gamma_arg:
+            kb.raw_line(f"{output_arg}[row_start + i] = ({input_arg}[row_start + i] - mean_val) * inv_std * {gamma_arg}[i];")
+        else:
+            kb.raw_line(f"{output_arg}[row_start + i] = ({input_arg}[row_start + i] - mean_val) * inv_std;")
         kb.dedent()
         kb.raw_line("}")
 

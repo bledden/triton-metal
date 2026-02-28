@@ -1136,6 +1136,160 @@ kernel void flash_attention(
 """
 
 
+def make_residual_add_kernel(block_size=256, dtype="fp32", has_bias=True):
+    """Generate a fused residual connection kernel.
+
+    output = input + residual + bias (or input + residual if has_bias=False)
+
+    Common in transformer blocks after attention and FFN layers.
+
+    Args:
+        block_size: Threads per threadgroup.
+        dtype: Data type.
+        has_bias: Whether to include a bias term.
+    """
+    name = "residual_add_kernel"
+    kb = KernelBuilder(name, block_size=block_size)
+
+    kb.add_ptr_arg("input", dtype=dtype, const=True)
+    kb.add_ptr_arg("residual", dtype=dtype, const=True)
+    if has_bias:
+        kb.add_ptr_arg("bias", dtype=dtype, const=True)
+    kb.add_ptr_arg("output", dtype=dtype, const=False)
+    kb.add_scalar_arg("n_elements", dtype="u32")
+
+    offsets = kb.make_block_offsets("pid", "offsets")
+    mask = kb.make_mask(offsets, "n_elements", "mask")
+
+    in_val = kb.load("input", offsets, mask, out_var="in_val", dtype=dtype)
+    res_val = kb.load("residual", offsets, mask, out_var="res_val", dtype=dtype)
+
+    if has_bias:
+        bias_val = kb.load("bias", offsets, mask, out_var="bias_val", dtype=dtype)
+        kb._var("sum_val", f"{in_val} + {res_val} + {bias_val}", ty="float")
+        kb.store("output", offsets, "sum_val", mask, dtype=dtype)
+    else:
+        kb._var("sum_val", f"{in_val} + {res_val}", ty="float")
+        kb.store("output", offsets, "sum_val", mask, dtype=dtype)
+
+    return kb.build()
+
+
+def make_kv_cache_attention_kernel(head_dim=64, block_size=256):
+    """Generate a KV-cache attention kernel for autoregressive inference.
+
+    Single query token attending to a cached K,V sequence:
+    score[j] = Q[0,:] . K[j,:] * scale
+    attn = softmax(scores)
+    output = sum(attn[j] * V[j,:])
+
+    Each threadgroup handles one attention head.
+    Iterates over the KV cache in chunks.
+
+    Args:
+        head_dim: Dimension of each attention head.
+        block_size: Threads per threadgroup.
+
+    Kernel args:
+        Q: [n_heads, head_dim] — single query token per head
+        K_cache: [n_heads, max_seq_len, head_dim] — key cache
+        V_cache: [n_heads, max_seq_len, head_dim] — value cache
+        O: [n_heads, head_dim] — output
+        seq_len: current sequence length (how much of cache is valid)
+        scale: 1/sqrt(head_dim)
+    """
+    return f"""#include <metal_stdlib>
+using namespace metal;
+
+kernel void kv_cache_attention(
+    device const float* Q [[buffer(0)]],
+    device const float* K_cache [[buffer(1)]],
+    device const float* V_cache [[buffer(2)]],
+    device float* O [[buffer(3)]],
+    constant uint& seq_len [[buffer(4)]],
+    constant float& scale [[buffer(5)]],
+    uint pid [[threadgroup_position_in_grid]],
+    uint lid [[thread_position_in_threadgroup]],
+    uint sgitg [[simdgroup_index_in_threadgroup]],
+    uint tiisg [[thread_index_in_simdgroup]]
+) {{
+    // pid = head index
+    const uint D = {head_dim}u;
+    uint head_offset_q = pid * D;
+    uint head_offset_kv = pid * seq_len * D;
+
+    // Shared memory for online softmax
+    threadgroup float tg_scores[{block_size}];  // attention scores buffer
+
+    // Phase 1: Compute all attention scores and find max
+    // Each thread handles one or more KV positions
+    float local_max = -INFINITY;
+    for (uint j = lid; j < seq_len; j += {block_size}u) {{
+        float dot = 0.0f;
+        for (uint d = 0u; d < D; d++) {{
+            dot += Q[head_offset_q + d] * K_cache[head_offset_kv + j * D + d];
+        }}
+        float score = dot * scale;
+        tg_scores[j % {block_size}u] = score;  // partial storage
+        local_max = max(local_max, score);
+    }}
+
+    // Reduce max across threadgroup
+    float sg_max = simd_max(local_max);
+    threadgroup float shared_max[{(block_size + 31) // 32}];
+    if (sgitg == 0u) shared_max[tiisg] = -INFINITY;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tiisg == 0u) shared_max[sgitg] = sg_max;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float rd_max = shared_max[tiisg];
+    float global_max = simd_max(rd_max);
+
+    // Phase 2: Compute exp(score - max) and sum
+    float local_sum = 0.0f;
+    for (uint j = lid; j < seq_len; j += {block_size}u) {{
+        float dot = 0.0f;
+        for (uint d = 0u; d < D; d++) {{
+            dot += Q[head_offset_q + d] * K_cache[head_offset_kv + j * D + d];
+        }}
+        float score = dot * scale;
+        float p = exp(score - global_max);
+        local_sum += p;
+    }}
+
+    // Reduce sum
+    float sg_sum = simd_sum(local_sum);
+    threadgroup float shared_sum[{(block_size + 31) // 32}];
+    if (sgitg == 0u) shared_sum[tiisg] = 0.0f;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tiisg == 0u) shared_sum[sgitg] = sg_sum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float rd_sum = shared_sum[tiisg];
+    float global_sum = simd_sum(rd_sum);
+    float inv_sum = 1.0f / global_sum;
+
+    // Phase 3: Compute weighted V sum
+    // Each thread accumulates over its KV positions for all D dimensions
+    // To avoid excessive register pressure, process D in chunks
+    for (uint d_start = 0u; d_start < D; d_start += {block_size}u) {{
+        float o_val = 0.0f;
+        uint d = d_start + lid;
+        if (d < D) {{
+            for (uint j = 0u; j < seq_len; j++) {{
+                float dot = 0.0f;
+                for (uint dd = 0u; dd < D; dd++) {{
+                    dot += Q[head_offset_q + dd] * K_cache[head_offset_kv + j * D + dd];
+                }}
+                float score = dot * scale;
+                float attn_weight = exp(score - global_max) * inv_sum;
+                o_val += attn_weight * V_cache[head_offset_kv + j * D + d];
+            }}
+            O[head_offset_q + d] = o_val;
+        }}
+    }}
+}}
+"""
+
+
 def make_simdgroup_matmul_kernel(dtype="fp32"):
     """Generate a matmul kernel using Apple's simdgroup_matrix hardware.
 

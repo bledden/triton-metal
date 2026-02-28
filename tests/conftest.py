@@ -207,6 +207,51 @@ class MetalKernelRunner:
         view = buf.contents().as_buffer(n * 2)
         return [struct.unpack_from("e", view, i * 2)[0] for i in range(n)]
 
+    # -- BFloat16 helpers --
+
+    @staticmethod
+    def _float_to_bf16_bytes(f):
+        """Convert float to bfloat16 bytes (truncate lower 16 bits of float32)."""
+        b = struct.pack("f", f)
+        return b[2:4]  # upper 2 bytes on little-endian
+
+    @staticmethod
+    def _bf16_bytes_to_float(b):
+        """Convert bfloat16 bytes to float."""
+        return struct.unpack("f", b"\x00\x00" + b)[0]
+
+    def make_bf16_buffer(self, data):
+        """Create a Metal buffer filled with bfloat16 data."""
+        import Metal
+
+        n = len(data)
+        buf = self.device.newBufferWithLength_options_(
+            n * 2, Metal.MTLResourceStorageModeShared
+        )
+        view = buf.contents().as_buffer(n * 2)
+        for i, val in enumerate(data):
+            bf16 = self._float_to_bf16_bytes(float(val))
+            view[i * 2] = bf16[0]
+            view[i * 2 + 1] = bf16[1]
+        return buf
+
+    def make_empty_bf16_buffer(self, n):
+        """Create an empty bfloat16 buffer of n elements."""
+        import Metal
+
+        return self.device.newBufferWithLength_options_(
+            n * 2, Metal.MTLResourceStorageModeShared
+        )
+
+    def read_bf16_buffer(self, buf, n):
+        """Read n bfloat16 values from a Metal buffer."""
+        view = buf.contents().as_buffer(n * 2)
+        results = []
+        for i in range(n):
+            b = bytes([view[i * 2], view[i * 2 + 1]])
+            results.append(self._bf16_bytes_to_float(b))
+        return results
+
 
 @pytest.fixture
 def metal_device():

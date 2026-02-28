@@ -1516,3 +1516,196 @@ def test_flash_attention_multi_block(runner):
             assert abs(got - expected) < tol, (
                 f"pos={i} dim={d}: got {got}, expected {expected}"
             )
+
+
+# ---------------------------------------------------------------------------
+# BFloat16 tests
+# ---------------------------------------------------------------------------
+
+@requires_metal
+def test_vector_add_bf16(runner):
+    """output = a + b in bfloat16 precision"""
+    from triton_metal.codegen.msl_emitter import make_vector_add_kernel
+
+    n = 1024
+    msl = make_vector_add_kernel(block_size=256, dtype="bf16")
+    path = runner.compile(msl, "vector_add")
+    pipeline = runner.load(path, "vector_add")
+
+    a_data = [float(i) * 0.01 for i in range(n)]
+    b_data = [float(i) * 0.005 for i in range(n)]
+
+    a_buf = runner.make_bf16_buffer(a_data)
+    b_buf = runner.make_bf16_buffer(b_data)
+    out_buf = runner.make_empty_bf16_buffer(n)
+    n_buf = runner.make_uint_buffer(n)
+
+    runner.run(pipeline, [a_buf, b_buf, out_buf, n_buf], n)
+
+    result = runner.read_bf16_buffer(out_buf, n)
+    for i in range(0, n, 16):  # spot-check every 16th
+        expected = a_data[i] + b_data[i]
+        # BF16 has ~2-3 decimal digits of precision
+        tol = max(0.1, abs(expected) * 0.02)
+        assert abs(result[i] - expected) < tol, (
+            f"[{i}] got {result[i]}, expected {expected}"
+        )
+
+
+@requires_metal
+def test_silu_bf16(runner):
+    """output = x * sigmoid(x) in bfloat16 precision"""
+    from triton_metal.codegen.msl_emitter import make_silu_kernel
+
+    n = 512
+    msl = make_silu_kernel(block_size=256, dtype="bf16")
+    path = runner.compile(msl, "silu_kernel")
+    pipeline = runner.load(path, "silu_kernel")
+
+    input_data = [(i - n // 2) * 0.01 for i in range(n)]
+    input_buf = runner.make_bf16_buffer(input_data)
+    out_buf = runner.make_empty_bf16_buffer(n)
+    n_buf = runner.make_uint_buffer(n)
+
+    runner.run(pipeline, [input_buf, out_buf, n_buf], n)
+
+    result = runner.read_bf16_buffer(out_buf, n)
+    for i in range(0, n, 8):
+        x = input_data[i]
+        expected = x / (1.0 + math.exp(-x))
+        tol = max(0.05, abs(expected) * 0.1)
+        assert abs(result[i] - expected) < tol, (
+            f"[{i}] x={x}: got {result[i]}, expected {expected}"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Residual + bias add tests
+# ---------------------------------------------------------------------------
+
+@requires_metal
+def test_residual_add_with_bias(runner):
+    """output = input + residual + bias"""
+    from triton_metal.codegen.msl_emitter import make_residual_add_kernel
+
+    n = 1024
+    msl = make_residual_add_kernel(block_size=256, has_bias=True)
+    path = runner.compile(msl, "residual_add_kernel")
+    pipeline = runner.load(path, "residual_add_kernel")
+
+    in_data = [float(i) * 0.1 for i in range(n)]
+    res_data = [float(i) * 0.05 for i in range(n)]
+    bias_data = [0.5] * n
+
+    in_buf = runner.make_float_buffer(in_data)
+    res_buf = runner.make_float_buffer(res_data)
+    bias_buf = runner.make_float_buffer(bias_data)
+    out_buf = runner.make_empty_buffer(n)
+    n_buf = runner.make_uint_buffer(n)
+
+    runner.run(pipeline, [in_buf, res_buf, bias_buf, out_buf, n_buf], n)
+
+    result = runner.read_float_buffer(out_buf, n)
+    for i in range(n):
+        expected = in_data[i] + res_data[i] + bias_data[i]
+        assert abs(result[i] - expected) < 1e-4, (
+            f"[{i}] got {result[i]}, expected {expected}"
+        )
+
+
+@requires_metal
+def test_residual_add_no_bias(runner):
+    """output = input + residual (no bias)"""
+    from triton_metal.codegen.msl_emitter import make_residual_add_kernel
+
+    n = 1024
+    msl = make_residual_add_kernel(block_size=256, has_bias=False)
+    path = runner.compile(msl, "residual_add_kernel")
+    pipeline = runner.load(path, "residual_add_kernel")
+
+    in_data = [float(i) * 0.1 for i in range(n)]
+    res_data = [float(i) * 0.05 for i in range(n)]
+
+    in_buf = runner.make_float_buffer(in_data)
+    res_buf = runner.make_float_buffer(res_data)
+    out_buf = runner.make_empty_buffer(n)
+    n_buf = runner.make_uint_buffer(n)
+
+    runner.run(pipeline, [in_buf, res_buf, out_buf, n_buf], n)
+
+    result = runner.read_float_buffer(out_buf, n)
+    for i in range(n):
+        expected = in_data[i] + res_data[i]
+        assert abs(result[i] - expected) < 1e-4, (
+            f"[{i}] got {result[i]}, expected {expected}"
+        )
+
+
+# ---------------------------------------------------------------------------
+# KV-cache attention tests
+# ---------------------------------------------------------------------------
+
+@requires_metal
+def test_kv_cache_attention(runner):
+    """KV-cache attention: single query token attending to cached KV."""
+    from triton_metal.codegen.msl_emitter import make_kv_cache_attention_kernel
+
+    head_dim = 64
+    seq_len = 8
+    n_heads = 1
+    scale = 1.0 / math.sqrt(head_dim)
+
+    msl = make_kv_cache_attention_kernel(head_dim=head_dim, block_size=256)
+    path = runner.compile(msl, "kv_cache_attention")
+    pipeline = runner.load(path, "kv_cache_attention")
+
+    random.seed(777)
+    Q_data = [random.gauss(0, 0.5) for _ in range(n_heads * head_dim)]
+    K_data = [random.gauss(0, 0.5) for _ in range(n_heads * seq_len * head_dim)]
+    V_data = [random.gauss(0, 0.5) for _ in range(n_heads * seq_len * head_dim)]
+
+    Q_buf = runner.make_float_buffer(Q_data)
+    K_buf = runner.make_float_buffer(K_data)
+    V_buf = runner.make_float_buffer(V_data)
+    O_buf = runner.make_empty_buffer(n_heads * head_dim)
+    seq_buf = runner.make_uint_buffer(seq_len)
+    scale_buf = runner.make_float_scalar_buffer(scale)
+
+    import Metal
+    cmd = runner.queue.commandBuffer()
+    enc = cmd.computeCommandEncoder()
+    enc.setComputePipelineState_(pipeline)
+    for i, buf in enumerate([Q_buf, K_buf, V_buf, O_buf, seq_buf, scale_buf]):
+        enc.setBuffer_offset_atIndex_(buf, 0, i)
+    enc.dispatchThreadgroups_threadsPerThreadgroup_(
+        Metal.MTLSizeMake(n_heads, 1, 1),
+        Metal.MTLSizeMake(256, 1, 1),
+    )
+    enc.endEncoding()
+    cmd.commit()
+    cmd.waitUntilCompleted()
+    assert cmd.status() == 4, f"Kernel failed, status={cmd.status()}"
+
+    result = runner.read_float_buffer(O_buf, n_heads * head_dim)
+
+    # Reference: softmax(Q @ K^T * scale) @ V
+    for h in range(n_heads):
+        scores = []
+        for j in range(seq_len):
+            dot = sum(Q_data[h * head_dim + d] * K_data[h * seq_len * head_dim + j * head_dim + d]
+                      for d in range(head_dim))
+            scores.append(dot * scale)
+
+        mx = max(scores)
+        exps = [math.exp(s - mx) for s in scores]
+        s = sum(exps)
+        attn = [e / s for e in exps]
+
+        for d in range(head_dim):
+            expected = sum(attn[j] * V_data[h * seq_len * head_dim + j * head_dim + d]
+                          for j in range(seq_len))
+            got = result[h * head_dim + d]
+            tol = max(1e-3, abs(expected) * 0.01)
+            assert abs(got - expected) < tol, (
+                f"head={h} dim={d}: got {got}, expected {expected}"
+            )

@@ -2846,6 +2846,213 @@ kernel void beam_search(
 """
 
 
+def make_fused_mlp_kernel(block_size=256):
+    """Generate a fused SwiGLU MLP kernel (LLaMA-style).
+
+    output[i] = silu(gate[i]) * up[i]
+
+    This is the element-wise fusion of the gate and up projections after
+    the linear layers. The full LLaMA MLP is:
+        gate = W_gate @ x
+        up = W_up @ x
+        output = silu(gate) * up
+
+    This kernel fuses the silu activation with the element-wise multiply.
+    The linear projections (W_gate, W_up) are handled separately.
+
+    Layout:
+        gate: [n] — output of W_gate @ x
+        up: [n] — output of W_up @ x
+        output: [n] — silu(gate) * up
+        n_elements: total element count
+
+    Args:
+        block_size: Threads per threadgroup.
+    """
+    return f"""#include <metal_stdlib>
+using namespace metal;
+
+kernel void fused_mlp(
+    device const float* gate [[buffer(0)]],
+    device const float* up [[buffer(1)]],
+    device float* output [[buffer(2)]],
+    constant uint& n_elements [[buffer(3)]],
+    uint gid [[thread_position_in_grid]]
+) {{
+    if (gid >= n_elements) return;
+    float g = gate[gid];
+    float silu_g = g / (1.0f + exp(-g));
+    output[gid] = silu_g * up[gid];
+}}
+"""
+
+
+def make_sliding_window_attention_kernel(head_dim=64, window_size=256, block_size=256):
+    """Generate a sliding window attention kernel (Mistral-style).
+
+    Each query token only attends to the last `window_size` tokens,
+    reducing the O(n^2) attention to O(n * window_size).
+
+    For a single query at position q_pos:
+        window_start = max(0, q_pos - window_size + 1)
+        Attend only to K[window_start:q_pos+1]
+
+    Layout:
+        Q: [head_dim] — single query vector
+        K_cache: [max_seq_len, head_dim] — full KV-cache
+        V_cache: [max_seq_len, head_dim]
+        O: [head_dim] — output
+        q_pos: query position
+        seq_len: total sequence length
+
+    Dispatch: 1 threadgroup.
+
+    Args:
+        head_dim: Dimension per head.
+        window_size: Number of tokens to attend to.
+        block_size: Threads per threadgroup.
+    """
+    n_simdgroups = (block_size + 31) // 32
+    return f"""#include <metal_stdlib>
+using namespace metal;
+
+kernel void sliding_window_attention(
+    device const float* Q [[buffer(0)]],
+    device const float* K_cache [[buffer(1)]],
+    device const float* V_cache [[buffer(2)]],
+    device float* O [[buffer(3)]],
+    constant uint& q_pos [[buffer(4)]],
+    constant uint& seq_len [[buffer(5)]],
+    uint lid [[thread_position_in_threadgroup]],
+    uint sgitg [[simdgroup_index_in_threadgroup]],
+    uint tiisg [[thread_index_in_simdgroup]]
+) {{
+    const uint D = {head_dim}u;
+    const uint WINDOW = {window_size}u;
+    const uint BLOCK = {block_size}u;
+    const float scale = 1.0f / sqrt(float(D));
+
+    // Window bounds
+    uint win_end = min(q_pos + 1u, seq_len);
+    uint win_start = (q_pos + 1u > WINDOW) ? (q_pos + 1u - WINDOW) : 0u;
+    uint win_len = win_end - win_start;
+
+    // Phase 1: max score within window
+    float local_max = -INFINITY;
+    for (uint w = lid; w < win_len; w += BLOCK) {{
+        uint j = win_start + w;
+        float dot = 0.0f;
+        for (uint d = 0u; d < D; d++) {{
+            dot += Q[d] * K_cache[j * D + d];
+        }}
+        local_max = max(local_max, dot * scale);
+    }}
+
+    float sg_max = simd_max(local_max);
+    threadgroup float shared_max[{n_simdgroups}];
+    if (sgitg == 0u) shared_max[tiisg] = -INFINITY;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tiisg == 0u) shared_max[sgitg] = sg_max;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float rd_max = (tiisg < {n_simdgroups}u) ? shared_max[tiisg] : -INFINITY;
+    float global_max = simd_max(rd_max);
+
+    // Phase 2: exp sum
+    float local_sum = 0.0f;
+    for (uint w = lid; w < win_len; w += BLOCK) {{
+        uint j = win_start + w;
+        float dot = 0.0f;
+        for (uint d = 0u; d < D; d++) {{
+            dot += Q[d] * K_cache[j * D + d];
+        }}
+        local_sum += exp(dot * scale - global_max);
+    }}
+
+    float sg_sum = simd_sum(local_sum);
+    threadgroup float shared_sum[{n_simdgroups}];
+    if (sgitg == 0u) shared_sum[tiisg] = 0.0f;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tiisg == 0u) shared_sum[sgitg] = sg_sum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float rd_sum = (tiisg < {n_simdgroups}u) ? shared_sum[tiisg] : 0.0f;
+    float global_sum = simd_sum(rd_sum);
+    float inv_sum = 1.0f / global_sum;
+
+    // Phase 3: Weighted V sum
+    for (uint d_start = 0u; d_start < D; d_start += BLOCK) {{
+        uint d = d_start + lid;
+        if (d < D) {{
+            float o_val = 0.0f;
+            for (uint w = 0u; w < win_len; w++) {{
+                uint j = win_start + w;
+                float dot = 0.0f;
+                for (uint dd = 0u; dd < D; dd++) {{
+                    dot += Q[dd] * K_cache[j * D + dd];
+                }}
+                float attn_w = exp(dot * scale - global_max) * inv_sum;
+                o_val += attn_w * V_cache[j * D + d];
+            }}
+            O[d] = o_val;
+        }}
+    }}
+}}
+"""
+
+
+def make_repeat_kv_kernel(block_size=256):
+    """Generate a kernel that repeats KV heads for GQA inference.
+
+    For Grouped Query Attention, the number of KV heads is less than
+    the number of query heads. This kernel expands KV by repeating
+    each KV head n_rep times.
+
+    output[h, s, d] = input[h // n_rep, s, d]
+
+    Layout:
+        input: [n_kv_heads, seq_len, head_dim] — original KV
+        output: [n_q_heads, seq_len, head_dim] — expanded KV
+        n_kv_heads: number of KV heads
+        seq_len: sequence length
+        head_dim: dimension per head
+        n_rep: repetition factor (n_q_heads / n_kv_heads)
+
+    Each thread handles one element in the output.
+
+    Args:
+        block_size: Threads per threadgroup.
+    """
+    return f"""#include <metal_stdlib>
+using namespace metal;
+
+kernel void repeat_kv(
+    device const float* input [[buffer(0)]],
+    device float* output [[buffer(1)]],
+    constant uint& n_kv_heads [[buffer(2)]],
+    constant uint& seq_len [[buffer(3)]],
+    constant uint& head_dim [[buffer(4)]],
+    constant uint& n_rep [[buffer(5)]],
+    uint gid [[thread_position_in_grid]]
+) {{
+    uint n_q_heads = n_kv_heads * n_rep;
+    uint total = n_q_heads * seq_len * head_dim;
+    if (gid >= total) return;
+
+    // Decompose flat index: output[q_head, s, d]
+    uint d = gid % head_dim;
+    uint remainder = gid / head_dim;
+    uint s = remainder % seq_len;
+    uint q_head = remainder / seq_len;
+
+    // Map query head to KV head
+    uint kv_head = q_head / n_rep;
+
+    // Read from input[kv_head, s, d]
+    uint in_idx = (kv_head * seq_len + s) * head_dim + d;
+    output[gid] = input[in_idx];
+}}
+"""
+
+
 def make_simdgroup_matmul_kernel(dtype="fp32"):
     """Generate a matmul kernel using Apple's simdgroup_matrix hardware.
 

@@ -3408,3 +3408,183 @@ def test_fp16_kv_attention(runner):
         assert abs(got - expected) < 0.05, (
             f"dim {d}: got {got}, expected {expected}"
         )
+
+
+# ---------------------------------------------------------------------------
+# Fused MLP (SwiGLU) tests
+# ---------------------------------------------------------------------------
+
+
+@requires_metal
+def test_fused_mlp(runner):
+    """Fused MLP: output = silu(gate) * up."""
+    from triton_metal.codegen.msl_emitter import make_fused_mlp_kernel
+
+    n = 512
+
+    msl = make_fused_mlp_kernel(block_size=256)
+    path = runner.compile(msl, "fused_mlp")
+    pipeline = runner.load(path, "fused_mlp")
+
+    random.seed(1234)
+    gate_data = [random.uniform(-2.0, 2.0) for _ in range(n)]
+    up_data = [random.uniform(-2.0, 2.0) for _ in range(n)]
+
+    gate_buf = runner.make_float_buffer(gate_data)
+    up_buf = runner.make_float_buffer(up_data)
+    out_buf = runner.make_empty_buffer(n)
+    n_buf = runner.make_uint_buffer(n)
+
+    runner.run(pipeline, [gate_buf, up_buf, out_buf, n_buf], n, block_size=256)
+
+    result = runner.read_float_buffer(out_buf, n)
+
+    for i in range(n):
+        g = gate_data[i]
+        silu_g = g / (1.0 + math.exp(-g))
+        expected = silu_g * up_data[i]
+        got = result[i]
+        assert abs(got - expected) < 0.01, (
+            f"idx {i}: got {got}, expected {expected}"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Sliding Window Attention tests
+# ---------------------------------------------------------------------------
+
+
+@requires_metal
+def test_sliding_window_attention(runner):
+    """Sliding window attention: only attend to last window_size tokens."""
+    from triton_metal.codegen.msl_emitter import make_sliding_window_attention_kernel
+
+    head_dim = 32
+    window_size = 8
+    seq_len = 20
+    q_pos = 15  # Will attend to positions 8..15
+
+    msl = make_sliding_window_attention_kernel(
+        head_dim=head_dim, window_size=window_size, block_size=256)
+    path = runner.compile(msl, "sliding_window_attn")
+    pipeline = runner.load(path, "sliding_window_attention")
+
+    random.seed(7890)
+    q_data = [random.uniform(-0.5, 0.5) for _ in range(head_dim)]
+    k_data = [random.uniform(-0.5, 0.5) for _ in range(seq_len * head_dim)]
+    v_data = [random.uniform(-0.5, 0.5) for _ in range(seq_len * head_dim)]
+
+    q_buf = runner.make_float_buffer(q_data)
+    k_buf = runner.make_float_buffer(k_data)
+    v_buf = runner.make_float_buffer(v_data)
+    out_buf = runner.make_empty_buffer(head_dim)
+    qpos_buf = runner.make_uint_buffer(q_pos)
+    sl_buf = runner.make_uint_buffer(seq_len)
+
+    import Metal
+    cmd = runner.queue.commandBuffer()
+    enc = cmd.computeCommandEncoder()
+    enc.setComputePipelineState_(pipeline)
+    for i, buf in enumerate([q_buf, k_buf, v_buf, out_buf, qpos_buf, sl_buf]):
+        enc.setBuffer_offset_atIndex_(buf, 0, i)
+    enc.dispatchThreadgroups_threadsPerThreadgroup_(
+        Metal.MTLSizeMake(1, 1, 1),
+        Metal.MTLSizeMake(256, 1, 1),
+    )
+    enc.endEncoding()
+    cmd.commit()
+    cmd.waitUntilCompleted()
+    assert cmd.status() == 4, f"Kernel failed, status={cmd.status()}"
+
+    result = runner.read_float_buffer(out_buf, head_dim)
+
+    # Reference: only attend within window
+    win_start = max(0, q_pos + 1 - window_size)
+    win_end = min(q_pos + 1, seq_len)
+    scale = 1.0 / math.sqrt(head_dim)
+
+    scores = []
+    for j in range(win_start, win_end):
+        dot = sum(q_data[d] * k_data[j * head_dim + d] for d in range(head_dim))
+        scores.append(dot * scale)
+
+    max_s = max(scores)
+    exp_s = [math.exp(s - max_s) for s in scores]
+    sum_exp = sum(exp_s)
+    attn = [e / sum_exp for e in exp_s]
+
+    for d in range(head_dim):
+        expected = sum(attn[w] * v_data[(win_start + w) * head_dim + d]
+                       for w in range(len(attn)))
+        got = result[d]
+        assert abs(got - expected) < 0.05, (
+            f"dim {d}: got {got}, expected {expected}"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Repeat KV tests
+# ---------------------------------------------------------------------------
+
+
+@requires_metal
+def test_repeat_kv(runner):
+    """Repeat KV: expand n_kv_heads to n_q_heads by repeating."""
+    from triton_metal.codegen.msl_emitter import make_repeat_kv_kernel
+    import struct as struct_mod
+
+    n_kv_heads = 2
+    n_rep = 4
+    n_q_heads = n_kv_heads * n_rep  # = 8
+    seq_len = 4
+    head_dim = 8
+
+    msl = make_repeat_kv_kernel(block_size=256)
+    path = runner.compile(msl, "repeat_kv")
+    pipeline = runner.load(path, "repeat_kv")
+
+    # input: [n_kv_heads, seq_len, head_dim]
+    random.seed(2020)
+    total_in = n_kv_heads * seq_len * head_dim
+    in_data = [random.uniform(-1.0, 1.0) for _ in range(total_in)]
+
+    total_out = n_q_heads * seq_len * head_dim
+    in_buf = runner.make_float_buffer(in_data)
+    out_buf = runner.make_empty_buffer(total_out)
+    nkvh_buf = runner.make_uint_buffer(n_kv_heads)
+    sl_buf = runner.make_uint_buffer(seq_len)
+    hd_buf = runner.make_uint_buffer(head_dim)
+    nr_buf = runner.make_uint_buffer(n_rep)
+
+    block_size = 256
+    n_groups = (total_out + block_size - 1) // block_size
+
+    import Metal
+    cmd = runner.queue.commandBuffer()
+    enc = cmd.computeCommandEncoder()
+    enc.setComputePipelineState_(pipeline)
+    for i, buf in enumerate([in_buf, out_buf, nkvh_buf, sl_buf, hd_buf, nr_buf]):
+        enc.setBuffer_offset_atIndex_(buf, 0, i)
+    enc.dispatchThreadgroups_threadsPerThreadgroup_(
+        Metal.MTLSizeMake(n_groups, 1, 1),
+        Metal.MTLSizeMake(block_size, 1, 1),
+    )
+    enc.endEncoding()
+    cmd.commit()
+    cmd.waitUntilCompleted()
+    assert cmd.status() == 4, f"Kernel failed, status={cmd.status()}"
+
+    result = runner.read_float_buffer(out_buf, total_out)
+
+    # Reference: output[q_head, s, d] = input[q_head // n_rep, s, d]
+    for qh in range(n_q_heads):
+        kv_h = qh // n_rep
+        for s in range(seq_len):
+            for d in range(head_dim):
+                out_idx = (qh * seq_len + s) * head_dim + d
+                in_idx = (kv_h * seq_len + s) * head_dim + d
+                expected = in_data[in_idx]
+                got = result[out_idx]
+                assert abs(got - expected) < 0.001, (
+                    f"q_head={qh} s={s} d={d}: got {got}, expected {expected}"
+                )

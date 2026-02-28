@@ -4306,6 +4306,124 @@ kernel void fused_linear(
 """
 
 
+def make_reduce_scatter_kernel(n_buffers=2, block_size=256, dtype="fp32"):
+    """Generate a reduce-scatter kernel for multi-buffer reduction.
+
+    Reduces n_buffers input buffers element-wise (sum), then scatters
+    the result: each segment of the output gets a contiguous chunk of
+    the reduced result.
+
+    For single-GPU use, this simulates the collective operation by summing
+    multiple input buffers and writing output segments. Useful as a building
+    block for pipeline-parallel inference.
+
+    Args:
+        n_buffers: Number of input buffers to reduce.
+        block_size: Threads per threadgroup.
+        dtype: Data type.
+
+    Kernel args:
+        input0..inputN-1: [total_elements] input buffers
+        output: [total_elements] reduced output
+        n_elements: total element count
+    """
+    msl_ty = triton_type_to_msl(dtype)
+
+    # Build buffer parameters
+    buffer_params = []
+    for i in range(n_buffers):
+        buffer_params.append(
+            f"    device const {msl_ty}* input{i} [[buffer({i})]]"
+        )
+    out_idx = n_buffers
+    n_idx = n_buffers + 1
+    buffer_params.append(f"    device {msl_ty}* output [[buffer({out_idx})]]")
+    buffer_params.append(f"    constant uint& n_elements [[buffer({n_idx})]]")
+    params_str = ",\n".join(buffer_params)
+
+    # Build sum expression
+    sum_parts = [f"input{i}[gid]" for i in range(n_buffers)]
+    sum_expr = " + ".join(sum_parts)
+
+    msl = f"""#include <metal_stdlib>
+using namespace metal;
+
+kernel void reduce_scatter(
+{params_str},
+    uint gid [[thread_position_in_grid]]
+) {{
+    if (gid >= n_elements) return;
+    output[gid] = {sum_expr};
+}}
+"""
+    kb = KernelBuilder("reduce_scatter", block_size=block_size)
+    kb.set_prebuilt_msl(msl)
+    return kb.build()
+
+
+def make_all_reduce_kernel(n_buffers=2, block_size=256, dtype="fp32", op="sum"):
+    """Generate an all-reduce kernel for multi-buffer reduction.
+
+    Reduces n_buffers input buffers element-wise and writes the full
+    result to the output buffer (all ranks get the complete result).
+
+    Supports sum, max, and min reductions.
+
+    Args:
+        n_buffers: Number of input buffers to reduce.
+        block_size: Threads per threadgroup.
+        dtype: Data type.
+        op: Reduction operation ("sum", "max", "min").
+
+    Kernel args:
+        input0..inputN-1: [n_elements] input buffers
+        output: [n_elements] reduced output
+        n_elements: total element count
+    """
+    msl_ty = triton_type_to_msl(dtype)
+
+    buffer_params = []
+    for i in range(n_buffers):
+        buffer_params.append(
+            f"    device const {msl_ty}* input{i} [[buffer({i})]]"
+        )
+    out_idx = n_buffers
+    n_idx = n_buffers + 1
+    buffer_params.append(f"    device {msl_ty}* output [[buffer({out_idx})]]")
+    buffer_params.append(f"    constant uint& n_elements [[buffer({n_idx})]]")
+    params_str = ",\n".join(buffer_params)
+
+    # Build reduction expression based on op
+    if op == "sum":
+        sum_parts = [f"input{i}[gid]" for i in range(n_buffers)]
+        reduce_expr = " + ".join(sum_parts)
+    elif op == "max":
+        reduce_expr = f"input0[gid]"
+        for i in range(1, n_buffers):
+            reduce_expr = f"max({reduce_expr}, input{i}[gid])"
+    elif op == "min":
+        reduce_expr = f"input0[gid]"
+        for i in range(1, n_buffers):
+            reduce_expr = f"min({reduce_expr}, input{i}[gid])"
+    else:
+        raise ValueError(f"Unsupported all-reduce op: {op}")
+
+    msl = f"""#include <metal_stdlib>
+using namespace metal;
+
+kernel void all_reduce(
+{params_str},
+    uint gid [[thread_position_in_grid]]
+) {{
+    if (gid >= n_elements) return;
+    output[gid] = {reduce_expr};
+}}
+"""
+    kb = KernelBuilder("all_reduce", block_size=block_size)
+    kb.set_prebuilt_msl(msl)
+    return kb.build()
+
+
 # ---------------------------------------------------------------------------
 # TTGIR integration (requires triton)
 # ---------------------------------------------------------------------------

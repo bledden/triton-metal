@@ -5126,3 +5126,122 @@ def test_transpose_kernel(runner):
             actual = result[c * rows + r]
             assert abs(actual - expected) < 0.01, \
                 f"T[{c},{r}] = {actual}, expected {expected} (from [{r},{c}])"
+
+
+# ---------------------------------------------------------------------------
+# Reduce-scatter kernel
+# ---------------------------------------------------------------------------
+
+@requires_metal
+def test_reduce_scatter_kernel(runner):
+    """Reduce-scatter sums 2 input buffers and writes to output."""
+    from triton_metal.codegen.msl_emitter import make_reduce_scatter_kernel
+
+    n = 1024
+    msl = make_reduce_scatter_kernel(n_buffers=2, block_size=256)
+    path = runner.compile(msl, "reduce_scatter")
+    pipeline = runner.load(path, "reduce_scatter")
+
+    a = [float(i) for i in range(n)]
+    b = [float(i * 2) for i in range(n)]
+
+    buf_a = runner.make_float_buffer(a)
+    buf_b = runner.make_float_buffer(b)
+    buf_out = runner.make_empty_buffer(n)
+    buf_n = runner.make_uint_buffer(n)
+
+    runner.run(pipeline, [buf_a, buf_b, buf_out, buf_n], n)
+    result = runner.read_float_buffer(buf_out, n)
+
+    for i in range(n):
+        expected = a[i] + b[i]
+        assert abs(result[i] - expected) < 0.01, \
+            f"reduce_scatter[{i}] = {result[i]}, expected {expected}"
+
+
+@requires_metal
+def test_reduce_scatter_3_buffers(runner):
+    """Reduce-scatter with 3 input buffers."""
+    from triton_metal.codegen.msl_emitter import make_reduce_scatter_kernel
+
+    n = 512
+    msl = make_reduce_scatter_kernel(n_buffers=3, block_size=256)
+    path = runner.compile(msl, "reduce_scatter")
+    pipeline = runner.load(path, "reduce_scatter")
+
+    a = [float(i) for i in range(n)]
+    b = [float(i * 2) for i in range(n)]
+    c = [float(i * 3) for i in range(n)]
+
+    buf_a = runner.make_float_buffer(a)
+    buf_b = runner.make_float_buffer(b)
+    buf_c = runner.make_float_buffer(c)
+    buf_out = runner.make_empty_buffer(n)
+    buf_n = runner.make_uint_buffer(n)
+
+    runner.run(pipeline, [buf_a, buf_b, buf_c, buf_out, buf_n], n)
+    result = runner.read_float_buffer(buf_out, n)
+
+    for i in range(n):
+        expected = a[i] + b[i] + c[i]
+        assert abs(result[i] - expected) < 0.01, \
+            f"reduce_scatter_3[{i}] = {result[i]}, expected {expected}"
+
+
+# ---------------------------------------------------------------------------
+# All-reduce kernel
+# ---------------------------------------------------------------------------
+
+@requires_metal
+def test_all_reduce_sum(runner):
+    """All-reduce (sum) of 2 input buffers."""
+    from triton_metal.codegen.msl_emitter import make_all_reduce_kernel
+
+    n = 1024
+    msl = make_all_reduce_kernel(n_buffers=2, op="sum")
+    path = runner.compile(msl, "all_reduce")
+    pipeline = runner.load(path, "all_reduce")
+
+    a = [float(i) * 0.5 for i in range(n)]
+    b = [float(i) * 1.5 for i in range(n)]
+
+    buf_a = runner.make_float_buffer(a)
+    buf_b = runner.make_float_buffer(b)
+    buf_out = runner.make_empty_buffer(n)
+    buf_n = runner.make_uint_buffer(n)
+
+    runner.run(pipeline, [buf_a, buf_b, buf_out, buf_n], n)
+    result = runner.read_float_buffer(buf_out, n)
+
+    for i in range(n):
+        expected = a[i] + b[i]
+        assert abs(result[i] - expected) < 0.01, \
+            f"all_reduce_sum[{i}] = {result[i]}, expected {expected}"
+
+
+@requires_metal
+def test_all_reduce_max(runner):
+    """All-reduce (max) of 2 input buffers."""
+    from triton_metal.codegen.msl_emitter import make_all_reduce_kernel
+
+    n = 512
+    msl = make_all_reduce_kernel(n_buffers=2, op="max")
+    path = runner.compile(msl, "all_reduce")
+    pipeline = runner.load(path, "all_reduce")
+
+    random.seed(42)
+    a = [random.uniform(-10, 10) for _ in range(n)]
+    b = [random.uniform(-10, 10) for _ in range(n)]
+
+    buf_a = runner.make_float_buffer(a)
+    buf_b = runner.make_float_buffer(b)
+    buf_out = runner.make_empty_buffer(n)
+    buf_n = runner.make_uint_buffer(n)
+
+    runner.run(pipeline, [buf_a, buf_b, buf_out, buf_n], n)
+    result = runner.read_float_buffer(buf_out, n)
+
+    for i in range(n):
+        expected = max(a[i], b[i])
+        assert abs(result[i] - expected) < 0.01, \
+            f"all_reduce_max[{i}] = {result[i]}, expected {expected}"

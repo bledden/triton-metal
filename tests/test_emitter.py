@@ -179,6 +179,34 @@ class MetalKernelRunner:
         view = buf.contents().as_buffer(n * 4)
         return [struct.unpack_from("f", view, i * 4)[0] for i in range(n)]
 
+    # -- Half-precision (FP16) helpers --
+
+    def make_half_buffer(self, data):
+        """Create a Metal buffer filled with half-precision (FP16) data."""
+        import Metal
+
+        n = len(data)
+        buf = self.device.newBufferWithLength_options_(
+            n * 2, Metal.MTLResourceStorageModeShared
+        )
+        view = buf.contents().as_buffer(n * 2)
+        for i, val in enumerate(data):
+            struct.pack_into("e", view, i * 2, float(val))
+        return buf
+
+    def make_empty_half_buffer(self, n):
+        """Create an empty half-precision buffer of n elements."""
+        import Metal
+
+        return self.device.newBufferWithLength_options_(
+            n * 2, Metal.MTLResourceStorageModeShared
+        )
+
+    def read_half_buffer(self, buf, n):
+        """Read n half-precision values from a Metal buffer."""
+        view = buf.contents().as_buffer(n * 2)
+        return [struct.unpack_from("e", view, i * 2)[0] for i in range(n)]
+
 
 @pytest.fixture
 def runner():
@@ -805,3 +833,93 @@ def test_matmul_multi_tile(runner):
             assert abs(got - expected) < 1e-1, (
                 f"C[{i},{j}]: got {got}, expected {expected}"
             )
+
+
+# ---------------------------------------------------------------------------
+# FP16 tests
+# ---------------------------------------------------------------------------
+
+@requires_metal
+def test_vector_add_fp16(runner):
+    """output = a + b in half precision"""
+    from triton_metal.codegen.msl_emitter import make_vector_add_kernel
+
+    n = 1024
+    msl = make_vector_add_kernel(block_size=256, dtype="fp16")
+    path = runner.compile(msl, "vector_add")
+    pipeline = runner.load(path, "vector_add")
+
+    a_data = [float(i) * 0.01 for i in range(n)]
+    b_data = [float(i) * 0.005 for i in range(n)]
+
+    a_buf = runner.make_half_buffer(a_data)
+    b_buf = runner.make_half_buffer(b_data)
+    out_buf = runner.make_empty_half_buffer(n)
+    n_buf = runner.make_uint_buffer(n)
+
+    runner.run(pipeline, [a_buf, b_buf, out_buf, n_buf], n)
+
+    result = runner.read_half_buffer(out_buf, n)
+    for i in range(n):
+        expected = a_data[i] + b_data[i]
+        # FP16 has ~3 decimal digits of precision
+        tol = max(1e-2, abs(expected) * 1e-2)
+        assert abs(result[i] - expected) < tol, (
+            f"[{i}] got {result[i]}, expected {expected}"
+        )
+
+
+@requires_metal
+def test_silu_fp16(runner):
+    """output = x * sigmoid(x) in half precision"""
+    from triton_metal.codegen.msl_emitter import make_silu_kernel
+
+    n = 512
+    msl = make_silu_kernel(block_size=256, dtype="fp16")
+    path = runner.compile(msl, "silu_kernel")
+    pipeline = runner.load(path, "silu_kernel")
+
+    input_data = [(i - n // 2) * 0.01 for i in range(n)]
+    input_buf = runner.make_half_buffer(input_data)
+    out_buf = runner.make_empty_half_buffer(n)
+    n_buf = runner.make_uint_buffer(n)
+
+    runner.run(pipeline, [input_buf, out_buf, n_buf], n)
+
+    result = runner.read_half_buffer(out_buf, n)
+    for i in range(n):
+        x = input_data[i]
+        expected = x / (1.0 + math.exp(-x))
+        tol = max(1e-2, abs(expected) * 5e-2)
+        assert abs(result[i] - expected) < tol, (
+            f"[{i}] x={x}: got {result[i]}, expected {expected}"
+        )
+
+
+@requires_metal
+def test_elementwise_mul_fp16(runner):
+    """output = a * b in half precision"""
+    from triton_metal.codegen.msl_emitter import make_elementwise_kernel
+
+    n = 1024
+    msl = make_elementwise_kernel("mul_fp16", 2, "mul", dtype="fp16")
+    path = runner.compile(msl, "mul_fp16")
+    pipeline = runner.load(path, "mul_fp16")
+
+    a_data = [float(i) * 0.01 for i in range(n)]
+    b_data = [float(i) * 0.02 for i in range(n)]
+
+    a_buf = runner.make_half_buffer(a_data)
+    b_buf = runner.make_half_buffer(b_data)
+    out_buf = runner.make_empty_half_buffer(n)
+    n_buf = runner.make_uint_buffer(n)
+
+    runner.run(pipeline, [a_buf, b_buf, out_buf, n_buf], n)
+
+    result = runner.read_half_buffer(out_buf, n)
+    for i in range(n):
+        expected = a_data[i] * b_data[i]
+        tol = max(1e-1, abs(expected) * 5e-2)
+        assert abs(result[i] - expected) < tol, (
+            f"[{i}] got {result[i]}, expected {expected}"
+        )

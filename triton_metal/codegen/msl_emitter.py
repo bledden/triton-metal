@@ -19,6 +19,28 @@ from triton_metal.codegen.msl_types import triton_type_to_msl
 
 
 # ---------------------------------------------------------------------------
+# Type helpers
+# ---------------------------------------------------------------------------
+
+def _msl_compute_type(dtype):
+    """Get the MSL compute type for a Triton dtype.
+
+    For fp16, computations are done in float and cast back to half on store.
+    This matches Triton's behavior and avoids precision issues.
+    """
+    if dtype in ("fp16", "bf16"):
+        return "float"
+    return triton_type_to_msl(dtype)
+
+
+def _msl_zero(dtype):
+    """Get the zero literal for a MSL type."""
+    if dtype in ("fp16", "bf16", "fp32", "f32"):
+        return "0.0f"
+    return "0"
+
+
+# ---------------------------------------------------------------------------
 # Kernel description API
 # ---------------------------------------------------------------------------
 
@@ -98,22 +120,36 @@ class KernelBuilder:
         self._var(out_var, f"{offsets_var} < {n_var}", ty="bool")
         return out_var
 
-    def load(self, ptr_var, offsets_var, mask_var=None, out_var=None):
-        """Masked load from a buffer pointer + offset."""
+    def load(self, ptr_var, offsets_var, mask_var=None, out_var=None, dtype="fp32"):
+        """Masked load from a buffer pointer + offset.
+
+        For FP16/BF16 buffers, the value is promoted to float for computation.
+        """
         if out_var is None:
             out_var = f"{ptr_var}_val"
+        compute_ty = _msl_compute_type(dtype)
+        zero = _msl_zero(dtype)
         if mask_var:
-            self._emit(f"float {out_var} = {mask_var} ? {ptr_var}[{offsets_var}] : 0.0f;")
+            self._emit(f"{compute_ty} {out_var} = {mask_var} ? "
+                       f"static_cast<{compute_ty}>({ptr_var}[{offsets_var}]) : {zero};")
         else:
-            self._emit(f"float {out_var} = {ptr_var}[{offsets_var}];")
+            self._emit(f"{compute_ty} {out_var} = "
+                       f"static_cast<{compute_ty}>({ptr_var}[{offsets_var}]);")
         return out_var
 
-    def store(self, ptr_var, offsets_var, val_var, mask_var=None):
-        """Masked store to a buffer pointer + offset."""
+    def store(self, ptr_var, offsets_var, val_var, mask_var=None, dtype="fp32"):
+        """Masked store to a buffer pointer + offset.
+
+        For FP16/BF16 buffers, casts from float compute type back to storage type.
+        """
+        store_ty = triton_type_to_msl(dtype)
+        compute_ty = _msl_compute_type(dtype)
+        needs_cast = (store_ty != compute_ty)
+        cast_val = f"static_cast<{store_ty}>({val_var})" if needs_cast else val_var
         if mask_var:
-            self._emit(f"if ({mask_var}) {{ {ptr_var}[{offsets_var}] = {val_var}; }}")
+            self._emit(f"if ({mask_var}) {{ {ptr_var}[{offsets_var}] = {cast_val}; }}")
         else:
-            self._emit(f"{ptr_var}[{offsets_var}] = {val_var};")
+            self._emit(f"{ptr_var}[{offsets_var}] = {cast_val};")
 
     def binary_op(self, op, a_var, b_var, out_var):
         """Emit a binary operation: out = a op b."""
@@ -354,13 +390,13 @@ def make_elementwise_kernel(name, n_inputs, op, block_size=256, dtype="fp32"):
     offsets = kb.make_block_offsets("pid", "offsets")
     mask = kb.make_mask(offsets, n_name, "mask")
 
-    # Load inputs
+    # Load inputs (promoted to float for FP16/BF16)
     val_names = []
     for i, inp in enumerate(input_names):
-        val = kb.load(inp, offsets, mask, out_var=f"val{i}")
+        val = kb.load(inp, offsets, mask, out_var=f"val{i}", dtype=dtype)
         val_names.append(val)
 
-    # Apply operation
+    # Apply operation (always in float compute precision)
     if n_inputs == 1:
         # Unary or fused unary
         if op in ("silu", "gelu", "gelu_tanh"):
@@ -374,8 +410,8 @@ def make_elementwise_kernel(name, n_inputs, op, block_size=256, dtype="fp32"):
     else:
         raise ValueError(f"Unsupported: {n_inputs} inputs with op '{op}'")
 
-    # Store result
-    kb.store(out_name, offsets, result, mask)
+    # Store result (cast back to half for FP16/BF16)
+    kb.store(out_name, offsets, result, mask, dtype=dtype)
 
     return kb.build()
 
@@ -410,9 +446,9 @@ def make_scalar_mul_kernel(block_size=256, dtype="fp32"):
     offsets = kb.make_block_offsets("pid", "offsets")
     mask = kb.make_mask(offsets, "n_elements", "mask")
 
-    val = kb.load("input", offsets, mask, out_var="val")
+    val = kb.load("input", offsets, mask, out_var="val", dtype=dtype)
     result = kb.binary_op("mul", val, "scalar", "result")
-    kb.store("output", offsets, result, mask)
+    kb.store("output", offsets, result, mask, dtype=dtype)
 
     return kb.build()
 

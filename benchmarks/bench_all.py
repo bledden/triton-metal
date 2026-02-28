@@ -59,6 +59,7 @@ from triton_metal.codegen.msl_emitter import (
     make_fused_mlp_kernel,
     make_sliding_window_attention_kernel,
     make_repeat_kv_kernel,
+    make_matmul_2d_kernel,
 )
 
 
@@ -164,9 +165,20 @@ def make_half_buffer(device, n, pattern="ramp"):
 
 
 def bench_custom_dispatch(bench, pipeline, buffers, n_groups, block_size,
-                          n_warmup=10, n_iters=100):
-    """Time a kernel with custom threadgroup dispatch."""
+                          n_warmup=10, n_iters=100, dispatch_2d=None):
+    """Time a kernel with custom threadgroup dispatch.
+
+    Args:
+        dispatch_2d: Optional (x, y) tuple for 2D threadgroup dispatch.
+            If provided, n_groups is ignored and dispatch uses 2D grid.
+    """
     import Metal as M
+
+    if dispatch_2d:
+        grid = M.MTLSizeMake(dispatch_2d[0], dispatch_2d[1], 1)
+    else:
+        grid = M.MTLSizeMake(n_groups, 1, 1)
+    tg_size = M.MTLSizeMake(block_size, 1, 1)
 
     for _ in range(n_warmup):
         cmd = bench.queue.commandBuffer()
@@ -174,10 +186,7 @@ def bench_custom_dispatch(bench, pipeline, buffers, n_groups, block_size,
         enc.setComputePipelineState_(pipeline)
         for i, buf in enumerate(buffers):
             enc.setBuffer_offset_atIndex_(buf, 0, i)
-        enc.dispatchThreadgroups_threadsPerThreadgroup_(
-            M.MTLSizeMake(n_groups, 1, 1),
-            M.MTLSizeMake(block_size, 1, 1),
-        )
+        enc.dispatchThreadgroups_threadsPerThreadgroup_(grid, tg_size)
         enc.endEncoding()
         cmd.commit()
         cmd.waitUntilCompleted()
@@ -189,10 +198,7 @@ def bench_custom_dispatch(bench, pipeline, buffers, n_groups, block_size,
         enc.setComputePipelineState_(pipeline)
         for i, buf in enumerate(buffers):
             enc.setBuffer_offset_atIndex_(buf, 0, i)
-        enc.dispatchThreadgroups_threadsPerThreadgroup_(
-            M.MTLSizeMake(n_groups, 1, 1),
-            M.MTLSizeMake(block_size, 1, 1),
-        )
+        enc.dispatchThreadgroups_threadsPerThreadgroup_(grid, tg_size)
         enc.endEncoding()
         cmd.commit()
         cmd.waitUntilCompleted()
@@ -1307,6 +1313,62 @@ def main():
                                         1, 256)
         n_bytes = 2 * n_tokens * vocab_size * 4  # read draft + target probs
         print(format_benchmark_result("spec_decode", result, n_bytes=n_bytes))
+
+    # =========================================================================
+    # Repeat KV (GQA head expansion)
+    # =========================================================================
+    print("\n" + "=" * 60)
+    print("REPEAT KV BENCHMARKS")
+    print("=" * 60)
+    msl = make_repeat_kv_kernel(block_size=256)
+    pipeline = compile_kernel(device, msl, "repeat_kv")
+    for n_kv_heads, n_rep, seq_len, head_dim in [(8, 4, 128, 64), (8, 4, 512, 128)]:
+        n_q_heads = n_kv_heads * n_rep
+        in_size = n_kv_heads * seq_len * head_dim
+        out_size = n_q_heads * seq_len * head_dim
+        in_buf = make_float_buffer(device, in_size, "randn")
+        out_buf = make_empty_buffer(device, out_size)
+        nkv_buf = make_uint_buffer(device, n_kv_heads)
+        sl_buf = make_uint_buffer(device, seq_len)
+        hd_buf = make_uint_buffer(device, head_dim)
+        nrep_buf = make_uint_buffer(device, n_rep)
+
+        result = bench_custom_dispatch(bench, pipeline,
+                                        [in_buf, out_buf, nkv_buf, sl_buf, hd_buf, nrep_buf],
+                                        (out_size + 255) // 256, 256)
+        n_bytes = (in_size + out_size) * 4
+        label = f"repeat_kv_h{n_kv_heads}x{n_rep}_s{seq_len}_d{head_dim}"
+        print(format_benchmark_result(label, result, n_bytes=n_bytes))
+
+    # =========================================================================
+    # 2D Dispatch Matmul
+    # =========================================================================
+    print("\n" + "=" * 60)
+    print("2D DISPATCH MATMUL BENCHMARKS")
+    print("=" * 60)
+    block_m, block_n, block_k = 32, 32, 32
+    threads_per_tg = block_m * block_n
+    msl = make_matmul_2d_kernel(block_m=block_m, block_n=block_n, block_k=block_k)
+    pipeline = compile_kernel(device, msl, "matmul_2d")
+    for size in [64, 128, 256]:
+        M = N = K = size
+        a_buf = make_float_buffer(device, M * K, "randn")
+        b_buf = make_float_buffer(device, K * N, "randn")
+        c_buf = make_empty_buffer(device, M * N)
+        m_buf = make_uint_buffer(device, M)
+        n_buf = make_uint_buffer(device, N)
+        k_buf = make_uint_buffer(device, K)
+
+        n_tile_cols = (N + block_n - 1) // block_n
+        n_tile_rows = (M + block_m - 1) // block_m
+
+        result = bench_custom_dispatch(bench, pipeline,
+                                        [a_buf, b_buf, c_buf, m_buf, n_buf, k_buf],
+                                        n_tile_cols * n_tile_rows, threads_per_tg,
+                                        dispatch_2d=(n_tile_cols, n_tile_rows))
+        flops = 2 * M * N * K
+        label = f"matmul_2d_{size}x{size}"
+        print(format_benchmark_result(label, result, n_flops=flops))
 
     # =========================================================================
     # Summary

@@ -113,6 +113,9 @@ class TTGIRParser:
         self.loaded_values = {}  # %ssa -> (ptr_arg_name, msl_var_name)
         self.computed_values = {} # %ssa -> msl_var_name
 
+        # Reduction tracking
+        self.reduce_ops = []  # [(result_ssa, input_ssa, op_kind, axis)]
+
         # Operation buffer for the kernel builder
         self.ops = []
 
@@ -164,8 +167,47 @@ class TTGIRParser:
                 dtype = _mlir_type_to_triton_dtype(elem_type)
                 self.scalar_args[arg_name] = (i, dtype)
 
+    def _scan_reductions(self):
+        """Scan for tt.reduce multi-line blocks in the IR text.
+
+        tt.reduce has a nested region:
+            %result = "tt.reduce"(%input) ({
+            ^bb0(%a: f32, %b: f32):
+              %combined = arith.addf %a, %b : f32
+              "tt.reduce.return"(%combined) : (f32) -> ()
+            }) {axis = 0 : i32} : (tensor<...>) -> f32
+        """
+        # Match the reduce block: result = "tt.reduce"(input) ({ ... body ... })
+        reduce_pattern = re.compile(
+            r'%(\w+)\s*=\s*"tt\.reduce"\s*\((%\w+)\)\s*\(\{'
+            r'(.*?)'
+            r'\}\)\s*\{axis\s*=\s*(\d+)',
+            re.DOTALL
+        )
+        for m in reduce_pattern.finditer(self.ir_text):
+            result_ssa = f"%{m.group(1)}"
+            input_ssa = m.group(2)
+            body = m.group(3)
+            axis = int(m.group(4))
+
+            # Detect the combine operation from the body
+            if "arith.addf" in body:
+                op_kind = "sum"
+            elif "arith.maxf" in body or "arith.maxnumf" in body:
+                op_kind = "max"
+            elif "arith.minf" in body or "arith.minnumf" in body:
+                op_kind = "min"
+            else:
+                op_kind = "sum"  # fallback
+
+            self.reduce_ops.append((result_ssa, input_ssa, op_kind, axis))
+            self.ssa_values[result_ssa] = ("reduce", input_ssa, op_kind)
+
     def _parse_body(self):
         """Walk through the body and classify operations."""
+        # First scan for multi-line reduce blocks
+        self._scan_reductions()
+
         for line in self.lines:
             line = line.strip()
             if not line or line.startswith("//") or line.startswith("module"):
@@ -380,20 +422,6 @@ class TTGIRParser:
             kb.add_scalar_arg(msl_name, dtype=dtype)
             arg_msl_names[arg_name] = msl_name
 
-        # Standard elementwise pattern:
-        # offsets = pid * BLOCK_SIZE + lid
-        # mask = offsets < n_elements
-        offsets = kb.make_block_offsets("pid", "offsets")
-
-        # Find the n_elements argument (usually the last scalar arg)
-        n_arg = None
-        for arg_name in self.scalar_args:
-            n_arg = arg_name
-        if n_arg:
-            mask = kb.make_mask(offsets, n_arg, "mask")
-        else:
-            mask = None
-
         # Determine the primary element dtype from the first pointer arg
         primary_dtype = "fp32"
         for arg_name, (idx, dtype, is_output) in self.ptr_args.items():
@@ -401,18 +429,31 @@ class TTGIRParser:
                 primary_dtype = dtype
                 break
 
+        # Find the n_elements argument (usually the last scalar arg)
+        n_arg = None
+        for arg_name in self.scalar_args:
+            n_arg = arg_name
+
+        # Check if this is a reduction kernel
+        if self.reduce_ops:
+            return self._build_reduction_kernel(kb, n_arg, primary_dtype)
+
+        # Standard elementwise pattern
+        offsets = kb.make_block_offsets("pid", "offsets")
+        if n_arg:
+            mask = kb.make_mask(offsets, n_arg, "mask")
+        else:
+            mask = None
+
         # Load from each input pointer
-        load_count = 0
         input_vars = {}
         for arg_name, (idx, dtype, is_output) in self.ptr_args.items():
             if not is_output:
                 var_name = f"val_{arg_name}"
                 kb.load(arg_name, offsets, mask, out_var=var_name, dtype=dtype)
                 input_vars[arg_name] = var_name
-                load_count += 1
 
         # Analyze the computation between loads and stores
-        # by tracing the SSA values that feed into tt.store
         result_var = self._emit_computation(kb, input_vars, primary_dtype)
 
         # Store to output
@@ -421,6 +462,97 @@ class TTGIRParser:
                 kb.store(arg_name, offsets, result_var, mask, dtype=dtype)
 
         return kb
+
+    def _build_reduction_kernel(self, kb, n_arg, primary_dtype):
+        """Generate a reduction kernel using threadgroup reduce pattern.
+
+        Uses strided accumulation (each thread loops over elements) followed
+        by two-level threadgroup reduction (SIMD intrinsics + shared memory).
+        """
+        reduce_result_ssa, reduce_input_ssa, reduce_op, _ = self.reduce_ops[0]
+
+        # Find the input pointer for the reduction
+        input_arg = None
+        for arg_name, (idx, dtype, is_output) in self.ptr_args.items():
+            if not is_output:
+                input_arg = arg_name
+                break
+
+        # Find the output pointer
+        output_arg = None
+        for arg_name, (idx, dtype, is_output) in self.ptr_args.items():
+            if is_output:
+                output_arg = arg_name
+                break
+
+        if not input_arg or not output_arg or not n_arg:
+            # Fallback: can't generate reduction, return empty kernel
+            return kb
+
+        # Shared memory for cross-SIMD-group reduction
+        n_simd_groups = (kb.block_size + 31) // 32
+        kb.declare_threadgroup_array("shared", dtype=primary_dtype, size=n_simd_groups)
+
+        # Identity value for the reduction
+        identity = {"sum": "0.0f", "max": "-INFINITY", "min": "INFINITY"}[reduce_op]
+        combine = {"sum": "+", "max": "max", "min": "min"}[reduce_op]
+
+        # Check if there's a pre-reduce computation (e.g., exp, mul before sum)
+        pre_reduce_op = self._find_pre_reduce_op(reduce_input_ssa)
+
+        # Strided accumulation loop
+        kb._var("acc", identity, ty="float")
+        kb.raw_line(f"for (uint i = lid; i < {n_arg}; i += {kb.block_size}u) {{")
+        kb.indent()
+        kb._var("idx", f"pid * {n_arg} + i", ty="uint")
+
+        if pre_reduce_op:
+            # Apply pre-reduce operation to each element
+            op_kind, op_args = pre_reduce_op
+            kb._var("loaded", f"{input_arg}[idx]", ty="float")
+            if op_kind in ("exp", "log", "sqrt", "abs"):
+                kb._var("elem", f"{op_kind}(loaded)", ty="float")
+            elif op_kind in ("mul",) and len(op_args) == 2:
+                kb._var("elem", f"loaded * loaded", ty="float")  # square
+            else:
+                kb.raw_line(f"float elem = loaded;")
+        else:
+            kb._var("elem", f"{input_arg}[idx]", ty="float")
+
+        if combine == "+":
+            kb.raw_line("acc += elem;")
+        else:
+            kb.raw_line(f"acc = {combine}(acc, elem);")
+        kb.dedent()
+        kb.raw_line("}")
+
+        # Two-level threadgroup reduction
+        kb.threadgroup_reduce(reduce_op, "acc", "shared", "total")
+
+        # Thread 0 writes result
+        kb.begin_if("lid == 0")
+        kb.raw_line(f"{output_arg}[pid] = total;")
+        kb.end_block()
+
+        return kb
+
+    def _find_pre_reduce_op(self, reduce_input_ssa):
+        """Check if there's a computation between load and reduce.
+
+        Returns (op_kind, op_args) if found, None otherwise.
+        """
+        val = self.ssa_values.get(reduce_input_ssa)
+        if val is None:
+            return None
+
+        op = val[0]
+        # If the input to reduce is a computation (not a direct load)
+        if op in ("exp", "log", "sqrt", "abs"):
+            return (op, [val[1]])
+        if op in ("add", "sub", "mul", "div"):
+            return (op, [val[1], val[2]])
+
+        return None
 
     def _emit_computation(self, kb, input_vars, dtype):
         """Analyze the computation graph and emit operations.
@@ -503,6 +635,10 @@ class TTGIRParser:
         if op == "splat":
             source = val_info[1]
             return self._emit_ssa_value(kb, source, input_vars, dtype, emitted)
+
+        # Reduce — the result is computed in _build_reduction_kernel
+        if op == "reduce":
+            return "total"
 
         return "0.0f"
 

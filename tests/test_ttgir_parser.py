@@ -116,6 +116,63 @@ module {
 """
 
 
+# Sum reduction: output = sum(input)
+SUM_REDUCE_TTGIR = """\
+module {
+  tt.func public @sum_kernel(%arg0: !tt.ptr<f32>, %arg1: !tt.ptr<f32>, %arg2: i32) {
+    %0 = tt.get_program_id x : i32
+    %c256_i32 = arith.constant 256 : i32
+    %1 = arith.muli %0, %c256_i32 : i32
+    %2 = tt.make_range {end = 256 : i32, start = 0 : i32} : tensor<256xi32>
+    %3 = tt.splat %1 : i32 -> tensor<256xi32>
+    %4 = arith.addi %3, %2 : tensor<256xi32>
+    %5 = tt.splat %arg2 : i32 -> tensor<256xi32>
+    %6 = arith.cmpi slt, %4, %5 : tensor<256xi32>
+    %7 = tt.splat %arg0 : !tt.ptr<f32> -> tensor<256x!tt.ptr<f32>>
+    %8 = tt.addptr %7, %4 : tensor<256x!tt.ptr<f32>>, tensor<256xi32>
+    %cst = arith.constant 0.000000e+00 : f32
+    %9 = tt.splat %cst : f32 -> tensor<256xf32>
+    %10 = tt.load %8, %6, %9 : tensor<256x!tt.ptr<f32>>
+    %11 = "tt.reduce"(%10) ({
+    ^bb0(%arg3: f32, %arg4: f32):
+      %13 = arith.addf %arg3, %arg4 : f32
+      "tt.reduce.return"(%13) : (f32) -> ()
+    }) {axis = 0 : i32} : (tensor<256xf32>) -> f32
+    tt.store %arg1, %11 : !tt.ptr<f32>
+    tt.return
+  }
+}
+"""
+
+# Max reduction: output = max(input)
+MAX_REDUCE_TTGIR = """\
+module {
+  tt.func public @max_kernel(%arg0: !tt.ptr<f32>, %arg1: !tt.ptr<f32>, %arg2: i32) {
+    %0 = tt.get_program_id x : i32
+    %c256_i32 = arith.constant 256 : i32
+    %1 = arith.muli %0, %c256_i32 : i32
+    %2 = tt.make_range {end = 256 : i32, start = 0 : i32} : tensor<256xi32>
+    %3 = tt.splat %1 : i32 -> tensor<256xi32>
+    %4 = arith.addi %3, %2 : tensor<256xi32>
+    %5 = tt.splat %arg2 : i32 -> tensor<256xi32>
+    %6 = arith.cmpi slt, %4, %5 : tensor<256xi32>
+    %7 = tt.splat %arg0 : !tt.ptr<f32> -> tensor<256x!tt.ptr<f32>>
+    %8 = tt.addptr %7, %4 : tensor<256x!tt.ptr<f32>>, tensor<256xi32>
+    %cst = arith.constant 0.000000e+00 : f32
+    %9 = tt.splat %cst : f32 -> tensor<256xf32>
+    %10 = tt.load %8, %6, %9 : tensor<256x!tt.ptr<f32>>
+    %11 = "tt.reduce"(%10) ({
+    ^bb0(%arg3: f32, %arg4: f32):
+      %13 = arith.maxf %arg3, %arg4 : f32
+      "tt.reduce.return"(%13) : (f32) -> ()
+    }) {axis = 0 : i32} : (tensor<256xf32>) -> f32
+    tt.store %arg1, %11 : !tt.ptr<f32>
+    tt.return
+  }
+}
+"""
+
+
 # ---------------------------------------------------------------------------
 # Tests
 # ---------------------------------------------------------------------------
@@ -338,3 +395,99 @@ def test_ttgir_vecadd_non_aligned(runner):
         assert abs(result[i] - expected) < 1e-5, (
             f"Mismatch at {i}: got {result[i]}, expected {expected}"
         )
+
+
+# ---------------------------------------------------------------------------
+# Reduction TTGIR tests
+# ---------------------------------------------------------------------------
+
+def test_parse_sum_reduce_detects_reduction():
+    """Parser detects tt.reduce with arith.addf as a sum reduction."""
+    from triton_metal.codegen.ttgir_parser import parse_ttgir
+
+    kb = parse_ttgir(SUM_REDUCE_TTGIR, FakeOptions())
+    assert kb.name == "sum_kernel"
+    assert kb._needs_simd_qualifiers
+
+
+def test_parse_max_reduce_detects_reduction():
+    """Parser detects tt.reduce with arith.maxf as a max reduction."""
+    from triton_metal.codegen.ttgir_parser import parse_ttgir
+
+    kb = parse_ttgir(MAX_REDUCE_TTGIR, FakeOptions())
+    assert kb.name == "max_kernel"
+    assert kb._needs_simd_qualifiers
+
+
+@requires_metal
+def test_ttgir_sum_reduce_compiles(runner):
+    """TTGIR sum reduction compiles to valid MSL."""
+    from triton_metal.codegen.ttgir_parser import parse_ttgir
+
+    kb = parse_ttgir(SUM_REDUCE_TTGIR, FakeOptions())
+    msl = kb.build()
+    runner.compile(msl, "sum_kernel")
+
+
+@requires_metal
+def test_ttgir_max_reduce_compiles(runner):
+    """TTGIR max reduction compiles to valid MSL."""
+    from triton_metal.codegen.ttgir_parser import parse_ttgir
+
+    kb = parse_ttgir(MAX_REDUCE_TTGIR, FakeOptions())
+    msl = kb.build()
+    runner.compile(msl, "max_kernel")
+
+
+@requires_metal
+def test_ttgir_sum_reduce_gpu(runner):
+    """TTGIR sum reduction: output = sum(input), verified on GPU."""
+    from triton_metal.codegen.ttgir_parser import parse_ttgir
+
+    kb = parse_ttgir(SUM_REDUCE_TTGIR, FakeOptions())
+    msl = kb.build()
+    n = 256
+
+    metallib = runner.compile(msl, "sum_kernel")
+    pipeline = runner.load(metallib, "sum_kernel")
+
+    input_data = [float(i) * 0.01 for i in range(n)]
+    buf_in = runner.make_float_buffer(input_data)
+    buf_out = runner.make_empty_buffer(1)
+    buf_n = runner.make_int_buffer(n)
+
+    runner.run(pipeline, [buf_in, buf_out, buf_n], n, block_size=256)
+
+    result = runner.read_float_buffer(buf_out, 1)
+    expected = sum(input_data)
+    assert abs(result[0] - expected) < 0.5, (
+        f"Sum: got {result[0]}, expected {expected}"
+    )
+
+
+@requires_metal
+def test_ttgir_max_reduce_gpu(runner):
+    """TTGIR max reduction: output = max(input), verified on GPU."""
+    from triton_metal.codegen.ttgir_parser import parse_ttgir
+    import random
+
+    kb = parse_ttgir(MAX_REDUCE_TTGIR, FakeOptions())
+    msl = kb.build()
+    n = 256
+
+    metallib = runner.compile(msl, "max_kernel")
+    pipeline = runner.load(metallib, "max_kernel")
+
+    random.seed(606)
+    input_data = [random.uniform(-100.0, 100.0) for _ in range(n)]
+    buf_in = runner.make_float_buffer(input_data)
+    buf_out = runner.make_empty_buffer(1)
+    buf_n = runner.make_int_buffer(n)
+
+    runner.run(pipeline, [buf_in, buf_out, buf_n], n, block_size=256)
+
+    result = runner.read_float_buffer(buf_out, 1)
+    expected = max(input_data)
+    assert abs(result[0] - expected) < 1e-3, (
+        f"Max: got {result[0]}, expected {expected}"
+    )

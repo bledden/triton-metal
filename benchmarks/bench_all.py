@@ -60,6 +60,9 @@ from triton_metal.codegen.msl_emitter import (
     make_sliding_window_attention_kernel,
     make_repeat_kv_kernel,
     make_matmul_2d_kernel,
+    make_matmul_swizzled_kernel,
+    make_activation_kernel,
+    make_variance_kernel,
 )
 
 
@@ -1369,6 +1372,74 @@ def main():
         flops = 2 * M * N * K
         label = f"matmul_2d_{size}x{size}"
         print(format_benchmark_result(label, result, n_flops=flops))
+
+    # =========================================================================
+    # Swizzled Matmul (L2 cache optimized)
+    # =========================================================================
+    print("\n" + "=" * 60)
+    print("SWIZZLED MATMUL BENCHMARKS")
+    print("=" * 60)
+    msl = make_matmul_swizzled_kernel(block_m=32, block_n=32, block_k=32, group_size=4)
+    pipeline = compile_kernel(device, msl, "matmul_swizzled")
+    for size in [64, 128, 256]:
+        M = N = K = size
+        a_buf = make_float_buffer(device, M * K, "randn")
+        b_buf = make_float_buffer(device, K * N, "randn")
+        c_buf = make_empty_buffer(device, M * N)
+        m_buf = make_uint_buffer(device, M)
+        n_buf = make_uint_buffer(device, N)
+        k_buf = make_uint_buffer(device, K)
+
+        n_tile_cols = (N + 32 - 1) // 32
+        n_tile_rows = (M + 32 - 1) // 32
+        n_groups = n_tile_rows * n_tile_cols
+        threads_per_tg = 32 * 32
+
+        result = bench_custom_dispatch(bench, pipeline,
+                                        [a_buf, b_buf, c_buf, m_buf, n_buf, k_buf],
+                                        n_groups, threads_per_tg)
+        flops = 2 * M * N * K
+        label = f"matmul_swizzled_{size}x{size}"
+        print(format_benchmark_result(label, result, n_flops=flops))
+
+    # =========================================================================
+    # Activation Functions
+    # =========================================================================
+    print("\n" + "=" * 60)
+    print("ACTIVATION FUNCTION BENCHMARKS")
+    print("=" * 60)
+    n = 1_000_000
+    in_buf = make_float_buffer(device, n, "randn")
+    out_buf = make_empty_buffer(device, n)
+    n_buf = make_uint_buffer(device, n)
+    n_bytes = 2 * n * 4  # read + write
+
+    for act_name in ["tanh", "sigmoid", "elu", "leaky_relu", "hardswish"]:
+        msl = make_activation_kernel(act_name, block_size=256)
+        pipeline = compile_kernel(device, msl, f"{act_name}_kernel")
+        result = bench(pipeline, [in_buf, out_buf, n_buf], n)
+        print(format_benchmark_result(act_name, result, n_bytes=n_bytes))
+
+    # =========================================================================
+    # Variance Kernel
+    # =========================================================================
+    print("\n" + "=" * 60)
+    print("VARIANCE BENCHMARKS")
+    print("=" * 60)
+    msl = make_variance_kernel(block_size=256)
+    pipeline = compile_kernel(device, msl, "variance_kernel")
+    for n_rows, n_cols in [(128, 256), (512, 1024)]:
+        total = n_rows * n_cols
+        in_buf = make_float_buffer(device, total, "randn")
+        out_buf = make_empty_buffer(device, n_rows)
+        ncols_buf = make_uint_buffer(device, n_cols)
+
+        result = bench_custom_dispatch(bench, pipeline,
+                                        [in_buf, out_buf, ncols_buf],
+                                        n_rows, 256)
+        n_bytes = total * 4 + n_rows * 4
+        label = f"variance_{n_rows}x{n_cols}"
+        print(format_benchmark_result(label, result, n_bytes=n_bytes))
 
     # =========================================================================
     # Summary

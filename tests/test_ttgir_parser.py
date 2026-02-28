@@ -3221,3 +3221,151 @@ def test_ttgir_embedding_compiles(runner):
     msl = kb.build()
     assert "embedding" in msl.lower()
     runner.compile(msl, "embedding_kernel")
+
+
+# ---------------------------------------------------------------------------
+# Concat pattern
+# ---------------------------------------------------------------------------
+
+# Concat: copy from 2 input buffers into 1 output (no math)
+CONCAT_TTGIR = """
+module {
+  tt.func public @concat_kernel(%arg0: !tt.ptr<f32> {tt.divisibility = 16 : i32},
+                                 %arg1: !tt.ptr<f32> {tt.divisibility = 16 : i32},
+                                 %arg2: !tt.ptr<f32> {tt.divisibility = 16 : i32, tt.output},
+                                 %arg3: i32, %arg4: i32) {
+    %0 = tt.get_program_id x : i32
+    %c256 = arith.constant 256 : i32
+    %1 = arith.muli %0, %c256 : i32
+    %2 = tt.make_range {end = 256 : i32, start = 0 : i32}
+    %3 = tt.splat %1
+    %4 = arith.addi %3, %2
+    %5 = tt.splat %arg3
+    %6 = arith.cmpi slt, %4, %5
+    %7 = tt.addptr %arg0, %4
+    %8 = tt.load %7, %6
+    %9 = tt.addptr %arg2, %4
+    tt.store %9, %8, %6
+    tt.return
+  }
+}
+"""
+
+def test_ttgir_concat_detected():
+    """TTGIR concat pattern is detected (2+ inputs, 1 output, no math)."""
+    from triton_metal.codegen.ttgir_parser import TTGIRParser
+    parser = TTGIRParser(CONCAT_TTGIR, FakeOptions())
+    parser._parse_function_signature()
+    parser._parse_body()
+    parser._classify_stores()
+    assert parser._is_concat_pattern()
+
+
+@requires_metal
+def test_ttgir_concat_compiles(runner):
+    """TTGIR concat pattern compiles to valid MSL."""
+    from triton_metal.codegen.ttgir_parser import parse_ttgir
+
+    kb = parse_ttgir(CONCAT_TTGIR, FakeOptions())
+    msl = kb.build()
+    assert "concat" in msl.lower()
+    runner.compile(msl, "concat_kernel")
+
+
+# ---------------------------------------------------------------------------
+# Split pattern
+# ---------------------------------------------------------------------------
+
+# Split: 1 input, 2 outputs (no math, pure copy)
+SPLIT_TTGIR = """
+module {
+  tt.func public @split_kernel(%arg0: !tt.ptr<f32> {tt.divisibility = 16 : i32},
+                                %arg1: !tt.ptr<f32> {tt.divisibility = 16 : i32, tt.output},
+                                %arg2: !tt.ptr<f32> {tt.divisibility = 16 : i32, tt.output},
+                                %arg3: i32) {
+    %0 = tt.get_program_id x : i32
+    %c256 = arith.constant 256 : i32
+    %1 = arith.muli %0, %c256 : i32
+    %2 = tt.make_range {end = 256 : i32, start = 0 : i32}
+    %3 = tt.splat %1
+    %4 = arith.addi %3, %2
+    %5 = tt.splat %arg3
+    %6 = arith.cmpi slt, %4, %5
+    %7 = tt.addptr %arg0, %4
+    %8 = tt.load %7, %6
+    %9 = tt.addptr %arg1, %4
+    tt.store %9, %8, %6
+    %10 = tt.addptr %arg2, %4
+    tt.store %10, %8, %6
+    tt.return
+  }
+}
+"""
+
+def test_ttgir_split_detected():
+    """TTGIR split pattern is detected (1 input, 2+ outputs)."""
+    from triton_metal.codegen.ttgir_parser import TTGIRParser
+    parser = TTGIRParser(SPLIT_TTGIR, FakeOptions())
+    parser._parse_function_signature()
+    parser._parse_body()
+    parser._classify_stores()
+    assert parser._is_split_pattern()
+
+
+@requires_metal
+def test_ttgir_split_compiles(runner):
+    """TTGIR split pattern compiles to valid MSL."""
+    from triton_metal.codegen.ttgir_parser import parse_ttgir
+
+    kb = parse_ttgir(SPLIT_TTGIR, FakeOptions())
+    msl = kb.build()
+    assert "split" in msl.lower()
+    runner.compile(msl, "split_kernel")
+
+
+# ---------------------------------------------------------------------------
+# Repeat KV pattern
+# ---------------------------------------------------------------------------
+
+# Repeat KV: 1 input, 1 output, 4+ scalar args, index remapping with div
+REPEAT_KV_TTGIR = """
+module {
+  tt.func public @repeat_kv_kernel(%arg0: !tt.ptr<f32> {tt.divisibility = 16 : i32},
+                                    %arg1: !tt.ptr<f32> {tt.divisibility = 16 : i32, tt.output},
+                                    %arg2: i32, %arg3: i32, %arg4: i32, %arg5: i32) {
+    %0 = tt.get_program_id x : i32
+    %c256 = arith.constant 256 : i32
+    %1 = arith.muli %0, %c256 : i32
+    %2 = tt.make_range {end = 256 : i32, start = 0 : i32}
+    %3 = tt.splat %1
+    %4 = arith.addi %3, %2
+    %5 = arith.divui %4, %arg5 : i32
+    %6 = arith.muli %5, %arg4 : i32
+    %7 = tt.addptr %arg0, %6
+    %8 = tt.load %7
+    %9 = tt.addptr %arg1, %4
+    tt.store %9, %8
+    tt.return
+  }
+}
+"""
+
+def test_ttgir_repeat_kv_detected():
+    """TTGIR repeat_kv pattern is detected (1 in, 1 out, 4+ scalars)."""
+    from triton_metal.codegen.ttgir_parser import TTGIRParser
+    parser = TTGIRParser(REPEAT_KV_TTGIR, FakeOptions())
+    parser._parse_function_signature()
+    parser._parse_body()
+    parser._classify_stores()
+    assert parser._is_repeat_kv_pattern()
+
+
+@requires_metal
+def test_ttgir_repeat_kv_compiles(runner):
+    """TTGIR repeat_kv pattern compiles to valid MSL."""
+    from triton_metal.codegen.ttgir_parser import parse_ttgir
+
+    kb = parse_ttgir(REPEAT_KV_TTGIR, FakeOptions())
+    msl = kb.build()
+    assert "repeat" in msl.lower() or "kv" in msl.lower()
+    runner.compile(msl, "repeat_kv")

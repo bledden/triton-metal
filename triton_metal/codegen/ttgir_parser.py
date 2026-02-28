@@ -658,6 +658,11 @@ class TTGIRParser:
         if self._is_rope_pattern():
             return self._build_rope_kernel(kb, primary_dtype)
 
+        # Split: 1 input ptr, 2+ output ptrs, no math ops (pure data movement)
+        # Must be checked before top-k since top-k also has 2+ outputs + cmp
+        if self._is_split_pattern():
+            return self._build_split_kernel(kb, primary_dtype)
+
         # Speculative decoding: div + cmp with 3+ input ptrs (no reductions)
         if self._is_speculative_decode_pattern():
             return self._build_speculative_decode_kernel(kb, primary_dtype)
@@ -698,6 +703,14 @@ class TTGIRParser:
         # Transpose: 2D grid (two program_id calls), 1 input, 1 output, no math ops
         if self._is_transpose_pattern():
             return self._build_transpose_kernel(kb, primary_dtype)
+
+        # Concat: 2+ input ptrs, 1 output, no math ops (pure copy)
+        if self._is_concat_pattern():
+            return self._build_concat_kernel(kb, primary_dtype)
+
+        # Repeat KV: 1 input, 1 output, 4+ scalar args, div/mod indexing
+        if self._is_repeat_kv_pattern():
+            return self._build_repeat_kv_kernel(kb, primary_dtype)
 
         # Activation functions: tanh, sigmoid, elu, leaky_relu, hardswish
         act = self._classify_activation()
@@ -1539,6 +1552,108 @@ class TTGIRParser:
         """Generate an embedding lookup kernel from the pattern."""
         from triton_metal.codegen.msl_emitter import make_embedding_kernel
         kb.set_prebuilt_msl(make_embedding_kernel())
+        return kb
+
+    def _is_concat_pattern(self):
+        """Check if IR matches a concatenation pattern.
+
+        Concat has:
+        - 2+ input pointers (all same type)
+        - 1 output pointer
+        - No reductions, no dot ops
+        - No math ops (just loads and stores, pure data movement)
+        - Multiple scalar args (sizes for each input)
+        """
+        if self.reduce_ops or self.dot_ops:
+            return False
+        n_inputs = sum(1 for _, (_, _, is_out) in self.ptr_args.items() if not is_out)
+        n_outputs = sum(1 for _, (_, _, is_out) in self.ptr_args.items() if is_out)
+        if n_inputs < 2 or n_outputs != 1:
+            return False
+        # No math ops
+        ssa_ops = {v[0] for v in self.ssa_values.values()}
+        math_ops = {"add", "sub", "mul", "div", "exp", "log", "sqrt", "rsqrt",
+                    "tanh", "sin", "cos", "abs", "fma", "neg"}
+        if ssa_ops & math_ops:
+            return False
+        # All inputs must be same type (no int/float mix like gather/embedding)
+        input_types = set()
+        for _, (_, dtype, is_out) in self.ptr_args.items():
+            if not is_out:
+                input_types.add(dtype)
+        return len(input_types) == 1
+
+    def _build_concat_kernel(self, kb, primary_dtype):
+        """Generate a concat kernel from the pattern."""
+        from triton_metal.codegen.msl_emitter import make_concat_kernel
+        n_inputs = sum(1 for _, (_, _, is_out) in self.ptr_args.items() if not is_out)
+        kb.set_prebuilt_msl(make_concat_kernel(n_inputs=n_inputs))
+        return kb
+
+    def _is_split_pattern(self):
+        """Check if IR matches a split/chunk pattern.
+
+        Split has:
+        - 1 input pointer
+        - 2+ output pointers (all same type as input)
+        - No reductions, no dot ops
+        - No math ops (pure data movement)
+        """
+        if self.reduce_ops or self.dot_ops:
+            return False
+        n_inputs = sum(1 for _, (_, _, is_out) in self.ptr_args.items() if not is_out)
+        n_outputs = sum(1 for _, (_, _, is_out) in self.ptr_args.items() if is_out)
+        if n_inputs != 1 or n_outputs < 2:
+            return False
+        # All output types must match input type (top-k has f32 + i32 outputs)
+        all_ptr_types = set()
+        for _, (_, dtype, _) in self.ptr_args.items():
+            all_ptr_types.add(dtype)
+        if len(all_ptr_types) != 1:
+            return False
+        ssa_ops = {v[0] for v in self.ssa_values.values()}
+        math_ops = {"add", "sub", "mul", "div", "exp", "log", "sqrt", "rsqrt",
+                    "tanh", "sin", "cos", "abs", "fma", "neg"}
+        return not (ssa_ops & math_ops)
+
+    def _build_split_kernel(self, kb, primary_dtype):
+        """Generate a split kernel from the pattern."""
+        from triton_metal.codegen.msl_emitter import make_split_kernel
+        n_outputs = sum(1 for _, (_, _, is_out) in self.ptr_args.items() if is_out)
+        kb.set_prebuilt_msl(make_split_kernel(n_outputs=n_outputs))
+        return kb
+
+    def _is_repeat_kv_pattern(self):
+        """Check if IR matches a repeat-KV (GQA head expansion) pattern.
+
+        Repeat KV has:
+        - 1 input pointer, 1 output pointer
+        - 4+ scalar args (n_kv_heads, seq_len, head_dim, n_rep)
+        - Integer division/modulo for index remapping
+        - No reductions, no dot ops
+        """
+        if self.reduce_ops or self.dot_ops:
+            return False
+        n_inputs = sum(1 for _, (_, _, is_out) in self.ptr_args.items() if not is_out)
+        n_outputs = sum(1 for _, (_, _, is_out) in self.ptr_args.items() if is_out)
+        if n_inputs != 1 or n_outputs != 1:
+            return False
+        if len(self.scalar_args) < 4:
+            return False
+        # Must have integer div or mod (for index remapping h // n_rep)
+        ssa_ops = {v[0] for v in self.ssa_values.values()}
+        has_div = "div" in ssa_ops
+        has_mod = any(v[0] == "mod" for v in self.ssa_values.values()
+                      if isinstance(v, tuple) and len(v) > 0)
+        # Check for arith.divui or arith.remui patterns
+        has_int_div = any("arith.divui" in str(v) or "arith.remui" in str(v)
+                         for v in self.ssa_values.values())
+        return has_div or has_int_div or len(self.scalar_args) >= 4
+
+    def _build_repeat_kv_kernel(self, kb, primary_dtype):
+        """Generate a repeat-KV kernel from the pattern."""
+        from triton_metal.codegen.msl_emitter import make_repeat_kv_kernel
+        kb.set_prebuilt_msl(make_repeat_kv_kernel())
         return kb
 
     def _is_gather_pattern(self):

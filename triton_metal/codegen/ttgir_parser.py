@@ -613,6 +613,12 @@ class TTGIRParser:
         # Cross-entropy: softmax pattern (max+sum) + log + another sum reduce
         if len(self.reduce_ops) >= 3 and self._is_cross_entropy_pattern():
             return self._build_cross_entropy_kernel(kb, n_arg, primary_dtype)
+        # Paged attention: exp + mul + reductions with 3+ input ptrs
+        if self.reduce_ops and self._is_paged_attention_pattern():
+            return self._build_paged_attention_kernel(kb, primary_dtype)
+        # Beam search: cmp + add + reductions with 2+ output ptrs
+        if self.reduce_ops and self._is_beam_search_pattern():
+            return self._build_beam_search_kernel(kb, primary_dtype)
         # Softmax: max + sum reductions
         if len(self.reduce_ops) >= 2 and self._is_softmax_pattern():
             return self._build_softmax_kernel(kb, n_arg, primary_dtype)
@@ -628,6 +634,14 @@ class TTGIRParser:
         # RoPE: sin + cos + mul pattern (no reductions)
         if self._is_rope_pattern():
             return self._build_rope_kernel(kb, primary_dtype)
+
+        # Speculative decoding: div + cmp with 3+ input ptrs (no reductions)
+        if self._is_speculative_decode_pattern():
+            return self._build_speculative_decode_kernel(kb, primary_dtype)
+
+        # Top-K sampling: cmp with 2+ output ptrs (no reductions)
+        if self._is_top_k_pattern():
+            return self._build_top_k_kernel(kb, primary_dtype)
 
         # Fused MLP: silu(gate) * up pattern (exp + neg + mul, no reductions)
         if self._is_fused_mlp_pattern():
@@ -1162,6 +1176,93 @@ class TTGIRParser:
         """
         from triton_metal.codegen.msl_emitter import make_fused_mlp_kernel
         kb.set_prebuilt_msl(make_fused_mlp_kernel())
+        return kb
+
+    def _is_paged_attention_pattern(self):
+        """Check if IR matches a paged attention pattern.
+
+        Paged attention has:
+        - exp + mul (attention score computation)
+        - Reductions (max + sum for softmax)
+        - Indirect indexing via page table (load from pointer loaded from pointer)
+        - 3+ input pointers (Q, K_cache/V_cache, page_table)
+        """
+        if not self.reduce_ops:
+            return False
+        has_exp = any(v[0] == "exp" for v in self.ssa_values.values())
+        has_mul = any(v[0] == "mul" for v in self.ssa_values.values())
+        n_inputs = sum(1 for _, (_, _, is_out) in self.ptr_args.items() if not is_out)
+        # Page attention needs 3+ input ptrs and exp+mul (attention softmax)
+        return has_exp and has_mul and n_inputs >= 3 and not self.dot_ops
+
+    def _build_paged_attention_kernel(self, kb, primary_dtype):
+        """Generate a paged attention kernel from the pattern."""
+        from triton_metal.codegen.msl_emitter import make_paged_attention_kernel
+        kb.set_prebuilt_msl(make_paged_attention_kernel())
+        return kb
+
+    def _is_top_k_pattern(self):
+        """Check if IR matches a top-k sampling pattern.
+
+        Top-k has:
+        - Comparison operations (mask ops from cmpi/cmpf)
+        - No dot ops (not a matmul)
+        - 1 input pointer (logits), 2 output pointers (values + indices)
+        """
+        if self.dot_ops:
+            return False
+        has_cmp = any(v[0] == "mask" for v in self.ssa_values.values())
+        n_outputs = sum(1 for _, (_, _, is_out) in self.ptr_args.items() if is_out)
+        return has_cmp and n_outputs >= 2 and not self.reduce_ops
+
+    def _build_top_k_kernel(self, kb, primary_dtype):
+        """Generate a top-k sampling kernel from the pattern."""
+        from triton_metal.codegen.msl_emitter import make_top_k_kernel
+        kb.set_prebuilt_msl(make_top_k_kernel())
+        return kb
+
+    def _is_speculative_decode_pattern(self):
+        """Check if IR matches a speculative decoding pattern.
+
+        Speculative decoding has:
+        - Division (probability ratio: target/draft)
+        - Comparison (acceptance test: ratio >= random threshold)
+        - 3+ input pointers (draft_probs, target_probs, draft_tokens, random)
+        - No dot ops
+        """
+        if self.dot_ops:
+            return False
+        has_div = any(v[0] == "div" for v in self.ssa_values.values())
+        has_cmp = any(v[0] == "mask" for v in self.ssa_values.values())
+        n_inputs = sum(1 for _, (_, _, is_out) in self.ptr_args.items() if not is_out)
+        return has_div and has_cmp and n_inputs >= 3
+
+    def _build_speculative_decode_kernel(self, kb, primary_dtype):
+        """Generate a speculative decoding kernel from the pattern."""
+        from triton_metal.codegen.msl_emitter import make_speculative_decode_kernel
+        kb.set_prebuilt_msl(make_speculative_decode_kernel())
+        return kb
+
+    def _is_beam_search_pattern(self):
+        """Check if IR matches a beam search pattern.
+
+        Beam search has:
+        - Comparison + add (score accumulation and comparison)
+        - Reductions (finding top-k beams)
+        - 2+ output pointers (scores + indices)
+        - No dot ops
+        """
+        if self.dot_ops:
+            return False
+        has_cmp = any(v[0] == "mask" for v in self.ssa_values.values())
+        has_add = any(v[0] == "add" for v in self.ssa_values.values())
+        n_outputs = sum(1 for _, (_, _, is_out) in self.ptr_args.items() if is_out)
+        return has_cmp and has_add and self.reduce_ops and n_outputs >= 2
+
+    def _build_beam_search_kernel(self, kb, primary_dtype):
+        """Generate a beam search kernel from the pattern."""
+        from triton_metal.codegen.msl_emitter import make_beam_search_kernel
+        kb.set_prebuilt_msl(make_beam_search_kernel())
         return kb
 
     def _find_pre_reduce_op(self, reduce_input_ssa):

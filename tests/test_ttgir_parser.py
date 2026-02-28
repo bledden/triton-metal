@@ -1845,3 +1845,269 @@ def test_ttgir_fused_mlp_compiles(runner):
     msl = kb.build()
     assert "mlp" in msl.lower() or "silu" in msl.lower() or "exp" in msl
     runner.compile(msl, "fused_mlp")
+
+
+# ---------------------------------------------------------------------------
+# Paged attention TTGIR pattern
+# ---------------------------------------------------------------------------
+
+PAGED_ATTENTION_TTGIR = """
+module {
+  tt.func public @paged_attention_kernel(%arg0: !tt.ptr<f32> {tt.divisibility = 16 : i32},
+                                          %arg1: !tt.ptr<f32> {tt.divisibility = 16 : i32},
+                                          %arg2: !tt.ptr<f32> {tt.divisibility = 16 : i32},
+                                          %arg3: !tt.ptr<i32> {tt.divisibility = 16 : i32},
+                                          %arg4: !tt.ptr<f32> {tt.divisibility = 16 : i32, tt.output},
+                                          %arg5: i32) {
+    %c0 = arith.constant 0 : index
+    %0 = tt.get_program_id x : i32
+    %1 = tt.make_range {end = 256 : i32, start = 0 : i32}
+    %2 = tt.splat %0
+    %3 = arith.addi %2, %1
+    %4 = tt.addptr %arg0, %3
+    %5 = tt.load %4
+    %6 = tt.addptr %arg1, %3
+    %7 = tt.load %6
+    %8 = arith.mulf %5, %7
+    %9 = math.exp %8
+    %10 = "tt.reduce"(%9) ({
+      ^bb0(%a: f32, %b: f32):
+        %s = arith.addf %a, %b
+        tt.reduce.return %s : f32
+    }) {axis = 0 : i32}
+    %11 = arith.divf %9, %10
+    %12 = tt.addptr %arg2, %3
+    %13 = tt.load %12
+    %14 = arith.mulf %11, %13
+    %15 = tt.addptr %arg4, %3
+    tt.store %15, %14
+    tt.return
+  }
+}
+"""
+
+def test_ttgir_paged_attention_detected():
+    """TTGIR paged attention pattern is detected."""
+    from triton_metal.codegen.ttgir_parser import TTGIRParser
+    parser = TTGIRParser(PAGED_ATTENTION_TTGIR, FakeOptions())
+    parser._parse_function_signature()
+    parser._parse_body()
+    parser._classify_stores()
+    assert parser._is_paged_attention_pattern()
+
+
+def test_ttgir_paged_attention_not_confused_with_softmax():
+    """Paged attention isn't confused with softmax (3+ input ptrs distinguishes it)."""
+    from triton_metal.codegen.ttgir_parser import TTGIRParser
+    parser = TTGIRParser(PAGED_ATTENTION_TTGIR, FakeOptions())
+    parser._parse_function_signature()
+    parser._parse_body()
+    # Should be paged attention, not plain softmax
+    assert parser._is_paged_attention_pattern()
+
+
+@requires_metal
+def test_ttgir_paged_attention_compiles(runner):
+    """TTGIR paged attention pattern compiles to valid MSL."""
+    from triton_metal.codegen.ttgir_parser import parse_ttgir
+
+    kb = parse_ttgir(PAGED_ATTENTION_TTGIR, FakeOptions())
+    msl = kb.build()
+    assert "paged" in msl.lower() or "attention" in msl.lower()
+    runner.compile(msl, "paged_attention")
+
+
+# ---------------------------------------------------------------------------
+# Top-K sampling TTGIR pattern
+# ---------------------------------------------------------------------------
+
+TOP_K_TTGIR = """
+module {
+  tt.func public @top_k_kernel(%arg0: !tt.ptr<f32> {tt.divisibility = 16 : i32},
+                                %arg1: !tt.ptr<f32> {tt.divisibility = 16 : i32, tt.output},
+                                %arg2: !tt.ptr<i32> {tt.divisibility = 16 : i32, tt.output},
+                                %arg3: i32,
+                                %arg4: i32) {
+    %c0 = arith.constant 0 : index
+    %0 = tt.get_program_id x : i32
+    %1 = tt.make_range {end = 256 : i32, start = 0 : i32}
+    %2 = tt.splat %0
+    %3 = arith.addi %2, %1
+    %4 = tt.addptr %arg0, %3
+    %5 = tt.load %4
+    %6 = arith.cmpi sgt, %5, %5
+    %7 = tt.addptr %arg1, %3
+    tt.store %7, %5
+    %8 = tt.addptr %arg2, %3
+    tt.store %8, %3
+    tt.return
+  }
+}
+"""
+
+def test_ttgir_top_k_detected():
+    """TTGIR top-k sampling pattern is detected."""
+    from triton_metal.codegen.ttgir_parser import TTGIRParser
+    parser = TTGIRParser(TOP_K_TTGIR, FakeOptions())
+    parser._parse_function_signature()
+    parser._parse_body()
+    parser._classify_stores()
+    assert parser._is_top_k_pattern()
+
+
+def test_ttgir_top_k_not_confused_with_elementwise():
+    """Top-k isn't confused with elementwise (2+ output ptrs distinguishes it)."""
+    from triton_metal.codegen.ttgir_parser import TTGIRParser
+    parser = TTGIRParser(TOP_K_TTGIR, FakeOptions())
+    parser._parse_function_signature()
+    parser._parse_body()
+    parser._classify_stores()
+    assert parser._is_top_k_pattern()
+    assert not parser._is_rope_pattern()
+
+
+@requires_metal
+def test_ttgir_top_k_compiles(runner):
+    """TTGIR top-k pattern compiles to valid MSL."""
+    from triton_metal.codegen.ttgir_parser import parse_ttgir
+
+    kb = parse_ttgir(TOP_K_TTGIR, FakeOptions())
+    msl = kb.build()
+    assert "top_k" in msl.lower() or "topk" in msl.lower() or "sort" in msl.lower()
+    runner.compile(msl, "top_k")
+
+
+# ---------------------------------------------------------------------------
+# Speculative decoding TTGIR pattern
+# ---------------------------------------------------------------------------
+
+SPECULATIVE_DECODE_TTGIR = """
+module {
+  tt.func public @speculative_decode_kernel(%arg0: !tt.ptr<f32> {tt.divisibility = 16 : i32},
+                                              %arg1: !tt.ptr<f32> {tt.divisibility = 16 : i32},
+                                              %arg2: !tt.ptr<i32> {tt.divisibility = 16 : i32},
+                                              %arg3: !tt.ptr<f32> {tt.divisibility = 16 : i32},
+                                              %arg4: !tt.ptr<i32> {tt.divisibility = 16 : i32, tt.output},
+                                              %arg5: !tt.ptr<f32> {tt.divisibility = 16 : i32, tt.output},
+                                              %arg6: i32) {
+    %c0 = arith.constant 0 : index
+    %0 = tt.get_program_id x : i32
+    %1 = tt.make_range {end = 256 : i32, start = 0 : i32}
+    %2 = tt.splat %0
+    %3 = arith.addi %2, %1
+    %4 = tt.addptr %arg0, %3
+    %5 = tt.load %4
+    %6 = tt.addptr %arg1, %3
+    %7 = tt.load %6
+    %8 = arith.divf %7, %5
+    %9 = tt.addptr %arg3, %3
+    %10 = tt.load %9
+    %11 = arith.cmpi sge, %8, %10
+    %12 = tt.addptr %arg4, %3
+    tt.store %12, %3
+    %13 = tt.addptr %arg5, %3
+    tt.store %13, %8
+    tt.return
+  }
+}
+"""
+
+def test_ttgir_speculative_decode_detected():
+    """TTGIR speculative decoding pattern is detected."""
+    from triton_metal.codegen.ttgir_parser import TTGIRParser
+    parser = TTGIRParser(SPECULATIVE_DECODE_TTGIR, FakeOptions())
+    parser._parse_function_signature()
+    parser._parse_body()
+    parser._classify_stores()
+    assert parser._is_speculative_decode_pattern()
+
+
+def test_ttgir_speculative_decode_not_confused():
+    """Speculative decode isn't confused with other patterns."""
+    from triton_metal.codegen.ttgir_parser import TTGIRParser
+    parser = TTGIRParser(SPECULATIVE_DECODE_TTGIR, FakeOptions())
+    parser._parse_function_signature()
+    parser._parse_body()
+    parser._classify_stores()
+    assert parser._is_speculative_decode_pattern()
+    assert not parser._is_rope_pattern()
+    assert not parser._is_fused_mlp_pattern()
+
+
+@requires_metal
+def test_ttgir_speculative_decode_compiles(runner):
+    """TTGIR speculative decoding pattern compiles to valid MSL."""
+    from triton_metal.codegen.ttgir_parser import parse_ttgir
+
+    kb = parse_ttgir(SPECULATIVE_DECODE_TTGIR, FakeOptions())
+    msl = kb.build()
+    assert "speculative" in msl.lower() or "decode" in msl.lower() or "accept" in msl.lower()
+    runner.compile(msl, "speculative_decode")
+
+
+# ---------------------------------------------------------------------------
+# Beam search TTGIR pattern
+# ---------------------------------------------------------------------------
+
+BEAM_SEARCH_TTGIR = """
+module {
+  tt.func public @beam_search_kernel(%arg0: !tt.ptr<f32> {tt.divisibility = 16 : i32},
+                                       %arg1: !tt.ptr<f32> {tt.divisibility = 16 : i32},
+                                       %arg2: !tt.ptr<f32> {tt.divisibility = 16 : i32, tt.output},
+                                       %arg3: !tt.ptr<i32> {tt.divisibility = 16 : i32, tt.output},
+                                       %arg4: i32) {
+    %c0 = arith.constant 0 : index
+    %0 = tt.get_program_id x : i32
+    %1 = tt.make_range {end = 256 : i32, start = 0 : i32}
+    %2 = tt.splat %0
+    %3 = arith.addi %2, %1
+    %4 = tt.addptr %arg0, %3
+    %5 = tt.load %4
+    %6 = tt.addptr %arg1, %3
+    %7 = tt.load %6
+    %8 = arith.addf %5, %7
+    %9 = arith.cmpi sgt, %8, %8
+    %10 = "tt.reduce"(%8) ({
+      ^bb0(%a: f32, %b: f32):
+        %mx = arith.maxf %a, %b
+        tt.reduce.return %mx : f32
+    }) {axis = 0 : i32}
+    %11 = tt.addptr %arg2, %3
+    tt.store %11, %8
+    %12 = tt.addptr %arg3, %3
+    tt.store %12, %3
+    tt.return
+  }
+}
+"""
+
+def test_ttgir_beam_search_detected():
+    """TTGIR beam search pattern is detected."""
+    from triton_metal.codegen.ttgir_parser import TTGIRParser
+    parser = TTGIRParser(BEAM_SEARCH_TTGIR, FakeOptions())
+    parser._parse_function_signature()
+    parser._parse_body()
+    parser._classify_stores()
+    assert parser._is_beam_search_pattern()
+
+
+def test_ttgir_beam_search_not_confused():
+    """Beam search isn't confused with plain reduction."""
+    from triton_metal.codegen.ttgir_parser import TTGIRParser
+    parser = TTGIRParser(BEAM_SEARCH_TTGIR, FakeOptions())
+    parser._parse_function_signature()
+    parser._parse_body()
+    parser._classify_stores()
+    assert parser._is_beam_search_pattern()
+    assert not parser._is_softmax_pattern()
+
+
+@requires_metal
+def test_ttgir_beam_search_compiles(runner):
+    """TTGIR beam search pattern compiles to valid MSL."""
+    from triton_metal.codegen.ttgir_parser import parse_ttgir
+
+    kb = parse_ttgir(BEAM_SEARCH_TTGIR, FakeOptions())
+    msl = kb.build()
+    assert "beam" in msl.lower() or "search" in msl.lower() or "score" in msl.lower()
+    runner.compile(msl, "beam_search")

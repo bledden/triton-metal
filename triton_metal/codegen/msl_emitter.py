@@ -1378,6 +1378,161 @@ kernel void kv_cache_attention(
 """
 
 
+def make_gqa_attention_kernel(head_dim=64, n_q_per_kv=4, block_size=256):
+    """Generate a Grouped Query Attention kernel for inference.
+
+    GQA: multiple query heads share fewer KV heads. Used in LLaMA 3,
+    Mistral, Gemma 2. Each threadgroup handles one query head and maps
+    to the correct KV head via integer division.
+
+    Layout:
+        Q: [n_q_heads, head_dim] — single query token per head
+        K_cache: [n_kv_heads, max_seq_len, head_dim]
+        V_cache: [n_kv_heads, max_seq_len, head_dim]
+        O: [n_q_heads, head_dim]
+
+    Args:
+        head_dim: Dimension per head.
+        n_q_per_kv: Number of query heads per KV head (e.g., 4 or 8).
+        block_size: Threads per threadgroup.
+    """
+    return f"""#include <metal_stdlib>
+using namespace metal;
+
+kernel void gqa_attention(
+    device const float* Q [[buffer(0)]],
+    device const float* K_cache [[buffer(1)]],
+    device const float* V_cache [[buffer(2)]],
+    device float* O [[buffer(3)]],
+    constant uint& seq_len [[buffer(4)]],
+    constant float& scale [[buffer(5)]],
+    uint pid [[threadgroup_position_in_grid]],
+    uint lid [[thread_position_in_threadgroup]],
+    uint sgitg [[simdgroup_index_in_threadgroup]],
+    uint tiisg [[thread_index_in_simdgroup]]
+) {{
+    // pid = query head index
+    const uint D = {head_dim}u;
+    const uint N_Q_PER_KV = {n_q_per_kv}u;
+
+    uint q_head = pid;
+    uint kv_head = q_head / N_Q_PER_KV;
+    uint head_offset_q = q_head * D;
+    uint head_offset_kv = kv_head * seq_len * D;
+
+    // Phase 1: Compute all attention scores
+    float local_max = -INFINITY;
+    for (uint j = lid; j < seq_len; j += {block_size}u) {{
+        float dot = 0.0f;
+        for (uint d = 0u; d < D; d++) {{
+            dot += Q[head_offset_q + d] * K_cache[head_offset_kv + j * D + d];
+        }}
+        local_max = max(local_max, dot * scale);
+    }}
+
+    // Reduce max
+    float sg_max = simd_max(local_max);
+    threadgroup float shared_max[{(block_size + 31) // 32}];
+    if (sgitg == 0u) shared_max[tiisg] = -INFINITY;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tiisg == 0u) shared_max[sgitg] = sg_max;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float rd_max = shared_max[tiisg];
+    float global_max = simd_max(rd_max);
+
+    // Phase 2: Compute exp(score - max) and sum
+    float local_sum = 0.0f;
+    for (uint j = lid; j < seq_len; j += {block_size}u) {{
+        float dot = 0.0f;
+        for (uint d = 0u; d < D; d++) {{
+            dot += Q[head_offset_q + d] * K_cache[head_offset_kv + j * D + d];
+        }}
+        float p = exp(dot * scale - global_max);
+        local_sum += p;
+    }}
+
+    float sg_sum = simd_sum(local_sum);
+    threadgroup float shared_sum[{(block_size + 31) // 32}];
+    if (sgitg == 0u) shared_sum[tiisg] = 0.0f;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tiisg == 0u) shared_sum[sgitg] = sg_sum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float rd_sum = shared_sum[tiisg];
+    float global_sum = simd_sum(rd_sum);
+    float inv_sum = 1.0f / global_sum;
+
+    // Phase 3: Weighted V sum
+    for (uint d_start = 0u; d_start < D; d_start += {block_size}u) {{
+        float o_val = 0.0f;
+        uint d = d_start + lid;
+        if (d < D) {{
+            for (uint j = 0u; j < seq_len; j++) {{
+                float dot = 0.0f;
+                for (uint dd = 0u; dd < D; dd++) {{
+                    dot += Q[head_offset_q + dd] * K_cache[head_offset_kv + j * D + dd];
+                }}
+                float attn_weight = exp(dot * scale - global_max) * inv_sum;
+                o_val += attn_weight * V_cache[head_offset_kv + j * D + d];
+            }}
+            O[head_offset_q + d] = o_val;
+        }}
+    }}
+}}
+"""
+
+
+def make_int8_matmul_kernel():
+    """Generate a weight-only INT8 quantized matmul kernel.
+
+    output = input(float) @ dequant(weight_int8, scale, zero_point)
+
+    Per-row quantization: each row of the weight matrix has its own
+    float scale and zero_point. Dequantization happens on-the-fly:
+    w_float = (w_int8 - zero_point) * scale
+
+    Layout:
+        input: [M, K] float
+        weight: [N, K] int8 (signed char)
+        scales: [N] float (per-output-channel scale)
+        zeros: [N] float (per-output-channel zero point)
+        output: [M, N] float
+
+    Uses tiled approach for memory efficiency. Each threadgroup
+    computes a block of the output.
+    """
+    return """#include <metal_stdlib>
+using namespace metal;
+
+kernel void int8_matmul(
+    device const float* input [[buffer(0)]],
+    device const char* weight [[buffer(1)]],
+    device float* output [[buffer(2)]],
+    device const float* scales [[buffer(3)]],
+    device const float* zeros [[buffer(4)]],
+    constant uint& M [[buffer(5)]],
+    constant uint& N [[buffer(6)]],
+    constant uint& K [[buffer(7)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    uint row = gid / N;
+    uint col = gid % N;
+    if (row >= M || col >= N) return;
+
+    float s = scales[col];
+    float z = zeros[col];
+    float acc = 0.0f;
+
+    // Dot product with on-the-fly dequantization
+    for (uint k = 0u; k < K; k++) {
+        float w = (float(weight[col * K + k]) - z) * s;
+        acc += input[row * K + k] * w;
+    }
+
+    output[row * N + col] = acc;
+}
+"""
+
+
 def make_simdgroup_matmul_kernel(dtype="fp32"):
     """Generate a matmul kernel using Apple's simdgroup_matrix hardware.
 

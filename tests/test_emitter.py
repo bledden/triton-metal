@@ -1996,3 +1996,179 @@ def test_fused_linear_with_bias(runner):
             assert abs(got - expected) < 1e-1, (
                 f"C[{i},{j}]: got {got}, expected {expected}"
             )
+
+
+# ---------------------------------------------------------------------------
+# Grouped Query Attention (GQA) tests
+# ---------------------------------------------------------------------------
+
+
+@requires_metal
+def test_gqa_attention(runner):
+    """GQA: 4 query heads share 1 KV head, verify attention output."""
+    from triton_metal.codegen.msl_emitter import make_gqa_attention_kernel
+
+    n_q_heads = 4
+    n_kv_heads = 1
+    n_q_per_kv = n_q_heads // n_kv_heads
+    seq_len = 16
+    head_dim = 64
+
+    msl = make_gqa_attention_kernel(n_q_per_kv=n_q_per_kv)
+    path = runner.compile(msl, "gqa_attention")
+    pipeline = runner.load(path, "gqa_attention")
+
+    random.seed(7777)
+    # Q: [n_q_heads, head_dim] — each query head is different
+    q_data = [random.uniform(-0.5, 0.5) for _ in range(n_q_heads * head_dim)]
+    # K: [n_kv_heads, seq_len, head_dim]
+    k_data = [random.uniform(-0.5, 0.5)
+              for _ in range(n_kv_heads * seq_len * head_dim)]
+    # V: [n_kv_heads, seq_len, head_dim]
+    v_data = [random.uniform(-0.5, 0.5)
+              for _ in range(n_kv_heads * seq_len * head_dim)]
+
+    q_buf = runner.make_float_buffer(q_data)
+    k_buf = runner.make_float_buffer(k_data)
+    v_buf = runner.make_float_buffer(v_data)
+    out_buf = runner.make_empty_buffer(n_q_heads * head_dim)
+    seq_buf = runner.make_uint_buffer(seq_len)
+    scale_val = 1.0 / math.sqrt(head_dim)
+    scale_buf = runner.make_float_scalar_buffer(scale_val)
+
+    import Metal
+    n_groups = n_q_heads  # one threadgroup per query head
+    cmd = runner.queue.commandBuffer()
+    enc = cmd.computeCommandEncoder()
+    enc.setComputePipelineState_(pipeline)
+    for i, buf in enumerate([q_buf, k_buf, v_buf, out_buf,
+                              seq_buf, scale_buf]):
+        enc.setBuffer_offset_atIndex_(buf, 0, i)
+    enc.dispatchThreadgroups_threadsPerThreadgroup_(
+        Metal.MTLSizeMake(n_groups, 1, 1),
+        Metal.MTLSizeMake(256, 1, 1),
+    )
+    enc.endEncoding()
+    cmd.commit()
+    cmd.waitUntilCompleted()
+    assert cmd.status() == 4, f"Kernel failed, status={cmd.status()}"
+
+    result = runner.read_float_buffer(out_buf, n_q_heads * head_dim)
+
+    # Reference: softmax(Q @ K^T / sqrt(d)) @ V for each query head
+    # All query heads share the same KV (since n_kv_heads=1)
+    scale = 1.0 / math.sqrt(head_dim)
+    for qh in range(n_q_heads):
+        kv_h = qh // n_q_per_kv  # which KV head to use
+
+        # Compute attention scores
+        scores = []
+        for s in range(seq_len):
+            dot = sum(q_data[qh * head_dim + d] *
+                      k_data[(kv_h * seq_len + s) * head_dim + d]
+                      for d in range(head_dim))
+            scores.append(dot * scale)
+
+        # Softmax
+        max_s = max(scores)
+        exp_s = [math.exp(s - max_s) for s in scores]
+        sum_exp = sum(exp_s)
+        attn = [e / sum_exp for e in exp_s]
+
+        # Weighted sum of V
+        for d in range(head_dim):
+            expected = sum(attn[s] *
+                          v_data[(kv_h * seq_len + s) * head_dim + d]
+                          for s in range(seq_len))
+            got = result[qh * head_dim + d]
+            assert abs(got - expected) < 0.05, (
+                f"head {qh}, dim {d}: got {got}, expected {expected}"
+            )
+
+    # Verify different query heads produce different outputs
+    head0 = result[:head_dim]
+    head1 = result[head_dim:2 * head_dim]
+    diff = sum(abs(a - b) for a, b in zip(head0, head1))
+    assert diff > 0.01, "Different query heads should produce different outputs"
+
+
+# ---------------------------------------------------------------------------
+# INT8 Quantized Matmul tests
+# ---------------------------------------------------------------------------
+
+
+@requires_metal
+def test_int8_matmul(runner):
+    """INT8 weight-only quantized matmul with per-row scale/zero_point."""
+    from triton_metal.codegen.msl_emitter import make_int8_matmul_kernel
+    import struct as struct_mod
+
+    M, N, K = 16, 16, 32
+    msl = make_int8_matmul_kernel()
+    path = runner.compile(msl, "int8_matmul")
+    pipeline = runner.load(path, "int8_matmul")
+
+    random.seed(8888)
+    # Input: float [M, K]
+    input_data = [random.uniform(-1.0, 1.0) for _ in range(M * K)]
+    # Quantized weights: int8 [N, K] stored as char
+    scale = 0.1
+    zero_point = 0
+    # Generate int8 weights in range [-10, 10]
+    weight_int8 = [random.randint(-10, 10) for _ in range(N * K)]
+    # Scale per row: [N]
+    scale_data = [scale] * N
+    # Zero point per row: [N]
+    zp_data = [float(zero_point)] * N
+
+    # Create int8 weight buffer (packed as signed bytes)
+    import Metal
+    w_buf = runner.device.newBufferWithLength_options_(
+        N * K, Metal.MTLResourceStorageModeShared
+    )
+    w_view = w_buf.contents().as_buffer(N * K)
+    for i, val in enumerate(weight_int8):
+        struct_mod.pack_into("b", w_view, i, val)
+
+    input_buf = runner.make_float_buffer(input_data)
+    out_buf = runner.make_empty_buffer(M * N)
+    scale_buf = runner.make_float_buffer(scale_data)
+    zp_buf = runner.make_float_buffer(zp_data)
+    M_buf = runner.make_uint_buffer(M)
+    N_buf = runner.make_uint_buffer(N)
+    K_buf = runner.make_uint_buffer(K)
+
+    # Dispatch: 1D grid, one thread per output element
+    total_elements = M * N
+    block_size = 256
+    n_groups = (total_elements + block_size - 1) // block_size
+    cmd = runner.queue.commandBuffer()
+    enc = cmd.computeCommandEncoder()
+    enc.setComputePipelineState_(pipeline)
+    # Buffer order matches kernel: input, weight, output, scales, zeros, M, N, K
+    for i, buf in enumerate([input_buf, w_buf, out_buf, scale_buf, zp_buf,
+                              M_buf, N_buf, K_buf]):
+        enc.setBuffer_offset_atIndex_(buf, 0, i)
+    enc.dispatchThreadgroups_threadsPerThreadgroup_(
+        Metal.MTLSizeMake(n_groups, 1, 1),
+        Metal.MTLSizeMake(block_size, 1, 1),
+    )
+    enc.endEncoding()
+    cmd.commit()
+    cmd.waitUntilCompleted()
+    assert cmd.status() == 4, f"Kernel failed, status={cmd.status()}"
+
+    result = runner.read_float_buffer(out_buf, M * N)
+
+    # Reference: dequantize weights then matmul
+    for i in range(M):
+        for j in range(N):
+            expected = sum(
+                input_data[i * K + k] *
+                (float(weight_int8[j * K + k]) - zero_point) * scale
+                for k in range(K)
+            )
+            got = result[i * N + j]
+            assert abs(got - expected) < 0.5, (
+                f"C[{i},{j}]: got {got}, expected {expected}"
+            )

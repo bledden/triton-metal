@@ -4314,3 +4314,188 @@ def test_kernel_builder_empty():
     assert "empty_test" in msl
     assert "device const float" in msl
     assert "device float" in msl
+
+
+# ---------------------------------------------------------------------------
+# Batch normalization tests
+# ---------------------------------------------------------------------------
+
+@requires_metal
+def test_batch_norm_kernel(runner):
+    """Batch norm (eval mode) with pre-computed running stats."""
+    from triton_metal.codegen.msl_emitter import make_batch_norm_kernel
+
+    C = 4  # channels
+    HW = 16  # spatial size
+    total = C * HW
+
+    msl = make_batch_norm_kernel(block_size=256)
+    path = runner.compile(msl, "batch_norm_kernel")
+    pipeline = runner.load(path, "batch_norm_kernel")
+
+    # Input: channels interleaved with spatial
+    in_data = [float(i) * 0.1 for i in range(total)]
+    gamma_data = [1.0] * C
+    beta_data = [0.0] * C
+    mean_data = [float(c) * 0.1 * (HW // 2) for c in range(C)]  # approx means
+    var_data = [1.0] * C  # unit variance for simplicity
+
+    in_buf = runner.make_float_buffer(in_data)
+    out_buf = runner.make_empty_buffer(total)
+    gamma_buf = runner.make_float_buffer(gamma_data)
+    beta_buf = runner.make_float_buffer(beta_data)
+    mean_buf = runner.make_float_buffer(mean_data)
+    var_buf = runner.make_float_buffer(var_data)
+    nc_buf = runner.make_uint_buffer(C)
+    hw_buf = runner.make_uint_buffer(HW)
+
+    runner.run(pipeline,
+               [in_buf, out_buf, gamma_buf, beta_buf, mean_buf, var_buf, nc_buf, hw_buf],
+               total, 256)
+    result = runner.read_float_buffer(out_buf, total)
+
+    # Verify: output = gamma * (input - mean) / sqrt(var + eps) + beta
+    eps = 1e-5
+    for idx in range(total):
+        channel = (idx // HW) % C
+        x = in_data[idx]
+        expected = gamma_data[channel] * (x - mean_data[channel]) / math.sqrt(var_data[channel] + eps) + beta_data[channel]
+        assert abs(result[idx] - expected) < 0.01, f"idx={idx}: {result[idx]} != {expected}"
+
+
+@requires_metal
+def test_batch_norm_with_affine(runner):
+    """Batch norm with non-trivial gamma/beta."""
+    from triton_metal.codegen.msl_emitter import make_batch_norm_kernel
+
+    C = 2
+    HW = 8
+    total = C * HW
+
+    msl = make_batch_norm_kernel(block_size=256)
+    path = runner.compile(msl, "batch_norm_kernel")
+    pipeline = runner.load(path, "batch_norm_kernel")
+
+    in_data = [1.0] * total  # all ones
+    gamma_data = [2.0, 0.5]
+    beta_data = [1.0, -1.0]
+    mean_data = [1.0, 1.0]  # mean matches input → normalized = 0
+    var_data = [1.0, 1.0]
+
+    in_buf = runner.make_float_buffer(in_data)
+    out_buf = runner.make_empty_buffer(total)
+    gamma_buf = runner.make_float_buffer(gamma_data)
+    beta_buf = runner.make_float_buffer(beta_data)
+    mean_buf = runner.make_float_buffer(mean_data)
+    var_buf = runner.make_float_buffer(var_data)
+    nc_buf = runner.make_uint_buffer(C)
+    hw_buf = runner.make_uint_buffer(HW)
+
+    runner.run(pipeline,
+               [in_buf, out_buf, gamma_buf, beta_buf, mean_buf, var_buf, nc_buf, hw_buf],
+               total, 256)
+    result = runner.read_float_buffer(out_buf, total)
+
+    # input=1, mean=1 → normalized=0 → output = gamma*0 + beta = beta
+    for idx in range(total):
+        channel = (idx // HW) % C
+        expected = beta_data[channel]
+        assert abs(result[idx] - expected) < 0.01, f"idx={idx}: {result[idx]} != {expected}"
+
+
+# ---------------------------------------------------------------------------
+# Online softmax tests
+# ---------------------------------------------------------------------------
+
+@requires_metal
+def test_online_softmax(runner):
+    """Online (single-pass) softmax produces correct results."""
+    from triton_metal.codegen.msl_emitter import make_online_softmax_kernel
+
+    n_cols = 64
+    msl = make_online_softmax_kernel(block_size=256)
+    path = runner.compile(msl, "online_softmax_kernel")
+    pipeline = runner.load(path, "online_softmax_kernel")
+
+    in_data = [float(i) * 0.2 for i in range(n_cols)]
+    in_buf = runner.make_float_buffer(in_data)
+    out_buf = runner.make_empty_buffer(n_cols)
+    ncols_buf = runner.make_uint_buffer(n_cols)
+
+    import Metal
+    cmd = runner.queue.commandBuffer()
+    enc = cmd.computeCommandEncoder()
+    enc.setComputePipelineState_(pipeline)
+    for i, buf in enumerate([in_buf, out_buf, ncols_buf]):
+        enc.setBuffer_offset_atIndex_(buf, 0, i)
+    enc.dispatchThreadgroups_threadsPerThreadgroup_(
+        Metal.MTLSizeMake(1, 1, 1),
+        Metal.MTLSizeMake(256, 1, 1),
+    )
+    enc.endEncoding()
+    cmd.commit()
+    cmd.waitUntilCompleted()
+    assert cmd.status() == 4
+
+    result = runner.read_float_buffer(out_buf, n_cols)
+
+    # Verify: sums to 1 and matches reference softmax
+    row_sum = sum(result)
+    assert abs(row_sum - 1.0) < 0.001, f"Sum: {row_sum}"
+
+    max_val = max(in_data)
+    exp_vals = [math.exp(x - max_val) for x in in_data]
+    exp_sum = sum(exp_vals)
+    for i in [0, 16, 32, 48, 63]:
+        expected = exp_vals[i] / exp_sum
+        assert abs(result[i] - expected) < 0.001, f"i={i}: {result[i]} != {expected}"
+
+
+@requires_metal
+def test_online_softmax_uniform(runner):
+    """Online softmax with uniform input → all equal (1/n)."""
+    from triton_metal.codegen.msl_emitter import make_online_softmax_kernel
+
+    n_cols = 128
+    msl = make_online_softmax_kernel(block_size=256)
+    path = runner.compile(msl, "online_softmax_kernel")
+    pipeline = runner.load(path, "online_softmax_kernel")
+
+    in_data = [1.0] * n_cols
+    in_buf = runner.make_float_buffer(in_data)
+    out_buf = runner.make_empty_buffer(n_cols)
+    ncols_buf = runner.make_uint_buffer(n_cols)
+
+    import Metal
+    cmd = runner.queue.commandBuffer()
+    enc = cmd.computeCommandEncoder()
+    enc.setComputePipelineState_(pipeline)
+    for i, buf in enumerate([in_buf, out_buf, ncols_buf]):
+        enc.setBuffer_offset_atIndex_(buf, 0, i)
+    enc.dispatchThreadgroups_threadsPerThreadgroup_(
+        Metal.MTLSizeMake(1, 1, 1),
+        Metal.MTLSizeMake(256, 1, 1),
+    )
+    enc.endEncoding()
+    cmd.commit()
+    cmd.waitUntilCompleted()
+    assert cmd.status() == 4
+
+    result = runner.read_float_buffer(out_buf, n_cols)
+
+    expected = 1.0 / n_cols
+    for i, v in enumerate(result):
+        assert abs(v - expected) < 0.001, f"i={i}: {v} != {expected}"
+
+
+# ---------------------------------------------------------------------------
+# Causal attention tests
+# ---------------------------------------------------------------------------
+
+@requires_metal
+def test_causal_attention_compiles(runner):
+    """Causal attention kernel compiles successfully."""
+    from triton_metal.codegen.msl_emitter import make_causal_attention_kernel
+
+    msl = make_causal_attention_kernel(n_heads=4, head_dim=32, block_size=128)
+    runner.compile(msl, "causal_attention")

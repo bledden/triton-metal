@@ -1373,6 +1373,287 @@ kernel void variance_kernel(
     return msl
 
 
+def make_batch_norm_kernel(block_size=256, dtype="fp32", eps=1e-5):
+    """Generate a batch normalization kernel (inference mode).
+
+    For each channel c:
+        output[b, c, h, w] = gamma[c] * (input[b, c, h, w] - mean[c]) / sqrt(var[c] + eps) + beta[c]
+
+    Uses pre-computed running mean and variance (eval mode).
+    Each threadgroup processes one spatial position across channels.
+
+    Layout:
+        input: [N * C * HW] flattened, stored as [N, C, HW]
+        output: [N * C * HW]
+        gamma: [C] — scale parameters
+        beta: [C] — shift parameters
+        running_mean: [C]
+        running_var: [C]
+        n_channels: scalar
+        spatial_size: HW (height * width)
+
+    Args:
+        block_size: Threads per threadgroup.
+        dtype: Data type.
+        eps: Epsilon for numerical stability.
+    """
+    msl_ty = triton_type_to_msl(dtype)
+    compute_ty = _msl_compute_type(dtype)
+
+    msl = f"""#include <metal_stdlib>
+using namespace metal;
+
+kernel void batch_norm_kernel(
+    device const {msl_ty}* input [[buffer(0)]],
+    device {msl_ty}* output [[buffer(1)]],
+    device const {msl_ty}* gamma [[buffer(2)]],
+    device const {msl_ty}* beta [[buffer(3)]],
+    device const {msl_ty}* running_mean [[buffer(4)]],
+    device const {msl_ty}* running_var [[buffer(5)]],
+    device const uint* n_channels_buf [[buffer(6)]],
+    device const uint* spatial_size_buf [[buffer(7)]],
+    uint pid [[threadgroup_position_in_grid]],
+    uint lid [[thread_position_in_threadgroup]],
+    uint tid [[thread_position_in_grid]]
+) {{
+    const uint n_channels = n_channels_buf[0];
+    const uint spatial_size = spatial_size_buf[0];
+    const uint total = n_channels * spatial_size;
+
+    // Each thread processes one element: index = batch * C*HW + channel * HW + spatial
+    // We iterate over the flattened [N*C*HW] with standard 1D dispatch
+    uint idx = tid;
+    if (idx >= total) return;
+
+    // Determine which channel this element belongs to
+    uint channel = (idx / spatial_size) % n_channels;
+
+    {compute_ty} x = static_cast<{compute_ty}>(input[idx]);
+    {compute_ty} mean = static_cast<{compute_ty}>(running_mean[channel]);
+    {compute_ty} var = static_cast<{compute_ty}>(running_var[channel]);
+    {compute_ty} g = static_cast<{compute_ty}>(gamma[channel]);
+    {compute_ty} b = static_cast<{compute_ty}>(beta[channel]);
+
+    {compute_ty} normalized = (x - mean) * rsqrt(var + {eps}f);
+    output[idx] = static_cast<{msl_ty}>(g * normalized + b);
+}}
+"""
+    return msl
+
+
+def make_causal_attention_kernel(n_heads=8, head_dim=64, block_size=256):
+    """Generate a multi-head attention kernel with causal (triangular) mask.
+
+    Computes: Attention(Q, K, V) = softmax(Q @ K^T / sqrt(d) + causal_mask) @ V
+
+    The causal mask sets entries where key_pos > query_pos to -inf,
+    preventing attention to future tokens (autoregressive).
+
+    Each threadgroup processes one query position for one head.
+    For small sequences only (seq_len <= block_size).
+
+    Layout:
+        Q: [n_heads, seq_len, head_dim]
+        K: [n_heads, seq_len, head_dim]
+        V: [n_heads, seq_len, head_dim]
+        output: [n_heads, seq_len, head_dim]
+        seq_len: scalar
+
+    Args:
+        n_heads: Number of attention heads.
+        head_dim: Dimension per head.
+        block_size: Threads per threadgroup.
+    """
+    msl = f"""#include <metal_stdlib>
+using namespace metal;
+
+kernel void causal_attention(
+    device const float* Q [[buffer(0)]],
+    device const float* K [[buffer(1)]],
+    device const float* V [[buffer(2)]],
+    device float* output [[buffer(3)]],
+    device const uint* seq_len_buf [[buffer(4)]],
+    uint pid [[threadgroup_position_in_grid]],
+    uint lid [[thread_position_in_threadgroup]],
+    uint sgitg [[simdgroup_index_in_threadgroup]],
+    uint tiisg [[thread_index_in_simdgroup]]
+) {{
+    const uint seq_len = seq_len_buf[0];
+    const uint head = pid / seq_len;
+    const uint query_pos = pid % seq_len;
+    const float scale = rsqrt(float({head_dim}));
+
+    const uint head_offset = head * seq_len * {head_dim}u;
+    const uint q_offset = head_offset + query_pos * {head_dim}u;
+
+    // Each thread computes attention score for one key position
+    threadgroup float tg_scores[{block_size}];
+    threadgroup float tg_max[{(block_size + 31) // 32}];
+    threadgroup float tg_sum[{(block_size + 31) // 32}];
+
+    // Step 1: compute Q @ K^T with causal mask
+    float score = -INFINITY;
+    if (lid < seq_len && lid <= query_pos) {{
+        // Dot product Q[query_pos] . K[lid]
+        float dot = 0.0f;
+        for (uint d = 0; d < {head_dim}u; d++) {{
+            dot += Q[q_offset + d] * K[head_offset + lid * {head_dim}u + d];
+        }}
+        score = dot * scale;
+    }}
+    tg_scores[lid] = score;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Step 2: online softmax - find max
+    float local_max = score;
+    local_max = simd_max(local_max);
+    if (tiisg == 0) tg_max[sgitg] = local_max;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (lid == 0) {{
+        float m = -INFINITY;
+        for (uint i = 0; i < {(block_size + 31) // 32}u; i++) m = max(m, tg_max[i]);
+        tg_max[0] = m;
+    }}
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float row_max = tg_max[0];
+
+    // Step 3: exp(score - max)
+    float exp_score = (lid < seq_len && lid <= query_pos) ? exp(score - row_max) : 0.0f;
+    tg_scores[lid] = exp_score;
+
+    // Step 4: sum
+    float local_sum = exp_score;
+    local_sum = simd_sum(local_sum);
+    if (tiisg == 0) tg_sum[sgitg] = local_sum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (lid == 0) {{
+        float s = 0.0f;
+        for (uint i = 0; i < {(block_size + 31) // 32}u; i++) s += tg_sum[i];
+        tg_sum[0] = s;
+    }}
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float row_sum = tg_sum[0];
+
+    // Normalize
+    float weight = (lid < seq_len && lid <= query_pos) ? tg_scores[lid] / row_sum : 0.0f;
+
+    // Step 5: weighted sum of V
+    // Each thread contributes weight * V[lid]
+    for (uint d = lid; d < {head_dim}u; d += {block_size}u) {{
+        float val = 0.0f;
+        for (uint k = 0; k <= query_pos && k < seq_len; k++) {{
+            float w = tg_scores[k] / row_sum;
+            val += w * V[head_offset + k * {head_dim}u + d];
+        }}
+        output[q_offset + d] = val;
+    }}
+}}
+"""
+    return msl
+
+
+def make_online_softmax_kernel(block_size=256, dtype="fp32"):
+    """Generate a single-pass online softmax kernel.
+
+    Uses the online softmax trick to compute softmax in one pass:
+    - Track running max and running sum of exp(x - max)
+    - Correct when a new max is found: multiply old sum by exp(old_max - new_max)
+
+    More efficient than two-pass softmax for long sequences.
+
+    Layout:
+        input: [n_rows, n_cols]
+        output: [n_rows, n_cols]
+        n_cols: number of columns
+
+    Args:
+        block_size: Threads per threadgroup.
+        dtype: Data type.
+    """
+    msl_ty = triton_type_to_msl(dtype)
+    compute_ty = _msl_compute_type(dtype)
+
+    msl = f"""#include <metal_stdlib>
+using namespace metal;
+
+kernel void online_softmax_kernel(
+    device const {msl_ty}* input [[buffer(0)]],
+    device {msl_ty}* output [[buffer(1)]],
+    device const uint* ncols_buf [[buffer(2)]],
+    uint pid [[threadgroup_position_in_grid]],
+    uint lid [[thread_position_in_threadgroup]],
+    uint sgitg [[simdgroup_index_in_threadgroup]],
+    uint tiisg [[thread_index_in_simdgroup]]
+) {{
+    const uint n_cols = ncols_buf[0];
+    const uint row = pid;
+    const uint row_offset = row * n_cols;
+
+    // Single-pass: each thread processes a strided chunk
+    // Use -1e30 instead of -INFINITY to avoid NaN in exp(-inf - (-inf))
+    {compute_ty} thread_max = -1e30f;
+    {compute_ty} thread_sum = 0.0f;
+
+    for (uint col = lid; col < n_cols; col += {block_size}u) {{
+        {compute_ty} x = static_cast<{compute_ty}>(input[row_offset + col]);
+        if (x > thread_max) {{
+            thread_sum = thread_sum * exp(thread_max - x) + 1.0f;
+            thread_max = x;
+        }} else {{
+            thread_sum += exp(x - thread_max);
+        }}
+    }}
+
+    // SIMD-level online reduce: combine (max, sum) pairs
+    for (uint offset = 16; offset > 0; offset >>= 1) {{
+        {compute_ty} other_max = simd_shuffle_down(thread_max, offset);
+        {compute_ty} other_sum = simd_shuffle_down(thread_sum, offset);
+        {compute_ty} new_max = max(thread_max, other_max);
+        {compute_ty} scale1 = exp(thread_max - new_max);
+        {compute_ty} scale2 = exp(other_max - new_max);
+        thread_sum = thread_sum * scale1 + other_sum * scale2;
+        thread_max = new_max;
+    }}
+
+    // Cross-simdgroup reduce
+    threadgroup {compute_ty} tg_max[{(block_size + 31) // 32}];
+    threadgroup {compute_ty} tg_sum[{(block_size + 31) // 32}];
+    if (tiisg == 0) {{
+        tg_max[sgitg] = thread_max;
+        tg_sum[sgitg] = thread_sum;
+    }}
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (lid == 0) {{
+        {compute_ty} final_max = tg_max[0];
+        {compute_ty} final_sum = tg_sum[0];
+        for (uint i = 1; i < {(block_size + 31) // 32}u; i++) {{
+            {compute_ty} m = tg_max[i];
+            {compute_ty} s = tg_sum[i];
+            {compute_ty} new_max = max(final_max, m);
+            final_sum = final_sum * exp(final_max - new_max) + s * exp(m - new_max);
+            final_max = new_max;
+        }}
+        tg_max[0] = final_max;
+        tg_sum[0] = final_sum;
+    }}
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    {compute_ty} row_max = tg_max[0];
+    {compute_ty} row_sum = tg_sum[0];
+
+    // Write normalized output
+    for (uint col = lid; col < n_cols; col += {block_size}u) {{
+        {compute_ty} x = static_cast<{compute_ty}>(input[row_offset + col]);
+        output[row_offset + col] = static_cast<{msl_ty}>(exp(x - row_max) / row_sum);
+    }}
+}}
+"""
+    return msl
+
+
 def make_cross_entropy_kernel(block_size=256, dtype="fp32"):
     """Generate a fused cross-entropy loss kernel.
 

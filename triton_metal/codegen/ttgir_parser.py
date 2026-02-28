@@ -29,13 +29,20 @@ from triton_metal.codegen.msl_emitter import KernelBuilder
 # ---------------------------------------------------------------------------
 
 def _mlir_type_to_triton_dtype(mlir_type):
-    """Convert MLIR type string to Triton dtype string."""
+    """Convert MLIR type string to Triton dtype string.
+
+    Raises TypeError if the type is FP64 (not supported on Apple Silicon).
+    """
     mlir_type = mlir_type.strip()
+    if mlir_type == "f64":
+        raise TypeError(
+            "FP64 (double) is not supported on Apple Silicon GPUs. "
+            "Got MLIR type 'f64'. Cast to float32 before running on Metal."
+        )
     _map = {
         "f32": "fp32",
         "f16": "fp16",
         "bf16": "bf16",
-        "f64": "fp64",
         "i1": "i1",
         "i8": "i8",
         "i16": "i16",
@@ -421,9 +428,21 @@ class TTGIRParser:
                         self.ssa_values[result] = (op_key, m.group(2), m.group(3))
                     break
 
+            # math.fma (fused multiply-add: a*b + c)
+            if "math.fma" in line:
+                m = re.match(
+                    r"%(\w+)\s*=\s*math\.fma\s+(%\w+)\s*,\s*(%\w+)\s*,\s*(%\w+)",
+                    line
+                )
+                if m:
+                    result = f"%{m.group(1)}"
+                    self.ssa_values[result] = ("fma", m.group(2), m.group(3), m.group(4))
+                continue
+
             # Unary math ops
             for op_name, op_key in [("math.exp", "exp"), ("math.log", "log"),
-                                     ("math.sqrt", "sqrt"), ("math.absf", "abs")]:
+                                     ("math.sqrt", "sqrt"), ("math.rsqrt", "rsqrt"),
+                                     ("math.absf", "abs")]:
                 if op_name in line:
                     m = re.match(
                         rf"%(\w+)\s*=\s*{re.escape(op_name)}\s+(%\w+)",
@@ -809,10 +828,20 @@ class TTGIRParser:
             return var_name
 
         # Unary math ops
-        if op in ("exp", "log", "sqrt", "abs", "neg"):
+        if op in ("exp", "log", "sqrt", "rsqrt", "abs", "neg"):
             x_var = self._emit_ssa_value(kb, val_info[1], input_vars, dtype, emitted)
             var_name = f"r_{len(self.computed_values)}"
             kb.unary_op(op, x_var, var_name)
+            self.computed_values[ssa] = var_name
+            return var_name
+
+        # Fused multiply-add: fma(a, b, c) = a*b + c
+        if op == "fma":
+            a_var = self._emit_ssa_value(kb, val_info[1], input_vars, dtype, emitted)
+            b_var = self._emit_ssa_value(kb, val_info[2], input_vars, dtype, emitted)
+            c_var = self._emit_ssa_value(kb, val_info[3], input_vars, dtype, emitted)
+            var_name = f"r_{len(self.computed_values)}"
+            kb.fused_op("fma", [a_var, b_var, c_var], var_name)
             self.computed_values[ssa] = var_name
             return var_name
 

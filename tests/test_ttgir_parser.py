@@ -908,3 +908,189 @@ def test_parse_scf_for_loop_iv_in_ssa():
 
     assert "%iv" in parser.ssa_values
     assert parser.ssa_values["%iv"][0] == "loop_iv"
+
+
+# ---------------------------------------------------------------------------
+# FP64 rejection tests
+# ---------------------------------------------------------------------------
+
+# FMA: output = a * b + c (fused multiply-add)
+FMA_TTGIR = """\
+module {
+  tt.func public @fma_kernel(%arg0: !tt.ptr<f32>, %arg1: !tt.ptr<f32>, %arg2: !tt.ptr<f32>, %arg3: !tt.ptr<f32>, %arg4: i32) {
+    %0 = tt.get_program_id x : i32
+    %c256_i32 = arith.constant 256 : i32
+    %1 = arith.muli %0, %c256_i32 : i32
+    %2 = tt.make_range {end = 256 : i32, start = 0 : i32} : tensor<256xi32>
+    %3 = tt.splat %1 : i32 -> tensor<256xi32>
+    %4 = arith.addi %3, %2 : tensor<256xi32>
+    %5 = tt.splat %arg4 : i32 -> tensor<256xi32>
+    %6 = arith.cmpi slt, %4, %5 : tensor<256xi32>
+    %7 = tt.splat %arg0 : !tt.ptr<f32> -> tensor<256x!tt.ptr<f32>>
+    %8 = tt.addptr %7, %4 : tensor<256x!tt.ptr<f32>>, tensor<256xi32>
+    %9 = tt.splat %arg1 : !tt.ptr<f32> -> tensor<256x!tt.ptr<f32>>
+    %10 = tt.addptr %9, %4 : tensor<256x!tt.ptr<f32>>, tensor<256xi32>
+    %11 = tt.splat %arg2 : !tt.ptr<f32> -> tensor<256x!tt.ptr<f32>>
+    %12 = tt.addptr %11, %4 : tensor<256x!tt.ptr<f32>>, tensor<256xi32>
+    %cst = arith.constant 0.000000e+00 : f32
+    %13 = tt.splat %cst : f32 -> tensor<256xf32>
+    %14 = tt.load %8, %6, %13 : tensor<256x!tt.ptr<f32>>
+    %15 = tt.load %10, %6, %13 : tensor<256x!tt.ptr<f32>>
+    %16 = tt.load %12, %6, %13 : tensor<256x!tt.ptr<f32>>
+    %17 = math.fma %14, %15, %16 : tensor<256xf32>
+    %18 = tt.splat %arg3 : !tt.ptr<f32> -> tensor<256x!tt.ptr<f32>>
+    %19 = tt.addptr %18, %4 : tensor<256x!tt.ptr<f32>>, tensor<256xi32>
+    tt.store %19, %17, %6 : tensor<256x!tt.ptr<f32>>
+    tt.return
+  }
+}
+"""
+
+# RSQRT: output = rsqrt(input) = 1/sqrt(input)
+RSQRT_TTGIR = """\
+module {
+  tt.func public @rsqrt_kernel(%arg0: !tt.ptr<f32>, %arg1: !tt.ptr<f32>, %arg2: i32) {
+    %0 = tt.get_program_id x : i32
+    %c256_i32 = arith.constant 256 : i32
+    %1 = arith.muli %0, %c256_i32 : i32
+    %2 = tt.make_range {end = 256 : i32, start = 0 : i32} : tensor<256xi32>
+    %3 = tt.splat %1 : i32 -> tensor<256xi32>
+    %4 = arith.addi %3, %2 : tensor<256xi32>
+    %5 = tt.splat %arg2 : i32 -> tensor<256xi32>
+    %6 = arith.cmpi slt, %4, %5 : tensor<256xi32>
+    %7 = tt.splat %arg0 : !tt.ptr<f32> -> tensor<256x!tt.ptr<f32>>
+    %8 = tt.addptr %7, %4 : tensor<256x!tt.ptr<f32>>, tensor<256xi32>
+    %cst = arith.constant 0.000000e+00 : f32
+    %9 = tt.splat %cst : f32 -> tensor<256xf32>
+    %10 = tt.load %8, %6, %9 : tensor<256x!tt.ptr<f32>>
+    %11 = math.rsqrt %10 : tensor<256xf32>
+    %12 = tt.splat %arg1 : !tt.ptr<f32> -> tensor<256x!tt.ptr<f32>>
+    %13 = tt.addptr %12, %4 : tensor<256x!tt.ptr<f32>>, tensor<256xi32>
+    tt.store %13, %11, %6 : tensor<256x!tt.ptr<f32>>
+    tt.return
+  }
+}
+"""
+
+FP64_TTGIR = """\
+module {
+  tt.func public @fp64_kernel(%arg0: !tt.ptr<f64>, %arg1: !tt.ptr<f64>, %arg2: i32) {
+    %0 = tt.get_program_id x : i32
+    tt.return
+  }
+}
+"""
+
+
+def test_fp64_rejected_in_parser():
+    """Parser rejects FP64 types with a clear error message."""
+    from triton_metal.codegen.ttgir_parser import parse_ttgir
+
+    with pytest.raises(TypeError, match="FP64.*not supported.*Apple Silicon"):
+        parse_ttgir(FP64_TTGIR, FakeOptions())
+
+
+def test_fp64_rejected_in_msl_types():
+    """MSL type mapper rejects FP64 types."""
+    from triton_metal.codegen.msl_types import triton_type_to_msl
+
+    with pytest.raises(TypeError, match="FP64.*not supported"):
+        triton_type_to_msl("fp64")
+
+    with pytest.raises(TypeError, match="FP64.*not supported"):
+        triton_type_to_msl("*fp64")
+
+
+def test_fp64_rejected_in_emitter():
+    """MSL emitter rejects FP64 kernel generation."""
+    from triton_metal.codegen.msl_emitter import make_elementwise_kernel
+
+    with pytest.raises(TypeError, match="FP64.*not supported"):
+        make_elementwise_kernel("bad_kernel", 2, "add", dtype="fp64")
+
+
+# ---------------------------------------------------------------------------
+# math.fma and math.rsqrt tests
+# ---------------------------------------------------------------------------
+
+@requires_metal
+def test_ttgir_fma_compiles(runner):
+    """TTGIR math.fma compiles to valid MSL."""
+    from triton_metal.codegen.ttgir_parser import parse_ttgir
+
+    kb = parse_ttgir(FMA_TTGIR, FakeOptions())
+    msl = kb.build()
+    assert "fma(" in msl
+    runner.compile(msl, "fma_kernel")
+
+
+@requires_metal
+def test_ttgir_fma_gpu(runner):
+    """TTGIR fma: output = a*b + c, verified on GPU."""
+    from triton_metal.codegen.ttgir_parser import parse_ttgir
+
+    kb = parse_ttgir(FMA_TTGIR, FakeOptions())
+    msl = kb.build()
+    n = 256
+
+    metallib = runner.compile(msl, "fma_kernel")
+    pipeline = runner.load(metallib, "fma_kernel")
+
+    a_data = [float(i) * 0.1 for i in range(n)]
+    b_data = [float(i) * 0.2 for i in range(n)]
+    c_data = [float(i) * 0.05 for i in range(n)]
+    buf_a = runner.make_float_buffer(a_data)
+    buf_b = runner.make_float_buffer(b_data)
+    buf_c = runner.make_float_buffer(c_data)
+    buf_out = runner.make_empty_buffer(n)
+    buf_n = runner.make_int_buffer(n)
+
+    runner.run(pipeline, [buf_a, buf_b, buf_c, buf_out, buf_n], n, block_size=256)
+
+    result = runner.read_float_buffer(buf_out, n)
+    for i in range(n):
+        expected = a_data[i] * b_data[i] + c_data[i]
+        tol = max(1e-4, abs(expected) * 1e-5)
+        assert abs(result[i] - expected) < tol, (
+            f"[{i}] got {result[i]}, expected {expected}"
+        )
+
+
+@requires_metal
+def test_ttgir_rsqrt_compiles(runner):
+    """TTGIR math.rsqrt compiles to valid MSL."""
+    from triton_metal.codegen.ttgir_parser import parse_ttgir
+
+    kb = parse_ttgir(RSQRT_TTGIR, FakeOptions())
+    msl = kb.build()
+    assert "rsqrt(" in msl
+    runner.compile(msl, "rsqrt_kernel")
+
+
+@requires_metal
+def test_ttgir_rsqrt_gpu(runner):
+    """TTGIR rsqrt: output = 1/sqrt(input), verified on GPU."""
+    from triton_metal.codegen.ttgir_parser import parse_ttgir
+
+    kb = parse_ttgir(RSQRT_TTGIR, FakeOptions())
+    msl = kb.build()
+    n = 256
+
+    metallib = runner.compile(msl, "rsqrt_kernel")
+    pipeline = runner.load(metallib, "rsqrt_kernel")
+
+    # Use positive values to avoid NaN
+    input_data = [float(i + 1) * 0.1 for i in range(n)]
+    buf_in = runner.make_float_buffer(input_data)
+    buf_out = runner.make_empty_buffer(n)
+    buf_n = runner.make_int_buffer(n)
+
+    runner.run(pipeline, [buf_in, buf_out, buf_n], n, block_size=256)
+
+    result = runner.read_float_buffer(buf_out, n)
+    for i in range(n):
+        expected = 1.0 / math.sqrt(input_data[i])
+        tol = max(1e-4, abs(expected) * 1e-4)
+        assert abs(result[i] - expected) < tol, (
+            f"[{i}] got {result[i]}, expected {expected}"
+        )

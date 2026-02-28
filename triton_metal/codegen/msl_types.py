@@ -1,5 +1,8 @@
 """Triton type to MSL type mappings."""
 
+# Types that Apple Silicon GPUs do not support.
+_UNSUPPORTED_TYPES = {"fp64", "f64"}
+
 # Triton dtype string -> MSL type string
 _TYPE_MAP = {
     "fp16": "half",
@@ -21,6 +24,16 @@ _TYPE_MAP = {
 _PTR_QUALIFIER = "device"
 
 
+def _check_fp64(triton_type: str):
+    """Reject FP64 types — Apple Silicon GPUs have no FP64 hardware."""
+    base = triton_type.lstrip("*").strip()
+    if base in _UNSUPPORTED_TYPES:
+        raise TypeError(
+            f"FP64 (double) is not supported on Apple Silicon GPUs. "
+            f"Got type '{triton_type}'. Cast to float32 before running on Metal."
+        )
+
+
 def triton_type_to_msl(triton_type: str) -> str:
     """Convert a Triton type string to its MSL equivalent.
 
@@ -29,7 +42,11 @@ def triton_type_to_msl(triton_type: str) -> str:
 
     Returns:
         MSL type string, e.g. "float", "device half*", "int"
+
+    Raises:
+        TypeError: If the type is FP64 (not supported on Apple Silicon).
     """
+    _check_fp64(triton_type)
     if triton_type.startswith("*"):
         inner = triton_type[1:]
         msl_inner = _TYPE_MAP.get(inner, inner)

@@ -232,6 +232,80 @@ module {
 """
 
 
+# Softmax: output = softmax(input) — fused max + exp + sum + divide
+SOFTMAX_TTGIR = """\
+module {
+  tt.func public @softmax_kernel(%arg0: !tt.ptr<f32>, %arg1: !tt.ptr<f32>, %arg2: i32) {
+    %0 = tt.get_program_id x : i32
+    %c256_i32 = arith.constant 256 : i32
+    %1 = arith.muli %0, %c256_i32 : i32
+    %2 = tt.make_range {end = 256 : i32, start = 0 : i32} : tensor<256xi32>
+    %3 = tt.splat %1 : i32 -> tensor<256xi32>
+    %4 = arith.addi %3, %2 : tensor<256xi32>
+    %5 = tt.splat %arg2 : i32 -> tensor<256xi32>
+    %6 = arith.cmpi slt, %4, %5 : tensor<256xi32>
+    %7 = tt.splat %arg0 : !tt.ptr<f32> -> tensor<256x!tt.ptr<f32>>
+    %8 = tt.addptr %7, %4 : tensor<256x!tt.ptr<f32>>, tensor<256xi32>
+    %cst = arith.constant 0.000000e+00 : f32
+    %9 = tt.splat %cst : f32 -> tensor<256xf32>
+    %10 = tt.load %8, %6, %9 : tensor<256x!tt.ptr<f32>>
+    %11 = "tt.reduce"(%10) ({
+    ^bb0(%arg3: f32, %arg4: f32):
+      %m = arith.maxf %arg3, %arg4 : f32
+      "tt.reduce.return"(%m) : (f32) -> ()
+    }) {axis = 0 : i32} : (tensor<256xf32>) -> f32
+    %12 = tt.splat %11 : f32 -> tensor<256xf32>
+    %13 = arith.subf %10, %12 : tensor<256xf32>
+    %14 = math.exp %13 : tensor<256xf32>
+    %15 = "tt.reduce"(%14) ({
+    ^bb0(%arg5: f32, %arg6: f32):
+      %s = arith.addf %arg5, %arg6 : f32
+      "tt.reduce.return"(%s) : (f32) -> ()
+    }) {axis = 0 : i32} : (tensor<256xf32>) -> f32
+    %16 = tt.splat %15 : f32 -> tensor<256xf32>
+    %17 = arith.divf %14, %16 : tensor<256xf32>
+    %18 = tt.splat %arg1 : !tt.ptr<f32> -> tensor<256x!tt.ptr<f32>>
+    %19 = tt.addptr %18, %4 : tensor<256x!tt.ptr<f32>>, tensor<256xi32>
+    tt.store %19, %17, %6 : tensor<256x!tt.ptr<f32>>
+    tt.return
+  }
+}
+"""
+
+
+# scf.for loop: accumulates over chunks with a loop structure
+SCF_FOR_TTGIR = """\
+module {
+  tt.func public @loop_sum_kernel(%arg0: !tt.ptr<f32>, %arg1: !tt.ptr<f32>, %arg2: i32) {
+    %pid = tt.get_program_id x : i32
+    %c0 = arith.constant 0 : i32
+    %c256 = arith.constant 256 : i32
+    %cst_zero = arith.constant 0.000000e+00 : f32
+    %result = scf.for %iv = %c0 to %arg2 step %c256 iter_args(%acc = %cst_zero) -> (f32) {
+      %range = tt.make_range {end = 256 : i32, start = 0 : i32} : tensor<256xi32>
+      %iv_splat = tt.splat %iv : i32 -> tensor<256xi32>
+      %offsets = arith.addi %iv_splat, %range : tensor<256xi32>
+      %n_splat = tt.splat %arg2 : i32 -> tensor<256xi32>
+      %mask = arith.cmpi slt, %offsets, %n_splat : tensor<256xi32>
+      %ptr_splat = tt.splat %arg0 : !tt.ptr<f32> -> tensor<256x!tt.ptr<f32>>
+      %ptrs = tt.addptr %ptr_splat, %offsets : tensor<256x!tt.ptr<f32>>, tensor<256xi32>
+      %zero_splat = tt.splat %cst_zero : f32 -> tensor<256xf32>
+      %loaded = tt.load %ptrs, %mask, %zero_splat : tensor<256x!tt.ptr<f32>>
+      %chunk_sum = "tt.reduce"(%loaded) ({
+      ^bb0(%a: f32, %b: f32):
+        %s = arith.addf %a, %b : f32
+        "tt.reduce.return"(%s) : (f32) -> ()
+      }) {axis = 0 : i32} : (tensor<256xf32>) -> f32
+      %new_acc = arith.addf %acc, %chunk_sum : f32
+      scf.yield %new_acc : f32
+    }
+    tt.store %arg1, %result : !tt.ptr<f32>
+    tt.return
+  }
+}
+"""
+
+
 # ---------------------------------------------------------------------------
 # Tests
 # ---------------------------------------------------------------------------
@@ -641,3 +715,196 @@ def test_ttgir_negf_gpu(runner):
         assert abs(result[i]) < 1e-5, (
             f"[{i}] got {result[i]}, expected 0.0"
         )
+
+
+# ---------------------------------------------------------------------------
+# Softmax TTGIR tests (multi-reduce pattern)
+# ---------------------------------------------------------------------------
+
+def test_parse_softmax_detects_multi_reduce():
+    """Parser detects softmax pattern: max reduce + sum reduce."""
+    from triton_metal.codegen.ttgir_parser import TTGIRParser
+
+    parser = TTGIRParser(SOFTMAX_TTGIR, FakeOptions())
+    parser._parse_function_signature()
+    parser._parse_body()
+    assert len(parser.reduce_ops) == 2
+    ops = [r[2] for r in parser.reduce_ops]
+    assert "max" in ops
+    assert "sum" in ops
+
+
+def test_parse_softmax_routes_to_softmax_kernel():
+    """Parser routes multi-reduce (max+sum) to softmax kernel builder."""
+    from triton_metal.codegen.ttgir_parser import parse_ttgir
+
+    kb = parse_ttgir(SOFTMAX_TTGIR, FakeOptions())
+    assert kb.name == "softmax_kernel"
+    # Softmax needs SIMD qualifiers for reductions
+    assert kb._needs_simd_qualifiers
+    # Should have 2 shared memory arrays (shared_max, shared_sum)
+    tg_names = [name for name, _, _ in kb._threadgroup_arrays]
+    assert "shared_max" in tg_names
+    assert "shared_sum" in tg_names
+
+
+@requires_metal
+def test_ttgir_softmax_compiles(runner):
+    """TTGIR softmax compiles to valid MSL."""
+    from triton_metal.codegen.ttgir_parser import parse_ttgir
+
+    kb = parse_ttgir(SOFTMAX_TTGIR, FakeOptions())
+    msl = kb.build()
+    runner.compile(msl, "softmax_kernel")
+
+
+@requires_metal
+def test_ttgir_softmax_gpu(runner):
+    """TTGIR softmax: output = softmax(input), verified on GPU."""
+    from triton_metal.codegen.ttgir_parser import parse_ttgir
+
+    kb = parse_ttgir(SOFTMAX_TTGIR, FakeOptions())
+    msl = kb.build()
+    n = 256
+
+    metallib = runner.compile(msl, "softmax_kernel")
+    pipeline = runner.load(metallib, "softmax_kernel")
+
+    # Test data: a row of values
+    input_data = [float(i) * 0.1 - 12.8 for i in range(n)]
+    buf_in = runner.make_float_buffer(input_data)
+    buf_out = runner.make_empty_buffer(n)
+    buf_n = runner.make_int_buffer(n)
+
+    runner.run(pipeline, [buf_in, buf_out, buf_n], n, block_size=256)
+
+    result = runner.read_float_buffer(buf_out, n)
+
+    # Reference softmax
+    max_val = max(input_data)
+    exps = [math.exp(x - max_val) for x in input_data]
+    sum_exp = sum(exps)
+    expected = [e / sum_exp for e in exps]
+
+    for i in range(n):
+        tol = max(1e-5, abs(expected[i]) * 1e-4)
+        assert abs(result[i] - expected[i]) < tol, (
+            f"[{i}] got {result[i]}, expected {expected[i]}"
+        )
+
+    # Verify outputs sum to 1.0
+    total = sum(result)
+    assert abs(total - 1.0) < 1e-4, f"Softmax sum: {total}, expected 1.0"
+
+
+@requires_metal
+def test_ttgir_softmax_multi_row_gpu(runner):
+    """TTGIR softmax with multiple rows (one threadgroup per row)."""
+    from triton_metal.codegen.ttgir_parser import parse_ttgir
+    import random
+
+    kb = parse_ttgir(SOFTMAX_TTGIR, FakeOptions())
+    msl = kb.build()
+    n_cols = 256
+    n_rows = 4
+
+    metallib = runner.compile(msl, "softmax_kernel")
+    pipeline = runner.load(metallib, "softmax_kernel")
+
+    random.seed(42)
+    input_data = [random.gauss(0, 2) for _ in range(n_rows * n_cols)]
+    buf_in = runner.make_float_buffer(input_data)
+    buf_out = runner.make_empty_buffer(n_rows * n_cols)
+    buf_n = runner.make_int_buffer(n_cols)
+
+    # Dispatch n_rows threadgroups
+    n_groups = n_rows
+    import Metal
+    cmd = runner.queue.commandBuffer()
+    enc = cmd.computeCommandEncoder()
+    enc.setComputePipelineState_(pipeline)
+    enc.setBuffer_offset_atIndex_(buf_in, 0, 0)
+    enc.setBuffer_offset_atIndex_(buf_out, 0, 1)
+    enc.setBuffer_offset_atIndex_(buf_n, 0, 2)
+    enc.dispatchThreadgroups_threadsPerThreadgroup_(
+        Metal.MTLSizeMake(n_groups, 1, 1),
+        Metal.MTLSizeMake(256, 1, 1),
+    )
+    enc.endEncoding()
+    cmd.commit()
+    cmd.waitUntilCompleted()
+    assert cmd.status() == 4
+
+    result = runner.read_float_buffer(buf_out, n_rows * n_cols)
+
+    # Verify each row sums to 1.0 and matches reference
+    for row in range(n_rows):
+        row_in = input_data[row * n_cols:(row + 1) * n_cols]
+        row_out = result[row * n_cols:(row + 1) * n_cols]
+
+        max_val = max(row_in)
+        exps = [math.exp(x - max_val) for x in row_in]
+        sum_exp = sum(exps)
+        expected = [e / sum_exp for e in exps]
+
+        row_sum = sum(row_out)
+        assert abs(row_sum - 1.0) < 1e-3, (
+            f"Row {row}: sum={row_sum}, expected 1.0"
+        )
+
+        for i in range(n_cols):
+            tol = max(1e-5, abs(expected[i]) * 1e-3)
+            assert abs(row_out[i] - expected[i]) < tol, (
+                f"Row {row}[{i}] got {row_out[i]}, expected {expected[i]}"
+            )
+
+
+# ---------------------------------------------------------------------------
+# scf.for loop detection tests
+# ---------------------------------------------------------------------------
+
+def test_parse_scf_for_detects_loop():
+    """Parser detects scf.for loop structures in TTGIR."""
+    from triton_metal.codegen.ttgir_parser import TTGIRParser
+
+    parser = TTGIRParser(SCF_FOR_TTGIR, FakeOptions())
+    parser._parse_function_signature()
+    parser._scan_scf_for_loops()
+
+    assert len(parser.scf_for_loops) == 1
+    loop = parser.scf_for_loops[0]
+    assert loop['iv'] == 'iv'
+    assert loop['lb'] == '%c0'
+    assert loop['ub'] == '%arg2'
+    assert loop['step'] == '%c256'
+    # Should have iter_args (accumulator)
+    assert len(loop['iter_args']) == 1
+    assert loop['iter_args'][0][0] == 'acc'  # iter arg name
+    assert loop['iter_args'][0][1] == '%cst_zero'  # init value
+
+
+def test_parse_scf_for_with_reduce():
+    """Parser detects both scf.for and tt.reduce in looped reduction."""
+    from triton_metal.codegen.ttgir_parser import TTGIRParser
+
+    parser = TTGIRParser(SCF_FOR_TTGIR, FakeOptions())
+    parser._parse_function_signature()
+    parser._parse_body()
+
+    # Should find the scf.for loop
+    assert len(parser.scf_for_loops) == 1
+    # Should also find the tt.reduce inside the loop body
+    assert len(parser.reduce_ops) == 1
+    assert parser.reduce_ops[0][2] == "sum"
+
+
+def test_parse_scf_for_loop_iv_in_ssa():
+    """Loop induction variable is tracked in SSA values."""
+    from triton_metal.codegen.ttgir_parser import TTGIRParser
+
+    parser = TTGIRParser(SCF_FOR_TTGIR, FakeOptions())
+    parser._parse_function_signature()
+    parser._scan_scf_for_loops()
+
+    assert "%iv" in parser.ssa_values
+    assert parser.ssa_values["%iv"][0] == "loop_iv"

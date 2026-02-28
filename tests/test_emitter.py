@@ -876,3 +876,90 @@ def test_simdgroup_matmul_rectangular(runner):
             assert abs(result[idx] - expected[idx]) < 1e-1, (
                 f"C[{i},{j}]: got {result[idx]}, expected {expected[idx]}"
             )
+
+
+# ---------------------------------------------------------------------------
+# FP16 simdgroup_matrix matmul tests
+# ---------------------------------------------------------------------------
+
+@requires_metal
+def test_simdgroup_matmul_fp16_compiles(runner):
+    """FP16 simdgroup matmul MSL compiles."""
+    from triton_metal.codegen.msl_emitter import make_simdgroup_matmul_kernel
+
+    msl = make_simdgroup_matmul_kernel(dtype="fp16")
+    runner.compile(msl, "simdgroup_matmul")
+
+
+@requires_metal
+def test_simdgroup_matmul_fp16_32x32(runner):
+    """FP16 simdgroup matmul: half inputs, float accumulation, 32x32."""
+    from triton_metal.codegen.msl_emitter import make_simdgroup_matmul_kernel
+
+    M, N, K = 32, 32, 32
+    msl = make_simdgroup_matmul_kernel(dtype="fp16")
+    path = runner.compile(msl, "simdgroup_matmul")
+    pipeline = runner.load(path, "simdgroup_matmul")
+
+    random.seed(707)
+    A_data = [random.uniform(-1.0, 1.0) for _ in range(M * K)]
+    B_data = [random.uniform(-1.0, 1.0) for _ in range(K * N)]
+
+    # Half-precision inputs, float output
+    A_buf = runner.make_half_buffer(A_data)
+    B_buf = runner.make_half_buffer(B_data)
+    C_buf = runner.make_empty_buffer(M * N)  # float output
+    M_buf = runner.make_uint_buffer(M)
+    N_buf = runner.make_uint_buffer(N)
+    K_buf = runner.make_uint_buffer(K)
+
+    _dispatch_simdgroup_matmul(runner, pipeline,
+                               [A_buf, B_buf, C_buf, M_buf, N_buf, K_buf], M, N)
+
+    result = runner.read_float_buffer(C_buf, M * N)
+    expected = _ref_matmul(A_data, B_data, M, N, K)
+
+    for i in range(M):
+        for j in range(N):
+            idx = i * N + j
+            # FP16 inputs lose precision → wider tolerance
+            tol = max(0.1, abs(expected[idx]) * 0.05)
+            assert abs(result[idx] - expected[idx]) < tol, (
+                f"C[{i},{j}]: got {result[idx]}, expected {expected[idx]}"
+            )
+
+
+@requires_metal
+def test_simdgroup_matmul_fp16_64x64(runner):
+    """FP16 simdgroup matmul: 64x64 multi-tile."""
+    from triton_metal.codegen.msl_emitter import make_simdgroup_matmul_kernel
+
+    M, N, K = 64, 64, 64
+    msl = make_simdgroup_matmul_kernel(dtype="fp16")
+    path = runner.compile(msl, "simdgroup_matmul")
+    pipeline = runner.load(path, "simdgroup_matmul")
+
+    random.seed(808)
+    A_data = [random.uniform(-0.5, 0.5) for _ in range(M * K)]
+    B_data = [random.uniform(-0.5, 0.5) for _ in range(K * N)]
+
+    A_buf = runner.make_half_buffer(A_data)
+    B_buf = runner.make_half_buffer(B_data)
+    C_buf = runner.make_empty_buffer(M * N)
+    M_buf = runner.make_uint_buffer(M)
+    N_buf = runner.make_uint_buffer(N)
+    K_buf = runner.make_uint_buffer(K)
+
+    _dispatch_simdgroup_matmul(runner, pipeline,
+                               [A_buf, B_buf, C_buf, M_buf, N_buf, K_buf], M, N)
+
+    result = runner.read_float_buffer(C_buf, M * N)
+    expected = _ref_matmul(A_data, B_data, M, N, K)
+
+    for i in range(0, M, 4):
+        for j in range(0, N, 4):
+            idx = i * N + j
+            tol = max(0.15, abs(expected[idx]) * 0.1)
+            assert abs(result[idx] - expected[idx]) < tol, (
+                f"C[{i},{j}]: got {result[idx]}, expected {expected[idx]}"
+            )

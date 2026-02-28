@@ -116,6 +116,9 @@ class TTGIRParser:
         # Reduction tracking
         self.reduce_ops = []  # [(result_ssa, input_ssa, op_kind, axis)]
 
+        # Loop tracking
+        self.scf_for_loops = []  # [(lb_ssa, ub_ssa, step_ssa, body_lines)]
+
         # Operation buffer for the kernel builder
         self.ops = []
 
@@ -167,6 +170,52 @@ class TTGIRParser:
                 dtype = _mlir_type_to_triton_dtype(elem_type)
                 self.scalar_args[arg_name] = (i, dtype)
 
+    def _scan_scf_for_loops(self):
+        """Scan for scf.for loop blocks in the IR text.
+
+        scf.for has the form:
+            %result = scf.for %iv = %lb to %ub step %step
+                      iter_args(%acc = %init) -> (type) {
+              ...body...
+              scf.yield %new_acc : type
+            }
+        or without iter_args:
+            scf.for %iv = %lb to %ub step %step {
+              ...body...
+            }
+        """
+        # Match scf.for with iter_args
+        loop_pattern = re.compile(
+            r'(?:%(\w+)(?::\d+)?\s*=\s*)?'  # optional result SSA
+            r'scf\.for\s+%(\w+)\s*=\s*(%\w+)\s+to\s+(%\w+)\s+step\s+(%\w+)'
+            r'(?:\s+iter_args\(([^)]*)\))?'  # optional iter_args
+        )
+        for m in loop_pattern.finditer(self.ir_text):
+            result_ssa = f"%{m.group(1)}" if m.group(1) else None
+            iv_name = m.group(2)
+            lb_ssa = m.group(3)
+            ub_ssa = m.group(4)
+            step_ssa = m.group(5)
+            iter_args_str = m.group(6)
+
+            # Parse iter_args if present
+            iter_args = []
+            if iter_args_str:
+                for ia_match in re.finditer(r'%(\w+)\s*=\s*(%\w+)', iter_args_str):
+                    iter_args.append((ia_match.group(1), ia_match.group(2)))
+
+            self.scf_for_loops.append({
+                'result_ssa': result_ssa,
+                'iv': iv_name,
+                'lb': lb_ssa,
+                'ub': ub_ssa,
+                'step': step_ssa,
+                'iter_args': iter_args,
+            })
+
+            # Record the loop variable in SSA tracking
+            self.ssa_values[f"%{iv_name}"] = ("loop_iv", lb_ssa, ub_ssa, step_ssa)
+
     def _scan_reductions(self):
         """Scan for tt.reduce multi-line blocks in the IR text.
 
@@ -205,7 +254,8 @@ class TTGIRParser:
 
     def _parse_body(self):
         """Walk through the body and classify operations."""
-        # First scan for multi-line reduce blocks
+        # First scan for multi-line blocks (reduce, scf.for)
+        self._scan_scf_for_loops()
         self._scan_reductions()
 
         for line in self.lines:
@@ -490,7 +540,9 @@ class TTGIRParser:
         for arg_name in self.scalar_args:
             n_arg = arg_name
 
-        # Check if this is a reduction kernel
+        # Check if this is a multi-reduce pattern (softmax) or single reduction
+        if len(self.reduce_ops) >= 2 and self._is_softmax_pattern():
+            return self._build_softmax_kernel(kb, n_arg, primary_dtype)
         if self.reduce_ops:
             return self._build_reduction_kernel(kb, n_arg, primary_dtype)
 
@@ -589,6 +641,91 @@ class TTGIRParser:
         kb.begin_if("lid == 0")
         kb.raw_line(f"{output_arg}[pid] = total;")
         kb.end_block()
+
+        return kb
+
+    def _is_softmax_pattern(self):
+        """Check if multi-reduce pattern matches softmax (max + sum)."""
+        if len(self.reduce_ops) < 2:
+            return False
+        ops = [r[2] for r in self.reduce_ops]
+        return "max" in ops and "sum" in ops
+
+    def _build_softmax_kernel(self, kb, n_arg, primary_dtype):
+        """Generate a fused row-wise softmax kernel.
+
+        Detected from 2 tt.reduce ops (max then sum) with exp in between.
+        Each threadgroup processes one row:
+        1. Find max(row)
+        2. Compute exp(x - max)
+        3. Sum the exponentials
+        4. Divide each by the sum
+        """
+        n_simd_groups = (kb.block_size + 31) // 32
+
+        # Find input and output pointers
+        input_arg = None
+        output_arg = None
+        for arg_name, (idx, dtype, is_output) in self.ptr_args.items():
+            if not is_output and input_arg is None:
+                input_arg = arg_name
+            if is_output:
+                output_arg = arg_name
+
+        if not input_arg or not output_arg or not n_arg:
+            return kb
+
+        # Shared memory for reductions
+        kb.declare_threadgroup_array("shared_max", dtype=primary_dtype, size=n_simd_groups)
+        kb.declare_threadgroup_array("shared_sum", dtype=primary_dtype, size=n_simd_groups)
+
+        # Row base pointer: each threadgroup handles one row
+        kb._var("row_start", f"pid * {n_arg}", ty="uint")
+
+        # Pass 1: Find row max (strided accumulation)
+        kb._var("local_max", "-INFINITY", ty="float")
+        kb.raw_line(f"for (uint i = lid; i < {n_arg}; i += {kb.block_size}u) {{")
+        kb.indent()
+        kb.raw_line(f"local_max = max(local_max, {input_arg}[row_start + i]);")
+        kb.dedent()
+        kb.raw_line("}")
+
+        # Reduce max across threadgroup
+        kb.threadgroup_reduce("max", "local_max", "shared_max", "row_max")
+
+        # Broadcast row_max to all threads via shared memory
+        kb.begin_if("lid == 0")
+        kb.raw_line("shared_max[0] = row_max;")
+        kb.end_block()
+        kb.barrier("threadgroup")
+        kb._var("max_val", "shared_max[0]", ty="float")
+
+        # Pass 2: Compute exp(x - max) and accumulate sum
+        kb._var("local_sum", "0.0f", ty="float")
+        kb.raw_line(f"for (uint i = lid; i < {n_arg}; i += {kb.block_size}u) {{")
+        kb.indent()
+        kb._var("e", f"exp({input_arg}[row_start + i] - max_val)", ty="float")
+        kb.raw_line(f"{output_arg}[row_start + i] = e;")
+        kb.raw_line("local_sum += e;")
+        kb.dedent()
+        kb.raw_line("}")
+
+        # Reduce sum across threadgroup
+        kb.threadgroup_reduce("sum", "local_sum", "shared_sum", "row_sum")
+
+        # Broadcast row_sum
+        kb.begin_if("lid == 0")
+        kb.raw_line("shared_sum[0] = row_sum;")
+        kb.end_block()
+        kb.barrier("threadgroup")
+        kb._var("sum_val", "shared_sum[0]", ty="float")
+
+        # Pass 3: Normalize
+        kb.raw_line(f"for (uint i = lid; i < {n_arg}; i += {kb.block_size}u) {{")
+        kb.indent()
+        kb.raw_line(f"{output_arg}[row_start + i] /= sum_val;")
+        kb.dedent()
+        kb.raw_line("}")
 
         return kb
 
@@ -716,6 +853,10 @@ class TTGIRParser:
         # Reduce — the result is computed in _build_reduction_kernel
         if op == "reduce":
             return "total"
+
+        # Loop induction variable
+        if op == "loop_iv":
+            return ssa.lstrip("%")
 
         return "0.0f"
 

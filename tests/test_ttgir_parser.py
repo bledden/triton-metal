@@ -2751,3 +2751,74 @@ def test_ttgir_group_norm_compiles(runner):
     msl = kb.build()
     assert "group_norm" in msl.lower() or "norm" in msl.lower()
     runner.compile(msl, "group_norm_kernel")
+
+
+# ---------------------------------------------------------------------------
+# Dropout TTGIR pattern
+# ---------------------------------------------------------------------------
+
+# Dropout: output = select(random > threshold, input * scale, 0)
+DROPOUT_TTGIR = """
+module {
+  tt.func public @dropout_kernel(%arg0: !tt.ptr<f32> {tt.divisibility = 16 : i32},
+                                  %arg1: !tt.ptr<f32> {tt.divisibility = 16 : i32},
+                                  %arg2: !tt.ptr<f32> {tt.divisibility = 16 : i32, tt.output},
+                                  %arg3: i32) {
+    %0 = tt.get_program_id x : i32
+    %c256 = arith.constant 256 : i32
+    %1 = arith.muli %0, %c256 : i32
+    %2 = tt.make_range {end = 256 : i32, start = 0 : i32}
+    %3 = tt.splat %1
+    %4 = arith.addi %3, %2
+    %5 = tt.splat %arg3
+    %6 = arith.cmpi slt, %4, %5
+    %7 = tt.addptr %arg0, %4
+    %8 = tt.load %7, %6
+    %9 = tt.addptr %arg1, %4
+    %10 = tt.load %9, %6
+    %cp = arith.constant 0.5 : f32
+    %11 = tt.splat %cp
+    %12 = arith.cmpf ogt, %10, %11
+    %cscale = arith.constant 2.0 : f32
+    %13 = tt.splat %cscale
+    %14 = arith.mulf %8, %13
+    %c0 = arith.constant 0.0 : f32
+    %15 = tt.splat %c0
+    %16 = arith.select %12, %14, %15
+    %17 = tt.addptr %arg2, %4
+    tt.store %17, %16, %6
+    tt.return
+  }
+}
+"""
+
+def test_ttgir_dropout_detected():
+    """TTGIR dropout pattern is detected (2 inputs + cmp + select + mul)."""
+    from triton_metal.codegen.ttgir_parser import TTGIRParser
+    parser = TTGIRParser(DROPOUT_TTGIR, FakeOptions())
+    parser._parse_function_signature()
+    parser._parse_body()
+    parser._classify_stores()
+    assert parser._is_dropout_pattern()
+
+
+def test_ttgir_dropout_not_confused_with_activation():
+    """Dropout (2 input ptrs) is not confused with activation (1 input ptr)."""
+    from triton_metal.codegen.ttgir_parser import TTGIRParser
+    parser = TTGIRParser(DROPOUT_TTGIR, FakeOptions())
+    parser._parse_function_signature()
+    parser._parse_body()
+    parser._classify_stores()
+    assert parser._is_dropout_pattern()
+    assert parser._classify_activation() is None
+
+
+@requires_metal
+def test_ttgir_dropout_compiles(runner):
+    """TTGIR dropout pattern compiles to valid MSL."""
+    from triton_metal.codegen.ttgir_parser import parse_ttgir
+
+    kb = parse_ttgir(DROPOUT_TTGIR, FakeOptions())
+    msl = kb.build()
+    assert "dropout" in msl.lower() or "mask" in msl.lower()
+    runner.compile(msl, "fused_dropout_kernel")

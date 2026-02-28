@@ -4065,6 +4065,122 @@ def make_group_norm_kernel(n_groups=32, block_size=256, dtype="fp32", eps=1e-5):
     return kb.build()
 
 
+def make_gather_kernel(block_size=256, dtype="fp32"):
+    """Generate a gather kernel: output[i] = input[indices[i]].
+
+    Supports arbitrary indexed reads (embedding lookup, KV-cache gather).
+
+    Args:
+        block_size: Threads per threadgroup.
+        dtype: Data type.
+    """
+    msl_ty = triton_type_to_msl(dtype)
+    compute_ty = _msl_compute_type(dtype)
+    kb = KernelBuilder("gather_kernel", block_size=block_size)
+    msl = f"""#include <metal_stdlib>
+using namespace metal;
+
+kernel void gather_kernel(
+    device const {msl_ty}* input [[buffer(0)]],
+    device const int* indices [[buffer(1)]],
+    device {msl_ty}* output [[buffer(2)]],
+    constant uint& n_elements [[buffer(3)]],
+    uint gid [[thread_position_in_grid]]
+) {{
+    if (gid >= n_elements) return;
+    int idx = indices[gid];
+    output[gid] = input[idx];
+}}
+"""
+    kb.set_prebuilt_msl(msl)
+    return kb.build()
+
+
+def make_scatter_kernel(block_size=256, dtype="fp32"):
+    """Generate a scatter kernel: output[indices[i]] = input[i].
+
+    Atomic-free version (assumes no duplicate indices).
+
+    Args:
+        block_size: Threads per threadgroup.
+        dtype: Data type.
+    """
+    msl_ty = triton_type_to_msl(dtype)
+    kb = KernelBuilder("scatter_kernel", block_size=block_size)
+    msl = f"""#include <metal_stdlib>
+using namespace metal;
+
+kernel void scatter_kernel(
+    device const {msl_ty}* input [[buffer(0)]],
+    device const int* indices [[buffer(1)]],
+    device {msl_ty}* output [[buffer(2)]],
+    constant uint& n_elements [[buffer(3)]],
+    uint gid [[thread_position_in_grid]]
+) {{
+    if (gid >= n_elements) return;
+    int idx = indices[gid];
+    output[idx] = input[gid];
+}}
+"""
+    kb.set_prebuilt_msl(msl)
+    return kb.build()
+
+
+def make_transpose_kernel(block_size=256, tile_size=16, dtype="fp32"):
+    """Generate a 2D matrix transpose kernel with threadgroup memory.
+
+    Uses tiled transpose with shared memory for coalesced reads and writes.
+    Each threadgroup handles a TILE_SIZE x TILE_SIZE tile.
+
+    Args:
+        block_size: Threads per threadgroup (should be tile_size * tile_size).
+        tile_size: Tile dimension (16 for 16x16 tiles).
+        dtype: Data type.
+    """
+    msl_ty = triton_type_to_msl(dtype)
+    actual_block = tile_size * tile_size
+    # Pad shared memory to avoid bank conflicts
+    pad = 1
+
+    kb = KernelBuilder("transpose_kernel", block_size=actual_block)
+    msl = f"""#include <metal_stdlib>
+using namespace metal;
+
+kernel void transpose_kernel(
+    device const {msl_ty}* input [[buffer(0)]],
+    device {msl_ty}* output [[buffer(1)]],
+    constant uint& rows [[buffer(2)]],
+    constant uint& cols [[buffer(3)]],
+    uint2 gid [[threadgroup_position_in_grid]],
+    uint lid [[thread_index_in_threadgroup]]
+) {{
+    const uint TILE = {tile_size}u;
+    threadgroup {msl_ty} tile[{tile_size}][{tile_size + pad}];
+
+    uint tx = lid % TILE;
+    uint ty = lid / TILE;
+
+    // Read tile (coalesced along cols)
+    uint read_row = gid.y * TILE + ty;
+    uint read_col = gid.x * TILE + tx;
+    if (read_row < rows && read_col < cols) {{
+        tile[ty][tx] = input[read_row * cols + read_col];
+    }}
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Write transposed tile (coalesced along rows of output = cols of input)
+    uint write_row = gid.x * TILE + ty;
+    uint write_col = gid.y * TILE + tx;
+    if (write_row < cols && write_col < rows) {{
+        output[write_row * rows + write_col] = tile[tx][ty];
+    }}
+}}
+"""
+    kb.set_prebuilt_msl(msl)
+    return kb.build()
+
+
 def make_fused_linear_kernel(has_bias=True):
     """Generate a fused linear layer kernel: output = input @ weight^T + bias.
 

@@ -663,6 +663,10 @@ class TTGIRParser:
         if self._is_top_k_pattern():
             return self._build_top_k_kernel(kb, primary_dtype)
 
+        # Dropout: 2 input ptrs + mask/select + mul, no reductions, 1 output
+        if self._is_dropout_pattern():
+            return self._build_dropout_kernel(kb, primary_dtype)
+
         # Batch normalization (eval): 4+ input ptrs, sub+mul, no reductions
         if self._is_batch_norm_pattern():
             return self._build_batch_norm_kernel(kb, primary_dtype)
@@ -1415,6 +1419,33 @@ class TTGIRParser:
         """Generate a group norm kernel from the pattern."""
         from triton_metal.codegen.msl_emitter import make_group_norm_kernel
         kb.set_prebuilt_msl(make_group_norm_kernel())
+        return kb
+
+    def _is_dropout_pattern(self):
+        """Check if IR matches a dropout pattern.
+
+        Dropout has:
+        - 2 input pointers (data, random_mask/threshold)
+        - 1 output pointer
+        - Comparison (mask) + select + mul operations
+        - No reductions, no dot ops
+        """
+        if self.reduce_ops or self.dot_ops:
+            return False
+        n_inputs = sum(1 for _, (_, _, is_out) in self.ptr_args.items() if not is_out)
+        n_outputs = sum(1 for _, (_, _, is_out) in self.ptr_args.items() if is_out)
+        if n_inputs != 2 or n_outputs != 1:
+            return False
+        ssa_ops = {v[0] for v in self.ssa_values.values()}
+        has_cmp = "mask" in ssa_ops
+        has_select = "select" in ssa_ops
+        has_mul = "mul" in ssa_ops
+        return has_cmp and has_select and has_mul
+
+    def _build_dropout_kernel(self, kb, primary_dtype):
+        """Generate a dropout kernel from the pattern."""
+        from triton_metal.codegen.msl_emitter import make_fused_dropout_kernel
+        kb.set_prebuilt_msl(make_fused_dropout_kernel())
         return kb
 
     def _is_batch_norm_pattern(self):

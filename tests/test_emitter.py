@@ -4902,3 +4902,170 @@ def test_matmul_fp16_identity(runner):
             actual = result[row * N + col]
             assert abs(actual - expected) < 0.5, \
                 f"C[{row},{col}] = {actual}, expected {expected}"
+
+
+# ---------------------------------------------------------------------------
+# Gather kernel tests
+# ---------------------------------------------------------------------------
+
+@requires_metal
+def test_gather_kernel(runner):
+    """Gather kernel reads from indexed positions."""
+    from triton_metal.codegen.msl_emitter import make_gather_kernel
+    import Metal
+    import struct
+
+    n = 4
+    data = [10.0, 20.0, 30.0, 40.0, 50.0]
+    indices = [4, 0, 2, 1]
+
+    msl = make_gather_kernel(block_size=256)
+    path = runner.compile(msl, "gather_kernel")
+    pipeline = runner.load(path, "gather_kernel")
+
+    inp_buf = runner.make_float_buffer(data)
+    # Make int buffer for indices
+    idx_buf = runner.device.newBufferWithLength_options_(
+        len(indices) * 4, Metal.MTLResourceStorageModeShared
+    )
+    view = idx_buf.contents().as_buffer(len(indices) * 4)
+    for i, idx in enumerate(indices):
+        struct.pack_into("i", view, i * 4, idx)
+    out_buf = runner.make_empty_buffer(n)
+    n_buf = runner.make_uint_buffer(n)
+
+    cmd = runner.queue.commandBuffer()
+    enc = cmd.computeCommandEncoderWithDescriptor_(
+        Metal.MTLComputePassDescriptor.computePassDescriptor()
+    )
+    enc.setComputePipelineState_(pipeline)
+    enc.setBuffer_offset_atIndex_(inp_buf, 0, 0)
+    enc.setBuffer_offset_atIndex_(idx_buf, 0, 1)
+    enc.setBuffer_offset_atIndex_(out_buf, 0, 2)
+    enc.setBuffer_offset_atIndex_(n_buf, 0, 3)
+    enc.dispatchThreadgroups_threadsPerThreadgroup_(
+        Metal.MTLSizeMake(1, 1, 1),
+        Metal.MTLSizeMake(256, 1, 1),
+    )
+    enc.endEncoding()
+    cmd.commit()
+    cmd.waitUntilCompleted()
+    assert cmd.status() == 4
+
+    result = runner.read_float_buffer(out_buf, n)
+    expected = [data[i] for i in indices]
+    for i in range(n):
+        assert abs(result[i] - expected[i]) < 0.01, f"i={i}: {result[i]} != {expected[i]}"
+
+
+# ---------------------------------------------------------------------------
+# Scatter kernel tests
+# ---------------------------------------------------------------------------
+
+@requires_metal
+def test_scatter_kernel(runner):
+    """Scatter kernel writes to indexed positions."""
+    from triton_metal.codegen.msl_emitter import make_scatter_kernel
+    import Metal
+    import struct
+
+    n = 4
+    data = [100.0, 200.0, 300.0, 400.0]
+    indices = [3, 1, 0, 2]
+
+    msl = make_scatter_kernel(block_size=256)
+    path = runner.compile(msl, "scatter_kernel")
+    pipeline = runner.load(path, "scatter_kernel")
+
+    inp_buf = runner.make_float_buffer(data)
+    idx_buf = runner.device.newBufferWithLength_options_(
+        len(indices) * 4, Metal.MTLResourceStorageModeShared
+    )
+    view = idx_buf.contents().as_buffer(len(indices) * 4)
+    for i, idx in enumerate(indices):
+        struct.pack_into("i", view, i * 4, idx)
+    out_buf = runner.make_empty_buffer(n)
+    n_buf = runner.make_uint_buffer(n)
+
+    cmd = runner.queue.commandBuffer()
+    enc = cmd.computeCommandEncoderWithDescriptor_(
+        Metal.MTLComputePassDescriptor.computePassDescriptor()
+    )
+    enc.setComputePipelineState_(pipeline)
+    enc.setBuffer_offset_atIndex_(inp_buf, 0, 0)
+    enc.setBuffer_offset_atIndex_(idx_buf, 0, 1)
+    enc.setBuffer_offset_atIndex_(out_buf, 0, 2)
+    enc.setBuffer_offset_atIndex_(n_buf, 0, 3)
+    enc.dispatchThreadgroups_threadsPerThreadgroup_(
+        Metal.MTLSizeMake(1, 1, 1),
+        Metal.MTLSizeMake(256, 1, 1),
+    )
+    enc.endEncoding()
+    cmd.commit()
+    cmd.waitUntilCompleted()
+    assert cmd.status() == 4
+
+    result = runner.read_float_buffer(out_buf, n)
+    # output[indices[i]] = data[i], so output[3]=100, output[1]=200, output[0]=300, output[2]=400
+    expected = [0.0] * n
+    for i in range(n):
+        expected[indices[i]] = data[i]
+    for i in range(n):
+        assert abs(result[i] - expected[i]) < 0.01, f"i={i}: {result[i]} != {expected[i]}"
+
+
+# ---------------------------------------------------------------------------
+# Transpose kernel tests
+# ---------------------------------------------------------------------------
+
+@requires_metal
+def test_transpose_kernel(runner):
+    """Transpose kernel correctly transposes a small matrix."""
+    from triton_metal.codegen.msl_emitter import make_transpose_kernel
+    import Metal
+
+    rows, cols = 4, 8
+    n = rows * cols
+    tile_size = 16
+
+    msl = make_transpose_kernel(tile_size=tile_size)
+    path = runner.compile(msl, "transpose_kernel")
+    pipeline = runner.load(path, "transpose_kernel")
+
+    # Input: row-major matrix where element = row * cols + col
+    data = [float(i) for i in range(n)]
+    inp_buf = runner.make_float_buffer(data)
+    out_buf = runner.make_empty_buffer(n)
+    rows_buf = runner.make_uint_buffer(rows)
+    cols_buf = runner.make_uint_buffer(cols)
+
+    n_tiles_x = (cols + tile_size - 1) // tile_size
+    n_tiles_y = (rows + tile_size - 1) // tile_size
+
+    cmd = runner.queue.commandBuffer()
+    enc = cmd.computeCommandEncoderWithDescriptor_(
+        Metal.MTLComputePassDescriptor.computePassDescriptor()
+    )
+    enc.setComputePipelineState_(pipeline)
+    enc.setBuffer_offset_atIndex_(inp_buf, 0, 0)
+    enc.setBuffer_offset_atIndex_(out_buf, 0, 1)
+    enc.setBuffer_offset_atIndex_(rows_buf, 0, 2)
+    enc.setBuffer_offset_atIndex_(cols_buf, 0, 3)
+    enc.dispatchThreadgroups_threadsPerThreadgroup_(
+        Metal.MTLSizeMake(n_tiles_x, n_tiles_y, 1),
+        Metal.MTLSizeMake(tile_size * tile_size, 1, 1),
+    )
+    enc.endEncoding()
+    cmd.commit()
+    cmd.waitUntilCompleted()
+    assert cmd.status() == 4
+
+    result = runner.read_float_buffer(out_buf, n)
+
+    # Verify: output[col * rows + row] should equal input[row * cols + col]
+    for r in range(rows):
+        for c in range(cols):
+            expected = data[r * cols + c]
+            actual = result[c * rows + r]
+            assert abs(actual - expected) < 0.01, \
+                f"T[{c},{r}] = {actual}, expected {expected} (from [{r},{c}])"

@@ -3369,3 +3369,157 @@ def test_ttgir_repeat_kv_compiles(runner):
     msl = kb.build()
     assert "repeat" in msl.lower() or "kv" in msl.lower()
     runner.compile(msl, "repeat_kv")
+
+
+# ---------------------------------------------------------------------------
+# Where (ternary select) TTGIR pattern
+# ---------------------------------------------------------------------------
+
+WHERE_TTGIR = """\
+module {
+  tt.func public @where_kernel(%cond: !tt.ptr<i32>, %x: !tt.ptr<f32>, %y: !tt.ptr<f32>, %output: !tt.ptr<f32>, %n_elements: i32) {
+    %0 = tt.get_program_id x : i32
+    %c256_i32 = arith.constant 256 : i32
+    %1 = arith.muli %0, %c256_i32 : i32
+    %2 = tt.make_range {start = 0 : i32, end = 256 : i32} : tensor<256xi32>
+    %3 = tt.splat %1 : i32 -> tensor<256xi32>
+    %4 = arith.addi %3, %2 : tensor<256xi32>
+    %5 = tt.splat %n_elements : i32 -> tensor<256xi32>
+    %mask = arith.cmpi slt, %4, %5 : tensor<256xi32>
+    %cond_ptr = tt.addptr %cond, %4 : !tt.ptr<i32>, tensor<256xi32>
+    %x_ptr = tt.addptr %x, %4 : !tt.ptr<f32>, tensor<256xi32>
+    %y_ptr = tt.addptr %y, %4 : !tt.ptr<f32>, tensor<256xi32>
+    %cond_val = tt.load %cond_ptr, %mask : !tt.ptr<i32>
+    %x_val = tt.load %x_ptr, %mask : !tt.ptr<f32>
+    %y_val = tt.load %y_ptr, %mask : !tt.ptr<f32>
+    %zero = arith.constant 0 : i32
+    %cond_bool = arith.cmpi sgt, %cond_val, %zero : tensor<256xi32>
+    %result = arith.select %cond_bool, %x_val, %y_val : tensor<256xf32>
+    %out_ptr = tt.addptr %output, %4 : !tt.ptr<f32>, tensor<256xi32>
+    tt.store %out_ptr, %result, %mask : !tt.ptr<f32>
+    tt.return
+  }
+}
+"""
+
+
+def test_ttgir_where_detected():
+    """TTGIR where pattern is detected (3 inputs, 1 output, select op)."""
+    from triton_metal.codegen.ttgir_parser import TTGIRParser
+    parser = TTGIRParser(WHERE_TTGIR, FakeOptions())
+    parser._parse_function_signature()
+    parser._parse_body()
+    parser._classify_stores()
+    assert parser._is_where_pattern()
+
+
+@requires_metal
+def test_ttgir_where_compiles(runner):
+    """TTGIR where pattern compiles to valid MSL."""
+    from triton_metal.codegen.ttgir_parser import parse_ttgir
+
+    kb = parse_ttgir(WHERE_TTGIR, FakeOptions())
+    msl = kb.build()
+    assert "where" in msl.lower()
+    runner.compile(msl, "where")
+
+
+# ---------------------------------------------------------------------------
+# Clamp TTGIR pattern
+# ---------------------------------------------------------------------------
+
+CLAMP_TTGIR = """\
+module {
+  tt.func public @clamp_kernel(%input: !tt.ptr<f32>, %output: !tt.ptr<f32>, %min_val: f32, %max_val: f32, %n_elements: i32) {
+    %0 = tt.get_program_id x : i32
+    %c256_i32 = arith.constant 256 : i32
+    %1 = arith.muli %0, %c256_i32 : i32
+    %2 = tt.make_range {start = 0 : i32, end = 256 : i32} : tensor<256xi32>
+    %3 = tt.splat %1 : i32 -> tensor<256xi32>
+    %4 = arith.addi %3, %2 : tensor<256xi32>
+    %5 = tt.splat %n_elements : i32 -> tensor<256xi32>
+    %mask = arith.cmpi slt, %4, %5 : tensor<256xi32>
+    %in_ptr = tt.addptr %input, %4 : !tt.ptr<f32>, tensor<256xi32>
+    %val = tt.load %in_ptr, %mask : !tt.ptr<f32>
+    %min_splat = tt.splat %min_val : f32 -> tensor<256xf32>
+    %max_splat = tt.splat %max_val : f32 -> tensor<256xf32>
+    %clamped_lo = arith.maxf %val, %min_splat : tensor<256xf32>
+    %clamped = arith.minf %clamped_lo, %max_splat : tensor<256xf32>
+    %out_ptr = tt.addptr %output, %4 : !tt.ptr<f32>, tensor<256xi32>
+    tt.store %out_ptr, %clamped, %mask : !tt.ptr<f32>
+    tt.return
+  }
+}
+"""
+
+
+def test_ttgir_clamp_detected():
+    """TTGIR clamp pattern is detected (1 in, 1 out, max+min ops)."""
+    from triton_metal.codegen.ttgir_parser import TTGIRParser
+    parser = TTGIRParser(CLAMP_TTGIR, FakeOptions())
+    parser._parse_function_signature()
+    parser._parse_body()
+    parser._classify_stores()
+    assert parser._is_clamp_pattern()
+
+
+@requires_metal
+def test_ttgir_clamp_compiles(runner):
+    """TTGIR clamp pattern compiles to valid MSL."""
+    from triton_metal.codegen.ttgir_parser import parse_ttgir
+
+    kb = parse_ttgir(CLAMP_TTGIR, FakeOptions())
+    msl = kb.build()
+    assert "clamp" in msl.lower()
+    runner.compile(msl, "clamp")
+
+
+# ---------------------------------------------------------------------------
+# Cumsum TTGIR pattern
+# ---------------------------------------------------------------------------
+
+CUMSUM_TTGIR = """\
+module {
+  tt.func public @cumsum_kernel(%input: !tt.ptr<f32>, %output: !tt.ptr<f32>, %n_cols: i32) {
+    %0 = tt.get_program_id x : i32
+    %c256_i32 = arith.constant 256 : i32
+    %1 = arith.muli %0, %c256_i32 : i32
+    %c0 = arith.constant 0 : index
+    %c1 = arith.constant 1 : index
+    %n_idx = arith.index_cast %n_cols : i32 to index
+    %acc_init = arith.constant 0.0 : f32
+    %acc = scf.for %iv = %c0 to %n_idx step %c1 iter_args(%running = %acc_init) -> (f32) {
+      %col = arith.index_cast %iv : index to i32
+      %idx = arith.addi %1, %col : i32
+      %in_ptr = tt.addptr %input, %idx : !tt.ptr<f32>, i32
+      %val = tt.load %in_ptr : !tt.ptr<f32>
+      %new_running = arith.addf %running, %val : f32
+      %out_ptr = tt.addptr %output, %idx : !tt.ptr<f32>, i32
+      tt.store %out_ptr, %new_running : !tt.ptr<f32>
+      scf.yield %new_running : f32
+    }
+    tt.return
+  }
+}
+"""
+
+
+def test_ttgir_cumsum_detected():
+    """TTGIR cumsum pattern is detected (scf.for with addf, 1 in, 1 out)."""
+    from triton_metal.codegen.ttgir_parser import TTGIRParser
+    parser = TTGIRParser(CUMSUM_TTGIR, FakeOptions())
+    parser._parse_function_signature()
+    parser._parse_body()
+    parser._classify_stores()
+    assert parser._is_cumsum_pattern()
+
+
+@requires_metal
+def test_ttgir_cumsum_compiles(runner):
+    """TTGIR cumsum pattern compiles to valid MSL."""
+    from triton_metal.codegen.ttgir_parser import parse_ttgir
+
+    kb = parse_ttgir(CUMSUM_TTGIR, FakeOptions())
+    msl = kb.build()
+    assert "cumsum" in msl.lower()
+    runner.compile(msl, "cumsum")

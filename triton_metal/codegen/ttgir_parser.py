@@ -713,6 +713,18 @@ class TTGIRParser:
         if self._is_repeat_kv_pattern():
             return self._build_repeat_kv_kernel(kb, primary_dtype)
 
+        # Where (ternary select): 3 input ptrs (cond, x, y), 1 output, select op
+        if self._is_where_pattern():
+            return self._build_where_kernel(kb, primary_dtype)
+
+        # Clamp: 1 input ptr, 1 output, 2 scalar args (min, max), maxf+minf ops
+        if self._is_clamp_pattern():
+            return self._build_clamp_kernel(kb, primary_dtype)
+
+        # Cumsum: scf.for with sequential add, 1 input, 1 output
+        if self._is_cumsum_pattern():
+            return self._build_cumsum_kernel(kb, primary_dtype)
+
         # Activation functions: tanh, sigmoid, elu, leaky_relu, hardswish
         act = self._classify_activation()
         if act:
@@ -1729,6 +1741,99 @@ class TTGIRParser:
         """Generate a repeat-KV kernel from the pattern."""
         from triton_metal.codegen.msl_emitter import make_repeat_kv_kernel
         kb.set_prebuilt_msl(make_repeat_kv_kernel())
+        return kb
+
+    def _is_where_pattern(self):
+        """Check if IR matches a where (ternary select) pattern.
+
+        Where has:
+        - 3 input pointers (condition, x, y) or 2+ input ptrs with select op
+        - 1 output pointer
+        - select op present in SSA values
+        - No reductions, no dot ops
+        """
+        if self.reduce_ops or self.dot_ops:
+            return False
+        n_inputs = sum(1 for _, (_, _, is_out) in self.ptr_args.items() if not is_out)
+        n_outputs = sum(1 for _, (_, _, is_out) in self.ptr_args.items() if is_out)
+        if n_outputs != 1 or n_inputs < 2:
+            return False
+        ssa_ops = {v[0] for v in self.ssa_values.values()}
+        has_select = "select" in ssa_ops
+        # Must have select and no complex math ops (distinguishes from dropout)
+        math_ops = {"exp", "log", "sqrt", "rsqrt", "tanh", "sin", "cos"}
+        has_math = bool(ssa_ops & math_ops)
+        # Where specifically uses select as the primary operation
+        # Dropout also has select, but dropout has mul (scaling by 1/p)
+        has_mul = "mul" in ssa_ops
+        return has_select and not has_math and n_inputs >= 3
+
+    def _build_where_kernel(self, kb, primary_dtype):
+        """Generate a where kernel from the pattern."""
+        from triton_metal.codegen.msl_emitter import make_where_kernel
+        kb.set_prebuilt_msl(make_where_kernel(dtype=primary_dtype))
+        return kb
+
+    def _is_clamp_pattern(self):
+        """Check if IR matches a clamp (min+max) pattern.
+
+        Clamp has:
+        - 1 input pointer, 1 output pointer
+        - 2+ scalar args (min_val, max_val, n_elements)
+        - max and min operations (parsed as fmax/fmin, maxf/minf, maxnumf/minnumf)
+        - No reductions, no dot ops
+        """
+        if self.reduce_ops or self.dot_ops:
+            return False
+        n_inputs = sum(1 for _, (_, _, is_out) in self.ptr_args.items() if not is_out)
+        n_outputs = sum(1 for _, (_, _, is_out) in self.ptr_args.items() if is_out)
+        if n_inputs != 1 or n_outputs != 1:
+            return False
+        if len(self.scalar_args) < 2:
+            return False
+        ssa_ops = {v[0] for v in self.ssa_values.values()}
+        max_ops = {"max", "maxf", "fmax", "maxnumf", "maxnf"}
+        min_ops = {"min", "minf", "fmin", "minnumf", "minnf"}
+        has_max = bool(ssa_ops & max_ops)
+        has_min = bool(ssa_ops & min_ops)
+        return has_max and has_min
+
+    def _build_clamp_kernel(self, kb, primary_dtype):
+        """Generate a clamp kernel from the pattern."""
+        from triton_metal.codegen.msl_emitter import make_clamp_kernel
+        kb.set_prebuilt_msl(make_clamp_kernel(dtype=primary_dtype))
+        return kb
+
+    def _is_cumsum_pattern(self):
+        """Check if IR matches a cumulative sum (prefix scan) pattern.
+
+        Cumsum has:
+        - 1 input pointer, 1 output pointer
+        - scf.for loop with iter_args (sequential dependency via addf)
+        - No reductions (those use tt.reduce, not sequential accumulation)
+        - No dot ops
+        """
+        if self.reduce_ops or self.dot_ops:
+            return False
+        if not self.scf_for_loops:
+            return False
+        n_inputs = sum(1 for _, (_, _, is_out) in self.ptr_args.items() if not is_out)
+        n_outputs = sum(1 for _, (_, _, is_out) in self.ptr_args.items() if is_out)
+        if n_inputs != 1 or n_outputs != 1:
+            return False
+        # Check that a loop has iter_args (sequential dependency)
+        for loop_info in self.scf_for_loops:
+            if loop_info.get('iter_args'):
+                # The loop has a running accumulator — likely cumsum
+                # Also verify arith.addf appears in the IR near this loop
+                if "arith.addf" in self.ir_text:
+                    return True
+        return False
+
+    def _build_cumsum_kernel(self, kb, primary_dtype):
+        """Generate a cumsum kernel from the pattern."""
+        from triton_metal.codegen.msl_emitter import make_cumsum_kernel
+        kb.set_prebuilt_msl(make_cumsum_kernel(dtype=primary_dtype))
         return kb
 
     def _is_gather_pattern(self):

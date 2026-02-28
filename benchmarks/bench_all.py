@@ -40,6 +40,16 @@ from triton_metal.codegen.msl_emitter import (
     make_top_k_kernel,
     make_kv_cache_attention_kernel,
     make_residual_add_kernel,
+    make_embedding_kernel,
+    make_scalar_mul_kernel,
+    make_rope_attention_kernel,
+    make_gqa_attention_kernel,
+    make_batched_kv_decode_kernel,
+    make_int8_matmul_kernel,
+    make_int4_matmul_kernel,
+    make_concat_kernel,
+    make_split_kernel,
+    make_top_p_kernel,
 )
 
 
@@ -627,6 +637,306 @@ def main():
         n_bytes = 4 * seq_len * head_dim * 4
         print(format_benchmark_result("flash_attn", result,
                                        n_bytes=n_bytes, n_flops=n_flops))
+
+    # =========================================================================
+    # Embedding Lookup benchmarks
+    # =========================================================================
+    print("\n" + "=" * 60)
+    print("EMBEDDING LOOKUP BENCHMARKS")
+    print("=" * 60)
+
+    for vocab_size, embed_dim, batch_size in [(32000, 4096, 32), (128000, 4096, 64)]:
+        print(f"\n--- vocab={vocab_size:,}, dim={embed_dim}, batch={batch_size} ---")
+
+        msl = make_embedding_kernel(block_size=256)
+        pipeline = compile_and_load(device, msl, "embedding_kernel")
+
+        table_buf = make_float_buffer(device, vocab_size * embed_dim, "small")
+        # indices: int32 array
+        idx_buf = device.newBufferWithLength_options_(
+            batch_size * 4, Metal.MTLResourceStorageModeShared
+        )
+        idx_view = idx_buf.contents().as_buffer(batch_size * 4)
+        for i in range(batch_size):
+            struct.pack_into("i", idx_view, i * 4, i % vocab_size)
+        out_buf = make_empty_buffer(device, batch_size * embed_dim)
+        dim_buf = make_uint_buffer(device, embed_dim)
+
+        result = bench_custom_dispatch(bench, pipeline,
+                                        [table_buf, idx_buf, out_buf, dim_buf],
+                                        batch_size, 256)
+        n_bytes = batch_size * embed_dim * 4 * 2  # read table row + write output
+        print(format_benchmark_result("embedding", result, n_bytes=n_bytes))
+
+    # =========================================================================
+    # Scalar Multiply benchmarks
+    # =========================================================================
+    print("\n" + "=" * 60)
+    print("SCALAR MULTIPLY BENCHMARKS")
+    print("=" * 60)
+
+    for n in [65536, 1_000_000]:
+        print(f"\n--- n = {n:,} ---")
+
+        msl = make_scalar_mul_kernel(block_size=256)
+        pipeline = compile_and_load(device, msl, "scalar_mul")
+
+        in_buf = make_float_buffer(device, n, "ramp")
+        out_buf = make_empty_buffer(device, n)
+        sc_buf = make_float_scalar_buffer(device, 2.5)
+        n_buf = make_uint_buffer(device, n)
+
+        result = bench.time_kernel(pipeline, [in_buf, out_buf, sc_buf, n_buf], n)
+        n_bytes = 2 * n * 4
+        print(format_benchmark_result("scalar_mul", result, n_bytes=n_bytes, n_flops=n))
+
+    # =========================================================================
+    # Fused RoPE + Attention benchmarks
+    # =========================================================================
+    print("\n" + "=" * 60)
+    print("FUSED ROPE + ATTENTION BENCHMARKS")
+    print("=" * 60)
+
+    for seq_len in [64, 256, 1024]:
+        head_dim = 64
+        print(f"\n--- seq_len={seq_len}, head_dim={head_dim} ---")
+
+        msl = make_rope_attention_kernel(head_dim=head_dim, block_size=256)
+        pipeline = compile_and_load(device, msl, "rope_attention")
+
+        q_buf = make_float_buffer(device, head_dim, "small")
+        k_buf = make_float_buffer(device, seq_len * head_dim, "ramp")
+        v_buf = make_float_buffer(device, seq_len * head_dim, "ramp")
+        freq_buf = make_float_buffer(device, head_dim // 2, "small")
+        out_buf = make_empty_buffer(device, head_dim)
+        sl_buf = make_uint_buffer(device, seq_len)
+        qpos_buf = make_uint_buffer(device, seq_len - 1)
+
+        result = bench_custom_dispatch(bench, pipeline,
+                                        [q_buf, k_buf, v_buf, freq_buf, out_buf,
+                                         sl_buf, qpos_buf],
+                                        1, 256)
+        n_flops = seq_len * head_dim * 8  # RoPE + dot + softmax + V mul
+        n_bytes = (head_dim + 2 * seq_len * head_dim + head_dim // 2 + head_dim) * 4
+        print(format_benchmark_result("rope_attn", result, n_bytes=n_bytes, n_flops=n_flops))
+
+    # =========================================================================
+    # GQA Attention benchmarks
+    # =========================================================================
+    print("\n" + "=" * 60)
+    print("GROUPED QUERY ATTENTION BENCHMARKS")
+    print("=" * 60)
+
+    for n_q_heads, n_q_per_kv, seq_len in [(32, 4, 128), (32, 4, 512)]:
+        head_dim = 64
+        n_kv_heads = n_q_heads // n_q_per_kv
+        print(f"\n--- q_heads={n_q_heads}, kv_heads={n_kv_heads}, seq={seq_len} ---")
+
+        msl = make_gqa_attention_kernel(head_dim=head_dim, n_q_per_kv=n_q_per_kv)
+        pipeline = compile_and_load(device, msl, "gqa_attention")
+
+        q_buf = make_float_buffer(device, n_q_heads * head_dim, "small")
+        k_buf = make_float_buffer(device, n_kv_heads * seq_len * head_dim, "ramp")
+        v_buf = make_float_buffer(device, n_kv_heads * seq_len * head_dim, "ramp")
+        out_buf = make_empty_buffer(device, n_q_heads * head_dim)
+        sl_buf = make_uint_buffer(device, seq_len)
+        scale_buf = make_float_scalar_buffer(device, 1.0 / (head_dim ** 0.5))
+
+        result = bench_custom_dispatch(bench, pipeline,
+                                        [q_buf, k_buf, v_buf, out_buf, sl_buf, scale_buf],
+                                        n_q_heads, 256)
+        n_flops = n_q_heads * 4 * seq_len * head_dim
+        n_bytes = (n_q_heads * head_dim + 2 * n_kv_heads * seq_len * head_dim +
+                   n_q_heads * head_dim) * 4
+        print(format_benchmark_result("gqa_attn", result, n_bytes=n_bytes, n_flops=n_flops))
+
+    # =========================================================================
+    # Batched KV Decode benchmarks
+    # =========================================================================
+    print("\n" + "=" * 60)
+    print("BATCHED KV DECODE BENCHMARKS")
+    print("=" * 60)
+
+    for batch_size, n_heads, max_seq_len in [(4, 8, 256), (8, 8, 512)]:
+        head_dim = 64
+        print(f"\n--- batch={batch_size}, heads={n_heads}, max_seq={max_seq_len} ---")
+
+        msl = make_batched_kv_decode_kernel(n_heads=n_heads, head_dim=head_dim)
+        pipeline = compile_and_load(device, msl, "batched_kv_decode")
+
+        q_buf = make_float_buffer(device, batch_size * n_heads * head_dim, "small")
+        k_buf = make_float_buffer(device, batch_size * n_heads * max_seq_len * head_dim, "ramp")
+        v_buf = make_float_buffer(device, batch_size * n_heads * max_seq_len * head_dim, "ramp")
+        out_buf = make_empty_buffer(device, batch_size * n_heads * head_dim)
+        # seq_lens: all set to max_seq_len
+        sl_buf = device.newBufferWithLength_options_(
+            batch_size * 4, Metal.MTLResourceStorageModeShared
+        )
+        sl_view = sl_buf.contents().as_buffer(batch_size * 4)
+        for i in range(batch_size):
+            struct.pack_into("I", sl_view, i * 4, max_seq_len)
+        max_sl_buf = make_uint_buffer(device, max_seq_len)
+        bs_buf = make_uint_buffer(device, batch_size)
+
+        n_groups = batch_size * n_heads
+        result = bench_custom_dispatch(bench, pipeline,
+                                        [q_buf, k_buf, v_buf, out_buf, sl_buf,
+                                         max_sl_buf, bs_buf],
+                                        n_groups, 256)
+        n_flops = batch_size * n_heads * 4 * max_seq_len * head_dim
+        n_bytes = (batch_size * n_heads * (head_dim + 2 * max_seq_len * head_dim + head_dim)) * 4
+        print(format_benchmark_result("batched_kv", result, n_bytes=n_bytes, n_flops=n_flops))
+
+    # =========================================================================
+    # INT8 Quantized Matmul benchmarks
+    # =========================================================================
+    print("\n" + "=" * 60)
+    print("INT8 QUANTIZED MATMUL BENCHMARKS")
+    print("=" * 60)
+
+    for M_dim, N_dim, K_dim in [(32, 4096, 4096), (64, 4096, 4096)]:
+        print(f"\n--- M={M_dim}, N={N_dim}, K={K_dim} ---")
+
+        msl = make_int8_matmul_kernel()
+        pipeline = compile_and_load(device, msl, "int8_matmul")
+
+        in_buf = make_float_buffer(device, M_dim * K_dim, "small")
+        # INT8 weights: one byte per element
+        w_buf = device.newBufferWithLength_options_(
+            N_dim * K_dim, Metal.MTLResourceStorageModeShared
+        )
+        w_view = w_buf.contents().as_buffer(N_dim * K_dim)
+        for i in range(min(N_dim * K_dim, 65536)):  # fill first portion
+            struct.pack_into("b", w_view, i, (i % 127) - 63)
+        out_buf = make_empty_buffer(device, M_dim * N_dim)
+        sc_buf = make_float_buffer(device, N_dim, "ones")
+        zp_buf = make_float_buffer(device, N_dim, "small")
+        M_buf = make_uint_buffer(device, M_dim)
+        N_buf = make_uint_buffer(device, N_dim)
+        K_buf = make_uint_buffer(device, K_dim)
+
+        total = M_dim * N_dim
+        result = bench_custom_dispatch(bench, pipeline,
+                                        [in_buf, w_buf, out_buf, sc_buf, zp_buf,
+                                         M_buf, N_buf, K_buf],
+                                        (total + 255) // 256, 256)
+        n_flops = 2 * M_dim * N_dim * K_dim
+        n_bytes = (M_dim * K_dim * 4 + N_dim * K_dim + M_dim * N_dim * 4 + N_dim * 8)
+        print(format_benchmark_result("int8_matmul", result, n_bytes=n_bytes, n_flops=n_flops))
+
+    # =========================================================================
+    # INT4 Quantized Matmul benchmarks
+    # =========================================================================
+    print("\n" + "=" * 60)
+    print("INT4 QUANTIZED MATMUL BENCHMARKS")
+    print("=" * 60)
+
+    for M_dim, N_dim, K_dim in [(32, 4096, 4096), (64, 4096, 4096)]:
+        group_size = 128
+        print(f"\n--- M={M_dim}, N={N_dim}, K={K_dim}, gs={group_size} ---")
+
+        msl = make_int4_matmul_kernel(group_size=group_size)
+        pipeline = compile_and_load(device, msl, "int4_matmul")
+
+        in_buf = make_float_buffer(device, M_dim * K_dim, "small")
+        # INT4 packed: 2 values per byte
+        packed_size = N_dim * (K_dim // 2)
+        w_buf = device.newBufferWithLength_options_(
+            packed_size, Metal.MTLResourceStorageModeShared
+        )
+        w_view = w_buf.contents().as_buffer(packed_size)
+        for i in range(min(packed_size, 65536)):
+            struct.pack_into("B", w_view, i, (i % 255))
+        out_buf = make_empty_buffer(device, M_dim * N_dim)
+        n_groups_k = (K_dim + group_size - 1) // group_size
+        sc_buf = make_float_buffer(device, N_dim * n_groups_k, "ones")
+        zp_buf = make_float_buffer(device, N_dim * n_groups_k, "small")
+        M_buf = make_uint_buffer(device, M_dim)
+        N_buf = make_uint_buffer(device, N_dim)
+        K_buf = make_uint_buffer(device, K_dim)
+
+        total = M_dim * N_dim
+        result = bench_custom_dispatch(bench, pipeline,
+                                        [in_buf, w_buf, out_buf, sc_buf, zp_buf,
+                                         M_buf, N_buf, K_buf],
+                                        (total + 255) // 256, 256)
+        n_flops = 2 * M_dim * N_dim * K_dim
+        n_bytes = (M_dim * K_dim * 4 + packed_size + M_dim * N_dim * 4 +
+                   N_dim * n_groups_k * 8)
+        print(format_benchmark_result("int4_matmul", result, n_bytes=n_bytes, n_flops=n_flops))
+
+    # =========================================================================
+    # Concat / Split benchmarks
+    # =========================================================================
+    print("\n" + "=" * 60)
+    print("CONCAT / SPLIT BENCHMARKS")
+    print("=" * 60)
+
+    for n in [65536, 1_000_000]:
+        print(f"\n--- n = {n:,} per tensor ---")
+
+        # Concat 2 tensors
+        msl = make_concat_kernel(n_inputs=2)
+        pipeline = compile_and_load(device, msl, "concat_kernel")
+
+        a_buf = make_float_buffer(device, n, "ramp")
+        b_buf = make_float_buffer(device, n, "ones")
+        out_buf = make_empty_buffer(device, 2 * n)
+        n0_buf = make_uint_buffer(device, n)
+        n1_buf = make_uint_buffer(device, n)
+
+        total = 2 * n
+        result = bench_custom_dispatch(bench, pipeline,
+                                        [a_buf, b_buf, out_buf, n0_buf, n1_buf],
+                                        (total + 255) // 256, 256)
+        n_bytes = total * 4 * 2  # read + write
+        print(format_benchmark_result("concat_2", result, n_bytes=n_bytes))
+
+        # Split into 2
+        msl = make_split_kernel(n_outputs=2)
+        pipeline = compile_and_load(device, msl, "split_kernel")
+
+        in_buf = make_float_buffer(device, total, "ramp")
+        o0_buf = make_empty_buffer(device, n)
+        o1_buf = make_empty_buffer(device, n)
+        cs_buf = make_uint_buffer(device, n)
+
+        result = bench_custom_dispatch(bench, pipeline,
+                                        [in_buf, o0_buf, o1_buf, cs_buf],
+                                        (total + 255) // 256, 256)
+        print(format_benchmark_result("split_2", result, n_bytes=n_bytes))
+
+    # =========================================================================
+    # Top-P Sampling benchmarks
+    # =========================================================================
+    print("\n" + "=" * 60)
+    print("TOP-P (NUCLEUS) SAMPLING BENCHMARKS")
+    print("=" * 60)
+
+    for vocab_size in [1024, 32768, 128000]:
+        print(f"\n--- vocab={vocab_size:,}, p=0.9 ---")
+
+        msl = make_top_p_kernel(max_k=256, block_size=256)
+        pipeline = compile_and_load(device, msl, "top_p")
+
+        logits_buf = make_float_buffer(device, vocab_size, "ramp")
+        val_buf = make_empty_buffer(device, 256)
+        idx_buf = device.newBufferWithLength_options_(
+            256 * 4, Metal.MTLResourceStorageModeShared
+        )
+        cnt_buf = device.newBufferWithLength_options_(
+            4, Metal.MTLResourceStorageModeShared
+        )
+        vsz_buf = make_uint_buffer(device, vocab_size)
+        temp_buf = make_float_scalar_buffer(device, 1.0)
+        p_buf = make_float_scalar_buffer(device, 0.9)
+
+        result = bench_custom_dispatch(bench, pipeline,
+                                        [logits_buf, val_buf, idx_buf, cnt_buf,
+                                         vsz_buf, temp_buf, p_buf],
+                                        1, 256)
+        n_bytes = vocab_size * 4
+        print(format_benchmark_result("top_p", result, n_bytes=n_bytes))
 
     # =========================================================================
     # Summary

@@ -963,3 +963,173 @@ def test_simdgroup_matmul_fp16_64x64(runner):
             assert abs(result[idx] - expected[idx]) < tol, (
                 f"C[{i},{j}]: got {result[idx]}, expected {expected[idx]}"
             )
+
+
+# ---------------------------------------------------------------------------
+# RMS normalization tests
+# ---------------------------------------------------------------------------
+
+@requires_metal
+def test_rms_norm(runner):
+    """RMS norm: output = x * rsqrt(mean(x^2) + eps) * weight"""
+    from triton_metal.codegen.msl_emitter import make_rms_norm_kernel
+
+    n_cols = 64
+    n_rows = 4
+    eps = 1e-6
+    msl = make_rms_norm_kernel(block_size=256, eps=eps)
+    path = runner.compile(msl, "rms_norm_kernel")
+    pipeline = runner.load(path, "rms_norm_kernel")
+
+    random.seed(321)
+    input_data = [random.gauss(0, 1) for _ in range(n_rows * n_cols)]
+    weight_data = [random.uniform(0.5, 1.5) for _ in range(n_cols)]
+
+    input_buf = runner.make_float_buffer(input_data)
+    weight_buf = runner.make_float_buffer(weight_data)
+    out_buf = runner.make_empty_buffer(n_rows * n_cols)
+    ncols_buf = runner.make_uint_buffer(n_cols)
+
+    import Metal
+    cmd = runner.queue.commandBuffer()
+    enc = cmd.computeCommandEncoder()
+    enc.setComputePipelineState_(pipeline)
+    for i, buf in enumerate([input_buf, weight_buf, out_buf, ncols_buf]):
+        enc.setBuffer_offset_atIndex_(buf, 0, i)
+    enc.dispatchThreadgroups_threadsPerThreadgroup_(
+        Metal.MTLSizeMake(n_rows, 1, 1),
+        Metal.MTLSizeMake(256, 1, 1),
+    )
+    enc.endEncoding()
+    cmd.commit()
+    cmd.waitUntilCompleted()
+    assert cmd.status() == 4
+
+    result = runner.read_float_buffer(out_buf, n_rows * n_cols)
+
+    # Reference RMS norm
+    for row in range(n_rows):
+        row_in = input_data[row * n_cols:(row + 1) * n_cols]
+        row_out = result[row * n_cols:(row + 1) * n_cols]
+
+        mean_sq = sum(x * x for x in row_in) / n_cols
+        rms = 1.0 / math.sqrt(mean_sq + eps)
+
+        for j in range(n_cols):
+            expected = row_in[j] * rms * weight_data[j]
+            tol = max(1e-4, abs(expected) * 1e-3)
+            assert abs(row_out[j] - expected) < tol, (
+                f"Row {row}[{j}] got {row_out[j]}, expected {expected}"
+            )
+
+
+@requires_metal
+def test_rms_norm_large_row(runner):
+    """RMS norm with row larger than block_size (tests strided access)."""
+    from triton_metal.codegen.msl_emitter import make_rms_norm_kernel
+
+    n_cols = 512
+    eps = 1e-6
+    msl = make_rms_norm_kernel(block_size=256, eps=eps)
+    path = runner.compile(msl, "rms_norm_kernel")
+    pipeline = runner.load(path, "rms_norm_kernel")
+
+    random.seed(654)
+    input_data = [random.gauss(0, 2) for _ in range(n_cols)]
+    weight_data = [1.0] * n_cols  # unity weight for simplicity
+
+    input_buf = runner.make_float_buffer(input_data)
+    weight_buf = runner.make_float_buffer(weight_data)
+    out_buf = runner.make_empty_buffer(n_cols)
+    ncols_buf = runner.make_uint_buffer(n_cols)
+
+    import Metal
+    cmd = runner.queue.commandBuffer()
+    enc = cmd.computeCommandEncoder()
+    enc.setComputePipelineState_(pipeline)
+    for i, buf in enumerate([input_buf, weight_buf, out_buf, ncols_buf]):
+        enc.setBuffer_offset_atIndex_(buf, 0, i)
+    enc.dispatchThreadgroups_threadsPerThreadgroup_(
+        Metal.MTLSizeMake(1, 1, 1),
+        Metal.MTLSizeMake(256, 1, 1),
+    )
+    enc.endEncoding()
+    cmd.commit()
+    cmd.waitUntilCompleted()
+    assert cmd.status() == 4
+
+    result = runner.read_float_buffer(out_buf, n_cols)
+
+    mean_sq = sum(x * x for x in input_data) / n_cols
+    rms = 1.0 / math.sqrt(mean_sq + eps)
+    for j in range(n_cols):
+        expected = input_data[j] * rms
+        tol = max(1e-4, abs(expected) * 1e-3)
+        assert abs(result[j] - expected) < tol, (
+            f"[{j}] got {result[j]}, expected {expected}"
+        )
+
+
+# ---------------------------------------------------------------------------
+# RoPE (rotary position embeddings) tests
+# ---------------------------------------------------------------------------
+
+@requires_metal
+def test_rope(runner):
+    """RoPE: apply rotary position embeddings."""
+    from triton_metal.codegen.msl_emitter import make_rope_kernel
+
+    dim = 64
+    seq_len = 4
+    msl = make_rope_kernel(block_size=256)
+    path = runner.compile(msl, "rope_kernel")
+    pipeline = runner.load(path, "rope_kernel")
+
+    random.seed(987)
+    input_data = [random.gauss(0, 1) for _ in range(seq_len * dim)]
+
+    # Pre-compute inverse frequencies: 1 / (10000^(2i/dim))
+    freqs = [1.0 / (10000.0 ** (2 * i / dim)) for i in range(dim // 2)]
+
+    input_buf = runner.make_float_buffer(input_data)
+    freqs_buf = runner.make_float_buffer(freqs)
+    out_buf = runner.make_empty_buffer(seq_len * dim)
+    dim_buf = runner.make_uint_buffer(dim)
+    pos_buf = runner.make_uint_buffer(0)  # pos_offset = 0
+
+    import Metal
+    cmd = runner.queue.commandBuffer()
+    enc = cmd.computeCommandEncoder()
+    enc.setComputePipelineState_(pipeline)
+    for i, buf in enumerate([input_buf, freqs_buf, out_buf, dim_buf, pos_buf]):
+        enc.setBuffer_offset_atIndex_(buf, 0, i)
+    enc.dispatchThreadgroups_threadsPerThreadgroup_(
+        Metal.MTLSizeMake(seq_len, 1, 1),
+        Metal.MTLSizeMake(256, 1, 1),
+    )
+    enc.endEncoding()
+    cmd.commit()
+    cmd.waitUntilCompleted()
+    assert cmd.status() == 4
+
+    result = runner.read_float_buffer(out_buf, seq_len * dim)
+
+    # Reference RoPE
+    for pos in range(seq_len):
+        for i in range(dim // 2):
+            theta = pos * freqs[i]
+            cos_t = math.cos(theta)
+            sin_t = math.sin(theta)
+            x0 = input_data[pos * dim + 2 * i]
+            x1 = input_data[pos * dim + 2 * i + 1]
+            exp0 = x0 * cos_t - x1 * sin_t
+            exp1 = x0 * sin_t + x1 * cos_t
+
+            got0 = result[pos * dim + 2 * i]
+            got1 = result[pos * dim + 2 * i + 1]
+            assert abs(got0 - exp0) < 1e-4, (
+                f"pos={pos} pair={i}[0]: got {got0}, expected {exp0}"
+            )
+            assert abs(got1 - exp1) < 1e-4, (
+                f"pos={pos} pair={i}[1]: got {got1}, expected {exp1}"
+            )

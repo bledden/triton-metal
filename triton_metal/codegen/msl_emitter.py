@@ -690,6 +690,115 @@ def make_matmul_kernel(block_m=32, block_n=32, block_k=32, dtype="fp32"):
     return kb.build()
 
 
+def make_rms_norm_kernel(block_size=256, dtype="fp32", eps=1e-6):
+    """Generate a fused RMS normalization kernel.
+
+    Used in LLaMA, Mistral, Gemma, and other modern LLMs.
+    For each row: output = x * rsqrt(mean(x^2) + eps) * weight
+
+    Each threadgroup processes one row. Three passes:
+    1. Compute sum of squares (strided accumulation + threadgroup reduce)
+    2. Compute RMS = rsqrt(mean_sq + eps)
+    3. Apply normalization: output[i] = input[i] * rms * weight[i]
+
+    Args:
+        block_size: Threads per threadgroup.
+        dtype: Data type.
+        eps: Epsilon for numerical stability.
+    """
+    n_simd_groups = (block_size + 31) // 32
+
+    kb = KernelBuilder("rms_norm_kernel", block_size=block_size)
+    kb.add_ptr_arg("input", dtype=dtype, const=True)
+    kb.add_ptr_arg("weight", dtype=dtype, const=True)
+    kb.add_ptr_arg("output", dtype=dtype, const=False)
+    kb.add_scalar_arg("n_cols", dtype="u32")
+
+    kb.declare_threadgroup_array("shared_sq", dtype=dtype, size=n_simd_groups)
+
+    # Row base pointer
+    kb._var("row_start", "pid * n_cols", ty="uint")
+
+    # Pass 1: Sum of squares (strided)
+    kb._var("sq_sum", "0.0f", ty="float")
+    kb.raw_line(f"for (uint i = lid; i < n_cols; i += {block_size}u) {{")
+    kb.indent()
+    kb._var("v", "input[row_start + i]", ty="float")
+    kb.raw_line("sq_sum += v * v;")
+    kb.dedent()
+    kb.raw_line("}")
+
+    # Reduce sum of squares across threadgroup
+    kb.threadgroup_reduce("sum", "sq_sum", "shared_sq", "total_sq")
+
+    # Broadcast and compute RMS
+    kb.begin_if("lid == 0")
+    kb.raw_line("shared_sq[0] = total_sq;")
+    kb.end_block()
+    kb.barrier("threadgroup")
+    kb._var("mean_sq", "shared_sq[0] / float(n_cols)", ty="float")
+    kb._var("rms", f"rsqrt(mean_sq + {eps}f)", ty="float")
+
+    # Pass 2: Apply normalization
+    kb.raw_line(f"for (uint i = lid; i < n_cols; i += {block_size}u) {{")
+    kb.indent()
+    kb.raw_line("output[row_start + i] = input[row_start + i] * rms * weight[i];")
+    kb.dedent()
+    kb.raw_line("}")
+
+    return kb.build()
+
+
+def make_rope_kernel(block_size=256, dtype="fp32"):
+    """Generate a fused RoPE (rotary position embedding) kernel.
+
+    Applies rotary position embeddings to pairs of elements:
+    For each pair (x0, x1) at position pos with frequency freq:
+        out0 = x0 * cos(theta) - x1 * sin(theta)
+        out1 = x0 * sin(theta) + x1 * cos(theta)
+    where theta = pos * freq
+
+    Each threadgroup processes elements for one position.
+    Frequencies are pre-computed: freq[i] = 1 / (10000^(2i/dim)).
+
+    Args:
+        block_size: Threads per threadgroup.
+        dtype: Data type.
+
+    Kernel args:
+        input: [seq_len, dim] tensor
+        freqs: [dim/2] pre-computed inverse frequencies
+        output: [seq_len, dim] tensor
+        dim: hidden dimension (must be even)
+        pos_offset: starting position index
+    """
+    kb = KernelBuilder("rope_kernel", block_size=block_size)
+    kb.add_ptr_arg("input", dtype=dtype, const=True)
+    kb.add_ptr_arg("freqs", dtype=dtype, const=True)
+    kb.add_ptr_arg("output", dtype=dtype, const=False)
+    kb.add_scalar_arg("dim", dtype="u32")
+    kb.add_scalar_arg("pos_offset", dtype="u32")
+
+    # Each threadgroup handles one position (pid = position index)
+    kb._var("pos", "pid + pos_offset", ty="uint")
+    kb._var("row_start", "pid * dim", ty="uint")
+
+    # Each thread handles a pair of elements
+    kb.raw_line(f"for (uint i = lid; i < dim / 2u; i += {block_size}u) {{")
+    kb.indent()
+    kb._var("theta", "float(pos) * freqs[i]", ty="float")
+    kb._var("cos_t", "cos(theta)", ty="float")
+    kb._var("sin_t", "sin(theta)", ty="float")
+    kb._var("x0", "input[row_start + 2u * i]", ty="float")
+    kb._var("x1", "input[row_start + 2u * i + 1u]", ty="float")
+    kb.raw_line("output[row_start + 2u * i] = x0 * cos_t - x1 * sin_t;")
+    kb.raw_line("output[row_start + 2u * i + 1u] = x0 * sin_t + x1 * cos_t;")
+    kb.dedent()
+    kb.raw_line("}")
+
+    return kb.build()
+
+
 def make_simdgroup_matmul_kernel(dtype="fp32"):
     """Generate a matmul kernel using Apple's simdgroup_matrix hardware.
 

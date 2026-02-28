@@ -5111,6 +5111,7 @@ def emit_msl(mod, metadata, options):
     metadata["name"] = kernel_name
 
     kb = parse_ttgir(ir_text, options)
+    metadata["block_size"] = kb.block_size
     return kb.build()
 
 

@@ -30,6 +30,10 @@ class MetalOptions:
     debug: bool = False
     backend_name: str = "metal"
     arch: str = "apple-m4"
+    sanitize_overflow: bool = True
+    launch_cooperative_grid: bool = False
+    launch_pdl: bool = False
+    instrumentation_mode: str = ""
 
     @staticmethod
     def _make_hashable(value):
@@ -73,10 +77,12 @@ class MetalBackend(BaseBackend):
         return MetalOptions(**result)
 
     def pack_metadata(self, metadata):
+        block_size = getattr(metadata, "block_size", None) or metadata.num_warps * 32
         return (
             metadata.num_warps,
             metadata.num_ctas,
             metadata.shared,
+            block_size,
         )
 
     def get_codegen_implementation(self, options):
@@ -145,6 +151,12 @@ class MetalBackend(BaseBackend):
         passes.common.add_symbol_dce(pm)
         pm.run(mod, "make_ttgir")
         metadata["tensordesc_meta"] = None
+        # Extract shared memory requirement from MLIR module if available.
+        try:
+            shared = mod.get_int_attr("ttg.shared")
+        except Exception:
+            shared = None
+        metadata["shared"] = shared if shared is not None else 0
         return mod
 
     @staticmethod
@@ -172,7 +184,8 @@ class MetalBackend(BaseBackend):
 
         # Skip compilation if cached metallib exists.
         if os.path.exists(metallib_path):
-            return metallib_path
+            with open(metallib_path, "rb") as f:
+                return f.read()
 
         with open(metal_path, "w") as f:
             f.write(src)
@@ -217,7 +230,8 @@ class MetalBackend(BaseBackend):
                 f"AIR file: {air_path}"
             ) from None
 
-        return metallib_path
+        with open(metallib_path, "rb") as f:
+            return f.read()
 
     @functools.lru_cache()
     def hash(self):

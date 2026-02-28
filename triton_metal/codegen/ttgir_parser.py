@@ -26,6 +26,62 @@ from triton_metal.codegen.msl_emitter import KernelBuilder
 
 
 # ---------------------------------------------------------------------------
+# MLIR preprocessing
+# ---------------------------------------------------------------------------
+
+def _strip_loc_annotations(text):
+    """Remove all loc(...) annotations from MLIR text.
+
+    These contain nested parentheses (e.g., loc("x_ptr"(#loc)))
+    which break simple regex parsing.
+    """
+    result = []
+    i = 0
+    n = len(text)
+    while i < n:
+        # Look for 'loc(' preceded by whitespace or start
+        if text[i:i+4] == 'loc(' and (i == 0 or text[i-1] in ' \t\n,'):
+            # Skip balanced parentheses
+            depth = 0
+            j = i + 3  # points at '('
+            while j < n:
+                if text[j] == '(':
+                    depth += 1
+                elif text[j] == ')':
+                    depth -= 1
+                    if depth == 0:
+                        j += 1
+                        break
+                j += 1
+            # Also skip any trailing whitespace
+            while j < n and text[j] in ' \t':
+                j += 1
+            i = j
+        else:
+            result.append(text[i])
+            i += 1
+    return ''.join(result)
+
+
+def _strip_layout_annotations(text):
+    """Strip #ttg.blocked<...> layout definitions and inline references.
+
+    Real Triton IR has lines like:
+        #blocked = #ttg.blocked<{sizePerThread = [2], ...}>
+    and tensor types like:
+        tensor<256xf32, #blocked>
+
+    We strip the definition lines entirely and remove the
+    ', #identifier' from tensor types.
+    """
+    # Remove definition lines: #name = #ttg.blocked<{...}>
+    text = re.sub(r'^#\w+\s*=\s*#ttg\.\w+<\{[^}]*\}>.*$', '', text, flags=re.MULTILINE)
+    # Remove layout reference in tensor types: tensor<256xf32, #blocked>
+    text = re.sub(r'(tensor<[^,>]+),\s*#\w+>', r'\1>', text)
+    return text
+
+
+# ---------------------------------------------------------------------------
 # MLIR type mapping
 # ---------------------------------------------------------------------------
 
@@ -102,6 +158,10 @@ class TTGIRParser:
     """
 
     def __init__(self, ir_text, options):
+        # Preprocess: strip loc() annotations and layout annotations
+        # that break regex parsing.
+        ir_text = _strip_loc_annotations(ir_text)
+        ir_text = _strip_layout_annotations(ir_text)
         self.ir_text = ir_text
         self.options = options
         self.lines = ir_text.strip().split("\n")

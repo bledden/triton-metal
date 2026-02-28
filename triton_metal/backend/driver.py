@@ -1,4 +1,6 @@
 import platform
+import struct
+import tempfile
 
 from triton.backends.compiler import GPUTarget
 from triton.backends.driver import DriverBase
@@ -50,21 +52,36 @@ class MetalUtils:
             self._command_queue = self.device.newCommandQueue()
         return self._command_queue
 
-    def load_binary(self, name, metallib_path, shared_mem):
-        """Load a metallib from a file path and create a compute pipeline state.
+    def load_binary(self, name, kernel, shared_mem, device=None):
+        """Load a metallib and create a compute pipeline state.
 
         Uses newLibraryWithURL instead of newLibraryWithData to avoid a
         PyObjC segfault in NSData's interaction with Metal's internal
         SHA256 hashing.
 
-        Returns (library, pipeline_state, n_regs, n_spills).
+        Args:
+            name: kernel function name.
+            kernel: metallib bytes (Triton framework) or file path str (legacy).
+            shared_mem: bytes of shared memory needed.
+            device: ignored (Metal has a single GPU).
+
+        Returns 5-tuple: (library, pipeline_state, n_regs, n_spills, n_max_threads).
         """
         import Foundation
 
-        url = Foundation.NSURL.fileURLWithPath_(metallib_path)
+        if isinstance(kernel, (bytes, bytearray)):
+            # Triton framework path: write bytes to temp file.
+            with tempfile.NamedTemporaryFile(suffix=".metallib", delete=False) as f:
+                f.write(kernel)
+                tmp_path = f.name
+            url = Foundation.NSURL.fileURLWithPath_(tmp_path)
+        else:
+            # Legacy path: kernel is a file path string.
+            url = Foundation.NSURL.fileURLWithPath_(kernel)
+
         library, error = self.device.newLibraryWithURL_error_(url, None)
         if error is not None:
-            raise RuntimeError(f"Failed to load metallib from {metallib_path}: {error}")
+            raise RuntimeError(f"Failed to load metallib: {error}")
 
         function = library.newFunctionWithName_(name)
         if function is None:
@@ -82,7 +99,8 @@ class MetalUtils:
         if error is not None:
             raise RuntimeError(f"Failed to create pipeline state: {error}")
 
-        return library, pipeline_state, 0, 0
+        n_max_threads = pipeline_state.maxTotalThreadsPerThreadgroup()
+        return library, pipeline_state, 0, 0, n_max_threads
 
     def launch(
         self,
@@ -121,12 +139,18 @@ class MetalUtils:
             raise RuntimeError(f"Metal kernel execution failed: {error}")
 
     def make_buffer_from_ptr(self, ptr, nbytes):
-        """Create a Metal buffer wrapping an existing pointer (zero-copy UMA)."""
+        """Create a Metal buffer wrapping an existing pointer (zero-copy UMA).
+
+        Uses a ctypes array (not c_void_p) so PyObjC can validate the
+        buffer size for newBufferWithBytesNoCopy.
+        """
         import ctypes
         import Metal
 
+        # Wrap pointer as a sized ctypes array so PyObjC accepts it.
+        src = (ctypes.c_char * nbytes).from_address(ptr)
         buf = self.device.newBufferWithBytesNoCopy_length_options_deallocator_(
-            ctypes.c_void_p(ptr),
+            src,
             nbytes,
             Metal.MTLResourceStorageModeShared,
             None,
@@ -148,83 +172,127 @@ class MetalUtils:
             raise RuntimeError(f"Failed to allocate Metal buffer ({nbytes} bytes)")
         return buf
 
+    def get_device_properties(self, device=0):
+        return {
+            "max_shared_mem": 32768,  # 32 KB threadgroup memory
+            "max_num_regs": 0,
+            "multiprocessor_count": self.device.maxThreadgroupMemoryLength() // 1024,
+            "warp_size": 32,
+        }
+
+    def unload_module(self, module):
+        pass  # Metal libraries are reference-counted by ObjC ARC
+
+
+_metal_utils = None
+
+
+def _get_utils():
+    """Module-level MetalUtils singleton (Metal device is a system singleton)."""
+    global _metal_utils
+    if _metal_utils is None:
+        _metal_utils = MetalUtils()
+    return _metal_utils
+
 
 class MetalLauncher:
-    """Wraps a compiled metallib kernel for repeated dispatch."""
+    """Triton kernel launcher for Metal backend.
 
-    def __init__(self, utils, name, kernel_bytes, shared_mem, num_warps):
-        self.utils = utils
-        self.name = name
-        self.num_warps = num_warps
-        self._library, self._pipeline_state, _, _ = utils.load_binary(
-            name, kernel_bytes, shared_mem
-        )
+    Instantiated by the Triton framework as launcher_cls(src, metadata).
+    Called as launcher(gridX, gridY, gridZ, stream, function, kernel_metadata,
+                       launch_metadata, launch_enter_hook, launch_exit_hook, *args).
+    """
 
-    def __call__(self, grid, *args, **kwargs):
-        """Launch the kernel with the given grid and arguments.
+    def __init__(self, src, metadata):
+        self.constants = src.constants if hasattr(src, "constants") else {}
+        self.arg_names = src.fn.arg_names if hasattr(src, "fn") else []
+        self.signature = src.signature if hasattr(src, "signature") else {}
 
-        Args:
-            grid: tuple of (grid_x, grid_y, grid_z) threadgroup counts.
-            *args: kernel arguments (torch tensors or scalars).
-        """
-        import struct
+    def __call__(
+        self,
+        gridX,
+        gridY,
+        gridZ,
+        stream,
+        function,  # MTLComputePipelineState from load_binary
+        kernel_metadata,
+        launch_metadata,
+        launch_enter_hook,
+        launch_exit_hook,
+        *args,
+    ):
+        import ctypes
 
+        if launch_enter_hook:
+            launch_enter_hook(kernel_metadata, launch_metadata)
+
+        utils = _get_utils()
+
+        # Unpack kernel metadata: (num_warps, num_ctas, shared, block_size)
+        num_warps = kernel_metadata[0] if kernel_metadata else 4
+        block_size = kernel_metadata[3] if kernel_metadata and len(kernel_metadata) > 3 else num_warps * 32
+
+        # Pack arguments into Metal buffers.
+        # For tensors, we copy data into Metal-allocated buffers to avoid
+        # NoCopy's page-alignment requirement (ARM64 pages are 16 KB).
+        # After dispatch, we copy output data back.
         buffers = []
+        tensor_copies = []  # (metal_buf, tensor, nbytes) for output writeback
 
         for arg in args:
             if hasattr(arg, "data_ptr"):
-                # PyTorch tensor — wrap its pointer as a Metal buffer.
                 ptr = arg.data_ptr()
                 nbytes = arg.nelement() * arg.element_size()
-                buf = self.utils.make_buffer_from_ptr(ptr, nbytes)
+                # Allocate Metal buffer and copy tensor data in.
+                buf = utils.make_buffer(nbytes)
+                src = (ctypes.c_char * nbytes).from_address(ptr)
+                dst = buf.contents().as_buffer(nbytes)
+                dst[:] = bytes(src)
                 buffers.append((buf, 0))
+                # Track all tensor args for output writeback.
+                tensor_copies.append((buf, arg, nbytes))
             elif isinstance(arg, bool):
-                # Pack bool as 1-byte int (matches i1 → int8_t mapping).
-                buf = self.utils.make_buffer(4)
+                buf = utils.make_buffer(4)
                 view = buf.contents().as_buffer(4)
                 struct.pack_into("i", view, 0, int(arg))
                 buffers.append((buf, 0))
             elif isinstance(arg, int):
-                # Dtype-aware packing: use 8 bytes for values outside
-                # 32-bit unsigned range, signed packing for negatives.
-                if arg < 0 or arg > 0xFFFFFFFF:
-                    buf = self.utils.make_buffer(8)
+                if arg < -(1 << 31) or arg > 0xFFFFFFFF:
+                    buf = utils.make_buffer(8)
                     view = buf.contents().as_buffer(8)
                     struct.pack_into("q", view, 0, arg)  # int64_t
                 elif arg < 0:
-                    buf = self.utils.make_buffer(4)
+                    buf = utils.make_buffer(4)
                     view = buf.contents().as_buffer(4)
                     struct.pack_into("i", view, 0, arg)  # int32_t (signed)
                 else:
-                    buf = self.utils.make_buffer(4)
+                    buf = utils.make_buffer(4)
                     view = buf.contents().as_buffer(4)
                     struct.pack_into("I", view, 0, arg)  # uint32_t
                 buffers.append((buf, 0))
             elif isinstance(arg, float):
-                buf = self.utils.make_buffer(4)
+                buf = utils.make_buffer(4)
                 view = buf.contents().as_buffer(4)
                 struct.pack_into("f", view, 0, arg)
                 buffers.append((buf, 0))
             else:
                 raise TypeError(f"Unsupported argument type: {type(arg)}")
 
-        threads_per_tg = self.num_warps * 32
+        threads_per_tg = block_size
+        grid = (gridX, gridY, gridZ)
         threadgroup_size = (threads_per_tg, 1, 1)
 
-        # Normalize grid to 3D.
-        if isinstance(grid, int):
-            grid = (grid, 1, 1)
-        elif len(grid) == 1:
-            grid = (grid[0], 1, 1)
-        elif len(grid) == 2:
-            grid = (grid[0], grid[1], 1)
+        utils.launch(function, grid, threadgroup_size, buffers)
 
-        self.utils.launch(
-            self._pipeline_state,
-            grid,
-            threadgroup_size,
-            buffers,
-        )
+        # Copy results back from Metal buffers to tensor memory.
+        for metal_buf, tensor, nbytes in tensor_copies:
+            src_view = metal_buf.contents().as_buffer(nbytes)
+            dst_ptr = tensor.data_ptr()
+            dst = (ctypes.c_char * nbytes).from_address(dst_ptr)
+            dst[:] = bytes(src_view)
+
+        if launch_exit_hook:
+            launch_exit_hook(kernel_metadata, launch_metadata)
 
 
 def _detect_metal_arch():
@@ -264,6 +332,12 @@ class MetalDriver(DriverBase):
     def get_current_target(self):
         arch = _detect_metal_arch()
         return GPUTarget("metal", arch, 32)
+
+    def get_current_device(self):
+        return 0  # Metal has a single GPU
+
+    def get_current_stream(self, device=0):
+        return 0  # Metal has no CUDA-style streams
 
     def get_active_torch_device(self):
         import torch

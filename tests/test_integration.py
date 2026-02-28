@@ -1,0 +1,482 @@
+"""End-to-end integration tests for the Metal backend.
+
+Tests the full pipeline: TTGIR → MSL → metallib → GPU execution.
+These tests don't require Triton itself — they simulate the compilation
+pipeline using TTGIR text inputs and validate correctness on GPU.
+
+If Triton is installed, additional tests run @triton.jit kernels through
+the Metal backend.
+"""
+
+import math
+import os
+import struct
+import subprocess
+import tempfile
+
+import pytest
+
+try:
+    import Metal
+    import Foundation
+    HAS_METAL = True
+except ImportError:
+    HAS_METAL = False
+
+try:
+    import triton
+    HAS_TRITON = True
+except ImportError:
+    HAS_TRITON = False
+
+requires_metal = pytest.mark.skipif(
+    not HAS_METAL, reason="Metal framework not available"
+)
+requires_triton = pytest.mark.skipif(
+    not HAS_TRITON, reason="Triton not installed"
+)
+
+
+class IntegrationRunner:
+    """Full pipeline runner: TTGIR text → MSL → metallib → GPU execute."""
+
+    def __init__(self):
+        self.device = Metal.MTLCreateSystemDefaultDevice()
+        self.queue = self.device.newCommandQueue()
+        self.cache_dir = os.path.join(
+            tempfile.gettempdir(), "triton_metal_integration_test"
+        )
+        os.makedirs(self.cache_dir, exist_ok=True)
+
+    def compile_ttgir_to_msl(self, ttgir_text):
+        """Parse TTGIR and emit MSL source."""
+        from triton_metal.codegen.ttgir_parser import parse_ttgir
+
+        class FakeOpts:
+            num_warps = 4
+            warp_size = 32
+            num_stages = 1
+
+        kb = parse_ttgir(ttgir_text, FakeOpts())
+        return kb.build()
+
+    def compile_msl_to_metallib(self, msl_src, kernel_name):
+        """Compile MSL source to metallib and return pipeline state."""
+        import hashlib
+
+        src_hash = hashlib.sha256(msl_src.encode()).hexdigest()[:16]
+        base = f"{kernel_name}_{src_hash}"
+        metal_path = os.path.join(self.cache_dir, f"{base}.metal")
+        air_path = os.path.join(self.cache_dir, f"{base}.air")
+        metallib_path = os.path.join(self.cache_dir, f"{base}.metallib")
+
+        with open(metal_path, "w") as f:
+            f.write(msl_src)
+        subprocess.check_call(
+            ["xcrun", "-sdk", "macosx", "metal", "-c", metal_path,
+             "-o", air_path, "-std=metal3.2", "-O2"],
+            stderr=subprocess.PIPE,
+        )
+        subprocess.check_call(
+            ["xcrun", "-sdk", "macosx", "metallib", air_path,
+             "-o", metallib_path],
+            stderr=subprocess.PIPE,
+        )
+
+        url = Foundation.NSURL.fileURLWithPath_(metallib_path)
+        library, error = self.device.newLibraryWithURL_error_(url, None)
+        assert error is None, f"Load failed: {error}"
+        function = library.newFunctionWithName_(kernel_name)
+        assert function is not None, f"Kernel '{kernel_name}' not found"
+        pipeline, error = self.device.newComputePipelineStateWithFunction_error_(
+            function, None
+        )
+        assert error is None, f"Pipeline failed: {error}"
+        return pipeline
+
+    def make_buffer(self, data, fmt="f"):
+        """Create a Metal buffer from a list of values."""
+        size_per = struct.calcsize(fmt)
+        n = len(data)
+        buf = self.device.newBufferWithLength_options_(
+            n * size_per, Metal.MTLResourceStorageModeShared
+        )
+        view = buf.contents().as_buffer(n * size_per)
+        for i, v in enumerate(data):
+            struct.pack_into(fmt, view, i * size_per, v)
+        return buf
+
+    def make_uint_buf(self, value):
+        """Create a single-uint buffer."""
+        return self.make_buffer([value], "I")
+
+    def make_empty_buffer(self, n, fmt="f"):
+        """Create an empty Metal buffer."""
+        size_per = struct.calcsize(fmt)
+        return self.device.newBufferWithLength_options_(
+            n * size_per, Metal.MTLResourceStorageModeShared
+        )
+
+    def read_buffer(self, buf, n, fmt="f"):
+        """Read values from a Metal buffer."""
+        size_per = struct.calcsize(fmt)
+        view = buf.contents().as_buffer(n * size_per)
+        return [struct.unpack_from(fmt, view, i * size_per)[0] for i in range(n)]
+
+    def dispatch(self, pipeline, buffers, n_groups, block_size):
+        """Dispatch a compute kernel."""
+        cmd = self.queue.commandBuffer()
+        enc = cmd.computeCommandEncoder()
+        enc.setComputePipelineState_(pipeline)
+        for i, buf in enumerate(buffers):
+            enc.setBuffer_offset_atIndex_(buf, 0, i)
+        enc.dispatchThreadgroups_threadsPerThreadgroup_(
+            Metal.MTLSizeMake(n_groups, 1, 1),
+            Metal.MTLSizeMake(block_size, 1, 1),
+        )
+        enc.endEncoding()
+        cmd.commit()
+        cmd.waitUntilCompleted()
+
+
+@pytest.fixture
+def runner():
+    if not HAS_METAL:
+        pytest.skip("Metal not available")
+    return IntegrationRunner()
+
+
+# ---------------------------------------------------------------------------
+# Full pipeline: TTGIR → MSL → metallib → GPU
+# ---------------------------------------------------------------------------
+
+VECADD_TTGIR = """
+module {
+  tt.func public @vector_add(%arg0: !tt.ptr<f32> {tt.divisibility = 16 : i32},
+                              %arg1: !tt.ptr<f32> {tt.divisibility = 16 : i32},
+                              %arg2: !tt.ptr<f32> {tt.divisibility = 16 : i32},
+                              %arg3: i32) {
+    %0 = tt.get_program_id x : i32
+    %c256_i32 = arith.constant 256 : i32
+    %1 = arith.muli %0, %c256_i32 : i32
+    %2 = tt.make_range {end = 256 : i32, start = 0 : i32} : tensor<256xi32>
+    %3 = tt.splat %1 : i32 -> tensor<256xi32>
+    %4 = arith.addi %3, %2 : tensor<256xi32>
+    %5 = arith.cmpi slt, %4, %arg3 : tensor<256xi32>
+    %6 = tt.splat %arg0 : !tt.ptr<f32> -> tensor<256x!tt.ptr<f32>>
+    %7 = tt.addptr %6, %4 : tensor<256x!tt.ptr<f32>>, tensor<256xi32>
+    %8 = tt.load %7, %5 : !tt.ptr<f32>
+    %9 = tt.splat %arg1 : !tt.ptr<f32> -> tensor<256x!tt.ptr<f32>>
+    %10 = tt.addptr %9, %4 : tensor<256x!tt.ptr<f32>>, tensor<256xi32>
+    %11 = tt.load %10, %5 : !tt.ptr<f32>
+    %12 = arith.addf %8, %11 : tensor<256xf32>
+    %13 = tt.splat %arg2 : !tt.ptr<f32> -> tensor<256x!tt.ptr<f32>>
+    %14 = tt.addptr %13, %4 : tensor<256x!tt.ptr<f32>>, tensor<256xi32>
+    tt.store %14, %12, %5 : !tt.ptr<f32>
+    tt.return
+  }
+}
+"""
+
+
+@requires_metal
+def test_integration_vecadd_pipeline(runner):
+    """Full pipeline: TTGIR text → MSL → metallib → GPU → correct results."""
+    # Step 1: Parse TTGIR to MSL
+    msl = runner.compile_ttgir_to_msl(VECADD_TTGIR)
+    assert "vector_add" in msl or "kernel" in msl
+
+    # Step 2: Compile MSL to metallib
+    pipeline = runner.compile_msl_to_metallib(msl, "vector_add")
+
+    # Step 3: Create test data
+    n = 1024
+    a_data = [float(i) * 0.1 for i in range(n)]
+    b_data = [float(i) * 0.2 for i in range(n)]
+
+    a_buf = runner.make_buffer(a_data)
+    b_buf = runner.make_buffer(b_data)
+    out_buf = runner.make_empty_buffer(n)
+    n_buf = runner.make_uint_buf(n)
+
+    # Step 4: Execute on GPU
+    n_groups = (n + 255) // 256
+    runner.dispatch(pipeline, [a_buf, b_buf, out_buf, n_buf], n_groups, 256)
+
+    # Step 5: Verify results
+    result = runner.read_buffer(out_buf, n)
+    for i in range(n):
+        expected = a_data[i] + b_data[i]
+        assert abs(result[i] - expected) < 1e-4, (
+            f"index {i}: got {result[i]}, expected {expected}"
+        )
+
+
+SOFTMAX_TTGIR = """
+module {
+  tt.func public @softmax_kernel(%arg0: !tt.ptr<f32> {tt.divisibility = 16 : i32},
+                                   %arg1: !tt.ptr<f32> {tt.divisibility = 16 : i32},
+                                   %arg2: i32) {
+    %0 = tt.get_program_id x : i32
+    %c256_i32 = arith.constant 256 : i32
+    %1 = arith.muli %0, %c256_i32 : i32
+    %2 = tt.make_range {end = 256 : i32, start = 0 : i32} : tensor<256xi32>
+    %3 = tt.splat %1 : i32 -> tensor<256xi32>
+    %4 = arith.addi %3, %2 : tensor<256xi32>
+    %5 = tt.splat %arg0 : !tt.ptr<f32> -> tensor<256x!tt.ptr<f32>>
+    %6 = tt.addptr %5, %4 : tensor<256x!tt.ptr<f32>>, tensor<256xi32>
+    %7 = tt.load %6 : !tt.ptr<f32>
+
+    %row_max = "tt.reduce"(%7) ({
+    ^bb0(%a: f32, %b: f32):
+      %mx = arith.maxf %a, %b : f32
+      "tt.reduce.return"(%mx) : (f32) -> ()
+    }) {axis = 1 : i32} : (tensor<256xf32>) -> f32
+
+    %max_splat = tt.splat %row_max : f32 -> tensor<256xf32>
+    %shifted = arith.subf %7, %max_splat : tensor<256xf32>
+    %exp_val = math.exp %shifted : tensor<256xf32>
+
+    %exp_sum = "tt.reduce"(%exp_val) ({
+    ^bb0(%c: f32, %d: f32):
+      %sm = arith.addf %c, %d : f32
+      "tt.reduce.return"(%sm) : (f32) -> ()
+    }) {axis = 1 : i32} : (tensor<256xf32>) -> f32
+
+    %sum_splat = tt.splat %exp_sum : f32 -> tensor<256xf32>
+    %result = arith.divf %exp_val, %sum_splat : tensor<256xf32>
+
+    %8 = tt.splat %arg1 : !tt.ptr<f32> -> tensor<256x!tt.ptr<f32>>
+    %9 = tt.addptr %8, %4 : tensor<256x!tt.ptr<f32>>, tensor<256xi32>
+    tt.store %9, %result : !tt.ptr<f32>
+    tt.return
+  }
+}
+"""
+
+
+@requires_metal
+def test_integration_softmax_pipeline(runner):
+    """Full pipeline: TTGIR softmax → MSL → metallib → GPU → correct results."""
+    msl = runner.compile_ttgir_to_msl(SOFTMAX_TTGIR)
+
+    # The parser should detect softmax pattern (max + sum reduces)
+    assert "softmax" in msl.lower() or "max" in msl.lower()
+
+    pipeline = runner.compile_msl_to_metallib(msl, "softmax_kernel")
+
+    # Test with a single row of 64 elements
+    n_cols = 64
+    n_rows = 4
+    total = n_rows * n_cols
+
+    # Create input data
+    input_data = [float(i % 10) * 0.1 for i in range(total)]
+    in_buf = runner.make_buffer(input_data)
+    out_buf = runner.make_empty_buffer(total)
+    ncols_buf = runner.make_uint_buf(n_cols)
+
+    runner.dispatch(pipeline, [in_buf, out_buf, ncols_buf], n_rows, 256)
+
+    result = runner.read_buffer(out_buf, total)
+
+    # Verify each row sums to 1.0 (softmax property)
+    for r in range(n_rows):
+        row = result[r * n_cols:(r + 1) * n_cols]
+        row_sum = sum(row)
+        assert abs(row_sum - 1.0) < 1e-4, (
+            f"Row {r} sum = {row_sum}, expected ~1.0"
+        )
+        # All values should be positive
+        assert all(v >= 0 for v in row), f"Row {r} has negative values"
+
+
+@requires_metal
+def test_integration_direct_kernel_roundtrip(runner):
+    """Direct kernel (not TTGIR): generate MSL → compile → execute → verify."""
+    from triton_metal.codegen.msl_emitter import make_silu_kernel
+
+    msl = make_silu_kernel(block_size=256)
+    pipeline = runner.compile_msl_to_metallib(msl, "silu_kernel")
+
+    n = 512
+    input_data = [float(i) * 0.01 - 2.5 for i in range(n)]  # range [-2.5, 2.6]
+    in_buf = runner.make_buffer(input_data)
+    out_buf = runner.make_empty_buffer(n)
+    n_buf = runner.make_uint_buf(n)
+
+    n_groups = (n + 255) // 256
+    runner.dispatch(pipeline, [in_buf, out_buf, n_buf], n_groups, 256)
+
+    result = runner.read_buffer(out_buf, n)
+
+    # Verify against Python SiLU: x / (1 + exp(-x))
+    for i in range(n):
+        x = input_data[i]
+        expected = x / (1.0 + math.exp(-x))
+        assert abs(result[i] - expected) < 1e-4, (
+            f"index {i}: x={x}, got {result[i]}, expected {expected}"
+        )
+
+
+@requires_metal
+def test_integration_reduction_roundtrip(runner):
+    """Direct kernel reduction: generate → compile → execute → verify."""
+    from triton_metal.codegen.msl_emitter import make_reduce_kernel
+
+    msl = make_reduce_kernel("reduce_sum", "sum", block_size=256)
+    pipeline = runner.compile_msl_to_metallib(msl, "reduce_sum")
+
+    n = 1024
+    input_data = [float(i + 1) for i in range(n)]
+    in_buf = runner.make_buffer(input_data)
+    out_buf = runner.make_empty_buffer(1)
+    n_buf = runner.make_uint_buf(n)
+
+    runner.dispatch(pipeline, [in_buf, out_buf, n_buf], 1, 256)
+
+    result = runner.read_buffer(out_buf, 1)
+    expected = sum(input_data)  # n*(n+1)/2 = 524800.0
+    assert abs(result[0] - expected) < 1.0, (
+        f"Sum: got {result[0]}, expected {expected}"
+    )
+
+
+@requires_metal
+def test_integration_matmul_roundtrip(runner):
+    """Direct kernel matmul: generate → compile → execute → verify."""
+    from triton_metal.codegen.msl_emitter import make_matmul_kernel
+
+    M, N, K = 32, 32, 32
+    msl = make_matmul_kernel(block_m=32, block_n=32, block_k=32)
+    pipeline = runner.compile_msl_to_metallib(msl, "matmul_kernel")
+
+    # Identity-like A (diagonal 1s), simple B
+    A_data = [0.0] * (M * K)
+    for i in range(min(M, K)):
+        A_data[i * K + i] = 1.0
+    B_data = [float(i % 10) * 0.1 for i in range(K * N)]
+
+    A_buf = runner.make_buffer(A_data)
+    B_buf = runner.make_buffer(B_data)
+    C_buf = runner.make_empty_buffer(M * N)
+    M_buf = runner.make_uint_buf(M)
+    N_buf = runner.make_uint_buf(N)
+    K_buf = runner.make_uint_buf(K)
+
+    threads_per_tg = 32 * 32
+    runner.dispatch(pipeline, [A_buf, B_buf, C_buf, M_buf, N_buf, K_buf],
+                     1, threads_per_tg)
+
+    result = runner.read_buffer(C_buf, M * N)
+
+    # C = I @ B = B
+    for i in range(M * N):
+        assert abs(result[i] - B_data[i]) < 1e-3, (
+            f"index {i}: got {result[i]}, expected {B_data[i]}"
+        )
+
+
+@requires_metal
+def test_integration_flash_attention_roundtrip(runner):
+    """Direct kernel flash attention: generate → compile → execute → verify."""
+    from triton_metal.codegen.msl_emitter import make_flash_attention_kernel
+
+    seq_len = 16
+    head_dim = 64
+    msl = make_flash_attention_kernel(head_dim=head_dim, Br=16, Bc=16)
+    pipeline = runner.compile_msl_to_metallib(msl, "flash_attention")
+
+    total = seq_len * head_dim
+    Q_data = [0.01] * total
+    K_data = [0.01] * total
+    V_data = [float(i % head_dim) * 0.01 for i in range(total)]
+
+    Q_buf = runner.make_buffer(Q_data)
+    K_buf = runner.make_buffer(K_data)
+    V_buf = runner.make_buffer(V_data)
+    O_buf = runner.make_empty_buffer(total)
+    sl_buf = runner.make_uint_buf(seq_len)
+
+    runner.dispatch(pipeline, [Q_buf, K_buf, V_buf, O_buf, sl_buf], 1, 256)
+
+    result = runner.read_buffer(O_buf, total)
+
+    # With uniform Q and K, attention weights should be ~uniform
+    # so output ≈ mean(V) per position
+    # Just check output is finite and non-zero
+    assert all(math.isfinite(v) for v in result[:head_dim]), "Output should be finite"
+    assert any(abs(v) > 1e-6 for v in result[:head_dim]), "Output should be non-zero"
+
+
+@requires_triton
+@requires_metal
+def test_integration_backend_driver():
+    """Test MetalDriver can detect the device and create targets."""
+    from triton_metal.backend.driver import MetalDriver
+
+    driver = MetalDriver()
+    assert driver.is_active(), "Metal should be active on macOS"
+
+    target = driver.get_current_target()
+    assert "apple" in target.arch.lower() or "m" in target.arch.lower()
+
+    device = driver.get_active_torch_device()
+    assert "mps" in str(device)
+
+
+@requires_triton
+@requires_metal
+def test_integration_backend_compiler():
+    """Test MetalBackend compilation stages work."""
+    from triton_metal.backend.compiler import MetalBackend, MetalOptions
+
+    # Test options parsing
+    opts = MetalOptions()
+    assert opts.warp_size == 32
+    assert opts.max_threadgroup_memory == 32768
+
+    # Test hash is deterministic
+    h1 = opts.hash()
+    h2 = opts.hash()
+    assert h1 == h2
+
+    # Test make_metallib stage directly
+    from triton_metal.codegen.msl_emitter import make_vector_add_kernel
+    msl_src = make_vector_add_kernel()
+    metallib_path = MetalBackend.make_metallib(
+        msl_src, {"name": "test_va"}, opts
+    )
+    assert os.path.exists(metallib_path)
+    assert metallib_path.endswith(".metallib")
+
+
+# ---------------------------------------------------------------------------
+# Triton JIT tests (only run if Triton is installed)
+# ---------------------------------------------------------------------------
+
+@requires_triton
+@requires_metal
+def test_triton_jit_vector_add():
+    """@triton.jit vector_add compiles and runs via Metal backend."""
+    import torch
+
+    @triton.jit
+    def vector_add_kernel(a_ptr, b_ptr, out_ptr, n,
+                           BLOCK_SIZE: triton.language.constexpr):
+        pid = triton.language.program_id(0)
+        offsets = pid * BLOCK_SIZE + triton.language.arange(0, BLOCK_SIZE)
+        mask = offsets < n
+        a = triton.language.load(a_ptr + offsets, mask=mask)
+        b = triton.language.load(b_ptr + offsets, mask=mask)
+        triton.language.store(out_ptr + offsets, a + b, mask=mask)
+
+    n = 1024
+    a = torch.randn(n, device="mps")
+    b = torch.randn(n, device="mps")
+    out = torch.empty(n, device="mps")
+
+    vector_add_kernel[(n + 255) // 256](a, b, out, n, BLOCK_SIZE=256)
+
+    expected = a + b
+    assert torch.allclose(out, expected, atol=1e-5)

@@ -5481,3 +5481,449 @@ def test_layer_norm_bf16(runner):
         row_vals = result[row * n_cols : (row + 1) * n_cols]
         row_mean = sum(row_vals) / n_cols
         assert abs(row_mean) < 0.5, f"row {row} mean = {row_mean}, expected ≈ 0"
+
+
+# ---------------------------------------------------------------------------
+# Attention kernel GPU tests
+# ---------------------------------------------------------------------------
+
+
+def _ref_softmax(scores):
+    """Reference softmax on a list of floats."""
+    m = max(scores)
+    exps = [math.exp(s - m) for s in scores]
+    total = sum(exps)
+    return [e / total for e in exps]
+
+
+def _ref_dot(a, b):
+    """Reference dot product of two lists."""
+    return sum(x * y for x, y in zip(a, b))
+
+
+@requires_metal
+def test_causal_attention_gpu(runner):
+    """Causal attention kernel: validate softmax(Q@K^T * mask) @ V."""
+    import Metal
+    from triton_metal.codegen.msl_emitter import make_causal_attention_kernel
+
+    n_heads = 1
+    head_dim = 8
+    seq_len = 4
+    block_size = 256
+
+    random.seed(42)
+    total = n_heads * seq_len * head_dim
+    Q = [random.gauss(0, 0.5) for _ in range(total)]
+    K = [random.gauss(0, 0.5) for _ in range(total)]
+    V = [random.gauss(0, 0.5) for _ in range(total)]
+
+    # Reference computation
+    scale = 1.0 / math.sqrt(head_dim)
+    expected = [0.0] * total
+    for h in range(n_heads):
+        for qp in range(seq_len):
+            # Compute scores with causal mask
+            scores = []
+            for kp in range(seq_len):
+                if kp <= qp:
+                    qi = h * seq_len * head_dim + qp * head_dim
+                    ki = h * seq_len * head_dim + kp * head_dim
+                    dot = _ref_dot(Q[qi:qi+head_dim], K[ki:ki+head_dim])
+                    scores.append(dot * scale)
+                else:
+                    scores.append(float('-inf'))
+            weights = _ref_softmax(scores)
+            for d in range(head_dim):
+                val = 0.0
+                for kp in range(seq_len):
+                    vi = h * seq_len * head_dim + kp * head_dim + d
+                    val += weights[kp] * V[vi]
+                oi = h * seq_len * head_dim + qp * head_dim + d
+                expected[oi] = val
+
+    msl = make_causal_attention_kernel(n_heads=n_heads, head_dim=head_dim,
+                                        block_size=block_size)
+    path = runner.compile(msl, "causal_attention")
+    pipeline = runner.load(path, "causal_attention")
+
+    q_buf = runner.make_float_buffer(Q)
+    k_buf = runner.make_float_buffer(K)
+    v_buf = runner.make_float_buffer(V)
+    out_buf = runner.make_empty_buffer(total)
+    # seq_len is passed as a device buffer (uint*) for this kernel
+    sl_buf = runner.make_uint_buffer(seq_len)
+
+    n_threadgroups = n_heads * seq_len
+    cmd = runner.queue.commandBuffer()
+    enc = cmd.computeCommandEncoder()
+    enc.setComputePipelineState_(pipeline)
+    for i, buf in enumerate([q_buf, k_buf, v_buf, out_buf, sl_buf]):
+        enc.setBuffer_offset_atIndex_(buf, 0, i)
+    enc.dispatchThreadgroups_threadsPerThreadgroup_(
+        Metal.MTLSizeMake(n_threadgroups, 1, 1),
+        Metal.MTLSizeMake(block_size, 1, 1),
+    )
+    enc.endEncoding()
+    cmd.commit()
+    cmd.waitUntilCompleted()
+    assert cmd.status() == 4
+
+    result = runner.read_float_buffer(out_buf, total)
+    for i in range(total):
+        assert abs(result[i] - expected[i]) < 0.05, \
+            f"idx {i}: got {result[i]}, expected {expected[i]}"
+
+
+@requires_metal
+def test_flash_attention_gpu(runner):
+    """Flash attention kernel: validate FlashAttention-2 with online softmax."""
+    import Metal
+    from triton_metal.codegen.msl_emitter import make_flash_attention_kernel
+
+    head_dim = 8
+    seq_len = 8
+    n_heads = 1
+    Br, Bc = 4, 4
+    block_size = 256
+
+    random.seed(123)
+    total = n_heads * seq_len * head_dim
+    Q = [random.gauss(0, 0.3) for _ in range(total)]
+    K = [random.gauss(0, 0.3) for _ in range(total)]
+    V = [random.gauss(0, 0.3) for _ in range(total)]
+
+    # Reference: standard attention (non-causal)
+    scale = 1.0 / math.sqrt(head_dim)
+    expected = [0.0] * total
+    for h in range(n_heads):
+        for qp in range(seq_len):
+            scores = []
+            for kp in range(seq_len):
+                qi = h * seq_len * head_dim + qp * head_dim
+                ki = h * seq_len * head_dim + kp * head_dim
+                dot = _ref_dot(Q[qi:qi+head_dim], K[ki:ki+head_dim])
+                scores.append(dot * scale)
+            weights = _ref_softmax(scores)
+            for d in range(head_dim):
+                val = 0.0
+                for kp in range(seq_len):
+                    vi = h * seq_len * head_dim + kp * head_dim + d
+                    val += weights[kp] * V[vi]
+                oi = h * seq_len * head_dim + qp * head_dim + d
+                expected[oi] = val
+
+    msl = make_flash_attention_kernel(head_dim=head_dim, Br=Br, Bc=Bc,
+                                       block_size=block_size, causal=False)
+    path = runner.compile(msl, "flash_attention")
+    pipeline = runner.load(path, "flash_attention")
+
+    q_buf = runner.make_float_buffer(Q)
+    k_buf = runner.make_float_buffer(K)
+    v_buf = runner.make_float_buffer(V)
+    out_buf = runner.make_empty_buffer(total)
+    sl_buf = runner.make_uint_buffer(seq_len)
+    scale_buf = runner.make_float_scalar_buffer(scale)
+
+    n_q_blocks = (seq_len + Br - 1) // Br
+    n_threadgroups = n_heads * n_q_blocks
+
+    cmd = runner.queue.commandBuffer()
+    enc = cmd.computeCommandEncoder()
+    enc.setComputePipelineState_(pipeline)
+    for i, buf in enumerate([q_buf, k_buf, v_buf, out_buf, sl_buf, scale_buf]):
+        enc.setBuffer_offset_atIndex_(buf, 0, i)
+    enc.dispatchThreadgroups_threadsPerThreadgroup_(
+        Metal.MTLSizeMake(n_threadgroups, 1, 1),
+        Metal.MTLSizeMake(block_size, 1, 1),
+    )
+    enc.endEncoding()
+    cmd.commit()
+    cmd.waitUntilCompleted()
+    assert cmd.status() == 4
+
+    result = runner.read_float_buffer(out_buf, total)
+    for i in range(total):
+        assert abs(result[i] - expected[i]) < 0.1, \
+            f"idx {i}: got {result[i]}, expected {expected[i]}"
+
+
+@requires_metal
+def test_kv_cache_attention_gpu(runner):
+    """KV-cache attention: single query token attending to cached K,V."""
+    import Metal
+    from triton_metal.codegen.msl_emitter import make_kv_cache_attention_kernel
+
+    head_dim = 8
+    seq_len = 4
+    n_heads = 2
+    block_size = 256
+
+    random.seed(77)
+    Q = [random.gauss(0, 0.5) for _ in range(n_heads * head_dim)]
+    K = [random.gauss(0, 0.5) for _ in range(n_heads * seq_len * head_dim)]
+    V = [random.gauss(0, 0.5) for _ in range(n_heads * seq_len * head_dim)]
+
+    # Reference computation
+    scale = 1.0 / math.sqrt(head_dim)
+    expected = [0.0] * (n_heads * head_dim)
+    for h in range(n_heads):
+        scores = []
+        for j in range(seq_len):
+            qi = h * head_dim
+            ki = h * seq_len * head_dim + j * head_dim
+            dot = _ref_dot(Q[qi:qi+head_dim], K[ki:ki+head_dim])
+            scores.append(dot * scale)
+        weights = _ref_softmax(scores)
+        for d in range(head_dim):
+            val = 0.0
+            for j in range(seq_len):
+                vi = h * seq_len * head_dim + j * head_dim + d
+                val += weights[j] * V[vi]
+            expected[h * head_dim + d] = val
+
+    msl = make_kv_cache_attention_kernel(head_dim=head_dim, block_size=block_size)
+    path = runner.compile(msl, "kv_cache_attention")
+    pipeline = runner.load(path, "kv_cache_attention")
+
+    q_buf = runner.make_float_buffer(Q)
+    k_buf = runner.make_float_buffer(K)
+    v_buf = runner.make_float_buffer(V)
+    out_buf = runner.make_empty_buffer(n_heads * head_dim)
+    sl_buf = runner.make_uint_buffer(seq_len)
+    scale_buf = runner.make_float_scalar_buffer(scale)
+
+    cmd = runner.queue.commandBuffer()
+    enc = cmd.computeCommandEncoder()
+    enc.setComputePipelineState_(pipeline)
+    for i, buf in enumerate([q_buf, k_buf, v_buf, out_buf, sl_buf, scale_buf]):
+        enc.setBuffer_offset_atIndex_(buf, 0, i)
+    enc.dispatchThreadgroups_threadsPerThreadgroup_(
+        Metal.MTLSizeMake(n_heads, 1, 1),
+        Metal.MTLSizeMake(block_size, 1, 1),
+    )
+    enc.endEncoding()
+    cmd.commit()
+    cmd.waitUntilCompleted()
+    assert cmd.status() == 4
+
+    result = runner.read_float_buffer(out_buf, n_heads * head_dim)
+    for i in range(n_heads * head_dim):
+        assert abs(result[i] - expected[i]) < 0.05, \
+            f"idx {i}: got {result[i]}, expected {expected[i]}"
+
+
+@requires_metal
+def test_gqa_attention_gpu(runner):
+    """Grouped query attention: multiple Q heads share fewer KV heads."""
+    import Metal
+    from triton_metal.codegen.msl_emitter import make_gqa_attention_kernel
+
+    head_dim = 8
+    seq_len = 4
+    n_q_per_kv = 2
+    n_kv_heads = 2
+    n_q_heads = n_kv_heads * n_q_per_kv  # = 4
+    block_size = 256
+
+    random.seed(99)
+    Q = [random.gauss(0, 0.5) for _ in range(n_q_heads * head_dim)]
+    K = [random.gauss(0, 0.5) for _ in range(n_kv_heads * seq_len * head_dim)]
+    V = [random.gauss(0, 0.5) for _ in range(n_kv_heads * seq_len * head_dim)]
+
+    # Reference computation
+    scale = 1.0 / math.sqrt(head_dim)
+    expected = [0.0] * (n_q_heads * head_dim)
+    for qh in range(n_q_heads):
+        kv_head = qh // n_q_per_kv
+        scores = []
+        for j in range(seq_len):
+            qi = qh * head_dim
+            ki = kv_head * seq_len * head_dim + j * head_dim
+            dot = _ref_dot(Q[qi:qi+head_dim], K[ki:ki+head_dim])
+            scores.append(dot * scale)
+        weights = _ref_softmax(scores)
+        for d in range(head_dim):
+            val = 0.0
+            for j in range(seq_len):
+                vi = kv_head * seq_len * head_dim + j * head_dim + d
+                val += weights[j] * V[vi]
+            expected[qh * head_dim + d] = val
+
+    msl = make_gqa_attention_kernel(head_dim=head_dim, n_q_per_kv=n_q_per_kv,
+                                     block_size=block_size)
+    path = runner.compile(msl, "gqa_attention")
+    pipeline = runner.load(path, "gqa_attention")
+
+    q_buf = runner.make_float_buffer(Q)
+    k_buf = runner.make_float_buffer(K)
+    v_buf = runner.make_float_buffer(V)
+    out_buf = runner.make_empty_buffer(n_q_heads * head_dim)
+    sl_buf = runner.make_uint_buffer(seq_len)
+    scale_buf = runner.make_float_scalar_buffer(scale)
+
+    cmd = runner.queue.commandBuffer()
+    enc = cmd.computeCommandEncoder()
+    enc.setComputePipelineState_(pipeline)
+    for i, buf in enumerate([q_buf, k_buf, v_buf, out_buf, sl_buf, scale_buf]):
+        enc.setBuffer_offset_atIndex_(buf, 0, i)
+    enc.dispatchThreadgroups_threadsPerThreadgroup_(
+        Metal.MTLSizeMake(n_q_heads, 1, 1),
+        Metal.MTLSizeMake(block_size, 1, 1),
+    )
+    enc.endEncoding()
+    cmd.commit()
+    cmd.waitUntilCompleted()
+    assert cmd.status() == 4
+
+    result = runner.read_float_buffer(out_buf, n_q_heads * head_dim)
+    for i in range(n_q_heads * head_dim):
+        assert abs(result[i] - expected[i]) < 0.05, \
+            f"idx {i}: got {result[i]}, expected {expected[i]}"
+
+
+@requires_metal
+def test_paged_attention_gpu(runner):
+    """Paged attention: KV-cache stored in fixed-size pages with page table."""
+    import Metal
+    from triton_metal.codegen.msl_emitter import make_paged_attention_kernel
+
+    head_dim = 8
+    page_size = 4
+    seq_len = 8  # 2 pages
+    n_pages = (seq_len + page_size - 1) // page_size  # = 2
+    block_size = 256
+
+    random.seed(55)
+    Q = [random.gauss(0, 0.5) for _ in range(head_dim)]
+    # Pages: [n_physical_pages, page_size, head_dim]
+    # Use identity page table (logical == physical)
+    K_pages = [random.gauss(0, 0.5) for _ in range(n_pages * page_size * head_dim)]
+    V_pages = [random.gauss(0, 0.5) for _ in range(n_pages * page_size * head_dim)]
+    page_table = list(range(n_pages))  # identity mapping
+
+    # Reference: flatten pages to contiguous, compute standard attention
+    scale = 1.0 / math.sqrt(head_dim)
+    scores = []
+    for j in range(seq_len):
+        page_idx = j // page_size
+        within_page = j % page_size
+        phys_page = page_table[page_idx]
+        ki = phys_page * page_size * head_dim + within_page * head_dim
+        dot = _ref_dot(Q, K_pages[ki:ki+head_dim])
+        scores.append(dot * scale)
+    weights = _ref_softmax(scores)
+
+    expected = [0.0] * head_dim
+    for d in range(head_dim):
+        for j in range(seq_len):
+            page_idx = j // page_size
+            within_page = j % page_size
+            phys_page = page_table[page_idx]
+            vi = phys_page * page_size * head_dim + within_page * head_dim + d
+            expected[d] += weights[j] * V_pages[vi]
+
+    msl = make_paged_attention_kernel(head_dim=head_dim, page_size=page_size,
+                                       block_size=block_size)
+    path = runner.compile(msl, "paged_attention")
+    pipeline = runner.load(path, "paged_attention")
+
+    q_buf = runner.make_float_buffer(Q)
+    kp_buf = runner.make_float_buffer(K_pages)
+    vp_buf = runner.make_float_buffer(V_pages)
+    # page_table is uint array
+    pt_buf = runner.make_float_buffer([0.0] * n_pages)  # placeholder, will pack uints
+    import struct as _struct
+    pt_view = pt_buf.contents().as_buffer(n_pages * 4)
+    for i, p in enumerate(page_table):
+        _struct.pack_into("I", pt_view, i * 4, p)
+    out_buf = runner.make_empty_buffer(head_dim)
+    sl_buf = runner.make_uint_buffer(seq_len)
+    np_buf = runner.make_uint_buffer(n_pages)
+
+    # Single threadgroup dispatch
+    cmd = runner.queue.commandBuffer()
+    enc = cmd.computeCommandEncoder()
+    enc.setComputePipelineState_(pipeline)
+    for i, buf in enumerate([q_buf, kp_buf, vp_buf, pt_buf, out_buf, sl_buf, np_buf]):
+        enc.setBuffer_offset_atIndex_(buf, 0, i)
+    enc.dispatchThreadgroups_threadsPerThreadgroup_(
+        Metal.MTLSizeMake(1, 1, 1),
+        Metal.MTLSizeMake(block_size, 1, 1),
+    )
+    enc.endEncoding()
+    cmd.commit()
+    cmd.waitUntilCompleted()
+    assert cmd.status() == 4
+
+    result = runner.read_float_buffer(out_buf, head_dim)
+    for d in range(head_dim):
+        assert abs(result[d] - expected[d]) < 0.1, \
+            f"dim {d}: got {result[d]}, expected {expected[d]}"
+
+
+@requires_metal
+def test_sliding_window_attention_gpu(runner):
+    """Sliding window attention: attend only to last window_size tokens."""
+    import Metal
+    from triton_metal.codegen.msl_emitter import make_sliding_window_attention_kernel
+
+    head_dim = 8
+    window_size = 4
+    seq_len = 8
+    q_pos = 6  # attends to positions 3,4,5,6
+    block_size = 256
+
+    random.seed(33)
+    Q = [random.gauss(0, 0.5) for _ in range(head_dim)]
+    K_cache = [random.gauss(0, 0.5) for _ in range(seq_len * head_dim)]
+    V_cache = [random.gauss(0, 0.5) for _ in range(seq_len * head_dim)]
+
+    # Reference
+    scale = 1.0 / math.sqrt(head_dim)
+    win_start = max(0, q_pos - window_size + 1)
+    win_end = min(q_pos + 1, seq_len)
+    scores = []
+    for j in range(win_start, win_end):
+        ki = j * head_dim
+        dot = _ref_dot(Q, K_cache[ki:ki+head_dim])
+        scores.append(dot * scale)
+    weights = _ref_softmax(scores)
+
+    expected = [0.0] * head_dim
+    for idx, j in enumerate(range(win_start, win_end)):
+        for d in range(head_dim):
+            expected[d] += weights[idx] * V_cache[j * head_dim + d]
+
+    msl = make_sliding_window_attention_kernel(head_dim=head_dim,
+                                                window_size=window_size,
+                                                block_size=block_size)
+    path = runner.compile(msl, "sliding_window_attention")
+    pipeline = runner.load(path, "sliding_window_attention")
+
+    q_buf = runner.make_float_buffer(Q)
+    k_buf = runner.make_float_buffer(K_cache)
+    v_buf = runner.make_float_buffer(V_cache)
+    out_buf = runner.make_empty_buffer(head_dim)
+    qp_buf = runner.make_uint_buffer(q_pos)
+    sl_buf = runner.make_uint_buffer(seq_len)
+
+    # Single threadgroup dispatch
+    cmd = runner.queue.commandBuffer()
+    enc = cmd.computeCommandEncoder()
+    enc.setComputePipelineState_(pipeline)
+    for i, buf in enumerate([q_buf, k_buf, v_buf, out_buf, qp_buf, sl_buf]):
+        enc.setBuffer_offset_atIndex_(buf, 0, i)
+    enc.dispatchThreadgroups_threadsPerThreadgroup_(
+        Metal.MTLSizeMake(1, 1, 1),
+        Metal.MTLSizeMake(block_size, 1, 1),
+    )
+    enc.endEncoding()
+    cmd.commit()
+    cmd.waitUntilCompleted()
+    assert cmd.status() == 4
+
+    result = runner.read_float_buffer(out_buf, head_dim)
+    for d in range(head_dim):
+        assert abs(result[d] - expected[d]) < 0.1, \
+            f"dim {d}: got {result[d]}, expected {expected[d]}"

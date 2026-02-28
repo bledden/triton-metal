@@ -3588,3 +3588,201 @@ def test_repeat_kv(runner):
                 assert abs(got - expected) < 0.001, (
                     f"q_head={qh} s={s} d={d}: got {got}, expected {expected}"
                 )
+
+
+# ---------------------------------------------------------------------------
+# Edge case and error handling tests
+# ---------------------------------------------------------------------------
+
+@requires_metal
+def test_vector_add_single_element(runner):
+    """Vector add with n=1 (single element, partial threadgroup)."""
+    from triton_metal.codegen.msl_emitter import make_vector_add_kernel
+
+    msl = make_vector_add_kernel(block_size=256)
+    path = runner.compile(msl, "vector_add")
+    pipeline = runner.load(path, "vector_add")
+
+    a_buf = runner.make_float_buffer([3.14])
+    b_buf = runner.make_float_buffer([2.71])
+    out_buf = runner.make_empty_buffer(1)
+    n_buf = runner.make_uint_buffer(1)
+
+    runner.run(pipeline, [a_buf, b_buf, out_buf, n_buf], 1, 256)
+    result = runner.read_float_buffer(out_buf, 1)
+    assert abs(result[0] - 5.85) < 0.001
+
+
+@requires_metal
+def test_vector_add_non_power_of_2(runner):
+    """Vector add with n=137 (non-power-of-2, tests masking)."""
+    from triton_metal.codegen.msl_emitter import make_vector_add_kernel
+
+    n = 137
+    msl = make_vector_add_kernel(block_size=256)
+    path = runner.compile(msl, "vector_add")
+    pipeline = runner.load(path, "vector_add")
+
+    a_data = [float(i) for i in range(n)]
+    b_data = [float(i) * 0.5 for i in range(n)]
+    a_buf = runner.make_float_buffer(a_data)
+    b_buf = runner.make_float_buffer(b_data)
+    out_buf = runner.make_empty_buffer(n)
+    n_buf = runner.make_uint_buffer(n)
+
+    runner.run(pipeline, [a_buf, b_buf, out_buf, n_buf], n, 256)
+    result = runner.read_float_buffer(out_buf, n)
+
+    for i in range(n):
+        expected = a_data[i] + b_data[i]
+        assert abs(result[i] - expected) < 0.01, f"i={i}: {result[i]} != {expected}"
+
+
+@requires_metal
+def test_silu_large_input(runner):
+    """SiLU with 100K elements (multi-threadgroup)."""
+    from triton_metal.codegen.msl_emitter import make_silu_kernel
+
+    n = 100_000
+    msl = make_silu_kernel(block_size=256)
+    path = runner.compile(msl, "silu_kernel")
+    pipeline = runner.load(path, "silu_kernel")
+
+    # Use values from a range that exercises both positive and negative
+    in_data = [float(i % 200 - 100) * 0.05 for i in range(n)]
+    in_buf = runner.make_float_buffer(in_data)
+    out_buf = runner.make_empty_buffer(n)
+    n_buf = runner.make_uint_buffer(n)
+
+    runner.run(pipeline, [in_buf, out_buf, n_buf], n, 256)
+    result = runner.read_float_buffer(out_buf, n)
+
+    # Check first and last elements plus a sample
+    for i in [0, 1, n // 2, n - 2, n - 1]:
+        x = in_data[i]
+        expected = x / (1.0 + math.exp(-x))
+        assert abs(result[i] - expected) < 0.001, f"i={i}: {result[i]} != {expected}"
+
+
+@requires_metal
+def test_reduce_sum_non_power_of_2(runner):
+    """Sum reduction with n=1000 (not a power of 2)."""
+    from triton_metal.codegen.msl_emitter import make_reduce_kernel
+
+    n = 1000
+    msl = make_reduce_kernel("reduce_sum", "sum", block_size=256)
+    path = runner.compile(msl, "reduce_sum")
+    pipeline = runner.load(path, "reduce_sum")
+
+    # Sum of 1..1000 = 500500
+    in_data = [float(i + 1) for i in range(n)]
+    in_buf = runner.make_float_buffer(in_data)
+    out_buf = runner.make_empty_buffer(1)
+    n_buf = runner.make_uint_buffer(n)
+
+    runner.run(pipeline, [in_buf, out_buf, n_buf], 1, 256)
+    result = runner.read_float_buffer(out_buf, 1)
+    assert abs(result[0] - 500500.0) < 1.0, f"Sum: {result[0]}"
+
+
+@requires_metal
+def test_softmax_single_row(runner):
+    """Softmax with a single row (n_rows=1)."""
+    from triton_metal.codegen.msl_emitter import make_softmax_kernel
+
+    n_cols = 32
+    msl = make_softmax_kernel(block_size=256)
+    path = runner.compile(msl, "softmax_kernel")
+    pipeline = runner.load(path, "softmax_kernel")
+
+    in_data = [float(i) * 0.3 for i in range(n_cols)]
+    in_buf = runner.make_float_buffer(in_data)
+    out_buf = runner.make_empty_buffer(n_cols)
+    ncols_buf = runner.make_uint_buffer(n_cols)
+
+    runner.run(pipeline, [in_buf, out_buf, ncols_buf], 1, 256)
+    result = runner.read_float_buffer(out_buf, n_cols)
+
+    # Should sum to 1
+    row_sum = sum(result)
+    assert abs(row_sum - 1.0) < 0.001, f"Sum: {row_sum}"
+    # All positive
+    assert all(v >= 0 for v in result)
+
+
+@requires_metal
+def test_softmax_uniform_input(runner):
+    """Softmax with uniform input → all outputs should be equal (1/n)."""
+    from triton_metal.codegen.msl_emitter import make_softmax_kernel
+
+    n_cols = 64
+    msl = make_softmax_kernel(block_size=256)
+    path = runner.compile(msl, "softmax_kernel")
+    pipeline = runner.load(path, "softmax_kernel")
+
+    in_data = [1.0] * n_cols  # all same value
+    in_buf = runner.make_float_buffer(in_data)
+    out_buf = runner.make_empty_buffer(n_cols)
+    ncols_buf = runner.make_uint_buffer(n_cols)
+
+    runner.run(pipeline, [in_buf, out_buf, ncols_buf], 1, 256)
+    result = runner.read_float_buffer(out_buf, n_cols)
+
+    expected = 1.0 / n_cols
+    for i, v in enumerate(result):
+        assert abs(v - expected) < 0.001, f"i={i}: {v} != {expected}"
+
+
+@requires_metal
+def test_layer_norm_zero_variance(runner):
+    """Layer norm with zero variance → output should be beta (all same input)."""
+    from triton_metal.codegen.msl_emitter import make_layer_norm_kernel
+
+    n_cols = 64
+    msl = make_layer_norm_kernel(block_size=256)
+    path = runner.compile(msl, "layer_norm_kernel")
+    pipeline = runner.load(path, "layer_norm_kernel")
+
+    # All same value → variance = 0, output = (0)*gamma + beta = beta
+    in_data = [5.0] * n_cols
+    gamma_data = [1.0] * n_cols
+    beta_data = [0.5] * n_cols
+
+    in_buf = runner.make_float_buffer(in_data)
+    gamma_buf = runner.make_float_buffer(gamma_data)
+    beta_buf = runner.make_float_buffer(beta_data)
+    out_buf = runner.make_empty_buffer(n_cols)
+    ncols_buf = runner.make_uint_buffer(n_cols)
+
+    runner.run(pipeline, [in_buf, gamma_buf, beta_buf, out_buf, ncols_buf],
+                        1, 256)
+    result = runner.read_float_buffer(out_buf, n_cols)
+
+    # With zero variance, normalized x = 0 (since x-mean=0), so output = 0*gamma + beta = beta
+    for i, v in enumerate(result):
+        assert abs(v - 0.5) < 0.01, f"i={i}: {v} != 0.5"
+
+
+@requires_metal
+def test_fp64_rejection():
+    """FP64 types should be rejected by the parser."""
+    from triton_metal.codegen.ttgir_parser import _mlir_type_to_triton_dtype
+
+    with pytest.raises(TypeError, match="FP64.*not supported"):
+        _mlir_type_to_triton_dtype("f64")
+
+
+@requires_metal
+def test_kernel_builder_empty():
+    """KernelBuilder with no ops produces valid (empty) kernel."""
+    from triton_metal.codegen.msl_emitter import KernelBuilder
+
+    kb = KernelBuilder("empty_test", block_size=256)
+    kb.add_ptr_arg("input", dtype="fp32", const=True)
+    kb.add_ptr_arg("output", dtype="fp32", const=False)
+    kb.add_scalar_arg("n", dtype="u32")
+
+    msl = kb.build()
+    assert "empty_test" in msl
+    assert "device const float" in msl
+    assert "device float" in msl

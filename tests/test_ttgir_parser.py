@@ -116,6 +116,65 @@ module {
 """
 
 
+# FP16 vector add: C = A + B with half-precision inputs/outputs
+VECADD_FP16_TTGIR = """\
+module {
+  tt.func public @add_f16_kernel(%arg0: !tt.ptr<f16>, %arg1: !tt.ptr<f16>, %arg2: !tt.ptr<f16>, %arg3: i32) {
+    %0 = tt.get_program_id x : i32
+    %c256_i32 = arith.constant 256 : i32
+    %1 = arith.muli %0, %c256_i32 : i32
+    %2 = tt.make_range {end = 256 : i32, start = 0 : i32} : tensor<256xi32>
+    %3 = tt.splat %1 : i32 -> tensor<256xi32>
+    %4 = arith.addi %3, %2 : tensor<256xi32>
+    %5 = tt.splat %arg3 : i32 -> tensor<256xi32>
+    %6 = arith.cmpi slt, %4, %5 : tensor<256xi32>
+    %7 = tt.splat %arg0 : !tt.ptr<f16> -> tensor<256x!tt.ptr<f16>>
+    %8 = tt.addptr %7, %4 : tensor<256x!tt.ptr<f16>>, tensor<256xi32>
+    %9 = tt.splat %arg1 : !tt.ptr<f16> -> tensor<256x!tt.ptr<f16>>
+    %10 = tt.addptr %9, %4 : tensor<256x!tt.ptr<f16>>, tensor<256xi32>
+    %cst = arith.constant 0.000000e+00 : f16
+    %11 = tt.splat %cst : f16 -> tensor<256xf16>
+    %12 = tt.load %8, %6, %11 : tensor<256x!tt.ptr<f16>>
+    %13 = tt.load %10, %6, %11 : tensor<256x!tt.ptr<f16>>
+    %14 = arith.extf %12 : tensor<256xf16> to tensor<256xf32>
+    %15 = arith.extf %13 : tensor<256xf16> to tensor<256xf32>
+    %16 = arith.addf %14, %15 : tensor<256xf32>
+    %17 = arith.truncf %16 : tensor<256xf32> to tensor<256xf16>
+    %18 = tt.splat %arg2 : !tt.ptr<f16> -> tensor<256x!tt.ptr<f16>>
+    %19 = tt.addptr %18, %4 : tensor<256x!tt.ptr<f16>>, tensor<256xi32>
+    tt.store %19, %17, %6 : tensor<256x!tt.ptr<f16>>
+    tt.return
+  }
+}
+"""
+
+# Negate + select: C = A > 0 ? A : -A (abs via select)
+SELECT_TTGIR = """\
+module {
+  tt.func public @abs_select_kernel(%arg0: !tt.ptr<f32>, %arg1: !tt.ptr<f32>, %arg2: i32) {
+    %0 = tt.get_program_id x : i32
+    %c256_i32 = arith.constant 256 : i32
+    %1 = arith.muli %0, %c256_i32 : i32
+    %2 = tt.make_range {end = 256 : i32, start = 0 : i32} : tensor<256xi32>
+    %3 = tt.splat %1 : i32 -> tensor<256xi32>
+    %4 = arith.addi %3, %2 : tensor<256xi32>
+    %5 = tt.splat %arg2 : i32 -> tensor<256xi32>
+    %6 = arith.cmpi slt, %4, %5 : tensor<256xi32>
+    %7 = tt.splat %arg0 : !tt.ptr<f32> -> tensor<256x!tt.ptr<f32>>
+    %8 = tt.addptr %7, %4 : tensor<256x!tt.ptr<f32>>, tensor<256xi32>
+    %cst = arith.constant 0.000000e+00 : f32
+    %9 = tt.splat %cst : f32 -> tensor<256xf32>
+    %10 = tt.load %8, %6, %9 : tensor<256x!tt.ptr<f32>>
+    %11 = arith.negf %10 : tensor<256xf32>
+    %12 = arith.addf %10, %11 : tensor<256xf32>
+    %13 = tt.splat %arg1 : !tt.ptr<f32> -> tensor<256x!tt.ptr<f32>>
+    %14 = tt.addptr %13, %4 : tensor<256x!tt.ptr<f32>>, tensor<256xi32>
+    tt.store %14, %12, %6 : tensor<256x!tt.ptr<f32>>
+    tt.return
+  }
+}
+"""
+
 # Sum reduction: output = sum(input)
 SUM_REDUCE_TTGIR = """\
 module {
@@ -491,3 +550,94 @@ def test_ttgir_max_reduce_gpu(runner):
     assert abs(result[0] - expected) < 1e-3, (
         f"Max: got {result[0]}, expected {expected}"
     )
+
+
+# ---------------------------------------------------------------------------
+# FP16 and extended ops TTGIR tests
+# ---------------------------------------------------------------------------
+
+def test_parse_fp16_args():
+    """Parser detects fp16 pointer types correctly."""
+    from triton_metal.codegen.ttgir_parser import parse_ttgir
+
+    kb = parse_ttgir(VECADD_FP16_TTGIR, FakeOptions())
+    assert kb.name == "add_f16_kernel"
+    ptr_args = [a for a in kb.args if a.is_ptr]
+    assert all(a.dtype == "fp16" for a in ptr_args)
+
+
+@requires_metal
+def test_ttgir_fp16_vecadd_compiles(runner):
+    """TTGIR FP16 vector add compiles to valid MSL."""
+    from triton_metal.codegen.ttgir_parser import parse_ttgir
+
+    kb = parse_ttgir(VECADD_FP16_TTGIR, FakeOptions())
+    msl = kb.build()
+    runner.compile(msl, "add_f16_kernel")
+
+
+@requires_metal
+def test_ttgir_fp16_vecadd_gpu(runner):
+    """TTGIR FP16 vector add: C = A + B in half precision, verified on GPU."""
+    from triton_metal.codegen.ttgir_parser import parse_ttgir
+
+    kb = parse_ttgir(VECADD_FP16_TTGIR, FakeOptions())
+    msl = kb.build()
+    n = 512
+
+    metallib = runner.compile(msl, "add_f16_kernel")
+    pipeline = runner.load(metallib, "add_f16_kernel")
+
+    a_data = [float(i) * 0.01 for i in range(n)]
+    b_data = [float(i) * 0.005 for i in range(n)]
+    buf_a = runner.make_half_buffer(a_data)
+    buf_b = runner.make_half_buffer(b_data)
+    buf_c = runner.make_empty_half_buffer(n)
+    buf_n = runner.make_int_buffer(n)
+
+    runner.run(pipeline, [buf_a, buf_b, buf_c, buf_n], n, block_size=256)
+
+    result = runner.read_half_buffer(buf_c, n)
+    for i in range(n):
+        expected = a_data[i] + b_data[i]
+        tol = max(1e-2, abs(expected) * 1e-2)
+        assert abs(result[i] - expected) < tol, (
+            f"[{i}] got {result[i]}, expected {expected}"
+        )
+
+
+@requires_metal
+def test_ttgir_negf_compiles(runner):
+    """TTGIR with arith.negf compiles to valid MSL."""
+    from triton_metal.codegen.ttgir_parser import parse_ttgir
+
+    kb = parse_ttgir(SELECT_TTGIR, FakeOptions())
+    msl = kb.build()
+    runner.compile(msl, "abs_select_kernel")
+
+
+@requires_metal
+def test_ttgir_negf_gpu(runner):
+    """TTGIR negate + add: output = x + (-x) = 0, verified on GPU."""
+    from triton_metal.codegen.ttgir_parser import parse_ttgir
+
+    kb = parse_ttgir(SELECT_TTGIR, FakeOptions())
+    msl = kb.build()
+    n = 256
+
+    metallib = runner.compile(msl, "abs_select_kernel")
+    pipeline = runner.load(metallib, "abs_select_kernel")
+
+    input_data = [float(i) - 128.0 for i in range(n)]
+    buf_in = runner.make_float_buffer(input_data)
+    buf_out = runner.make_empty_buffer(n)
+    buf_n = runner.make_int_buffer(n)
+
+    runner.run(pipeline, [buf_in, buf_out, buf_n], n, block_size=256)
+
+    result = runner.read_float_buffer(buf_out, n)
+    for i in range(n):
+        # x + (-x) should be 0
+        assert abs(result[i]) < 1e-5, (
+            f"[{i}] got {result[i]}, expected 0.0"
+        )

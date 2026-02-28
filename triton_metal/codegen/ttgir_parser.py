@@ -264,13 +264,69 @@ class TTGIRParser:
                     self.ssa_values[result] = ("muli", lhs, rhs)
                 continue
 
-            # arith.cmpi slt (mask generation)
-            if "arith.cmpi" in line and "slt" in line:
-                m = re.match(r"%(\w+)\s*=\s*arith\.cmpi\s+slt\s*,\s*(%\w+)\s*,\s*(%\w+)", line)
+            # arith.subi (integer sub)
+            if "arith.subi" in line:
+                m = re.match(r"%(\w+)\s*=\s*arith\.subi\s+(%\w+)\s*,\s*(%\w+)", line)
                 if m:
                     result = f"%{m.group(1)}"
+                    self.ssa_values[result] = ("subi", m.group(2), m.group(3))
+                continue
+
+            # arith.cmpi (all predicates — used for mask generation and conditionals)
+            if "arith.cmpi" in line:
+                m = re.match(r"%(\w+)\s*=\s*arith\.cmpi\s+(\w+)\s*,\s*(%\w+)\s*,\s*(%\w+)", line)
+                if m:
+                    result = f"%{m.group(1)}"
+                    pred = m.group(2)  # slt, sle, sgt, sge, eq, ne, ult, ule, ugt, uge
                     self.mask_var = result
-                    self.ssa_values[result] = ("mask", m.group(2), m.group(3))
+                    self.ssa_values[result] = ("mask", m.group(3), m.group(4))
+                continue
+
+            # arith.select (ternary: cond ? true_val : false_val)
+            if "arith.select" in line:
+                m = re.match(r"%(\w+)\s*=\s*arith\.select\s+(%\w+)\s*,\s*(%\w+)\s*,\s*(%\w+)", line)
+                if m:
+                    result = f"%{m.group(1)}"
+                    self.ssa_values[result] = ("select", m.group(2), m.group(3), m.group(4))
+                continue
+
+            # arith.maxf / arith.minf (float max/min — not inside tt.reduce)
+            if "arith.maxf" in line and "tt.reduce" not in line:
+                m = re.match(r"%(\w+)\s*=\s*arith\.maxf\s+(%\w+)\s*,\s*(%\w+)", line)
+                if m:
+                    result = f"%{m.group(1)}"
+                    self.ssa_values[result] = ("fmax", m.group(2), m.group(3))
+                continue
+
+            if "arith.minf" in line and "tt.reduce" not in line:
+                m = re.match(r"%(\w+)\s*=\s*arith\.minf\s+(%\w+)\s*,\s*(%\w+)", line)
+                if m:
+                    result = f"%{m.group(1)}"
+                    self.ssa_values[result] = ("fmin", m.group(2), m.group(3))
+                continue
+
+            # arith.negf (float negate)
+            if "arith.negf" in line:
+                m = re.match(r"%(\w+)\s*=\s*arith\.negf\s+(%\w+)", line)
+                if m:
+                    result = f"%{m.group(1)}"
+                    self.ssa_values[result] = ("neg", m.group(2))
+                continue
+
+            # arith.sitofp / arith.uitofp (int to float conversion)
+            if "arith.sitofp" in line or "arith.uitofp" in line:
+                m = re.match(r"%(\w+)\s*=\s*arith\.\w+tofp\s+(%\w+)", line)
+                if m:
+                    result = f"%{m.group(1)}"
+                    self.ssa_values[result] = ("passthrough", m.group(2))
+                continue
+
+            # arith.fptosi / arith.fptoui (float to int conversion)
+            if "arith.fptosi" in line or "arith.fptoui" in line:
+                m = re.match(r"%(\w+)\s*=\s*arith\.fpto\w+\s+(%\w+)", line)
+                if m:
+                    result = f"%{m.group(1)}"
+                    self.ssa_values[result] = ("passthrough", m.group(2))
                 continue
 
             # tt.addptr (pointer + offset)
@@ -601,6 +657,7 @@ class TTGIRParser:
             ptr_ssa = val_info[1]
             arg_name = self._trace_to_ptr_arg(ptr_ssa)
             if arg_name and arg_name in input_vars:
+                self.computed_values[ssa] = input_vars[arg_name]
                 return input_vars[arg_name]
             return "0.0f"
 
@@ -615,10 +672,30 @@ class TTGIRParser:
             return var_name
 
         # Unary math ops
-        if op in ("exp", "log", "sqrt", "abs"):
+        if op in ("exp", "log", "sqrt", "abs", "neg"):
             x_var = self._emit_ssa_value(kb, val_info[1], input_vars, dtype, emitted)
             var_name = f"r_{len(self.computed_values)}"
             kb.unary_op(op, x_var, var_name)
+            self.computed_values[ssa] = var_name
+            return var_name
+
+        # Float max/min
+        if op in ("fmax", "fmin"):
+            lhs_var = self._emit_ssa_value(kb, val_info[1], input_vars, dtype, emitted)
+            rhs_var = self._emit_ssa_value(kb, val_info[2], input_vars, dtype, emitted)
+            var_name = f"r_{len(self.computed_values)}"
+            msl_op = "max" if op == "fmax" else "min"
+            kb._var(var_name, f"{msl_op}({lhs_var}, {rhs_var})", ty="float")
+            self.computed_values[ssa] = var_name
+            return var_name
+
+        # Select (ternary)
+        if op == "select":
+            cond_var = self._emit_ssa_value(kb, val_info[1], input_vars, dtype, emitted)
+            true_var = self._emit_ssa_value(kb, val_info[2], input_vars, dtype, emitted)
+            false_var = self._emit_ssa_value(kb, val_info[3], input_vars, dtype, emitted)
+            var_name = f"r_{len(self.computed_values)}"
+            kb._var(var_name, f"{cond_var} ? {true_var} : {false_var}", ty="float")
             self.computed_values[ssa] = var_name
             return var_name
 

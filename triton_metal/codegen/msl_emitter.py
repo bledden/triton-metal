@@ -1481,6 +1481,118 @@ kernel void gqa_attention(
 """
 
 
+def make_batched_kv_decode_kernel(n_heads=8, head_dim=64, block_size=256):
+    """Generate a batched multi-head KV-cache decode kernel.
+
+    For autoregressive inference: each batch item has one query token per head,
+    attending to cached K,V of varying sequence lengths.
+
+    Layout:
+        Q: [batch, n_heads, head_dim] — current query tokens
+        K_cache: [batch, n_heads, max_seq_len, head_dim]
+        V_cache: [batch, n_heads, max_seq_len, head_dim]
+        O: [batch, n_heads, head_dim]
+        seq_lens: [batch] — actual sequence length per batch item
+
+    Dispatch: one threadgroup per (batch_item, head) pair.
+    pid = batch_idx * n_heads + head_idx.
+
+    Args:
+        n_heads: Number of attention heads.
+        head_dim: Dimension per head.
+        block_size: Threads per threadgroup.
+    """
+    return f"""#include <metal_stdlib>
+using namespace metal;
+
+kernel void batched_kv_decode(
+    device const float* Q [[buffer(0)]],
+    device const float* K_cache [[buffer(1)]],
+    device const float* V_cache [[buffer(2)]],
+    device float* O [[buffer(3)]],
+    device const uint* seq_lens [[buffer(4)]],
+    constant uint& max_seq_len [[buffer(5)]],
+    constant uint& batch_size [[buffer(6)]],
+    uint pid [[threadgroup_position_in_grid]],
+    uint lid [[thread_position_in_threadgroup]],
+    uint sgitg [[simdgroup_index_in_threadgroup]],
+    uint tiisg [[thread_index_in_simdgroup]]
+) {{
+    const uint N_HEADS = {n_heads}u;
+    const uint D = {head_dim}u;
+    const uint BLOCK = {block_size}u;
+    const float scale = 1.0f / sqrt(float(D));
+
+    uint batch_idx = pid / N_HEADS;
+    uint head_idx = pid % N_HEADS;
+    if (batch_idx >= batch_size) return;
+
+    uint seq_len = seq_lens[batch_idx];
+
+    // Offsets into contiguous memory
+    uint q_offset = (batch_idx * N_HEADS + head_idx) * D;
+    uint kv_head_offset = (batch_idx * N_HEADS + head_idx) * max_seq_len * D;
+    uint o_offset = q_offset;
+
+    // Phase 1: Find max attention score
+    float local_max = -INFINITY;
+    for (uint j = lid; j < seq_len; j += BLOCK) {{
+        float dot = 0.0f;
+        for (uint d = 0u; d < D; d++) {{
+            dot += Q[q_offset + d] * K_cache[kv_head_offset + j * D + d];
+        }}
+        local_max = max(local_max, dot * scale);
+    }}
+
+    float sg_max = simd_max(local_max);
+    threadgroup float shared_max[{(block_size + 31) // 32}];
+    if (sgitg == 0u) shared_max[tiisg] = -INFINITY;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tiisg == 0u) shared_max[sgitg] = sg_max;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float rd_max = shared_max[tiisg];
+    float global_max = simd_max(rd_max);
+
+    // Phase 2: exp sum
+    float local_sum = 0.0f;
+    for (uint j = lid; j < seq_len; j += BLOCK) {{
+        float dot = 0.0f;
+        for (uint d = 0u; d < D; d++) {{
+            dot += Q[q_offset + d] * K_cache[kv_head_offset + j * D + d];
+        }}
+        local_sum += exp(dot * scale - global_max);
+    }}
+
+    float sg_sum = simd_sum(local_sum);
+    threadgroup float shared_sum[{(block_size + 31) // 32}];
+    if (sgitg == 0u) shared_sum[tiisg] = 0.0f;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tiisg == 0u) shared_sum[sgitg] = sg_sum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float rd_sum = shared_sum[tiisg];
+    float global_sum = simd_sum(rd_sum);
+    float inv_sum = 1.0f / global_sum;
+
+    // Phase 3: Weighted V sum — each thread computes one output dimension
+    for (uint d_start = 0u; d_start < D; d_start += BLOCK) {{
+        uint d = d_start + lid;
+        if (d < D) {{
+            float o_val = 0.0f;
+            for (uint j = 0u; j < seq_len; j++) {{
+                float dot = 0.0f;
+                for (uint dd = 0u; dd < D; dd++) {{
+                    dot += Q[q_offset + dd] * K_cache[kv_head_offset + j * D + dd];
+                }}
+                float attn_w = exp(dot * scale - global_max) * inv_sum;
+                o_val += attn_w * V_cache[kv_head_offset + j * D + d];
+            }}
+            O[o_offset + d] = o_val;
+        }}
+    }}
+}}
+"""
+
+
 def make_int8_matmul_kernel():
     """Generate a weight-only INT8 quantized matmul kernel.
 
@@ -1620,6 +1732,141 @@ kernel void top_k(
             picked[ki] = tg_idxs[0];
         }}
         threadgroup_barrier(mem_flags::mem_threadgroup);
+    }}
+}}
+"""
+
+
+def make_top_p_kernel(max_k=256, block_size=256):
+    """Generate a top-p (nucleus) sampling kernel.
+
+    Given logits for a single row, applies temperature scaling, computes
+    softmax, sorts by descending probability, and returns the nucleus set
+    (tokens whose cumulative probability <= p, plus the first token that
+    exceeds the threshold).
+
+    Output:
+        out_values: softmax probabilities of selected tokens (descending)
+        out_indices: vocabulary indices of selected tokens
+        out_count: number of tokens in the nucleus (single uint)
+
+    Uses the top-k infrastructure internally: first finds the top max_k
+    by probability, then applies the cumulative threshold.
+
+    Args:
+        max_k: Maximum number of candidates to consider.
+        block_size: Threads per threadgroup.
+    """
+    return f"""#include <metal_stdlib>
+using namespace metal;
+
+kernel void top_p(
+    device const float* logits [[buffer(0)]],
+    device float* out_values [[buffer(1)]],
+    device uint* out_indices [[buffer(2)]],
+    device uint* out_count [[buffer(3)]],
+    constant uint& vocab_size [[buffer(4)]],
+    constant float& temperature [[buffer(5)]],
+    constant float& p_threshold [[buffer(6)]],
+    uint pid [[threadgroup_position_in_grid]],
+    uint lid [[thread_position_in_threadgroup]]
+) {{
+    const uint BLOCK = {block_size}u;
+    const uint MAX_K = {max_k}u;
+    const uint row_offset = pid * vocab_size;
+
+    // Phase 1: Find global max for numerical stability
+    threadgroup float tg_max[{block_size}];
+    float local_max = -INFINITY;
+    for (uint v = lid; v < vocab_size; v += BLOCK) {{
+        local_max = max(local_max, logits[row_offset + v]);
+    }}
+    tg_max[lid] = local_max;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint stride = BLOCK / 2u; stride > 0u; stride >>= 1u) {{
+        if (lid < stride) {{
+            tg_max[lid] = max(tg_max[lid], tg_max[lid + stride]);
+        }}
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }}
+    float global_max = tg_max[0];
+
+    // Phase 2: Compute exp sum for softmax denominator
+    threadgroup float tg_sum[{block_size}];
+    float local_sum = 0.0f;
+    for (uint v = lid; v < vocab_size; v += BLOCK) {{
+        local_sum += exp((logits[row_offset + v] - global_max) / temperature);
+    }}
+    tg_sum[lid] = local_sum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint stride = BLOCK / 2u; stride > 0u; stride >>= 1u) {{
+        if (lid < stride) {{
+            tg_sum[lid] += tg_sum[lid + stride];
+        }}
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }}
+    float inv_sum = 1.0f / tg_sum[0];
+
+    // Phase 3: Find top MAX_K candidates by softmax probability
+    threadgroup float cand_vals[{max_k}];
+    threadgroup uint cand_idxs[{max_k}];
+    threadgroup float tg_vals[{block_size}];
+    threadgroup uint tg_idxs[{block_size}];
+    threadgroup uint picked[{max_k}];
+
+    for (uint ki = 0u; ki < MAX_K; ki++) {{
+        float best_val = -INFINITY;
+        uint best_idx = 0u;
+
+        for (uint v = lid; v < vocab_size; v += BLOCK) {{
+            bool is_picked = false;
+            for (uint pp = 0u; pp < ki; pp++) {{
+                if (picked[pp] == v) {{ is_picked = true; break; }}
+            }}
+            if (!is_picked) {{
+                float prob = exp((logits[row_offset + v] - global_max) / temperature) * inv_sum;
+                if (prob > best_val) {{
+                    best_val = prob;
+                    best_idx = v;
+                }}
+            }}
+        }}
+
+        tg_vals[lid] = best_val;
+        tg_idxs[lid] = best_idx;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        for (uint stride = BLOCK / 2u; stride > 0u; stride >>= 1u) {{
+            if (lid < stride) {{
+                if (tg_vals[lid + stride] > tg_vals[lid]) {{
+                    tg_vals[lid] = tg_vals[lid + stride];
+                    tg_idxs[lid] = tg_idxs[lid + stride];
+                }}
+            }}
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }}
+
+        if (lid == 0u) {{
+            cand_vals[ki] = tg_vals[0];
+            cand_idxs[ki] = tg_idxs[0];
+            picked[ki] = tg_idxs[0];
+        }}
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }}
+
+    // Phase 4: Thread 0 applies cumulative probability threshold
+    if (lid == 0u) {{
+        float cum = 0.0f;
+        uint count = 0u;
+        for (uint i = 0u; i < MAX_K; i++) {{
+            cum += cand_vals[i];
+            uint out_offset = pid * MAX_K + i;
+            out_values[out_offset] = cand_vals[i];
+            out_indices[out_offset] = cand_idxs[i];
+            count++;
+            if (cum >= p_threshold) break;
+        }}
+        out_count[pid] = count;
     }}
 }}
 """

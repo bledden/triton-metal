@@ -2277,3 +2277,177 @@ def test_top_k_large_vocab(runner):
         assert result_idxs[i] == expected_indices[i], (
             f"top-{i} index: got {result_idxs[i]}, expected {expected_indices[i]}"
         )
+
+
+# ---------------------------------------------------------------------------
+# Top-P (Nucleus) Sampling tests
+# ---------------------------------------------------------------------------
+
+
+@requires_metal
+def test_top_p_sampling(runner):
+    """Top-p: nucleus sampling with p=0.9 and temperature=1.0."""
+    from triton_metal.codegen.msl_emitter import make_top_p_kernel
+    import struct as struct_mod
+
+    vocab_size = 512
+    max_k = 256
+    temperature = 1.0
+    p_threshold = 0.9
+
+    msl = make_top_p_kernel(max_k=max_k, block_size=256)
+    path = runner.compile(msl, "top_p")
+    pipeline = runner.load(path, "top_p")
+
+    # Create logits with a peaked distribution (few tokens dominate)
+    random.seed(5555)
+    logits = [random.uniform(-10.0, -5.0) for _ in range(vocab_size)]
+    # Make a few tokens very likely (high logits vs very low background)
+    logits[10] = 10.0
+    logits[20] = 9.5
+    logits[30] = 9.0
+    logits[40] = 8.5
+
+    logits_buf = runner.make_float_buffer(logits)
+    out_val_buf = runner.make_empty_buffer(max_k)
+    import Metal
+    out_idx_buf = runner.device.newBufferWithLength_options_(
+        max_k * 4, Metal.MTLResourceStorageModeShared
+    )
+    out_count_buf = runner.device.newBufferWithLength_options_(
+        4, Metal.MTLResourceStorageModeShared
+    )
+    vocab_buf = runner.make_uint_buffer(vocab_size)
+    temp_buf = runner.make_float_scalar_buffer(temperature)
+    p_buf = runner.make_float_scalar_buffer(p_threshold)
+
+    runner.run(pipeline,
+               [logits_buf, out_val_buf, out_idx_buf, out_count_buf,
+                vocab_buf, temp_buf, p_buf],
+               256, block_size=256)
+
+    # Read count
+    count_view = out_count_buf.contents().as_buffer(4)
+    count = struct_mod.unpack_from("I", count_view, 0)[0]
+
+    result_vals = runner.read_float_buffer(out_val_buf, count)
+    idx_view = out_idx_buf.contents().as_buffer(count * 4)
+    result_idxs = [struct_mod.unpack_from("I", idx_view, i * 4)[0] for i in range(count)]
+
+    # Verify: probabilities should be in descending order
+    for i in range(len(result_vals) - 1):
+        assert result_vals[i] >= result_vals[i + 1] - 1e-6, (
+            f"Not sorted: p[{i}]={result_vals[i]} < p[{i+1}]={result_vals[i+1]}"
+        )
+
+    # Verify: cumulative probability should reach p_threshold
+    cum = sum(result_vals)
+    assert cum >= p_threshold - 0.01, f"Cumulative {cum} < threshold {p_threshold}"
+
+    # Verify: top indices should include our peaked tokens
+    assert 10 in result_idxs, "Highest logit token should be in nucleus"
+    assert 20 in result_idxs, "Second highest logit token should be in nucleus"
+
+    # The nucleus should be small since the distribution is peaked
+    assert count < 50, f"Peaked distribution should have small nucleus, got {count}"
+
+
+# ---------------------------------------------------------------------------
+# Batched KV-Cache Decode tests
+# ---------------------------------------------------------------------------
+
+
+@requires_metal
+def test_batched_kv_decode(runner):
+    """Batched multi-head KV-cache decode with 2 batch items, 2 heads."""
+    from triton_metal.codegen.msl_emitter import make_batched_kv_decode_kernel
+
+    batch_size = 2
+    n_heads = 2
+    head_dim = 32
+    max_seq_len = 16
+    # Different sequence lengths per batch item
+    actual_seq_lens = [8, 12]
+
+    msl = make_batched_kv_decode_kernel(n_heads=n_heads, head_dim=head_dim,
+                                         block_size=256)
+    path = runner.compile(msl, "batched_kv_decode")
+    pipeline = runner.load(path, "batched_kv_decode")
+
+    random.seed(6666)
+    # Q: [batch, n_heads, head_dim]
+    q_data = [random.uniform(-0.5, 0.5)
+              for _ in range(batch_size * n_heads * head_dim)]
+    # K/V: [batch, n_heads, max_seq_len, head_dim]
+    kv_size = batch_size * n_heads * max_seq_len * head_dim
+    k_data = [random.uniform(-0.5, 0.5) for _ in range(kv_size)]
+    v_data = [random.uniform(-0.5, 0.5) for _ in range(kv_size)]
+
+    q_buf = runner.make_float_buffer(q_data)
+    k_buf = runner.make_float_buffer(k_data)
+    v_buf = runner.make_float_buffer(v_data)
+    out_buf = runner.make_empty_buffer(batch_size * n_heads * head_dim)
+
+    # seq_lens buffer: array of uints
+    import Metal
+    import struct as struct_mod
+    sl_buf = runner.device.newBufferWithLength_options_(
+        batch_size * 4, Metal.MTLResourceStorageModeShared
+    )
+    sl_view = sl_buf.contents().as_buffer(batch_size * 4)
+    for i, sl in enumerate(actual_seq_lens):
+        struct_mod.pack_into("I", sl_view, i * 4, sl)
+
+    max_sl_buf = runner.make_uint_buffer(max_seq_len)
+    bs_buf = runner.make_uint_buffer(batch_size)
+
+    # Dispatch: one threadgroup per (batch, head)
+    n_groups = batch_size * n_heads
+    import Metal
+    cmd = runner.queue.commandBuffer()
+    enc = cmd.computeCommandEncoder()
+    enc.setComputePipelineState_(pipeline)
+    for i, buf in enumerate([q_buf, k_buf, v_buf, out_buf, sl_buf,
+                              max_sl_buf, bs_buf]):
+        enc.setBuffer_offset_atIndex_(buf, 0, i)
+    enc.dispatchThreadgroups_threadsPerThreadgroup_(
+        Metal.MTLSizeMake(n_groups, 1, 1),
+        Metal.MTLSizeMake(256, 1, 1),
+    )
+    enc.endEncoding()
+    cmd.commit()
+    cmd.waitUntilCompleted()
+    assert cmd.status() == 4, f"Kernel failed, status={cmd.status()}"
+
+    result = runner.read_float_buffer(out_buf, batch_size * n_heads * head_dim)
+
+    # Reference implementation
+    scale = 1.0 / math.sqrt(head_dim)
+    for b in range(batch_size):
+        seq_len = actual_seq_lens[b]
+        for h in range(n_heads):
+            q_off = (b * n_heads + h) * head_dim
+            kv_off = (b * n_heads + h) * max_seq_len * head_dim
+            o_off = q_off
+
+            # Compute scores
+            scores = []
+            for j in range(seq_len):
+                dot = sum(q_data[q_off + d] * k_data[kv_off + j * head_dim + d]
+                          for d in range(head_dim))
+                scores.append(dot * scale)
+
+            # Softmax
+            max_s = max(scores)
+            exp_s = [math.exp(s - max_s) for s in scores]
+            sum_exp = sum(exp_s)
+            attn = [e / sum_exp for e in exp_s]
+
+            # Weighted V
+            for d in range(head_dim):
+                expected = sum(attn[j] * v_data[kv_off + j * head_dim + d]
+                               for j in range(seq_len))
+                got = result[o_off + d]
+                assert abs(got - expected) < 0.05, (
+                    f"batch {b} head {h} dim {d}: got {got}, expected {expected}"
+                )

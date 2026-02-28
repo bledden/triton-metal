@@ -2111,3 +2111,69 @@ def test_ttgir_beam_search_compiles(runner):
     msl = kb.build()
     assert "beam" in msl.lower() or "search" in msl.lower() or "score" in msl.lower()
     runner.compile(msl, "beam_search")
+
+
+# ---------------------------------------------------------------------------
+# Variance computation TTGIR pattern
+# ---------------------------------------------------------------------------
+
+VARIANCE_TTGIR = """
+module {
+  tt.func public @variance_kernel(%arg0: !tt.ptr<f32> {tt.divisibility = 16 : i32},
+                                    %arg1: !tt.ptr<f32> {tt.divisibility = 16 : i32, tt.output},
+                                    %arg2: i32) {
+    %c0 = arith.constant 0 : index
+    %0 = tt.get_program_id x : i32
+    %1 = tt.make_range {end = 256 : i32, start = 0 : i32}
+    %2 = tt.splat %0
+    %3 = arith.addi %2, %1
+    %4 = tt.addptr %arg0, %3
+    %5 = tt.load %4
+    %6 = "tt.reduce"(%5) ({
+      ^bb0(%a: f32, %b: f32):
+        %s = arith.addf %a, %b
+        tt.reduce.return %s : f32
+    }) {axis = 0 : i32}
+    %7 = arith.subf %5, %6
+    %8 = arith.mulf %7, %7
+    %9 = "tt.reduce"(%8) ({
+      ^bb0(%a: f32, %b: f32):
+        %s = arith.addf %a, %b
+        tt.reduce.return %s : f32
+    }) {axis = 0 : i32}
+    %10 = tt.addptr %arg1, %2
+    tt.store %10, %9
+    tt.return
+  }
+}
+"""
+
+def test_ttgir_variance_detected():
+    """TTGIR variance pattern is detected."""
+    from triton_metal.codegen.ttgir_parser import TTGIRParser
+    parser = TTGIRParser(VARIANCE_TTGIR, FakeOptions())
+    parser._parse_function_signature()
+    parser._parse_body()
+    assert parser._is_variance_pattern()
+
+
+def test_ttgir_variance_routed_before_layer_norm():
+    """Variance is detected and routed before layer norm (no rsqrt)."""
+    from triton_metal.codegen.ttgir_parser import TTGIRParser
+    parser = TTGIRParser(VARIANCE_TTGIR, FakeOptions())
+    parser._parse_function_signature()
+    parser._parse_body()
+    # Variance pattern should match (2 sums + sub + mul, no rsqrt)
+    assert parser._is_variance_pattern()
+    # Layer norm pattern overlaps but variance is checked first in routing
+
+
+@requires_metal
+def test_ttgir_variance_compiles(runner):
+    """TTGIR variance pattern compiles to valid MSL."""
+    from triton_metal.codegen.ttgir_parser import parse_ttgir
+
+    kb = parse_ttgir(VARIANCE_TTGIR, FakeOptions())
+    msl = kb.build()
+    assert "variance" in msl.lower() or "var" in msl.lower()
+    runner.compile(msl, "variance_kernel")

@@ -1285,6 +1285,94 @@ def make_fused_residual_norm_kernel(block_size=256, dtype="fp32", eps=1e-6):
     return kb.build()
 
 
+def make_variance_kernel(block_size=256, dtype="fp32"):
+    """Generate a row-wise variance kernel.
+
+    Computes var(x) = mean((x - mean(x))^2) for each row.
+    Two-pass approach: first compute mean, then compute mean of squared diffs.
+
+    Each threadgroup processes one row (dispatch one group per row).
+
+    Layout:
+        input: [n_rows, n_cols]
+        output: [n_rows] — variance for each row
+        n_cols: number of columns
+
+    Args:
+        block_size: Threads per threadgroup.
+        dtype: Data type.
+    """
+    msl_ty = triton_type_to_msl(dtype)
+    compute_ty = _msl_compute_type(dtype)
+
+    msl = f"""#include <metal_stdlib>
+using namespace metal;
+
+kernel void variance_kernel(
+    device const {msl_ty}* input [[buffer(0)]],
+    device {msl_ty}* output [[buffer(1)]],
+    device const uint* ncols_buf [[buffer(2)]],
+    uint pid [[threadgroup_position_in_grid]],
+    uint lid [[thread_position_in_threadgroup]],
+    uint sgitg [[simdgroup_index_in_threadgroup]],
+    uint tiisg [[thread_index_in_simdgroup]]
+) {{
+    const uint n_cols = ncols_buf[0];
+    const uint row = pid;
+    const uint row_offset = row * n_cols;
+
+    // Pass 1: compute mean via strided sum
+    {compute_ty} partial_sum = 0.0f;
+    for (uint col = lid; col < n_cols; col += {block_size}u) {{
+        partial_sum += static_cast<{compute_ty}>(input[row_offset + col]);
+    }}
+
+    // SIMD reduce for sum
+    partial_sum = simd_sum(partial_sum);
+
+    threadgroup {compute_ty} tg_sum[{(block_size + 31) // 32}];
+    if (tiisg == 0) {{
+        tg_sum[sgitg] = partial_sum;
+    }}
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    {compute_ty} mean_val = 0.0f;
+    if (lid == 0) {{
+        {compute_ty} total = 0.0f;
+        for (uint i = 0; i < {(block_size + 31) // 32}u; i++) {{
+            total += tg_sum[i];
+        }}
+        mean_val = total / static_cast<{compute_ty}>(n_cols);
+        tg_sum[0] = mean_val;
+    }}
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    mean_val = tg_sum[0];
+
+    // Pass 2: compute mean of squared differences
+    {compute_ty} partial_var = 0.0f;
+    for (uint col = lid; col < n_cols; col += {block_size}u) {{
+        {compute_ty} diff = static_cast<{compute_ty}>(input[row_offset + col]) - mean_val;
+        partial_var += diff * diff;
+    }}
+
+    partial_var = simd_sum(partial_var);
+    if (tiisg == 0) {{
+        tg_sum[sgitg] = partial_var;
+    }}
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (lid == 0) {{
+        {compute_ty} total_var = 0.0f;
+        for (uint i = 0; i < {(block_size + 31) // 32}u; i++) {{
+            total_var += tg_sum[i];
+        }}
+        output[row] = static_cast<{msl_ty}>(total_var / static_cast<{compute_ty}>(n_cols));
+    }}
+}}
+"""
+    return msl
+
+
 def make_cross_entropy_kernel(block_size=256, dtype="fp32"):
     """Generate a fused cross-entropy loss kernel.
 

@@ -625,6 +625,9 @@ class TTGIRParser:
         # Fused residual + layer norm: layer norm pattern with arith.addf before first reduce
         if len(self.reduce_ops) >= 2 and self._is_fused_residual_norm_pattern():
             return self._build_fused_residual_norm_kernel(kb, n_arg, primary_dtype)
+        # Variance: 2 sum reductions with sub+mul but no rsqrt (no normalization)
+        if len(self.reduce_ops) >= 2 and self._is_variance_pattern():
+            return self._build_variance_kernel(kb, n_arg, primary_dtype)
         # Standard layer norm
         if len(self.reduce_ops) >= 2 and self._is_layer_norm_pattern():
             return self._build_layer_norm_kernel(kb, n_arg, primary_dtype)
@@ -1100,6 +1103,34 @@ class TTGIRParser:
         """
         from triton_metal.codegen.msl_emitter import make_fused_residual_norm_kernel
         kb.set_prebuilt_msl(make_fused_residual_norm_kernel())
+        return kb
+
+    def _is_variance_pattern(self):
+        """Check if IR matches a variance computation pattern.
+
+        Variance has:
+        - 2 sum reductions (for mean and for sum of squared diffs)
+        - subtract (x - mean)
+        - multiply (diff * diff, i.e. squaring)
+        - NO rsqrt (that would be layer norm)
+        - 1 output pointer (variance values)
+        """
+        if len(self.reduce_ops) < 2:
+            return False
+        ops_list = [r[2] for r in self.reduce_ops]
+        if ops_list.count("sum") < 2 or "max" in ops_list:
+            return False
+        ssa_ops = {v[0] for v in self.ssa_values.values()}
+        has_sub = "sub" in ssa_ops
+        has_mul = "mul" in ssa_ops
+        has_rsqrt = "rsqrt" in ssa_ops
+        # Variance = 2 sums + sub + mul, but NO rsqrt
+        return has_sub and has_mul and not has_rsqrt
+
+    def _build_variance_kernel(self, kb, n_arg, primary_dtype):
+        """Generate a variance kernel from the pattern."""
+        from triton_metal.codegen.msl_emitter import make_variance_kernel
+        kb.set_prebuilt_msl(make_variance_kernel())
         return kb
 
     def _is_rope_pattern(self):

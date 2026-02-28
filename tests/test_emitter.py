@@ -4164,6 +4164,59 @@ def test_layer_norm_zero_variance(runner):
 
 
 @requires_metal
+def test_variance_kernel(runner):
+    """Variance kernel computes row-wise variance."""
+    from triton_metal.codegen.msl_emitter import make_variance_kernel
+
+    n_rows, n_cols = 4, 64
+    msl = make_variance_kernel(block_size=256)
+    path = runner.compile(msl, "variance_kernel")
+    pipeline = runner.load(path, "variance_kernel")
+
+    # Row 0: all same → variance = 0
+    # Row 1: [0,1,2,...,63] → mean=31.5, var=mean((x-31.5)^2)
+    # Row 2: all 1s → variance = 0
+    # Row 3: alternating ±1 → mean=0, var=1
+    in_data = []
+    in_data.extend([5.0] * n_cols)  # row 0
+    in_data.extend([float(i) for i in range(n_cols)])  # row 1
+    in_data.extend([1.0] * n_cols)  # row 2
+    in_data.extend([1.0 if i % 2 == 0 else -1.0 for i in range(n_cols)])  # row 3
+
+    in_buf = runner.make_float_buffer(in_data)
+    out_buf = runner.make_empty_buffer(n_rows)
+    ncols_buf = runner.make_uint_buffer(n_cols)
+
+    import Metal
+    cmd = runner.queue.commandBuffer()
+    enc = cmd.computeCommandEncoder()
+    enc.setComputePipelineState_(pipeline)
+    for i, buf in enumerate([in_buf, out_buf, ncols_buf]):
+        enc.setBuffer_offset_atIndex_(buf, 0, i)
+    enc.dispatchThreadgroups_threadsPerThreadgroup_(
+        Metal.MTLSizeMake(n_rows, 1, 1),
+        Metal.MTLSizeMake(256, 1, 1),
+    )
+    enc.endEncoding()
+    cmd.commit()
+    cmd.waitUntilCompleted()
+    assert cmd.status() == 4
+
+    result = runner.read_float_buffer(out_buf, n_rows)
+
+    # Row 0: all same → var = 0
+    assert abs(result[0]) < 0.01, f"Row 0 var: {result[0]}"
+    # Row 1: var of [0..63]
+    mean_1 = sum(range(n_cols)) / n_cols
+    expected_var_1 = sum((x - mean_1) ** 2 for x in range(n_cols)) / n_cols
+    assert abs(result[1] - expected_var_1) < 1.0, f"Row 1 var: {result[1]} != {expected_var_1}"
+    # Row 2: all same → var = 0
+    assert abs(result[2]) < 0.01, f"Row 2 var: {result[2]}"
+    # Row 3: ±1 alternating → var = 1.0
+    assert abs(result[3] - 1.0) < 0.01, f"Row 3 var: {result[3]}"
+
+
+@requires_metal
 def test_fp64_rejection():
     """FP64 types should be rejected by the parser."""
     from triton_metal.codegen.ttgir_parser import _mlir_type_to_triton_dtype

@@ -675,6 +675,10 @@ class TTGIRParser:
         if self._is_fused_mlp_pattern():
             return self._build_fused_mlp_kernel(kb, primary_dtype)
 
+        # Gather: 2 input ptrs (data + indices) with int arg, 1 output, no cmp/select
+        if self._is_gather_pattern():
+            return self._build_gather_kernel(kb, primary_dtype)
+
         # Activation functions: tanh, sigmoid, elu, leaky_relu, hardswish
         act = self._classify_activation()
         if act:
@@ -1419,6 +1423,38 @@ class TTGIRParser:
         """Generate a group norm kernel from the pattern."""
         from triton_metal.codegen.msl_emitter import make_group_norm_kernel
         kb.set_prebuilt_msl(make_group_norm_kernel())
+        return kb
+
+    def _is_gather_pattern(self):
+        """Check if IR matches a gather (indexed read) pattern.
+
+        Gather has:
+        - 2 input pointers (data buffer + index buffer)
+        - 1 output pointer
+        - No reductions, no dot ops
+        - No select/cmp (distinguishes from dropout)
+        - Index buffer has integer type
+        """
+        if self.reduce_ops or self.dot_ops:
+            return False
+        n_inputs = sum(1 for _, (_, _, is_out) in self.ptr_args.items() if not is_out)
+        n_outputs = sum(1 for _, (_, _, is_out) in self.ptr_args.items() if is_out)
+        if n_inputs != 2 or n_outputs != 1:
+            return False
+        ssa_ops = {v[0] for v in self.ssa_values.values()}
+        # Gather has no comparison/select (distinguishes from dropout)
+        has_select = "select" in ssa_ops
+        # Check if one input has integer type
+        has_int_input = any(
+            dtype in ("i32", "i64") for _, (_, dtype, is_out) in self.ptr_args.items()
+            if not is_out
+        )
+        return not has_select and has_int_input
+
+    def _build_gather_kernel(self, kb, primary_dtype):
+        """Generate a gather kernel from the pattern."""
+        from triton_metal.codegen.msl_emitter import make_gather_kernel
+        kb.set_prebuilt_msl(make_gather_kernel())
         return kb
 
     def _is_dropout_pattern(self):

@@ -4905,6 +4905,63 @@ def test_matmul_fp16_identity(runner):
 
 
 # ---------------------------------------------------------------------------
+# BF16 tests
+# ---------------------------------------------------------------------------
+
+@requires_metal
+def test_vector_add_bf16(runner):
+    """BF16 vector add produces correct results."""
+    from triton_metal.codegen.msl_emitter import make_vector_add_kernel
+
+    n = 256
+    msl = make_vector_add_kernel(block_size=256, dtype="bf16")
+    path = runner.compile(msl, "vector_add")
+    pipeline = runner.load(path, "vector_add")
+
+    a_data = [float(i) for i in range(n)]
+    b_data = [float(i * 2) for i in range(n)]
+    a_buf = runner.make_bf16_buffer(a_data)
+    b_buf = runner.make_bf16_buffer(b_data)
+    out_buf = runner.make_empty_bf16_buffer(n)
+    n_buf = runner.make_uint_buffer(n)
+
+    runner.run(pipeline, [a_buf, b_buf, out_buf, n_buf], n, 256)
+    result = runner.read_bf16_buffer(out_buf, n)
+
+    for i in range(n):
+        expected = a_data[i] + b_data[i]
+        # BF16 has ~3 decimal digits precision; tolerance scales with magnitude
+        tol = max(2.0, abs(expected) * 0.02)
+        assert abs(result[i] - expected) < tol, \
+            f"i={i}: {result[i]} != {expected}"
+
+
+@requires_metal
+def test_activation_tanh_bf16(runner):
+    """BF16 tanh activation compiles and runs."""
+    from triton_metal.codegen.msl_emitter import make_activation_kernel
+
+    n = 256
+    msl = make_activation_kernel(activation="tanh", block_size=256, dtype="bf16")
+    path = runner.compile(msl, "tanh_kernel")
+    pipeline = runner.load(path, "tanh_kernel")
+
+    import math
+    data = [0.0, 0.5, 1.0, -1.0] * 64
+    inp_buf = runner.make_bf16_buffer(data)
+    out_buf = runner.make_empty_bf16_buffer(n)
+    n_buf = runner.make_uint_buffer(n)
+
+    runner.run(pipeline, [inp_buf, out_buf, n_buf], n, 256)
+    result = runner.read_bf16_buffer(out_buf, n)
+
+    for i in range(min(4, n)):
+        expected = math.tanh(data[i])
+        assert abs(result[i] - expected) < 0.05, \
+            f"i={i}: {result[i]} != {expected}"
+
+
+# ---------------------------------------------------------------------------
 # Gather kernel tests
 # ---------------------------------------------------------------------------
 

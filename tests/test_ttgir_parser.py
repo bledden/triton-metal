@@ -2822,3 +2822,65 @@ def test_ttgir_dropout_compiles(runner):
     msl = kb.build()
     assert "dropout" in msl.lower() or "mask" in msl.lower()
     runner.compile(msl, "fused_dropout_kernel")
+
+
+# ---------------------------------------------------------------------------
+# Gather TTGIR pattern
+# ---------------------------------------------------------------------------
+
+# Gather: output[i] = data[indices[i]]
+GATHER_TTGIR = """
+module {
+  tt.func public @gather_kernel(%arg0: !tt.ptr<f32> {tt.divisibility = 16 : i32},
+                                 %arg1: !tt.ptr<i32> {tt.divisibility = 16 : i32},
+                                 %arg2: !tt.ptr<f32> {tt.divisibility = 16 : i32, tt.output},
+                                 %arg3: i32) {
+    %0 = tt.get_program_id x : i32
+    %c256 = arith.constant 256 : i32
+    %1 = arith.muli %0, %c256 : i32
+    %2 = tt.make_range {end = 256 : i32, start = 0 : i32}
+    %3 = tt.splat %1
+    %4 = arith.addi %3, %2
+    %5 = tt.splat %arg3
+    %6 = arith.cmpi slt, %4, %5
+    %7 = tt.addptr %arg1, %4
+    %8 = tt.load %7, %6
+    %9 = tt.addptr %arg0, %8
+    %10 = tt.load %9, %6
+    %11 = tt.addptr %arg2, %4
+    tt.store %11, %10, %6
+    tt.return
+  }
+}
+"""
+
+def test_ttgir_gather_detected():
+    """TTGIR gather pattern is detected (2 inputs with int index + 1 output)."""
+    from triton_metal.codegen.ttgir_parser import TTGIRParser
+    parser = TTGIRParser(GATHER_TTGIR, FakeOptions())
+    parser._parse_function_signature()
+    parser._parse_body()
+    parser._classify_stores()
+    assert parser._is_gather_pattern()
+
+
+def test_ttgir_gather_not_confused_with_dropout():
+    """Gather (int index input) is not confused with dropout (float random input)."""
+    from triton_metal.codegen.ttgir_parser import TTGIRParser
+    parser = TTGIRParser(GATHER_TTGIR, FakeOptions())
+    parser._parse_function_signature()
+    parser._parse_body()
+    parser._classify_stores()
+    assert parser._is_gather_pattern()
+    assert not parser._is_dropout_pattern()
+
+
+@requires_metal
+def test_ttgir_gather_compiles(runner):
+    """TTGIR gather pattern compiles to valid MSL."""
+    from triton_metal.codegen.ttgir_parser import parse_ttgir
+
+    kb = parse_ttgir(GATHER_TTGIR, FakeOptions())
+    msl = kb.build()
+    assert "gather" in msl.lower() or "indices" in msl.lower()
+    runner.compile(msl, "gather_kernel")

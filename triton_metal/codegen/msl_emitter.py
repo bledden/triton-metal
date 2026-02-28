@@ -8,8 +8,11 @@ The KernelBuilder can be driven by:
 - Direct Python API (standalone, no triton required)
 - TTGIR MLIR walking (when triton is available)
 
-Phase 1 targets elementwise kernels: vector add, scalar mul, activation
-functions (silu, gelu), and fused elementwise combinations.
+Supports:
+- Elementwise ops: vector add, scalar mul, activation functions (silu, gelu)
+- Reductions: sum, max, min via SIMD-group intrinsics + threadgroup shared memory
+- Softmax: fused row-wise max → subtract → exp → sum → divide
+- Matmul: tiled matrix multiplication with threadgroup shared memory
 """
 
 from triton_metal.codegen.msl_types import triton_type_to_msl
@@ -49,6 +52,8 @@ class KernelBuilder:
         self._body_lines = []
         self._locals = {}
         self._indent = 1
+        self._needs_simd_qualifiers = False
+        self._threadgroup_arrays = []  # (name, dtype, size) for static tg memory
 
     # -- Argument registration --
 
@@ -172,6 +177,99 @@ class KernelBuilder:
         """Emit a comment."""
         self._emit(f"// {text}")
 
+    # -- Indentation control --
+
+    def indent(self):
+        """Increase indentation level."""
+        self._indent += 1
+
+    def dedent(self):
+        """Decrease indentation level."""
+        self._indent = max(1, self._indent - 1)
+
+    def begin_if(self, condition):
+        """Emit an if statement and increase indent."""
+        self._emit(f"if ({condition}) {{")
+        self._indent += 1
+
+    def end_block(self):
+        """Close a block and decrease indent."""
+        self._indent -= 1
+        self._emit("}")
+
+    # -- Shared memory and barriers --
+
+    def declare_threadgroup_array(self, name, dtype="fp32", size=None):
+        """Declare a static threadgroup memory array."""
+        if size is None:
+            size = (self.block_size + 31) // 32  # one slot per SIMD group
+        self._threadgroup_arrays.append((name, dtype, size))
+        return name
+
+    def barrier(self, kind="threadgroup"):
+        """Emit a memory barrier."""
+        from triton_metal.codegen.msl_builtins import BARRIERS
+        self._emit(f"{BARRIERS[kind]};")
+
+    # -- Reduction operations --
+
+    def simd_reduce(self, op, val_var, out_var):
+        """Emit a SIMD-group reduction: out = simd_op(val).
+
+        Uses hardware SIMD intrinsics (32-wide on Apple Silicon).
+        """
+        self._needs_simd_qualifiers = True
+        from triton_metal.codegen.msl_builtins import SIMD_REDUCTIONS
+        intrinsic = SIMD_REDUCTIONS[op]
+        self._var(out_var, f"{intrinsic}({val_var})", ty="float")
+        return out_var
+
+    def threadgroup_reduce(self, op, val_var, shared_var, out_var):
+        """Emit a full threadgroup reduction: SIMD reduce → shared mem → final SIMD reduce.
+
+        Standard two-level pattern:
+        1. simd_op within each SIMD group
+        2. Lane 0 writes to shared memory
+        3. Barrier
+        4. SIMD group 0 reads shared and does final reduction
+
+        Variable names are suffixed with out_var to avoid collisions when
+        called multiple times in the same kernel.
+        """
+        self._needs_simd_qualifiers = True
+        from triton_metal.codegen.msl_builtins import SIMD_REDUCTIONS
+
+        intrinsic = SIMD_REDUCTIONS[op]
+        identity = {
+            "sum": "0.0f",
+            "max": "-INFINITY",
+            "min": "INFINITY",
+        }[op]
+
+        # Unique intermediate variable names
+        simd_var = f"simd_{out_var}"
+        read_var = f"shared_{out_var}"
+
+        # Step 1: SIMD-level reduction
+        self._var(simd_var, f"{intrinsic}({val_var})", ty="float")
+
+        # Step 2: Initialize shared memory
+        self.begin_if("sgitg == 0")
+        self._emit(f"{shared_var}[tiisg] = {identity};")
+        self.end_block()
+        self.barrier("threadgroup")
+
+        # Step 3: Lane 0 of each SIMD group writes to shared
+        self.begin_if("tiisg == 0")
+        self._emit(f"{shared_var}[sgitg] = {simd_var};")
+        self.end_block()
+        self.barrier("threadgroup")
+
+        # Step 4: SIMD group 0 reads back and does final reduction
+        self._var(read_var, f"{shared_var}[tiisg]", ty="float")
+        self._var(out_var, f"{intrinsic}({read_var})", ty="float")
+        return out_var
+
     # -- Build the MSL source --
 
     def build(self):
@@ -198,14 +296,23 @@ class MSLCodeGen:
             params.append(f"    {arg.msl_param(i)}")
 
         # Thread position qualifiers
-        next_idx = len(self.builder.args)  # not used for qualifiers
         params.append("    uint pid [[threadgroup_position_in_grid]]")
         params.append("    uint lid [[thread_position_in_threadgroup]]")
         params.append("    uint tid [[thread_position_in_grid]]")
 
+        # SIMD qualifiers (only when reductions are used)
+        if self.builder._needs_simd_qualifiers:
+            params.append("    uint sgitg [[simdgroup_index_in_threadgroup]]")
+            params.append("    uint tiisg [[thread_index_in_simdgroup]]")
+
         lines.append(f"kernel void {self.builder.name}(")
         lines.append(",\n".join(params))
         lines.append(") {")
+
+        # Static threadgroup memory declarations
+        for tg_name, tg_dtype, tg_size in self.builder._threadgroup_arrays:
+            msl_ty = triton_type_to_msl(tg_dtype)
+            lines.append(f"    threadgroup {msl_ty} {tg_name}[{tg_size}];")
 
         # Body
         for line in self.builder._body_lines:
@@ -306,6 +413,243 @@ def make_scalar_mul_kernel(block_size=256, dtype="fp32"):
     val = kb.load("input", offsets, mask, out_var="val")
     result = kb.binary_op("mul", val, "scalar", "result")
     kb.store("output", offsets, result, mask)
+
+    return kb.build()
+
+
+# ---------------------------------------------------------------------------
+# Reduction kernel generators
+# ---------------------------------------------------------------------------
+
+def make_reduce_kernel(name, op, block_size=256, dtype="fp32"):
+    """Generate a 1D reduction kernel: output[group] = reduce(input[group*N:...]).
+
+    Each threadgroup reduces block_size elements. For inputs larger than
+    block_size, launch multiple threadgroups and reduce the partial results.
+
+    Uses two-level reduction: SIMD intrinsics + threadgroup shared memory.
+
+    Args:
+        name: Kernel function name.
+        op: Reduction operation ("sum", "max", "min").
+        block_size: Elements per threadgroup.
+        dtype: Data type.
+    """
+    n_simd_groups = (block_size + 31) // 32
+
+    kb = KernelBuilder(name, block_size=block_size)
+    kb.add_ptr_arg("input", dtype=dtype, const=True)
+    kb.add_ptr_arg("output", dtype=dtype, const=False)
+    kb.add_scalar_arg("n_elements", dtype="u32")
+
+    # Shared memory for cross-SIMD-group reduction
+    kb.declare_threadgroup_array("shared", dtype=dtype, size=n_simd_groups)
+
+    identity = {"sum": "0.0f", "max": "-INFINITY", "min": "INFINITY"}[op]
+    combine = {"sum": "+", "max": "max", "min": "min"}[op]
+
+    # Each thread accumulates over strided elements
+    kb._var("acc", identity, ty="float")
+    kb.raw_line(f"for (uint i = lid; i < n_elements; i += {block_size}) {{")
+    kb.indent()
+    kb._var("idx", f"pid * n_elements + i", ty="uint")
+    if combine in ("+",):
+        kb.raw_line("acc += input[idx];")
+    else:
+        kb.raw_line(f"acc = {combine}(acc, input[idx]);")
+    kb.dedent()
+    kb.raw_line("}")
+
+    # Two-level threadgroup reduction
+    kb.threadgroup_reduce(op, "acc", "shared", "total")
+
+    # Thread 0 writes result
+    kb.begin_if("lid == 0")
+    kb.raw_line("output[pid] = total;")
+    kb.end_block()
+
+    return kb.build()
+
+
+def make_softmax_kernel(block_size=256, dtype="fp32"):
+    """Generate a fused row-wise softmax kernel.
+
+    Each threadgroup processes one row:
+    1. Find max(row) — for numerical stability
+    2. Compute exp(x - max) for each element
+    3. Sum the exponentials
+    4. Divide each by the sum
+
+    Args:
+        block_size: Threads per threadgroup (should be >= row length or will stride).
+        dtype: Data type.
+    """
+    n_simd_groups = (block_size + 31) // 32
+
+    kb = KernelBuilder("softmax_kernel", block_size=block_size)
+    kb.add_ptr_arg("input", dtype=dtype, const=True)
+    kb.add_ptr_arg("output", dtype=dtype, const=False)
+    kb.add_scalar_arg("n_cols", dtype="u32")
+
+    # Two shared arrays: one for max reduction, one for sum reduction
+    kb.declare_threadgroup_array("shared_max", dtype=dtype, size=n_simd_groups)
+    kb.declare_threadgroup_array("shared_sum", dtype=dtype, size=n_simd_groups)
+
+    # Row base pointer: each threadgroup handles one row
+    kb._var("row_start", "pid * n_cols", ty="uint")
+
+    # Pass 1: Find row max (strided accumulation)
+    kb._var("local_max", "-INFINITY", ty="float")
+    kb.raw_line(f"for (uint i = lid; i < n_cols; i += {block_size}) {{")
+    kb.indent()
+    kb.raw_line("local_max = max(local_max, input[row_start + i]);")
+    kb.dedent()
+    kb.raw_line("}")
+
+    # Reduce max across threadgroup
+    kb.threadgroup_reduce("max", "local_max", "shared_max", "row_max")
+
+    # Broadcast row_max to all threads via shared memory
+    kb.begin_if("lid == 0")
+    kb.raw_line("shared_max[0] = row_max;")
+    kb.end_block()
+    kb.barrier("threadgroup")
+    kb._var("max_val", "shared_max[0]", ty="float")
+
+    # Pass 2: Compute exp(x - max) and accumulate sum
+    kb._var("local_sum", "0.0f", ty="float")
+    kb.raw_line(f"for (uint i = lid; i < n_cols; i += {block_size}) {{")
+    kb.indent()
+    kb._var("e", "exp(input[row_start + i] - max_val)", ty="float")
+    kb.raw_line("output[row_start + i] = e;")
+    kb.raw_line("local_sum += e;")
+    kb.dedent()
+    kb.raw_line("}")
+
+    # Reduce sum across threadgroup
+    kb.threadgroup_reduce("sum", "local_sum", "shared_sum", "row_sum")
+
+    # Broadcast row_sum
+    kb.begin_if("lid == 0")
+    kb.raw_line("shared_sum[0] = row_sum;")
+    kb.end_block()
+    kb.barrier("threadgroup")
+    kb._var("sum_val", "shared_sum[0]", ty="float")
+
+    # Pass 3: Normalize
+    kb.raw_line(f"for (uint i = lid; i < n_cols; i += {block_size}) {{")
+    kb.indent()
+    kb.raw_line("output[row_start + i] /= sum_val;")
+    kb.dedent()
+    kb.raw_line("}")
+
+    return kb.build()
+
+
+def make_matmul_kernel(block_m=32, block_n=32, block_k=32, dtype="fp32"):
+    """Generate a tiled matrix multiplication kernel: C = A @ B.
+
+    A is (M, K), B is (K, N), C is (M, N).
+    Each threadgroup computes a BLOCK_M x BLOCK_N tile of C.
+
+    Uses threadgroup shared memory for A and B tiles to enable
+    coalesced global memory access and data reuse.
+
+    Constrained by Metal's 32KB threadgroup memory limit:
+    - 32x32 fp32 tile = 4KB, two tiles = 8KB (well within limit)
+
+    Args:
+        block_m: Tile height (rows of A/C per threadgroup).
+        block_n: Tile width (cols of B/C per threadgroup).
+        block_k: Tile depth (inner dimension chunk).
+        dtype: Data type.
+    """
+    # Threadgroup size: one thread per output element in the tile
+    threads_per_tg = block_m * block_n
+
+    kb = KernelBuilder("matmul_kernel", block_size=threads_per_tg)
+    kb.add_ptr_arg("A", dtype=dtype, const=True)
+    kb.add_ptr_arg("B", dtype=dtype, const=True)
+    kb.add_ptr_arg("C", dtype=dtype, const=False)
+    kb.add_scalar_arg("M", dtype="u32")
+    kb.add_scalar_arg("N", dtype="u32")
+    kb.add_scalar_arg("K", dtype="u32")
+
+    # Shared memory tiles
+    kb.declare_threadgroup_array("tileA", dtype=dtype, size=block_m * block_k)
+    kb.declare_threadgroup_array("tileB", dtype=dtype, size=block_k * block_n)
+
+    # Thread mapping: each thread computes one element of the output tile
+    # pid.x = tile column, pid.y = tile row (we use 2D grid)
+    # For simplicity, we flatten the 2D threadgroup into 1D and compute
+    # the local (row, col) from lid.
+    kb._var("local_row", f"lid / {block_n}u", ty="uint")
+    kb._var("local_col", f"lid % {block_n}u", ty="uint")
+
+    # Global tile position: pid encodes the 2D tile index.
+    # We use a linearized 2D grid: pid = tile_row * n_tile_cols + tile_col
+    kb._var("n_tile_cols", f"(N + {block_n}u - 1u) / {block_n}u", ty="uint")
+    kb._var("tile_row", "pid / n_tile_cols", ty="uint")
+    kb._var("tile_col", "pid % n_tile_cols", ty="uint")
+
+    # Global output row/col for this thread
+    kb._var("global_row", f"tile_row * {block_m}u + local_row", ty="uint")
+    kb._var("global_col", f"tile_col * {block_n}u + local_col", ty="uint")
+
+    # Accumulator
+    kb._var("acc", "0.0f", ty="float")
+
+    # Tile loop over K dimension
+    kb._var("n_tiles_k", f"(K + {block_k}u - 1u) / {block_k}u", ty="uint")
+    kb.raw_line("for (uint tk = 0; tk < n_tiles_k; tk++) {")
+    kb.indent()
+
+    # Load A tile: tileA[local_row][local_col_k] = A[global_row][tk*BLOCK_K + local_col_k]
+    # Each thread loads one element. We need block_m * block_k elements loaded
+    # by block_m * block_n threads, so some threads load multiple elements.
+    kb._var("a_col", f"tk * {block_k}u + local_col", ty="uint")
+    kb.raw_line(f"if (global_row < M && a_col < K) {{")
+    kb.indent()
+    kb.raw_line(f"tileA[local_row * {block_k}u + local_col] = A[global_row * K + a_col];")
+    kb.dedent()
+    kb.raw_line("} else {")
+    kb.indent()
+    kb.raw_line(f"tileA[local_row * {block_k}u + local_col] = 0.0f;")
+    kb.dedent()
+    kb.raw_line("}")
+
+    # Load B tile: tileB[local_row_k][local_col] = B[tk*BLOCK_K + local_row_k][global_col]
+    kb._var("b_row", f"tk * {block_k}u + local_row", ty="uint")
+    kb.raw_line(f"if (b_row < K && global_col < N) {{")
+    kb.indent()
+    kb.raw_line(f"tileB[local_row * {block_n}u + local_col] = B[b_row * N + global_col];")
+    kb.dedent()
+    kb.raw_line("} else {")
+    kb.indent()
+    kb.raw_line(f"tileB[local_row * {block_n}u + local_col] = 0.0f;")
+    kb.dedent()
+    kb.raw_line("}")
+
+    kb.barrier("threadgroup")
+
+    # Compute partial dot product for this tile
+    kb.raw_line(f"for (uint kk = 0; kk < {block_k}u; kk++) {{")
+    kb.indent()
+    kb.raw_line(f"acc += tileA[local_row * {block_k}u + kk] * tileB[kk * {block_n}u + local_col];")
+    kb.dedent()
+    kb.raw_line("}")
+
+    kb.barrier("threadgroup")
+
+    kb.dedent()
+    kb.raw_line("}")  # end tile loop
+
+    # Write result
+    kb.raw_line("if (global_row < M && global_col < N) {")
+    kb.indent()
+    kb.raw_line("C[global_row * N + global_col] = acc;")
+    kb.dedent()
+    kb.raw_line("}")
 
     return kb.build()
 

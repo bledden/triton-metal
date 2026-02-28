@@ -1,0 +1,15 @@
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+dist/
+build/
+.eggs/
+*.so
+*.dylib
+.ruff_cache/
+.pytest_cache/
+*.metallib
+*.air
+*.metal
+!triton_metal/**/*.metal

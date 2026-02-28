@@ -1,0 +1,18 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "triton-metal"
+version = "0.1.0"
+description = "Metal (Apple Silicon) backend for Triton"
+requires-python = ">=3.10"
+dependencies = [
+    "triton>=3.2.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0",
+    "ruff>=0.4.0",
+]

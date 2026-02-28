@@ -6374,3 +6374,190 @@ def test_col_reduce_min_gpu(runner):
         expected = min(data[r * n_cols + c] for r in range(n_rows))
         assert abs(result[c] - expected) < 1e-3, \
             f"col {c}: got {result[c]}, expected {expected}"
+
+
+# ---------------------------------------------------------------------------
+# Cumulative sum (prefix sum) tests
+# ---------------------------------------------------------------------------
+
+@requires_metal
+def test_cumsum_gpu(runner):
+    """Inclusive prefix sum: output[i] = sum(input[0:i+1])"""
+    from triton_metal.codegen.msl_emitter import make_cumsum_kernel
+    import Metal
+
+    n_rows, n_cols = 4, 64
+    msl = make_cumsum_kernel(block_size=256)
+    path = runner.compile(msl, "cumsum_kernel")
+    pipeline = runner.load(path, "cumsum_kernel")
+
+    random.seed(200)
+    data = [random.uniform(-5.0, 5.0) for _ in range(n_rows * n_cols)]
+    in_buf = runner.make_float_buffer(data)
+    out_buf = runner.make_empty_buffer(n_rows * n_cols)
+    nc_buf = runner.make_uint_buffer(n_cols)
+
+    cmd = runner.queue.commandBuffer()
+    enc = cmd.computeCommandEncoder()
+    enc.setComputePipelineState_(pipeline)
+    for i, buf in enumerate([in_buf, out_buf, nc_buf]):
+        enc.setBuffer_offset_atIndex_(buf, 0, i)
+    enc.dispatchThreadgroups_threadsPerThreadgroup_(
+        Metal.MTLSizeMake(n_rows, 1, 1),
+        Metal.MTLSizeMake(256, 1, 1),
+    )
+    enc.endEncoding()
+    cmd.commit()
+    cmd.waitUntilCompleted()
+
+    result = runner.read_float_buffer(out_buf, n_rows * n_cols)
+    for r in range(n_rows):
+        running = 0.0
+        for c in range(n_cols):
+            running += data[r * n_cols + c]
+            got = result[r * n_cols + c]
+            assert abs(got - running) < 0.1, \
+                f"row {r} col {c}: got {got}, expected {running}"
+
+
+# ---------------------------------------------------------------------------
+# Bitonic sort tests
+# ---------------------------------------------------------------------------
+
+@requires_metal
+def test_bitonic_sort_gpu(runner):
+    """Bitonic sort: verify sorted values and indices"""
+    from triton_metal.codegen.msl_emitter import make_bitonic_sort_kernel
+    import struct
+
+    n = 256
+    msl = make_bitonic_sort_kernel(block_size=256, ascending=True)
+    path = runner.compile(msl, "bitonic_sort_kernel")
+    pipeline = runner.load(path, "bitonic_sort_kernel")
+
+    random.seed(201)
+    data = [random.uniform(-100.0, 100.0) for _ in range(n)]
+    in_buf = runner.make_float_buffer(data)
+    val_buf = runner.make_empty_buffer(n)
+    # Index buffer: uint32 * n
+    idx_buf = runner.device.newBufferWithLength_options_(n * 4, 0)
+    n_buf = runner.make_uint_buffer(n)
+
+    runner.run(pipeline, [in_buf, val_buf, idx_buf, n_buf], n, block_size=256)
+
+    vals = runner.read_float_buffer(val_buf, n)
+    # Read uint indices
+    idx_view = idx_buf.contents().as_buffer(n * 4)
+    indices = list(struct.unpack_from(f"{n}I", idx_view, 0))
+
+    # Verify sorted
+    for i in range(n - 1):
+        assert vals[i] <= vals[i + 1], \
+            f"Not sorted at {i}: {vals[i]} > {vals[i+1]}"
+
+    # Verify indices point back to original values
+    for i in range(n):
+        assert abs(vals[i] - data[indices[i]]) < 1e-5, \
+            f"Index mismatch at {i}: vals[{i}]={vals[i]}, data[{indices[i]}]={data[indices[i]]}"
+
+
+# ---------------------------------------------------------------------------
+# Atomic operations tests
+# ---------------------------------------------------------------------------
+
+@requires_metal
+def test_atomic_add_gpu(runner):
+    """Atomic add: scatter-add input values to output by indices"""
+    from triton_metal.codegen.msl_emitter import make_atomic_add_kernel
+    import struct
+
+    n = 256
+    n_bins = 4
+    msl = make_atomic_add_kernel(block_size=256)
+    path = runner.compile(msl, "atomic_add_kernel")
+    pipeline = runner.load(path, "atomic_add_kernel")
+
+    # All values are 1.0, indices round-robin across 4 bins
+    data = [1.0] * n
+    indices = [i % n_bins for i in range(n)]
+    in_buf = runner.make_float_buffer(data)
+    out_buf = runner.make_float_buffer([0.0] * n_bins)
+    # Pack uint indices
+    idx_buf = runner.device.newBufferWithLength_options_(n * 4, 0)
+    idx_view = idx_buf.contents().as_buffer(n * 4)
+    for i, idx in enumerate(indices):
+        struct.pack_into("I", idx_view, i * 4, idx)
+    n_buf = runner.make_uint_buffer(n)
+
+    runner.run(pipeline, [in_buf, out_buf, idx_buf, n_buf], n, block_size=256)
+
+    result = runner.read_float_buffer(out_buf, n_bins)
+    # Each bin should have n/n_bins = 64 additions of 1.0
+    expected_per_bin = n // n_bins
+    for i in range(n_bins):
+        assert abs(result[i] - expected_per_bin) < 1.0, \
+            f"bin {i}: got {result[i]}, expected {expected_per_bin}"
+
+
+# ---------------------------------------------------------------------------
+# Conv2D tests
+# ---------------------------------------------------------------------------
+
+@requires_metal
+def test_conv2d_gpu(runner):
+    """Conv2D: 1x1x4x4 input, 1 output channel, 3x3 filter, pad=1"""
+    from triton_metal.codegen.msl_emitter import make_conv2d_kernel
+
+    in_c, out_c = 1, 1
+    kh, kw = 3, 3
+    in_h, in_w = 4, 4
+    out_h, out_w = 4, 4  # same padding
+    batch = 1
+
+    msl = make_conv2d_kernel(in_channels=in_c, out_channels=out_c,
+                             kernel_h=kh, kernel_w=kw,
+                             stride_h=1, stride_w=1,
+                             pad_h=1, pad_w=1, block_size=256)
+    path = runner.compile(msl, "conv2d_kernel")
+    pipeline = runner.load(path, "conv2d_kernel")
+
+    # Simple input: all 1.0
+    input_data = [1.0] * (batch * in_c * in_h * in_w)
+    # Filter: all 1.0 (sum of 3x3 = 9 for interior, less for edges)
+    weight_data = [1.0] * (out_c * in_c * kh * kw)
+    bias_data = [0.0] * out_c
+
+    in_buf = runner.make_float_buffer(input_data)
+    w_buf = runner.make_float_buffer(weight_data)
+    b_buf = runner.make_float_buffer(bias_data)
+    out_buf = runner.make_empty_buffer(batch * out_c * out_h * out_w)
+    batch_buf = runner.make_uint_buffer(batch)
+    ih_buf = runner.make_uint_buffer(in_h)
+    iw_buf = runner.make_uint_buffer(in_w)
+    oh_buf = runner.make_uint_buffer(out_h)
+    ow_buf = runner.make_uint_buffer(out_w)
+
+    n_elements = batch * out_c * out_h * out_w
+    runner.run(pipeline, [in_buf, w_buf, b_buf, out_buf,
+                          batch_buf, ih_buf, iw_buf, oh_buf, ow_buf],
+               n_elements, block_size=256)
+
+    result = runner.read_float_buffer(out_buf, n_elements)
+
+    # Reference: manually compute conv2d with all-1 filter, all-1 input, pad=1
+    # Each output pixel = count of valid neighbors in 3x3 window
+    expected = []
+    for oh_idx in range(out_h):
+        for ow_idx in range(out_w):
+            val = 0.0
+            for kh_idx in range(kh):
+                for kw_idx in range(kw):
+                    ih_idx = oh_idx + kh_idx - 1  # pad=1
+                    iw_idx = ow_idx + kw_idx - 1
+                    if 0 <= ih_idx < in_h and 0 <= iw_idx < in_w:
+                        val += 1.0
+            expected.append(val)
+
+    for i in range(n_elements):
+        assert abs(result[i] - expected[i]) < 1e-3, \
+            f"idx {i}: got {result[i]}, expected {expected[i]}"

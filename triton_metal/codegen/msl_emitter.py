@@ -4564,6 +4564,286 @@ kernel void all_reduce(
     return kb.build()
 
 
+def make_cumsum_kernel(block_size=256, dtype="fp32"):
+    """Generate a parallel prefix sum (inclusive scan) kernel.
+
+    Uses the Hillis-Steele algorithm within a threadgroup for in-place
+    prefix sum. Each threadgroup processes block_size elements.
+    For inputs larger than block_size, launch multiple passes.
+
+    The kernel processes one row per threadgroup (pid indexes rows).
+
+    Args:
+        block_size: Elements per threadgroup (also max row length).
+        dtype: Data type.
+    """
+    msl_type = triton_type_to_msl(dtype)
+    needs_cast = dtype in ("fp16", "bf16")
+    read_cast = f"float({msl_type}(" if needs_cast else ""
+    read_end = "))" if needs_cast else ""
+
+    msl = f"""#include <metal_stdlib>
+using namespace metal;
+
+kernel void cumsum_kernel(
+    device const {msl_type}* input [[buffer(0)]],
+    device {msl_type}* output [[buffer(1)]],
+    constant uint& n_cols [[buffer(2)]],
+    uint pid [[threadgroup_position_in_grid]],
+    uint lid [[thread_position_in_threadgroup]]
+) {{
+    // Each threadgroup handles one row
+    threadgroup float shared[{block_size}];
+
+    uint row_start = pid * n_cols;
+    // Load into shared memory
+    if (lid < n_cols) {{
+        shared[lid] = float(input[row_start + lid]);
+    }} else {{
+        shared[lid] = 0.0f;
+    }}
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Hillis-Steele inclusive scan
+    for (uint stride = 1; stride < {block_size}u; stride <<= 1) {{
+        float val = 0.0f;
+        if (lid >= stride) {{
+            val = shared[lid - stride];
+        }}
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (lid >= stride) {{
+            shared[lid] += val;
+        }}
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }}
+
+    // Write result
+    if (lid < n_cols) {{
+        output[row_start + lid] = {msl_type}(shared[lid]);
+    }}
+}}
+"""
+    kb = KernelBuilder("cumsum_kernel", block_size=block_size)
+    kb.set_prebuilt_msl(msl)
+    return kb.build()
+
+
+def make_bitonic_sort_kernel(block_size=256, ascending=True):
+    """Generate a bitonic sort kernel for in-threadgroup sorting.
+
+    Sorts block_size elements per threadgroup using the bitonic merge
+    sort network. Returns both sorted values and original indices
+    (argsort).
+
+    Each threadgroup handles one segment of block_size elements,
+    indexed by pid.
+
+    Args:
+        block_size: Number of elements to sort per threadgroup (must be power of 2).
+        ascending: Sort order.
+    """
+    cmp = "<" if ascending else ">"
+    msl = f"""#include <metal_stdlib>
+using namespace metal;
+
+kernel void bitonic_sort_kernel(
+    device const float* input [[buffer(0)]],
+    device float* output_vals [[buffer(1)]],
+    device uint* output_indices [[buffer(2)]],
+    constant uint& n_elements [[buffer(3)]],
+    uint pid [[threadgroup_position_in_grid]],
+    uint lid [[thread_position_in_threadgroup]]
+) {{
+    threadgroup float vals[{block_size}];
+    threadgroup uint idxs[{block_size}];
+
+    uint base = pid * {block_size}u;
+    uint gid = base + lid;
+
+    // Load or pad
+    if (gid < n_elements) {{
+        vals[lid] = input[gid];
+        idxs[lid] = gid;
+    }} else {{
+        vals[lid] = {"INFINITY" if ascending else "-INFINITY"};
+        idxs[lid] = 0xFFFFFFFFu;
+    }}
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Bitonic sort network
+    for (uint size = 2; size <= {block_size}u; size <<= 1) {{
+        for (uint stride = size >> 1; stride > 0; stride >>= 1) {{
+            uint pos = lid;
+            uint partner = pos ^ stride;
+            if (partner > pos) {{
+                bool ascending_pair = ((pos & size) == 0);
+                bool should_swap;
+                if (ascending_pair) {{
+                    should_swap = vals[pos] > vals[partner];
+                }} else {{
+                    should_swap = vals[pos] < vals[partner];
+                }}
+                if (should_swap) {{
+                    float tmp_v = vals[pos];
+                    vals[pos] = vals[partner];
+                    vals[partner] = tmp_v;
+                    uint tmp_i = idxs[pos];
+                    idxs[pos] = idxs[partner];
+                    idxs[partner] = tmp_i;
+                }}
+            }}
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }}
+    }}
+
+    // Write sorted output
+    if (gid < n_elements) {{
+        output_vals[gid] = vals[lid];
+        output_indices[gid] = idxs[lid];
+    }}
+}}
+"""
+    kb = KernelBuilder("bitonic_sort_kernel", block_size=block_size)
+    kb.set_prebuilt_msl(msl)
+    return kb.build()
+
+
+def make_atomic_add_kernel(block_size=256, dtype="fp32"):
+    """Generate a kernel that performs atomic addition to a global accumulator.
+
+    Each thread atomically adds its input element to the corresponding
+    output location. Used for gradient accumulation, histogram computation,
+    and scatter-add operations.
+
+    Args:
+        block_size: Threads per threadgroup.
+        dtype: Data type (fp32 only — Metal atomics are int32/uint32/float).
+    """
+    msl = f"""#include <metal_stdlib>
+using namespace metal;
+
+kernel void atomic_add_kernel(
+    device const float* input [[buffer(0)]],
+    device atomic_float* output [[buffer(1)]],
+    device const uint* indices [[buffer(2)]],
+    constant uint& n_elements [[buffer(3)]],
+    uint gid [[thread_position_in_grid]]
+) {{
+    if (gid >= n_elements) return;
+    uint idx = indices[gid];
+    atomic_fetch_add_explicit(&output[idx], input[gid], memory_order_relaxed);
+}}
+"""
+    kb = KernelBuilder("atomic_add_kernel", block_size=block_size)
+    kb.set_prebuilt_msl(msl)
+    return kb.build()
+
+
+def make_atomic_max_kernel(block_size=256):
+    """Generate a kernel that performs atomic max to a global accumulator.
+
+    Each thread atomically computes max of its input with the output location.
+    Uses atomic_fetch_max on int representation (reinterpret cast).
+
+    Args:
+        block_size: Threads per threadgroup.
+    """
+    # Metal doesn't have atomic_fetch_max for float, so use int reinterpret trick
+    msl = f"""#include <metal_stdlib>
+using namespace metal;
+
+kernel void atomic_max_kernel(
+    device const float* input [[buffer(0)]],
+    device atomic_int* output [[buffer(1)]],
+    constant uint& n_elements [[buffer(2)]],
+    uint gid [[thread_position_in_grid]]
+) {{
+    if (gid >= n_elements) return;
+    float val = input[gid];
+    int int_val = as_type<int>(val);
+    // For positive floats, int comparison preserves order.
+    // Handle negative: flip all bits if negative, else flip sign bit only.
+    int_val = (int_val >= 0) ? int_val : (int_val ^ 0x7FFFFFFF);
+    atomic_fetch_max_explicit(&output[0], int_val, memory_order_relaxed);
+}}
+"""
+    kb = KernelBuilder("atomic_max_kernel", block_size=block_size)
+    kb.set_prebuilt_msl(msl)
+    return kb.build()
+
+
+def make_conv2d_kernel(in_channels=3, out_channels=64, kernel_h=3, kernel_w=3,
+                       stride_h=1, stride_w=1, pad_h=1, pad_w=1, block_size=256):
+    """Generate a 2D convolution kernel using direct computation.
+
+    Each thread computes one output element by iterating over the filter
+    window. Suitable for small kernels (3x3, 1x1). For larger kernels,
+    im2col + matmul is more efficient.
+
+    Dispatch: n_threadgroups = ceil(out_h * out_w * out_channels / block_size)
+    Scalar args: batch_size, in_h, in_w, out_h, out_w
+
+    Args:
+        in_channels: Number of input channels.
+        out_channels: Number of output channels.
+        kernel_h, kernel_w: Filter dimensions.
+        stride_h, stride_w: Stride.
+        pad_h, pad_w: Zero-padding.
+        block_size: Threads per threadgroup.
+    """
+    msl = f"""#include <metal_stdlib>
+using namespace metal;
+
+kernel void conv2d_kernel(
+    device const float* input [[buffer(0)]],
+    device const float* weight [[buffer(1)]],
+    device const float* bias [[buffer(2)]],
+    device float* output [[buffer(3)]],
+    constant uint& batch_size [[buffer(4)]],
+    constant uint& in_h [[buffer(5)]],
+    constant uint& in_w [[buffer(6)]],
+    constant uint& out_h [[buffer(7)]],
+    constant uint& out_w [[buffer(8)]],
+    uint gid [[thread_position_in_grid]]
+) {{
+    // Total output elements per batch: out_channels * out_h * out_w
+    uint out_spatial = out_h * out_w;
+    uint out_total = {out_channels}u * out_spatial;
+    uint total = batch_size * out_total;
+    if (gid >= total) return;
+
+    uint b = gid / out_total;
+    uint rem = gid % out_total;
+    uint oc = rem / out_spatial;
+    uint spatial = rem % out_spatial;
+    uint oh = spatial / out_w;
+    uint ow = spatial % out_w;
+
+    float acc = bias[oc];
+
+    for (uint ic = 0; ic < {in_channels}u; ic++) {{
+        for (uint kh = 0; kh < {kernel_h}u; kh++) {{
+            for (uint kw = 0; kw < {kernel_w}u; kw++) {{
+                int ih = int(oh * {stride_h}u + kh) - {pad_h};
+                int iw = int(ow * {stride_w}u + kw) - {pad_w};
+                if (ih >= 0 && ih < int(in_h) && iw >= 0 && iw < int(in_w)) {{
+                    uint in_idx = b * ({in_channels}u * in_h * in_w) + ic * (in_h * in_w) + uint(ih) * in_w + uint(iw);
+                    uint w_idx = oc * ({in_channels}u * {kernel_h}u * {kernel_w}u) + ic * ({kernel_h}u * {kernel_w}u) + kh * {kernel_w}u + kw;
+                    acc += input[in_idx] * weight[w_idx];
+                }}
+            }}
+        }}
+    }}
+
+    uint out_idx = b * out_total + oc * out_spatial + oh * out_w + ow;
+    output[out_idx] = acc;
+}}
+"""
+    kb = KernelBuilder("conv2d_kernel", block_size=block_size)
+    kb.set_prebuilt_msl(msl)
+    return kb.build()
+
+
 # ---------------------------------------------------------------------------
 # TTGIR integration (requires triton)
 # ---------------------------------------------------------------------------

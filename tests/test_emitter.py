@@ -1134,6 +1134,81 @@ def test_elementwise_mul_fp16(runner):
 
 
 # ---------------------------------------------------------------------------
+# FP16 activation tests
+# ---------------------------------------------------------------------------
+
+@requires_metal
+def test_activation_tanh_fp16(runner):
+    """Tanh activation in FP16."""
+    from triton_metal.codegen.msl_emitter import make_activation_kernel
+
+    n = 1024
+    msl = make_activation_kernel("tanh", dtype="fp16")
+    path = runner.compile(msl, "tanh_kernel")
+    pipeline = runner.load(path, "tanh_kernel")
+
+    in_data = [float(i - 512) * 0.005 for i in range(n)]
+    in_buf = runner.make_half_buffer(in_data)
+    out_buf = runner.make_empty_half_buffer(n)
+    n_buf = runner.make_uint_buffer(n)
+
+    runner.run(pipeline, [in_buf, out_buf, n_buf], n)
+    result = runner.read_half_buffer(out_buf, n)
+
+    for i in [0, 256, 512, 768, 1023]:
+        expected = math.tanh(in_data[i])
+        assert abs(result[i] - expected) < 0.01, f"i={i}: {result[i]} != {expected}"
+
+
+@requires_metal
+def test_activation_sigmoid_fp16(runner):
+    """Sigmoid activation in FP16."""
+    from triton_metal.codegen.msl_emitter import make_activation_kernel
+
+    n = 1024
+    msl = make_activation_kernel("sigmoid", dtype="fp16")
+    path = runner.compile(msl, "sigmoid_kernel")
+    pipeline = runner.load(path, "sigmoid_kernel")
+
+    in_data = [float(i - 512) * 0.005 for i in range(n)]
+    in_buf = runner.make_half_buffer(in_data)
+    out_buf = runner.make_empty_half_buffer(n)
+    n_buf = runner.make_uint_buffer(n)
+
+    runner.run(pipeline, [in_buf, out_buf, n_buf], n)
+    result = runner.read_half_buffer(out_buf, n)
+
+    for i in [0, 256, 512, 768, 1023]:
+        x = in_data[i]
+        expected = 1.0 / (1.0 + math.exp(-x))
+        assert abs(result[i] - expected) < 0.01, f"i={i}: {result[i]} != {expected}"
+
+
+@requires_metal
+def test_activation_elu_fp16(runner):
+    """ELU activation in FP16."""
+    from triton_metal.codegen.msl_emitter import make_activation_kernel
+
+    n = 1024
+    msl = make_activation_kernel("elu", dtype="fp16")
+    path = runner.compile(msl, "elu_kernel")
+    pipeline = runner.load(path, "elu_kernel")
+
+    in_data = [float(i - 512) * 0.005 for i in range(n)]
+    in_buf = runner.make_half_buffer(in_data)
+    out_buf = runner.make_empty_half_buffer(n)
+    n_buf = runner.make_uint_buffer(n)
+
+    runner.run(pipeline, [in_buf, out_buf, n_buf], n)
+    result = runner.read_half_buffer(out_buf, n)
+
+    for i in [0, 256, 512, 768, 1023]:
+        x = in_data[i]
+        expected = x if x >= 0 else (math.exp(x) - 1.0)
+        assert abs(result[i] - expected) < 0.01, f"i={i}: {result[i]} != {expected}"
+
+
+# ---------------------------------------------------------------------------
 # simdgroup_matrix matmul tests
 # ---------------------------------------------------------------------------
 

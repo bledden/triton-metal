@@ -1129,13 +1129,20 @@ def make_rope_kernel(block_size=256, dtype="fp32"):
     # Each thread handles a pair of elements
     kb.raw_line(f"for (uint i = lid; i < dim / 2u; i += {block_size}u) {{")
     kb.indent()
-    kb._var("theta", "float(pos) * freqs[i]", ty="float")
+    needs_cast = dtype in ("fp16", "bf16")
+    read_freq = "float(freqs[i])" if needs_cast else "freqs[i]"
+    kb._var("theta", f"float(pos) * {read_freq}", ty="float")
     kb._var("cos_t", "cos(theta)", ty="float")
     kb._var("sin_t", "sin(theta)", ty="float")
-    kb._var("x0", "input[row_start + 2u * i]", ty="float")
-    kb._var("x1", "input[row_start + 2u * i + 1u]", ty="float")
-    kb.raw_line("output[row_start + 2u * i] = x0 * cos_t - x1 * sin_t;")
-    kb.raw_line("output[row_start + 2u * i + 1u] = x0 * sin_t + x1 * cos_t;")
+    kb._var("x0", "float(input[row_start + 2u * i])", ty="float")
+    kb._var("x1", "float(input[row_start + 2u * i + 1u])", ty="float")
+    if needs_cast:
+        store_ty = triton_type_to_msl(dtype)
+        kb.raw_line(f"output[row_start + 2u * i] = {store_ty}(x0 * cos_t - x1 * sin_t);")
+        kb.raw_line(f"output[row_start + 2u * i + 1u] = {store_ty}(x0 * sin_t + x1 * cos_t);")
+    else:
+        kb.raw_line("output[row_start + 2u * i] = x0 * cos_t - x1 * sin_t;")
+        kb.raw_line("output[row_start + 2u * i + 1u] = x0 * sin_t + x1 * cos_t;")
     kb.dedent()
     kb.raw_line("}")
 
@@ -1264,12 +1271,22 @@ def make_fused_residual_norm_kernel(block_size=256, dtype="fp32", eps=1e-6):
     # Row base pointer
     kb._var("row_start", "pid * n_cols", ty="uint")
 
+    # Half-precision handling
+    needs_cast = dtype in ("fp16", "bf16")
+    store_ty = triton_type_to_msl(dtype) if needs_cast else None
+
+    def _read(buf_expr):
+        return f"float({buf_expr})" if needs_cast else buf_expr
+
+    def _store(val_expr):
+        return f"{store_ty}({val_expr})" if needs_cast else val_expr
+
     # Pass 1: Compute x = input + residual, write residual_out, accumulate sum
     kb._var("local_sum", "0.0f", ty="float")
     kb.raw_line(f"for (uint i = lid; i < n_cols; i += {block_size}u) {{")
     kb.indent()
-    kb.raw_line("float x_val = input[row_start + i] + residual[row_start + i];")
-    kb.raw_line("residual_out[row_start + i] = x_val;")
+    kb.raw_line(f"float x_val = {_read('input[row_start + i]')} + {_read('residual[row_start + i]')};")
+    kb.raw_line(f"residual_out[row_start + i] = {_store('x_val')};")
     kb.raw_line("local_sum += x_val;")
     kb.dedent()
     kb.raw_line("}")
@@ -1286,7 +1303,7 @@ def make_fused_residual_norm_kernel(block_size=256, dtype="fp32", eps=1e-6):
     kb._var("local_var", "0.0f", ty="float")
     kb.raw_line(f"for (uint i = lid; i < n_cols; i += {block_size}u) {{")
     kb.indent()
-    kb.raw_line("float x_val = input[row_start + i] + residual[row_start + i];")
+    kb.raw_line(f"float x_val = {_read('input[row_start + i]')} + {_read('residual[row_start + i]')};")
     kb.raw_line("float diff = x_val - mean_val;")
     kb.raw_line("local_var += diff * diff;")
     kb.dedent()
@@ -1304,8 +1321,9 @@ def make_fused_residual_norm_kernel(block_size=256, dtype="fp32", eps=1e-6):
     # Pass 3: Normalize
     kb.raw_line(f"for (uint i = lid; i < n_cols; i += {block_size}u) {{")
     kb.indent()
-    kb.raw_line("float x_val = input[row_start + i] + residual[row_start + i];")
-    kb.raw_line("output[row_start + i] = (x_val - mean_val) * inv_std * gamma[i] + beta[i];")
+    kb.raw_line(f"float x_val = {_read('input[row_start + i]')} + {_read('residual[row_start + i]')};")
+    norm_val = f"(x_val - mean_val) * inv_std * {_read('gamma[i]')} + {_read('beta[i]')}"
+    kb.raw_line(f"output[row_start + i] = {_store(norm_val)};")
     kb.dedent()
     kb.raw_line("}")
 

@@ -1957,6 +1957,231 @@ kernel void paged_attention(
 """
 
 
+def make_multi_head_paged_attention_kernel(n_heads=8, head_dim=64, page_size=16, block_size=256):
+    """Generate a multi-head paged attention kernel.
+
+    Extends paged attention to handle multiple attention heads simultaneously.
+    Each threadgroup handles one head. The page table is shared across heads
+    but K/V pages are stored per-head.
+
+    Layout:
+        Q: [n_heads, head_dim] — one query per head
+        K_pages: [n_physical_pages, page_size, n_heads, head_dim]
+        V_pages: [n_physical_pages, page_size, n_heads, head_dim]
+        page_table: [max_pages_per_seq] — logical → physical page mapping
+        O: [n_heads, head_dim] — output per head
+        seq_len: actual sequence length
+        n_pages: number of logical pages
+
+    Dispatch: n_heads threadgroups (one per head).
+
+    Args:
+        n_heads: Number of attention heads.
+        head_dim: Dimension per head.
+        page_size: Tokens per page.
+        block_size: Threads per threadgroup.
+    """
+    n_simdgroups = (block_size + 31) // 32
+    return f"""#include <metal_stdlib>
+using namespace metal;
+
+kernel void multi_head_paged_attention(
+    device const float* Q [[buffer(0)]],
+    device const float* K_pages [[buffer(1)]],
+    device const float* V_pages [[buffer(2)]],
+    device const uint* page_table [[buffer(3)]],
+    device float* O [[buffer(4)]],
+    constant uint& seq_len [[buffer(5)]],
+    constant uint& n_pages [[buffer(6)]],
+    uint pid [[threadgroup_position_in_grid]],
+    uint lid [[thread_position_in_threadgroup]],
+    uint sgitg [[simdgroup_index_in_threadgroup]],
+    uint tiisg [[thread_index_in_simdgroup]]
+) {{
+    const uint N_HEADS = {n_heads}u;
+    const uint D = {head_dim}u;
+    const uint PAGE_SIZE = {page_size}u;
+    const uint BLOCK = {block_size}u;
+    const float scale = 1.0f / sqrt(float(D));
+
+    uint head_idx = pid;
+    if (head_idx >= N_HEADS) return;
+
+    uint q_offset = head_idx * D;
+
+    // Phase 1: Compute attention scores
+    float local_max = -INFINITY;
+    for (uint pos = lid; pos < seq_len; pos += BLOCK) {{
+        uint page_idx = pos / PAGE_SIZE;
+        uint page_offset = pos % PAGE_SIZE;
+        uint phys_page = page_table[page_idx];
+        // K layout: [phys_page, page_offset, head_idx, d]
+        uint k_base = ((phys_page * PAGE_SIZE + page_offset) * N_HEADS + head_idx) * D;
+
+        float dot = 0.0f;
+        for (uint d = 0u; d < D; d++) {{
+            dot += Q[q_offset + d] * K_pages[k_base + d];
+        }}
+        local_max = max(local_max, dot * scale);
+    }}
+
+    float sg_max = simd_max(local_max);
+    threadgroup float shared_max[{n_simdgroups}];
+    if (sgitg == 0u) shared_max[tiisg] = -INFINITY;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tiisg == 0u) shared_max[sgitg] = sg_max;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float rd_max = (tiisg < {n_simdgroups}u) ? shared_max[tiisg] : -INFINITY;
+    float global_max = simd_max(rd_max);
+
+    // Phase 2: exp sum
+    float local_sum = 0.0f;
+    for (uint pos = lid; pos < seq_len; pos += BLOCK) {{
+        uint page_idx = pos / PAGE_SIZE;
+        uint page_offset = pos % PAGE_SIZE;
+        uint phys_page = page_table[page_idx];
+        uint k_base = ((phys_page * PAGE_SIZE + page_offset) * N_HEADS + head_idx) * D;
+
+        float dot = 0.0f;
+        for (uint d = 0u; d < D; d++) {{
+            dot += Q[q_offset + d] * K_pages[k_base + d];
+        }}
+        local_sum += exp(dot * scale - global_max);
+    }}
+
+    float sg_sum = simd_sum(local_sum);
+    threadgroup float shared_sum[{n_simdgroups}];
+    if (sgitg == 0u) shared_sum[tiisg] = 0.0f;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tiisg == 0u) shared_sum[sgitg] = sg_sum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float rd_sum = (tiisg < {n_simdgroups}u) ? shared_sum[tiisg] : 0.0f;
+    float global_sum = simd_sum(rd_sum);
+    float inv_sum = 1.0f / global_sum;
+
+    // Phase 3: Weighted V sum
+    for (uint d_start = 0u; d_start < D; d_start += BLOCK) {{
+        uint d = d_start + lid;
+        if (d < D) {{
+            float o_val = 0.0f;
+            for (uint pos = 0u; pos < seq_len; pos++) {{
+                uint page_idx = pos / PAGE_SIZE;
+                uint page_offset = pos % PAGE_SIZE;
+                uint phys_page = page_table[page_idx];
+                uint k_base = ((phys_page * PAGE_SIZE + page_offset) * N_HEADS + head_idx) * D;
+                uint v_base = k_base;
+
+                float dot = 0.0f;
+                for (uint dd = 0u; dd < D; dd++) {{
+                    dot += Q[q_offset + dd] * K_pages[k_base + dd];
+                }}
+                float attn_w = exp(dot * scale - global_max) * inv_sum;
+                o_val += attn_w * V_pages[v_base + d];
+            }}
+            O[q_offset + d] = o_val;
+        }}
+    }}
+}}
+"""
+
+
+def make_fp16_kv_attention_kernel(head_dim=64, block_size=256):
+    """Generate a mixed-precision KV-cache attention kernel.
+
+    Q is float32, K and V caches are stored in float16 (half precision).
+    Computation is done in float32 for accuracy, but reads K/V as half,
+    reducing memory bandwidth by 2x for the KV-cache.
+
+    Layout:
+        Q: [head_dim] float32 — single query vector
+        K_cache: [max_seq_len, head_dim] float16
+        V_cache: [max_seq_len, head_dim] float16
+        O: [head_dim] float32 — output
+        seq_len: actual sequence length
+
+    Dispatch: 1 threadgroup.
+
+    Args:
+        head_dim: Dimension per head.
+        block_size: Threads per threadgroup.
+    """
+    n_simdgroups = (block_size + 31) // 32
+    return f"""#include <metal_stdlib>
+using namespace metal;
+
+kernel void fp16_kv_attention(
+    device const float* Q [[buffer(0)]],
+    device const half* K_cache [[buffer(1)]],
+    device const half* V_cache [[buffer(2)]],
+    device float* O [[buffer(3)]],
+    constant uint& seq_len [[buffer(4)]],
+    uint lid [[thread_position_in_threadgroup]],
+    uint sgitg [[simdgroup_index_in_threadgroup]],
+    uint tiisg [[thread_index_in_simdgroup]]
+) {{
+    const uint D = {head_dim}u;
+    const uint BLOCK = {block_size}u;
+    const float scale = 1.0f / sqrt(float(D));
+
+    // Phase 1: max score
+    float local_max = -INFINITY;
+    for (uint j = lid; j < seq_len; j += BLOCK) {{
+        float dot = 0.0f;
+        for (uint d = 0u; d < D; d++) {{
+            dot += Q[d] * float(K_cache[j * D + d]);
+        }}
+        local_max = max(local_max, dot * scale);
+    }}
+
+    float sg_max = simd_max(local_max);
+    threadgroup float shared_max[{n_simdgroups}];
+    if (sgitg == 0u) shared_max[tiisg] = -INFINITY;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tiisg == 0u) shared_max[sgitg] = sg_max;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float rd_max = (tiisg < {n_simdgroups}u) ? shared_max[tiisg] : -INFINITY;
+    float global_max = simd_max(rd_max);
+
+    // Phase 2: exp sum
+    float local_sum = 0.0f;
+    for (uint j = lid; j < seq_len; j += BLOCK) {{
+        float dot = 0.0f;
+        for (uint d = 0u; d < D; d++) {{
+            dot += Q[d] * float(K_cache[j * D + d]);
+        }}
+        local_sum += exp(dot * scale - global_max);
+    }}
+
+    float sg_sum = simd_sum(local_sum);
+    threadgroup float shared_sum[{n_simdgroups}];
+    if (sgitg == 0u) shared_sum[tiisg] = 0.0f;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tiisg == 0u) shared_sum[sgitg] = sg_sum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float rd_sum = (tiisg < {n_simdgroups}u) ? shared_sum[tiisg] : 0.0f;
+    float global_sum = simd_sum(rd_sum);
+    float inv_sum = 1.0f / global_sum;
+
+    // Phase 3: Weighted V sum (V is half, compute in float)
+    for (uint d_start = 0u; d_start < D; d_start += BLOCK) {{
+        uint d = d_start + lid;
+        if (d < D) {{
+            float o_val = 0.0f;
+            for (uint j = 0u; j < seq_len; j++) {{
+                float dot = 0.0f;
+                for (uint dd = 0u; dd < D; dd++) {{
+                    dot += Q[dd] * float(K_cache[j * D + dd]);
+                }}
+                float attn_w = exp(dot * scale - global_max) * inv_sum;
+                o_val += attn_w * float(V_cache[j * D + d]);
+            }}
+            O[d] = o_val;
+        }}
+    }}
+}}
+"""
+
+
 def make_int8_matmul_kernel():
     """Generate a weight-only INT8 quantized matmul kernel.
 
@@ -2508,6 +2733,114 @@ kernel void speculative_decode(
     float inv_total = (total > 0.0f) ? (1.0f / total) : 0.0f;
     for (uint v = lid; v < vocab_size; v += BLOCK) {{
         adjusted_probs[v] *= inv_total;
+    }}
+}}
+"""
+
+
+def make_beam_search_kernel(beam_width=4, block_size=256):
+    """Generate a beam search step kernel for LLM inference.
+
+    Given current beam scores and next-token log-probabilities, finds
+    the top beam_width candidates across all beams * vocab_size options.
+
+    For each beam b and vocabulary token v:
+        candidate_score = beam_scores[b] + log_probs[b * vocab_size + v]
+
+    Then selects the top beam_width candidates globally.
+
+    Uses iterative selection (like top-k): find the global best, mark it,
+    repeat beam_width times.
+
+    Layout:
+        beam_scores: [beam_width] — current cumulative log-probs per beam
+        log_probs: [beam_width, vocab_size] — next-token log-probs from model
+        out_scores: [beam_width] — selected beam scores
+        out_beam_ids: [beam_width] — which beam each selection came from (uint)
+        out_token_ids: [beam_width] — which token was selected (uint)
+        vocab_size: vocabulary size
+
+    Dispatch: 1 threadgroup.
+
+    Args:
+        beam_width: Number of beams.
+        block_size: Threads per threadgroup.
+    """
+    return f"""#include <metal_stdlib>
+using namespace metal;
+
+kernel void beam_search(
+    device const float* beam_scores [[buffer(0)]],
+    device const float* log_probs [[buffer(1)]],
+    device float* out_scores [[buffer(2)]],
+    device uint* out_beam_ids [[buffer(3)]],
+    device uint* out_token_ids [[buffer(4)]],
+    constant uint& vocab_size [[buffer(5)]],
+    uint lid [[thread_position_in_threadgroup]]
+) {{
+    const uint BLOCK = {block_size}u;
+    const uint BEAM_WIDTH = {beam_width}u;
+    const uint total = BEAM_WIDTH * vocab_size;
+
+    // Use threadgroup memory for iterative selection
+    threadgroup float tg_best_val[{block_size}];
+    threadgroup uint tg_best_idx[{block_size}];
+    threadgroup float picked_threshold[1];
+
+    // For each of beam_width selections
+    for (uint sel = 0u; sel < BEAM_WIDTH; sel++) {{
+        // Each thread finds its local best candidate
+        float local_best = -INFINITY;
+        uint local_idx = 0u;
+
+        for (uint i = lid; i < total; i += BLOCK) {{
+            uint beam = i / vocab_size;
+            uint tok = i % vocab_size;
+            float score = beam_scores[beam] + log_probs[i];
+
+            // Skip already-picked candidates (marked with -INFINITY)
+            if (sel > 0u) {{
+                bool is_picked = false;
+                for (uint p = 0u; p < sel; p++) {{
+                    if (out_beam_ids[p] == beam && out_token_ids[p] == tok) {{
+                        is_picked = true;
+                        break;
+                    }}
+                }}
+                if (is_picked) continue;
+            }}
+
+            if (score > local_best) {{
+                local_best = score;
+                local_idx = i;
+            }}
+        }}
+
+        tg_best_val[lid] = local_best;
+        tg_best_idx[lid] = local_idx;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // Parallel reduction to find global best
+        for (uint stride = BLOCK / 2u; stride > 0u; stride >>= 1u) {{
+            if (lid < stride) {{
+                if (tg_best_val[lid + stride] > tg_best_val[lid]) {{
+                    tg_best_val[lid] = tg_best_val[lid + stride];
+                    tg_best_idx[lid] = tg_best_idx[lid + stride];
+                }}
+            }}
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }}
+
+        // Thread 0 writes the selection
+        if (lid == 0u) {{
+            uint best_flat = tg_best_idx[0];
+            uint best_beam = best_flat / vocab_size;
+            uint best_tok = best_flat % vocab_size;
+            out_scores[sel] = tg_best_val[0];
+            out_beam_ids[sel] = best_beam;
+            out_token_ids[sel] = best_tok;
+        }}
+        threadgroup_barrier(mem_flags::mem_threadgroup);
     }}
 }}
 """

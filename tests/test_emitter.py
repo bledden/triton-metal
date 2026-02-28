@@ -3138,3 +3138,273 @@ def test_fused_residual_norm(runner):
             assert abs(got - expected) < 0.01, (
                 f"row {row} col {i}: got {got}, expected {expected}"
             )
+
+
+# ---------------------------------------------------------------------------
+# Beam Search tests
+# ---------------------------------------------------------------------------
+
+
+@requires_metal
+def test_beam_search(runner):
+    """Beam search: selects top beam_width candidates across beams * vocab."""
+    from triton_metal.codegen.msl_emitter import make_beam_search_kernel
+    import struct as struct_mod
+
+    beam_width = 4
+    vocab_size = 32
+
+    msl = make_beam_search_kernel(beam_width=beam_width, block_size=256)
+    path = runner.compile(msl, "beam_search")
+    pipeline = runner.load(path, "beam_search")
+
+    # Current beam scores (cumulative log-probs)
+    beam_scores_data = [-1.0, -2.0, -3.0, -5.0]
+
+    # Next-token log-probs per beam
+    random.seed(4242)
+    log_probs_data = [random.uniform(-10.0, -1.0)
+                      for _ in range(beam_width * vocab_size)]
+
+    # Plant some known high-scoring candidates
+    # beam 0, token 5: -1.0 + -0.1 = -1.1 (best)
+    log_probs_data[0 * vocab_size + 5] = -0.1
+    # beam 1, token 10: -2.0 + -0.2 = -2.2 (second)
+    log_probs_data[1 * vocab_size + 10] = -0.2
+    # beam 0, token 20: -1.0 + -1.5 = -2.5 (third)
+    log_probs_data[0 * vocab_size + 20] = -1.5
+    # beam 2, token 3: -3.0 + -0.1 = -3.1 (fourth)
+    log_probs_data[2 * vocab_size + 3] = -0.1
+
+    bs_buf = runner.make_float_buffer(beam_scores_data)
+    lp_buf = runner.make_float_buffer(log_probs_data)
+    out_scores_buf = runner.make_empty_buffer(beam_width)
+
+    import Metal
+    out_beams_buf = runner.device.newBufferWithLength_options_(
+        beam_width * 4, Metal.MTLResourceStorageModeShared
+    )
+    out_tokens_buf = runner.device.newBufferWithLength_options_(
+        beam_width * 4, Metal.MTLResourceStorageModeShared
+    )
+    vs_buf = runner.make_uint_buffer(vocab_size)
+
+    cmd = runner.queue.commandBuffer()
+    enc = cmd.computeCommandEncoder()
+    enc.setComputePipelineState_(pipeline)
+    for i, buf in enumerate([bs_buf, lp_buf, out_scores_buf, out_beams_buf,
+                              out_tokens_buf, vs_buf]):
+        enc.setBuffer_offset_atIndex_(buf, 0, i)
+    enc.dispatchThreadgroups_threadsPerThreadgroup_(
+        Metal.MTLSizeMake(1, 1, 1),
+        Metal.MTLSizeMake(256, 1, 1),
+    )
+    enc.endEncoding()
+    cmd.commit()
+    cmd.waitUntilCompleted()
+    assert cmd.status() == 4, f"Kernel failed, status={cmd.status()}"
+
+    result_scores = runner.read_float_buffer(out_scores_buf, beam_width)
+    beams_view = out_beams_buf.contents().as_buffer(beam_width * 4)
+    tokens_view = out_tokens_buf.contents().as_buffer(beam_width * 4)
+    result_beams = [struct_mod.unpack_from("I", beams_view, i * 4)[0]
+                    for i in range(beam_width)]
+    result_tokens = [struct_mod.unpack_from("I", tokens_view, i * 4)[0]
+                     for i in range(beam_width)]
+
+    # Verify the top-4 are in descending score order
+    assert result_scores[0] > result_scores[1] > result_scores[2] > result_scores[3]
+
+    # Best candidate: beam 0, token 5, score -1.1
+    assert result_beams[0] == 0
+    assert result_tokens[0] == 5
+    assert abs(result_scores[0] - (-1.1)) < 0.01
+
+    # Second: beam 1, token 10, score -2.2
+    assert result_beams[1] == 1
+    assert result_tokens[1] == 10
+    assert abs(result_scores[1] - (-2.2)) < 0.01
+
+
+# ---------------------------------------------------------------------------
+# Multi-Head Paged Attention tests
+# ---------------------------------------------------------------------------
+
+
+@requires_metal
+def test_multi_head_paged_attention(runner):
+    """Multi-head paged attention: 2 heads, 3 pages, shuffled physical order."""
+    from triton_metal.codegen.msl_emitter import make_multi_head_paged_attention_kernel
+    import struct as struct_mod
+
+    n_heads = 2
+    head_dim = 32
+    page_size = 8
+    seq_len = 16  # 2 full pages
+    n_pages = 2
+    page_table = [1, 0]  # Reversed
+
+    msl = make_multi_head_paged_attention_kernel(
+        n_heads=n_heads, head_dim=head_dim, page_size=page_size)
+    path = runner.compile(msl, "multi_head_paged_attn")
+    pipeline = runner.load(path, "multi_head_paged_attention")
+
+    random.seed(6161)
+    n_physical_pages = 2
+
+    # Q: [n_heads, head_dim]
+    q_data = [random.uniform(-0.5, 0.5) for _ in range(n_heads * head_dim)]
+    # K/V pages: [n_physical_pages, page_size, n_heads, head_dim]
+    total_kv = n_physical_pages * page_size * n_heads * head_dim
+    k_data = [random.uniform(-0.5, 0.5) for _ in range(total_kv)]
+    v_data = [random.uniform(-0.5, 0.5) for _ in range(total_kv)]
+
+    q_buf = runner.make_float_buffer(q_data)
+    k_buf = runner.make_float_buffer(k_data)
+    v_buf = runner.make_float_buffer(v_data)
+
+    import Metal
+    pt_buf = runner.device.newBufferWithLength_options_(
+        n_pages * 4, Metal.MTLResourceStorageModeShared
+    )
+    pt_view = pt_buf.contents().as_buffer(n_pages * 4)
+    for i, phys in enumerate(page_table):
+        struct_mod.pack_into("I", pt_view, i * 4, phys)
+
+    out_buf = runner.make_empty_buffer(n_heads * head_dim)
+    sl_buf = runner.make_uint_buffer(seq_len)
+    np_buf = runner.make_uint_buffer(n_pages)
+
+    cmd = runner.queue.commandBuffer()
+    enc = cmd.computeCommandEncoder()
+    enc.setComputePipelineState_(pipeline)
+    for i, buf in enumerate([q_buf, k_buf, v_buf, pt_buf, out_buf,
+                              sl_buf, np_buf]):
+        enc.setBuffer_offset_atIndex_(buf, 0, i)
+    enc.dispatchThreadgroups_threadsPerThreadgroup_(
+        Metal.MTLSizeMake(n_heads, 1, 1),
+        Metal.MTLSizeMake(256, 1, 1),
+    )
+    enc.endEncoding()
+    cmd.commit()
+    cmd.waitUntilCompleted()
+    assert cmd.status() == 4, f"Kernel failed, status={cmd.status()}"
+
+    result = runner.read_float_buffer(out_buf, n_heads * head_dim)
+    scale = 1.0 / math.sqrt(head_dim)
+
+    # Python reference per head
+    for h in range(n_heads):
+        q_off = h * head_dim
+        scores = []
+        for pos in range(seq_len):
+            pi = pos // page_size
+            po = pos % page_size
+            pp = page_table[pi]
+            # K layout: [pp, po, h, d]
+            k_base = ((pp * page_size + po) * n_heads + h) * head_dim
+            dot = sum(q_data[q_off + d] * k_data[k_base + d] for d in range(head_dim))
+            scores.append(dot * scale)
+
+        max_s = max(scores)
+        exp_s = [math.exp(s - max_s) for s in scores]
+        sum_exp = sum(exp_s)
+        attn = [e / sum_exp for e in exp_s]
+
+        for d in range(head_dim):
+            expected = 0.0
+            for pos in range(seq_len):
+                pi = pos // page_size
+                po = pos % page_size
+                pp = page_table[pi]
+                v_base = ((pp * page_size + po) * n_heads + h) * head_dim
+                expected += attn[pos] * v_data[v_base + d]
+            got = result[q_off + d]
+            assert abs(got - expected) < 0.05, (
+                f"head {h} dim {d}: got {got}, expected {expected}"
+            )
+
+
+# ---------------------------------------------------------------------------
+# FP16 KV-Cache Attention tests
+# ---------------------------------------------------------------------------
+
+
+@requires_metal
+def test_fp16_kv_attention(runner):
+    """FP16 KV-cache attention: Q in float32, K/V in float16, compute in float32."""
+    from triton_metal.codegen.msl_emitter import make_fp16_kv_attention_kernel
+    import struct as struct_mod
+
+    head_dim = 32
+    seq_len = 16
+
+    msl = make_fp16_kv_attention_kernel(head_dim=head_dim, block_size=256)
+    path = runner.compile(msl, "fp16_kv_attn")
+    pipeline = runner.load(path, "fp16_kv_attention")
+
+    random.seed(5151)
+    q_data = [random.uniform(-0.5, 0.5) for _ in range(head_dim)]
+    k_data = [random.uniform(-0.5, 0.5) for _ in range(seq_len * head_dim)]
+    v_data = [random.uniform(-0.5, 0.5) for _ in range(seq_len * head_dim)]
+
+    q_buf = runner.make_float_buffer(q_data)
+
+    # Create half-precision buffers for K and V
+    import Metal
+    k_buf = runner.device.newBufferWithLength_options_(
+        seq_len * head_dim * 2, Metal.MTLResourceStorageModeShared  # 2 bytes per half
+    )
+    v_buf = runner.device.newBufferWithLength_options_(
+        seq_len * head_dim * 2, Metal.MTLResourceStorageModeShared
+    )
+
+    # Pack as half-precision (IEEE 754 binary16)
+    k_view = k_buf.contents().as_buffer(seq_len * head_dim * 2)
+    v_view = v_buf.contents().as_buffer(seq_len * head_dim * 2)
+    for i in range(seq_len * head_dim):
+        struct_mod.pack_into("e", k_view, i * 2, k_data[i])
+        struct_mod.pack_into("e", v_view, i * 2, v_data[i])
+
+    out_buf = runner.make_empty_buffer(head_dim)
+    sl_buf = runner.make_uint_buffer(seq_len)
+
+    cmd = runner.queue.commandBuffer()
+    enc = cmd.computeCommandEncoder()
+    enc.setComputePipelineState_(pipeline)
+    for i, buf in enumerate([q_buf, k_buf, v_buf, out_buf, sl_buf]):
+        enc.setBuffer_offset_atIndex_(buf, 0, i)
+    enc.dispatchThreadgroups_threadsPerThreadgroup_(
+        Metal.MTLSizeMake(1, 1, 1),
+        Metal.MTLSizeMake(256, 1, 1),
+    )
+    enc.endEncoding()
+    cmd.commit()
+    cmd.waitUntilCompleted()
+    assert cmd.status() == 4, f"Kernel failed, status={cmd.status()}"
+
+    result = runner.read_float_buffer(out_buf, head_dim)
+
+    # Reference: use the half-precision-rounded values
+    k_half = [struct_mod.unpack_from("e", k_view, i * 2)[0]
+              for i in range(seq_len * head_dim)]
+    v_half = [struct_mod.unpack_from("e", v_view, i * 2)[0]
+              for i in range(seq_len * head_dim)]
+
+    scale = 1.0 / math.sqrt(head_dim)
+    scores = []
+    for j in range(seq_len):
+        dot = sum(q_data[d] * k_half[j * head_dim + d] for d in range(head_dim))
+        scores.append(dot * scale)
+
+    max_s = max(scores)
+    exp_s = [math.exp(s - max_s) for s in scores]
+    sum_exp = sum(exp_s)
+    attn = [e / sum_exp for e in exp_s]
+
+    for d in range(head_dim):
+        expected = sum(attn[j] * v_half[j * head_dim + d] for j in range(seq_len))
+        got = result[d]
+        assert abs(got - expected) < 0.05, (
+            f"dim {d}: got {got}, expected {expected}"
+        )

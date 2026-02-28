@@ -5245,3 +5245,239 @@ def test_all_reduce_max(runner):
         expected = max(a[i], b[i])
         assert abs(result[i] - expected) < 0.01, \
             f"all_reduce_max[{i}] = {result[i]}, expected {expected}"
+
+
+# ---------------------------------------------------------------------------
+# FP16 layer norm
+# ---------------------------------------------------------------------------
+
+@requires_metal
+def test_layer_norm_fp16(runner):
+    """Layer normalization in half precision."""
+    import Metal
+    from triton_metal.codegen.msl_emitter import make_layer_norm_kernel
+
+    n_cols = 128
+    n_rows = 4
+    msl = make_layer_norm_kernel(block_size=256, dtype="fp16")
+    path = runner.compile(msl, "layer_norm_kernel")
+    pipeline = runner.load(path, "layer_norm_kernel")
+
+    data = [float(i % n_cols) * 0.01 - 0.5 for i in range(n_rows * n_cols)]
+    gamma = [1.0] * n_cols
+    beta = [0.0] * n_cols
+
+    in_buf = runner.make_half_buffer(data)
+    gamma_buf = runner.make_half_buffer(gamma)
+    beta_buf = runner.make_half_buffer(beta)
+    out_buf = runner.make_empty_half_buffer(n_rows * n_cols)
+    ncols_buf = runner.make_uint_buffer(n_cols)
+
+    cmd = runner.queue.commandBuffer()
+    enc = cmd.computeCommandEncoder()
+    enc.setComputePipelineState_(pipeline)
+    for i, buf in enumerate([in_buf, gamma_buf, beta_buf, out_buf, ncols_buf]):
+        enc.setBuffer_offset_atIndex_(buf, 0, i)
+    enc.dispatchThreadgroups_threadsPerThreadgroup_(
+        Metal.MTLSizeMake(n_rows, 1, 1),
+        Metal.MTLSizeMake(256, 1, 1),
+    )
+    enc.endEncoding()
+    cmd.commit()
+    cmd.waitUntilCompleted()
+    assert cmd.status() == 4
+
+    result = runner.read_half_buffer(out_buf, n_rows * n_cols)
+
+    for row in range(n_rows):
+        row_vals = result[row * n_cols : (row + 1) * n_cols]
+        row_mean = sum(row_vals) / n_cols
+        assert abs(row_mean) < 0.2, f"row {row} mean = {row_mean}, expected ≈ 0"
+
+
+# ---------------------------------------------------------------------------
+# FP16 RMS norm
+# ---------------------------------------------------------------------------
+
+@requires_metal
+def test_rms_norm_fp16(runner):
+    """RMS normalization in half precision."""
+    import Metal
+    from triton_metal.codegen.msl_emitter import make_rms_norm_kernel
+
+    n_cols = 64
+    n_rows = 4
+    msl = make_rms_norm_kernel(block_size=256, dtype="fp16")
+    path = runner.compile(msl, "rms_norm_kernel")
+    pipeline = runner.load(path, "rms_norm_kernel")
+
+    data = [float(i % n_cols) * 0.02 + 0.1 for i in range(n_rows * n_cols)]
+    weight = [1.0] * n_cols
+
+    in_buf = runner.make_half_buffer(data)
+    w_buf = runner.make_half_buffer(weight)
+    out_buf = runner.make_empty_half_buffer(n_rows * n_cols)
+    ncols_buf = runner.make_uint_buffer(n_cols)
+
+    cmd = runner.queue.commandBuffer()
+    enc = cmd.computeCommandEncoder()
+    enc.setComputePipelineState_(pipeline)
+    for i, buf in enumerate([in_buf, w_buf, out_buf, ncols_buf]):
+        enc.setBuffer_offset_atIndex_(buf, 0, i)
+    enc.dispatchThreadgroups_threadsPerThreadgroup_(
+        Metal.MTLSizeMake(n_rows, 1, 1),
+        Metal.MTLSizeMake(256, 1, 1),
+    )
+    enc.endEncoding()
+    cmd.commit()
+    cmd.waitUntilCompleted()
+    assert cmd.status() == 4
+
+    result = runner.read_half_buffer(out_buf, n_rows * n_cols)
+
+    for row in range(n_rows):
+        row_vals = result[row * n_cols : (row + 1) * n_cols]
+        rms = math.sqrt(sum(v * v for v in row_vals) / n_cols)
+        assert 0.5 < rms < 2.0, f"row {row} RMS = {rms}, expected ≈ 1"
+
+
+# ---------------------------------------------------------------------------
+# FP16 reduction
+# ---------------------------------------------------------------------------
+
+@requires_metal
+def test_reduce_sum_fp16(runner):
+    """Sum reduction in half precision."""
+    from triton_metal.codegen.msl_emitter import make_reduce_kernel
+
+    n = 256
+    msl = make_reduce_kernel("reduce_sum", op="sum", block_size=256, dtype="fp16")
+    path = runner.compile(msl, "reduce_sum")
+    pipeline = runner.load(path, "reduce_sum")
+
+    # Small values to avoid overflow
+    data = [float(i) * 0.01 for i in range(n)]
+    in_buf = runner.make_half_buffer(data)
+    out_buf = runner.make_empty_half_buffer(1)
+    n_buf = runner.make_uint_buffer(n)
+
+    runner.run(pipeline, [in_buf, out_buf, n_buf], 1, block_size=256)
+    result = runner.read_half_buffer(out_buf, 1)
+
+    expected = sum(data)
+    tol = max(1.0, abs(expected) * 0.05)  # 5% tolerance for FP16 reduction
+    assert abs(result[0] - expected) < tol, \
+        f"reduce_sum_fp16 = {result[0]}, expected {expected}"
+
+
+# ---------------------------------------------------------------------------
+# FP16 RoPE
+# ---------------------------------------------------------------------------
+
+@requires_metal
+def test_rope_fp16(runner):
+    """RoPE (rotary position embedding) in half precision."""
+    from triton_metal.codegen.msl_emitter import make_rope_kernel
+
+    dim = 32
+    msl = make_rope_kernel(block_size=256, dtype="fp16")
+    path = runner.compile(msl, "rope_kernel")
+    pipeline = runner.load(path, "rope_kernel")
+
+    # Simple input: all ones
+    data = [1.0] * dim
+    # Frequencies: 1/(10000^(2i/dim)) — use simple freqs for testing
+    freqs = [1.0 / (10000.0 ** (2.0 * i / dim)) for i in range(dim // 2)]
+
+    in_buf = runner.make_half_buffer(data)
+    freq_buf = runner.make_half_buffer(freqs)
+    out_buf = runner.make_empty_half_buffer(dim)
+    dim_buf = runner.make_uint_buffer(dim)
+    pos_buf = runner.make_uint_buffer(0)  # position 0
+
+    runner.run(pipeline, [in_buf, freq_buf, out_buf, dim_buf, pos_buf],
+               1, block_size=256)
+    result = runner.read_half_buffer(out_buf, dim)
+
+    # At position 0, theta = 0 for all freqs, so cos(0)=1, sin(0)=0
+    # out[2i] = x0*1 - x1*0 = x0 = 1.0
+    # out[2i+1] = x0*0 + x1*1 = x1 = 1.0
+    for i in range(dim):
+        assert abs(result[i] - 1.0) < 0.05, \
+            f"rope_fp16[{i}] = {result[i]}, expected 1.0 (at position 0)"
+
+
+# ---------------------------------------------------------------------------
+# BF16 reduction
+# ---------------------------------------------------------------------------
+
+@requires_metal
+def test_reduce_sum_bf16(runner):
+    """Sum reduction in BF16 precision."""
+    from triton_metal.codegen.msl_emitter import make_reduce_kernel
+
+    n = 64  # Small to avoid precision issues
+    msl = make_reduce_kernel("reduce_sum", op="sum", block_size=256, dtype="bf16")
+    path = runner.compile(msl, "reduce_sum")
+    pipeline = runner.load(path, "reduce_sum")
+
+    data = [float(i) * 0.5 for i in range(n)]
+    in_buf = runner.make_bf16_buffer(data)
+    out_buf = runner.make_empty_bf16_buffer(1)
+    n_buf = runner.make_uint_buffer(n)
+
+    runner.run(pipeline, [in_buf, out_buf, n_buf], 1, block_size=256)
+    result = runner.read_bf16_buffer(out_buf, 1)
+
+    expected = sum(data)
+    tol = max(2.0, abs(expected) * 0.05)
+    assert abs(result[0] - expected) < tol, \
+        f"reduce_sum_bf16 = {result[0]}, expected {expected}"
+
+
+# ---------------------------------------------------------------------------
+# BF16 layer norm
+# ---------------------------------------------------------------------------
+
+@requires_metal
+def test_layer_norm_bf16(runner):
+    """Layer normalization in BF16 precision."""
+    import Metal
+    from triton_metal.codegen.msl_emitter import make_layer_norm_kernel
+
+    n_cols = 64
+    n_rows = 2
+    msl = make_layer_norm_kernel(block_size=256, dtype="bf16")
+    path = runner.compile(msl, "layer_norm_kernel")
+    pipeline = runner.load(path, "layer_norm_kernel")
+
+    data = [float(i % n_cols) * 0.1 - 3.0 for i in range(n_rows * n_cols)]
+    gamma = [1.0] * n_cols
+    beta = [0.0] * n_cols
+
+    in_buf = runner.make_bf16_buffer(data)
+    gamma_buf = runner.make_bf16_buffer(gamma)
+    beta_buf = runner.make_bf16_buffer(beta)
+    out_buf = runner.make_empty_bf16_buffer(n_rows * n_cols)
+    ncols_buf = runner.make_uint_buffer(n_cols)
+
+    cmd = runner.queue.commandBuffer()
+    enc = cmd.computeCommandEncoder()
+    enc.setComputePipelineState_(pipeline)
+    for i, buf in enumerate([in_buf, gamma_buf, beta_buf, out_buf, ncols_buf]):
+        enc.setBuffer_offset_atIndex_(buf, 0, i)
+    enc.dispatchThreadgroups_threadsPerThreadgroup_(
+        Metal.MTLSizeMake(n_rows, 1, 1),
+        Metal.MTLSizeMake(256, 1, 1),
+    )
+    enc.endEncoding()
+    cmd.commit()
+    cmd.waitUntilCompleted()
+    assert cmd.status() == 4
+
+    result = runner.read_bf16_buffer(out_buf, n_rows * n_cols)
+
+    for row in range(n_rows):
+        row_vals = result[row * n_cols : (row + 1) * n_cols]
+        row_mean = sum(row_vals) / n_cols
+        assert abs(row_mean) < 0.5, f"row {row} mean = {row_mean}, expected ≈ 0"

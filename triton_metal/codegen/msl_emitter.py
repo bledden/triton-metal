@@ -588,7 +588,11 @@ def make_reduce_kernel(name, op, block_size=256, dtype="fp32"):
 
     # Thread 0 writes result
     kb.begin_if("lid == 0")
-    kb.raw_line("output[pid] = total;")
+    if dtype in ("fp16", "bf16"):
+        store_ty = triton_type_to_msl(dtype)
+        kb.raw_line(f"output[pid] = {store_ty}(total);")
+    else:
+        kb.raw_line("output[pid] = total;")
     kb.end_block()
 
     return kb.build()
@@ -1073,9 +1077,15 @@ def make_rms_norm_kernel(block_size=256, dtype="fp32", eps=1e-6):
     kb._var("rms", f"rsqrt(mean_sq + {eps}f)", ty="float")
 
     # Pass 2: Apply normalization
+    needs_cast = dtype in ("fp16", "bf16")
+    if needs_cast:
+        store_ty = triton_type_to_msl(dtype)
+        norm_expr = f"{store_ty}(float(input[row_start + i]) * rms * float(weight[i]))"
+    else:
+        norm_expr = "input[row_start + i] * rms * weight[i]"
     kb.raw_line(f"for (uint i = lid; i < n_cols; i += {block_size}u) {{")
     kb.indent()
-    kb.raw_line("output[row_start + i] = input[row_start + i] * rms * weight[i];")
+    kb.raw_line(f"output[row_start + i] = {norm_expr};")
     kb.dedent()
     kb.raw_line("}")
 
@@ -1164,10 +1174,12 @@ def make_layer_norm_kernel(block_size=256, dtype="fp32", eps=1e-6):
     kb._var("row_start", "pid * n_cols", ty="uint")
 
     # Pass 1: Compute mean
+    needs_cast = dtype in ("fp16", "bf16")
+    read_expr = "float(input[row_start + i])" if needs_cast else "input[row_start + i]"
     kb._var("local_sum", "0.0f", ty="float")
     kb.raw_line(f"for (uint i = lid; i < n_cols; i += {block_size}u) {{")
     kb.indent()
-    kb.raw_line("local_sum += input[row_start + i];")
+    kb.raw_line(f"local_sum += {read_expr};")
     kb.dedent()
     kb.raw_line("}")
 
@@ -1183,7 +1195,7 @@ def make_layer_norm_kernel(block_size=256, dtype="fp32", eps=1e-6):
     kb._var("local_var", "0.0f", ty="float")
     kb.raw_line(f"for (uint i = lid; i < n_cols; i += {block_size}u) {{")
     kb.indent()
-    kb._var("diff", "input[row_start + i] - mean_val", ty="float")
+    kb._var("diff", f"{read_expr} - mean_val", ty="float")
     kb.raw_line("local_var += diff * diff;")
     kb.dedent()
     kb.raw_line("}")
@@ -1198,9 +1210,13 @@ def make_layer_norm_kernel(block_size=256, dtype="fp32", eps=1e-6):
     kb._var("inv_std", f"rsqrt(var_val + {eps}f)", ty="float")
 
     # Pass 3: Normalize
+    needs_cast = dtype in ("fp16", "bf16")
+    store_ty = triton_type_to_msl(dtype) if needs_cast else None
+    compute_expr = "(float(input[row_start + i]) - mean_val) * inv_std * float(gamma[i]) + float(beta[i])" if needs_cast else "(input[row_start + i] - mean_val) * inv_std * gamma[i] + beta[i]"
+    store_expr = f"{store_ty}({compute_expr})" if needs_cast else compute_expr
     kb.raw_line(f"for (uint i = lid; i < n_cols; i += {block_size}u) {{")
     kb.indent()
-    kb.raw_line("output[row_start + i] = (input[row_start + i] - mean_val) * inv_std * gamma[i] + beta[i];")
+    kb.raw_line(f"output[row_start + i] = {store_expr};")
     kb.dedent()
     kb.raw_line("}")
 

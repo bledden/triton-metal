@@ -67,6 +67,13 @@ from triton_metal.codegen.msl_emitter import (
     make_online_softmax_kernel,
     make_causal_attention_kernel,
     make_group_norm_kernel,
+    make_instance_norm_kernel,
+    make_fused_dropout_kernel,
+    make_gather_kernel,
+    make_scatter_kernel,
+    make_transpose_kernel,
+    make_reduce_scatter_kernel,
+    make_all_reduce_kernel,
 )
 
 
@@ -1328,7 +1335,7 @@ def main():
     print("REPEAT KV BENCHMARKS")
     print("=" * 60)
     msl = make_repeat_kv_kernel(block_size=256)
-    pipeline = compile_kernel(device, msl, "repeat_kv")
+    pipeline = compile_and_load(device, msl, "repeat_kv")
     for n_kv_heads, n_rep, seq_len, head_dim in [(8, 4, 128, 64), (8, 4, 512, 128)]:
         n_q_heads = n_kv_heads * n_rep
         in_size = n_kv_heads * seq_len * head_dim
@@ -1356,7 +1363,7 @@ def main():
     block_m, block_n, block_k = 32, 32, 32
     threads_per_tg = block_m * block_n
     msl = make_matmul_2d_kernel(block_m=block_m, block_n=block_n, block_k=block_k)
-    pipeline = compile_kernel(device, msl, "matmul_2d")
+    pipeline = compile_and_load(device, msl, "matmul_2d")
     for size in [64, 128, 256]:
         M = N = K = size
         a_buf = make_float_buffer(device, M * K, "randn")
@@ -1384,7 +1391,7 @@ def main():
     print("SWIZZLED MATMUL BENCHMARKS")
     print("=" * 60)
     msl = make_matmul_swizzled_kernel(block_m=32, block_n=32, block_k=32, group_size=4)
-    pipeline = compile_kernel(device, msl, "matmul_swizzled")
+    pipeline = compile_and_load(device, msl, "matmul_swizzled")
     for size in [64, 128, 256]:
         M = N = K = size
         a_buf = make_float_buffer(device, M * K, "randn")
@@ -1420,7 +1427,7 @@ def main():
 
     for act_name in ["tanh", "sigmoid", "elu", "leaky_relu", "hardswish"]:
         msl = make_activation_kernel(act_name, block_size=256)
-        pipeline = compile_kernel(device, msl, f"{act_name}_kernel")
+        pipeline = compile_and_load(device, msl, f"{act_name}_kernel")
         result = bench(pipeline, [in_buf, out_buf, n_buf], n)
         print(format_benchmark_result(act_name, result, n_bytes=n_bytes))
 
@@ -1431,7 +1438,7 @@ def main():
     print("VARIANCE BENCHMARKS")
     print("=" * 60)
     msl = make_variance_kernel(block_size=256)
-    pipeline = compile_kernel(device, msl, "variance_kernel")
+    pipeline = compile_and_load(device, msl, "variance_kernel")
     for n_rows, n_cols in [(128, 256), (512, 1024)]:
         total = n_rows * n_cols
         in_buf = make_float_buffer(device, total, "randn")
@@ -1452,7 +1459,7 @@ def main():
     print("BATCH NORMALIZATION BENCHMARKS")
     print("=" * 60)
     msl = make_batch_norm_kernel(block_size=256)
-    pipeline = compile_kernel(device, msl, "batch_norm_kernel")
+    pipeline = compile_and_load(device, msl, "batch_norm_kernel")
     for n in [1024, 65536, 262144]:
         in_buf = make_float_buffer(device, n, "randn")
         mean_buf = make_float_buffer(device, n, "randn")
@@ -1473,7 +1480,7 @@ def main():
     print("ONLINE SOFTMAX BENCHMARKS")
     print("=" * 60)
     msl = make_online_softmax_kernel(block_size=256)
-    pipeline = compile_kernel(device, msl, "online_softmax_kernel")
+    pipeline = compile_and_load(device, msl, "online_softmax_kernel")
     for n_rows, n_cols in [(128, 256), (512, 1024), (1024, 2048)]:
         total = n_rows * n_cols
         in_buf = make_float_buffer(device, total, "randn")
@@ -1495,7 +1502,7 @@ def main():
     print("=" * 60)
     for n_heads, head_dim in [(4, 32), (8, 64)]:
         msl = make_causal_attention_kernel(n_heads=n_heads, head_dim=head_dim, block_size=128)
-        pipeline = compile_kernel(device, msl, "causal_attention")
+        pipeline = compile_and_load(device, msl, "causal_attention")
         seq_len = 64
         total_q = n_heads * seq_len * head_dim
         total_kv = n_heads * seq_len * head_dim
@@ -1520,7 +1527,7 @@ def main():
     print("=" * 60)
     for n_groups, channels, spatial in [(32, 128, 256), (32, 256, 1024)]:
         msl = make_group_norm_kernel(n_groups=n_groups, block_size=256)
-        pipeline = compile_kernel(device, msl, "group_norm_kernel")
+        pipeline = compile_and_load(device, msl, "group_norm_kernel")
         total = channels * spatial
         in_buf = make_float_buffer(device, total, "randn")
         weight_buf = make_float_buffer(device, channels, "const", 1.0)
@@ -1535,6 +1542,148 @@ def main():
                                         n_groups, 256)
         n_bytes = total * 4 * 2 + channels * 4 * 2  # input/output + weight/bias
         label = f"group_norm_g{n_groups}_c{channels}_s{spatial}"
+        print(format_benchmark_result(label, result, n_bytes=n_bytes))
+
+    # =========================================================================
+    # Instance Normalization Kernel
+    # =========================================================================
+    print("\n" + "=" * 60)
+    print("INSTANCE NORMALIZATION BENCHMARKS")
+    print("=" * 60)
+    for channels, spatial in [(64, 256), (128, 1024)]:
+        msl = make_instance_norm_kernel(block_size=256)
+        pipeline = compile_and_load(device, msl, "instance_norm_kernel")
+        total = channels * spatial
+        in_buf = make_float_buffer(device, total, "randn")
+        out_buf = make_empty_buffer(device, total)
+        nchan_buf = make_uint_buffer(device, channels)
+        spatial_buf = make_uint_buffer(device, spatial)
+
+        result = bench_custom_dispatch(bench, pipeline,
+                                        [in_buf, out_buf, nchan_buf, spatial_buf],
+                                        channels, 256)
+        n_bytes = total * 4 * 2  # input + output
+        label = f"instance_norm_c{channels}_s{spatial}"
+        print(format_benchmark_result(label, result, n_bytes=n_bytes))
+
+    # =========================================================================
+    # Fused Dropout Kernel
+    # =========================================================================
+    print("\n" + "=" * 60)
+    print("FUSED DROPOUT BENCHMARKS")
+    print("=" * 60)
+    for n in [65536, 262144, 1048576]:
+        msl = make_fused_dropout_kernel(block_size=256)
+        pipeline = compile_and_load(device, msl, "fused_dropout_kernel")
+        in_buf = make_float_buffer(device, n, "randn")
+        out_buf = make_empty_buffer(device, n)
+        seed_buf = make_uint_buffer(device, 42)
+        n_buf = make_uint_buffer(device, n)
+        n_groups = (n + 255) // 256
+
+        result = bench_custom_dispatch(bench, pipeline,
+                                        [in_buf, out_buf, seed_buf, n_buf],
+                                        n_groups, 256)
+        n_bytes = n * 4 * 2
+        label = f"dropout_n{n}"
+        print(format_benchmark_result(label, result, n_bytes=n_bytes))
+
+    # =========================================================================
+    # Gather/Scatter Kernels
+    # =========================================================================
+    print("\n" + "=" * 60)
+    print("GATHER/SCATTER BENCHMARKS")
+    print("=" * 60)
+    for n in [65536, 262144]:
+        # Gather
+        msl = make_gather_kernel(block_size=256)
+        pipeline = compile_and_load(device, msl, "gather_kernel")
+        data_buf = make_float_buffer(device, n, "ramp")
+        idx_buf = make_uint_buffer(device, 0)  # dummy for now
+        out_buf = make_empty_buffer(device, n)
+        n_buf = make_uint_buffer(device, n)
+        n_groups = (n + 255) // 256
+
+        # Use identity indices (gid → gid) for benchmarking
+        import struct as st
+        idx_buf = device.newBufferWithLength_options_(
+            n * 4, Metal.MTLResourceStorageModeShared
+        )
+        view = idx_buf.contents().as_buffer(n * 4)
+        for i in range(n):
+            st.pack_into("i", view, i * 4, i)
+
+        result = bench_custom_dispatch(bench, pipeline,
+                                        [data_buf, idx_buf, out_buf, n_buf],
+                                        n_groups, 256)
+        n_bytes = n * 4 * 3  # data + indices + output
+        label = f"gather_n{n}"
+        print(format_benchmark_result(label, result, n_bytes=n_bytes))
+
+        # Scatter (same setup)
+        msl = make_scatter_kernel(block_size=256)
+        pipeline = compile_and_load(device, msl, "scatter_kernel")
+        result = bench_custom_dispatch(bench, pipeline,
+                                        [data_buf, idx_buf, out_buf, n_buf],
+                                        n_groups, 256)
+        label = f"scatter_n{n}"
+        print(format_benchmark_result(label, result, n_bytes=n_bytes))
+
+    # =========================================================================
+    # Transpose Kernel
+    # =========================================================================
+    print("\n" + "=" * 60)
+    print("TRANSPOSE BENCHMARKS")
+    print("=" * 60)
+    for rows, cols in [(256, 256), (512, 1024)]:
+        msl = make_transpose_kernel(block_size=256, tile_size=16)
+        pipeline = compile_and_load(device, msl, "transpose_kernel")
+        n = rows * cols
+        in_buf = make_float_buffer(device, n, "ramp")
+        out_buf = make_empty_buffer(device, n)
+        rows_buf = make_uint_buffer(device, rows)
+        cols_buf = make_uint_buffer(device, cols)
+        n_tiles_x = (cols + 15) // 16
+        n_tiles_y = (rows + 15) // 16
+
+        result = bench_custom_dispatch(bench, pipeline,
+                                        [in_buf, out_buf, rows_buf, cols_buf],
+                                        1, 256,
+                                        dispatch_2d=(n_tiles_x, n_tiles_y))
+        n_bytes = n * 4 * 2
+        label = f"transpose_{rows}x{cols}"
+        print(format_benchmark_result(label, result, n_bytes=n_bytes))
+
+    # =========================================================================
+    # Reduce-Scatter / All-Reduce Kernels
+    # =========================================================================
+    print("\n" + "=" * 60)
+    print("REDUCE-SCATTER / ALL-REDUCE BENCHMARKS")
+    print("=" * 60)
+    for n in [65536, 262144, 1048576]:
+        # Reduce-scatter (2 buffers)
+        msl = make_reduce_scatter_kernel(n_buffers=2, block_size=256)
+        pipeline = compile_and_load(device, msl, "reduce_scatter")
+        buf_a = make_float_buffer(device, n, "ramp")
+        buf_b = make_float_buffer(device, n, "ramp")
+        out_buf = make_empty_buffer(device, n)
+        n_buf = make_uint_buffer(device, n)
+        n_groups = (n + 255) // 256
+
+        result = bench_custom_dispatch(bench, pipeline,
+                                        [buf_a, buf_b, out_buf, n_buf],
+                                        n_groups, 256)
+        n_bytes = n * 4 * 3  # 2 inputs + 1 output
+        label = f"reduce_scatter_2buf_n{n}"
+        print(format_benchmark_result(label, result, n_bytes=n_bytes))
+
+        # All-reduce sum
+        msl = make_all_reduce_kernel(n_buffers=2, op="sum")
+        pipeline = compile_and_load(device, msl, "all_reduce")
+        result = bench_custom_dispatch(bench, pipeline,
+                                        [buf_a, buf_b, out_buf, n_buf],
+                                        n_groups, 256)
+        label = f"all_reduce_sum_2buf_n{n}"
         print(format_benchmark_result(label, result, n_bytes=n_bytes))
 
     # =========================================================================

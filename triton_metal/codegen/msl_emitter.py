@@ -434,6 +434,80 @@ def make_gelu_kernel(block_size=256, dtype="fp32"):
     return make_elementwise_kernel("gelu_kernel", 1, "gelu", block_size, dtype)
 
 
+def make_swiglu_kernel(block_size=256, dtype="fp32"):
+    """Generate a fused SwiGLU activation kernel.
+
+    SwiGLU(x, gate) = SiLU(gate) * x = (gate / (1 + exp(-gate))) * x
+
+    Used in LLaMA, Mistral, and Gemma FFN layers. Fuses the gate
+    activation and element-wise multiply into one kernel for memory efficiency.
+
+    Args:
+        block_size: Threads per threadgroup.
+        dtype: Data type.
+    """
+    kb = KernelBuilder("swiglu_kernel", block_size=block_size)
+
+    kb.add_ptr_arg("x", dtype=dtype, const=True)
+    kb.add_ptr_arg("gate", dtype=dtype, const=True)
+    kb.add_ptr_arg("output", dtype=dtype, const=False)
+    kb.add_scalar_arg("n_elements", dtype="u32")
+
+    offsets = kb.make_block_offsets("pid", "offsets")
+    mask = kb.make_mask(offsets, "n_elements", "mask")
+
+    x_val = kb.load("x", offsets, mask, out_var="x_val", dtype=dtype)
+    gate_val = kb.load("gate", offsets, mask, out_var="gate_val", dtype=dtype)
+
+    # SiLU(gate) * x
+    silu_gate = kb.fused_op("silu", [gate_val], "silu_gate")
+    result = kb.binary_op("mul", silu_gate, x_val, "result")
+
+    kb.store("output", offsets, result, mask, dtype=dtype)
+
+    return kb.build()
+
+
+def make_embedding_kernel(block_size=256, dtype="fp32"):
+    """Generate an embedding lookup kernel.
+
+    output[i, :] = table[indices[i], :]
+
+    Each threadgroup handles one token (one row of the output).
+    Threads within the group cooperatively copy the embedding vector.
+
+    Args:
+        block_size: Threads per threadgroup.
+        dtype: Data type.
+
+    Kernel args:
+        table: [vocab_size, embed_dim] embedding table
+        indices: [batch_size] int32 token indices
+        output: [batch_size, embed_dim] output
+        embed_dim: embedding dimension
+    """
+    kb = KernelBuilder("embedding_kernel", block_size=block_size)
+
+    kb.add_ptr_arg("table", dtype=dtype, const=True)
+    kb.add_ptr_arg("indices", dtype="i32", const=True)
+    kb.add_ptr_arg("output", dtype=dtype, const=False)
+    kb.add_scalar_arg("embed_dim", dtype="u32")
+
+    # pid = token index in the batch
+    kb._var("token_idx", "indices[pid]", ty="int")
+    kb._var("src_offset", "uint(token_idx) * embed_dim", ty="uint")
+    kb._var("dst_offset", "pid * embed_dim", ty="uint")
+
+    # Each thread copies one or more elements of the embedding vector
+    kb.raw_line(f"for (uint i = lid; i < embed_dim; i += {block_size}u) {{")
+    kb.indent()
+    kb.raw_line("output[dst_offset + i] = table[src_offset + i];")
+    kb.dedent()
+    kb.raw_line("}")
+
+    return kb.build()
+
+
 def make_scalar_mul_kernel(block_size=256, dtype="fp32"):
     """Generate a scalar multiply kernel: output = input * scalar.
 
@@ -948,7 +1022,7 @@ def make_cross_entropy_kernel(block_size=256, dtype="fp32"):
     return kb.build()
 
 
-def make_flash_attention_kernel(head_dim=64, Br=16, Bc=16, block_size=256):
+def make_flash_attention_kernel(head_dim=64, Br=16, Bc=16, block_size=256, causal=False):
     """Generate a fused Flash Attention kernel for Metal.
 
     Implements the FlashAttention-2 algorithm with online softmax:
@@ -962,6 +1036,9 @@ def make_flash_attention_kernel(head_dim=64, Br=16, Bc=16, block_size=256):
             O = exp(m - m_new) * O + P @ V
             m = m_new
         O = O / l
+
+    When causal=True, attention scores where key position > query position
+    are masked to -infinity, implementing autoregressive causal attention.
 
     Threadgroup memory budget (head_dim=64, Br=Bc=16, fp32):
         Q:  16x64x4 =  4KB
@@ -977,6 +1054,7 @@ def make_flash_attention_kernel(head_dim=64, Br=16, Bc=16, block_size=256):
         Br: Query block size (rows of Q per threadgroup).
         Bc: KV block size (rows of K/V loaded per inner loop step).
         block_size: Threads per threadgroup.
+        causal: If True, apply causal mask (key pos <= query pos only).
 
     Kernel args:
         Q: [n_heads * seq_len, head_dim]
@@ -986,6 +1064,17 @@ def make_flash_attention_kernel(head_dim=64, Br=16, Bc=16, block_size=256):
         seq_len: sequence length
         scale: 1/sqrt(head_dim)
     """
+    # Causal masking: mask out S[i][j] where kv_pos > q_pos
+    causal_mask = ""
+    if causal:
+        causal_mask = """
+            uint q_pos = q_start + r;
+            uint kv_pos_check = kv_start + c;
+            tg_S[i] = (kv_pos < seq_len && kv_pos_check <= q_pos) ? dot * scale : -INFINITY;"""
+    else:
+        causal_mask = """
+            tg_S[i] = (kv_pos < seq_len) ? dot * scale : -INFINITY;"""
+
     return f"""#include <metal_stdlib>
 using namespace metal;
 
@@ -1070,9 +1159,8 @@ kernel void flash_attention(
             for (uint d = 0u; d < D; d++) {{
                 dot += tg_Q[r * D + d] * tg_K[c * D + d];
             }}
-            // Mask out-of-bounds KV positions
-            uint kv_pos = kv_start + c;
-            tg_S[i] = (kv_pos < seq_len) ? dot * scale : -INFINITY;
+            // Mask out-of-bounds KV positions (and causal mask if enabled)
+            uint kv_pos = kv_start + c;{causal_mask}
         }}
         threadgroup_barrier(mem_flags::mem_threadgroup);
 

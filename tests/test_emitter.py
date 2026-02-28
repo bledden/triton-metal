@@ -1709,3 +1709,188 @@ def test_kv_cache_attention(runner):
             assert abs(got - expected) < tol, (
                 f"head={h} dim={d}: got {got}, expected {expected}"
             )
+
+
+# ---------------------------------------------------------------------------
+# SwiGLU tests
+# ---------------------------------------------------------------------------
+
+@requires_metal
+def test_swiglu(runner):
+    """SwiGLU: output = SiLU(gate) * x"""
+    from triton_metal.codegen.msl_emitter import make_swiglu_kernel
+
+    n = 1024
+    msl = make_swiglu_kernel(block_size=256)
+    path = runner.compile(msl, "swiglu_kernel")
+    pipeline = runner.load(path, "swiglu_kernel")
+
+    random.seed(888)
+    x_data = [random.gauss(0, 1) for _ in range(n)]
+    gate_data = [random.gauss(0, 1) for _ in range(n)]
+
+    x_buf = runner.make_float_buffer(x_data)
+    gate_buf = runner.make_float_buffer(gate_data)
+    out_buf = runner.make_empty_buffer(n)
+    n_buf = runner.make_uint_buffer(n)
+
+    runner.run(pipeline, [x_buf, gate_buf, out_buf, n_buf], n)
+
+    result = runner.read_float_buffer(out_buf, n)
+    for i in range(n):
+        g = gate_data[i]
+        silu_g = g / (1.0 + math.exp(-g))
+        expected = silu_g * x_data[i]
+        tol = max(1e-4, abs(expected) * 1e-3)
+        assert abs(result[i] - expected) < tol, (
+            f"[{i}] got {result[i]}, expected {expected}"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Embedding lookup tests
+# ---------------------------------------------------------------------------
+
+@requires_metal
+def test_embedding_lookup(runner):
+    """Embedding lookup: output[i] = table[indices[i]]"""
+    from triton_metal.codegen.msl_emitter import make_embedding_kernel
+
+    vocab_size = 32
+    embed_dim = 64
+    batch_size = 8
+
+    msl = make_embedding_kernel(block_size=256)
+    path = runner.compile(msl, "embedding_kernel")
+    pipeline = runner.load(path, "embedding_kernel")
+
+    random.seed(999)
+    table_data = [random.gauss(0, 1) for _ in range(vocab_size * embed_dim)]
+    indices = [random.randint(0, vocab_size - 1) for _ in range(batch_size)]
+
+    table_buf = runner.make_float_buffer(table_data)
+
+    import Metal
+    import struct as st
+    indices_buf = runner.device.newBufferWithLength_options_(
+        batch_size * 4, Metal.MTLResourceStorageModeShared
+    )
+    view = indices_buf.contents().as_buffer(batch_size * 4)
+    for i, idx in enumerate(indices):
+        st.pack_into("i", view, i * 4, idx)
+
+    out_buf = runner.make_empty_buffer(batch_size * embed_dim)
+    dim_buf = runner.make_uint_buffer(embed_dim)
+
+    cmd = runner.queue.commandBuffer()
+    enc = cmd.computeCommandEncoder()
+    enc.setComputePipelineState_(pipeline)
+    for i, buf in enumerate([table_buf, indices_buf, out_buf, dim_buf]):
+        enc.setBuffer_offset_atIndex_(buf, 0, i)
+    enc.dispatchThreadgroups_threadsPerThreadgroup_(
+        Metal.MTLSizeMake(batch_size, 1, 1),
+        Metal.MTLSizeMake(256, 1, 1),
+    )
+    enc.endEncoding()
+    cmd.commit()
+    cmd.waitUntilCompleted()
+    assert cmd.status() == 4
+
+    result = runner.read_float_buffer(out_buf, batch_size * embed_dim)
+
+    for b in range(batch_size):
+        token_idx = indices[b]
+        for d in range(embed_dim):
+            expected = table_data[token_idx * embed_dim + d]
+            got = result[b * embed_dim + d]
+            assert abs(got - expected) < 1e-5, (
+                f"batch={b} dim={d}: got {got}, expected {expected}"
+            )
+
+
+# ---------------------------------------------------------------------------
+# Causal Flash Attention tests
+# ---------------------------------------------------------------------------
+
+@requires_metal
+def test_flash_attention_causal(runner):
+    """Causal Flash Attention: future tokens should be masked."""
+    from triton_metal.codegen.msl_emitter import make_flash_attention_kernel
+
+    seq_len = 16
+    head_dim = 64
+    n_heads = 1
+    scale = 1.0 / math.sqrt(head_dim)
+
+    msl = make_flash_attention_kernel(head_dim=head_dim, Br=16, Bc=16, causal=True)
+    path = runner.compile(msl, "flash_attention")
+    pipeline = runner.load(path, "flash_attention")
+
+    random.seed(1234)
+    Q_data = [random.gauss(0, 0.5) for _ in range(n_heads * seq_len * head_dim)]
+    K_data = [random.gauss(0, 0.5) for _ in range(n_heads * seq_len * head_dim)]
+    V_data = [random.gauss(0, 0.5) for _ in range(n_heads * seq_len * head_dim)]
+
+    Q_buf = runner.make_float_buffer(Q_data)
+    K_buf = runner.make_float_buffer(K_data)
+    V_buf = runner.make_float_buffer(V_data)
+    O_buf = runner.make_empty_buffer(n_heads * seq_len * head_dim)
+    seq_buf = runner.make_uint_buffer(seq_len)
+    scale_buf = runner.make_float_scalar_buffer(scale)
+
+    n_q_blocks = (seq_len + 15) // 16
+    n_groups = n_heads * n_q_blocks
+
+    import Metal
+    cmd = runner.queue.commandBuffer()
+    enc = cmd.computeCommandEncoder()
+    enc.setComputePipelineState_(pipeline)
+    for i, buf in enumerate([Q_buf, K_buf, V_buf, O_buf, seq_buf, scale_buf]):
+        enc.setBuffer_offset_atIndex_(buf, 0, i)
+    enc.dispatchThreadgroups_threadsPerThreadgroup_(
+        Metal.MTLSizeMake(n_groups, 1, 1),
+        Metal.MTLSizeMake(256, 1, 1),
+    )
+    enc.endEncoding()
+    cmd.commit()
+    cmd.waitUntilCompleted()
+    assert cmd.status() == 4
+
+    result = runner.read_float_buffer(O_buf, n_heads * seq_len * head_dim)
+
+    # Reference: causal attention (lower triangular mask)
+    S = [[0.0] * seq_len for _ in range(seq_len)]
+    for i in range(seq_len):
+        for j in range(seq_len):
+            if j <= i:  # causal: attend only to past + self
+                dot = sum(Q_data[i * head_dim + d] * K_data[j * head_dim + d]
+                          for d in range(head_dim))
+                S[i][j] = dot * scale
+            else:
+                S[i][j] = float('-inf')
+
+    P = []
+    for i in range(seq_len):
+        mx = max(S[i])
+        exps = [math.exp(s - mx) if s > float('-inf') else 0.0 for s in S[i]]
+        s = sum(exps)
+        P.append([e / s if s > 0 else 0.0 for e in exps])
+
+    for i in range(seq_len):
+        for d in range(0, head_dim, 8):  # spot-check every 8th dim
+            expected = sum(P[i][j] * V_data[j * head_dim + d] for j in range(seq_len))
+            got = result[i * head_dim + d]
+            tol = max(1e-3, abs(expected) * 0.02)
+            assert abs(got - expected) < tol, (
+                f"pos={i} dim={d}: got {got}, expected {expected}"
+            )
+
+    # Verify causal property: first token output should only depend on first token
+    # (i.e., O[0] = V[0] since attention is all on position 0)
+    for d in range(head_dim):
+        got = result[d]
+        expected = V_data[d]  # position 0 attends only to itself
+        tol = max(1e-3, abs(expected) * 0.02)
+        assert abs(got - expected) < tol, (
+            f"Causal check: O[0][{d}] = {got}, V[0][{d}] = {expected}"
+        )

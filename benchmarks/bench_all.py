@@ -29,6 +29,9 @@ from triton_metal.codegen.msl_emitter import (
     make_reduce_kernel,
     make_softmax_kernel,
     make_matmul_kernel,
+    make_simdgroup_matmul_kernel,
+    make_rms_norm_kernel,
+    make_rope_kernel,
 )
 
 
@@ -319,6 +322,217 @@ def main():
         n_flops = 2 * M_dim * N_dim * K_dim
         n_bytes = (M_dim * K_dim + K_dim * N_dim + M_dim * N_dim) * 4
         print(format_benchmark_result("matmul", result, n_bytes=n_bytes, n_flops=n_flops))
+
+    # =========================================================================
+    # simdgroup_matrix matmul benchmarks
+    # =========================================================================
+    print("\n" + "=" * 60)
+    print("SIMDGROUP MATRIX MATMUL BENCHMARKS (hardware 8x8 MMA)")
+    print("=" * 60)
+
+    for size in [32, 64, 128, 256, 512]:
+        M_dim, N_dim, K_dim = size, size, size
+        print(f"\n--- {M_dim}x{K_dim} @ {K_dim}x{N_dim} ---")
+
+        msl = make_simdgroup_matmul_kernel()
+        pipeline = compile_and_load(device, msl, "simdgroup_matmul")
+
+        A_buf = make_float_buffer(device, M_dim * K_dim, "small")
+        B_buf = make_float_buffer(device, K_dim * N_dim, "small")
+        C_buf = make_empty_buffer(device, M_dim * N_dim)
+        M_buf = make_uint_buffer(device, M_dim)
+        N_buf = make_uint_buffer(device, N_dim)
+        K_buf = make_uint_buffer(device, K_dim)
+
+        n_tile_cols = (N_dim + 31) // 32
+        n_tile_rows = (M_dim + 31) // 32
+        n_groups = n_tile_rows * n_tile_cols
+
+        gpu_times_us = []
+        for _ in range(10):  # warmup
+            cmd = bench.queue.commandBuffer()
+            enc = cmd.computeCommandEncoder()
+            enc.setComputePipelineState_(pipeline)
+            for i, buf in enumerate([A_buf, B_buf, C_buf, M_buf, N_buf, K_buf]):
+                enc.setBuffer_offset_atIndex_(buf, 0, i)
+            enc.dispatchThreadgroups_threadsPerThreadgroup_(
+                M.MTLSizeMake(n_groups, 1, 1),
+                M.MTLSizeMake(128, 1, 1),
+            )
+            enc.endEncoding()
+            cmd.commit()
+            cmd.waitUntilCompleted()
+
+        for _ in range(100):
+            cmd = bench.queue.commandBuffer()
+            enc = cmd.computeCommandEncoder()
+            enc.setComputePipelineState_(pipeline)
+            for i, buf in enumerate([A_buf, B_buf, C_buf, M_buf, N_buf, K_buf]):
+                enc.setBuffer_offset_atIndex_(buf, 0, i)
+            enc.dispatchThreadgroups_threadsPerThreadgroup_(
+                M.MTLSizeMake(n_groups, 1, 1),
+                M.MTLSizeMake(128, 1, 1),
+            )
+            enc.endEncoding()
+            cmd.commit()
+            cmd.waitUntilCompleted()
+            gpu_times_us.append(
+                (cmd.GPUEndTime() - cmd.GPUStartTime()) * 1e6
+            )
+
+        gpu_times_us.sort()
+        nn = len(gpu_times_us)
+        result = {
+            "median_us": gpu_times_us[nn // 2],
+            "min_us": gpu_times_us[0],
+            "max_us": gpu_times_us[-1],
+            "p10_us": gpu_times_us[int(0.1 * (nn - 1))],
+            "p90_us": gpu_times_us[int(0.9 * (nn - 1))],
+            "all_us": gpu_times_us,
+        }
+        n_flops = 2 * M_dim * N_dim * K_dim
+        n_bytes = (M_dim * K_dim + K_dim * N_dim + M_dim * N_dim) * 4
+        print(format_benchmark_result("simdgroup_matmul", result,
+                                       n_bytes=n_bytes, n_flops=n_flops))
+
+    # =========================================================================
+    # RMS Norm benchmarks
+    # =========================================================================
+    print("\n" + "=" * 60)
+    print("RMS NORM BENCHMARKS")
+    print("=" * 60)
+
+    for n_cols in [64, 256, 1024, 4096]:
+        n_rows = 128
+        print(f"\n--- {n_rows} rows x {n_cols} cols ---")
+
+        msl = make_rms_norm_kernel(block_size=256)
+        pipeline = compile_and_load(device, msl, "rms_norm_kernel")
+
+        total = n_rows * n_cols
+        in_buf = make_float_buffer(device, total, "ramp")
+        wt_buf = make_float_buffer(device, n_cols, "ones")
+        out_buf = make_empty_buffer(device, total)
+        ncols_buf = make_uint_buffer(device, n_cols)
+
+        gpu_times_us = []
+        for _ in range(10):
+            cmd = bench.queue.commandBuffer()
+            enc = cmd.computeCommandEncoder()
+            enc.setComputePipelineState_(pipeline)
+            for i, buf in enumerate([in_buf, wt_buf, out_buf, ncols_buf]):
+                enc.setBuffer_offset_atIndex_(buf, 0, i)
+            enc.dispatchThreadgroups_threadsPerThreadgroup_(
+                M.MTLSizeMake(n_rows, 1, 1),
+                M.MTLSizeMake(256, 1, 1),
+            )
+            enc.endEncoding()
+            cmd.commit()
+            cmd.waitUntilCompleted()
+
+        for _ in range(100):
+            cmd = bench.queue.commandBuffer()
+            enc = cmd.computeCommandEncoder()
+            enc.setComputePipelineState_(pipeline)
+            for i, buf in enumerate([in_buf, wt_buf, out_buf, ncols_buf]):
+                enc.setBuffer_offset_atIndex_(buf, 0, i)
+            enc.dispatchThreadgroups_threadsPerThreadgroup_(
+                M.MTLSizeMake(n_rows, 1, 1),
+                M.MTLSizeMake(256, 1, 1),
+            )
+            enc.endEncoding()
+            cmd.commit()
+            cmd.waitUntilCompleted()
+            gpu_times_us.append(
+                (cmd.GPUEndTime() - cmd.GPUStartTime()) * 1e6
+            )
+
+        gpu_times_us.sort()
+        nn = len(gpu_times_us)
+        result = {
+            "median_us": gpu_times_us[nn // 2],
+            "min_us": gpu_times_us[0],
+            "max_us": gpu_times_us[-1],
+            "p10_us": gpu_times_us[int(0.1 * (nn - 1))],
+            "p90_us": gpu_times_us[int(0.9 * (nn - 1))],
+            "all_us": gpu_times_us,
+        }
+        # RMS norm: 2 reads (input + weight) + 1 write + reduction
+        n_bytes = total * 4 * 3 + n_cols * 4
+        # ~4 flops per element (square, sum, rsqrt, mul*weight)
+        n_flops = total * 4
+        print(format_benchmark_result("rms_norm", result,
+                                       n_bytes=n_bytes, n_flops=n_flops))
+
+    # =========================================================================
+    # RoPE benchmarks
+    # =========================================================================
+    print("\n" + "=" * 60)
+    print("ROPE BENCHMARKS")
+    print("=" * 60)
+
+    for dim in [64, 128, 256]:
+        seq_len = 512
+        print(f"\n--- seq_len={seq_len}, dim={dim} ---")
+
+        msl = make_rope_kernel(block_size=256)
+        pipeline = compile_and_load(device, msl, "rope_kernel")
+
+        total = seq_len * dim
+        in_buf = make_float_buffer(device, total, "ramp")
+        freq_buf = make_float_buffer(device, dim // 2, "small")
+        out_buf = make_empty_buffer(device, total)
+        dim_buf = make_uint_buffer(device, dim)
+        pos_buf = make_uint_buffer(device, 0)
+
+        gpu_times_us = []
+        for _ in range(10):
+            cmd = bench.queue.commandBuffer()
+            enc = cmd.computeCommandEncoder()
+            enc.setComputePipelineState_(pipeline)
+            for i, buf in enumerate([in_buf, freq_buf, out_buf, dim_buf, pos_buf]):
+                enc.setBuffer_offset_atIndex_(buf, 0, i)
+            enc.dispatchThreadgroups_threadsPerThreadgroup_(
+                M.MTLSizeMake(seq_len, 1, 1),
+                M.MTLSizeMake(256, 1, 1),
+            )
+            enc.endEncoding()
+            cmd.commit()
+            cmd.waitUntilCompleted()
+
+        for _ in range(100):
+            cmd = bench.queue.commandBuffer()
+            enc = cmd.computeCommandEncoder()
+            enc.setComputePipelineState_(pipeline)
+            for i, buf in enumerate([in_buf, freq_buf, out_buf, dim_buf, pos_buf]):
+                enc.setBuffer_offset_atIndex_(buf, 0, i)
+            enc.dispatchThreadgroups_threadsPerThreadgroup_(
+                M.MTLSizeMake(seq_len, 1, 1),
+                M.MTLSizeMake(256, 1, 1),
+            )
+            enc.endEncoding()
+            cmd.commit()
+            cmd.waitUntilCompleted()
+            gpu_times_us.append(
+                (cmd.GPUEndTime() - cmd.GPUStartTime()) * 1e6
+            )
+
+        gpu_times_us.sort()
+        nn = len(gpu_times_us)
+        result = {
+            "median_us": gpu_times_us[nn // 2],
+            "min_us": gpu_times_us[0],
+            "max_us": gpu_times_us[-1],
+            "p10_us": gpu_times_us[int(0.1 * (nn - 1))],
+            "p90_us": gpu_times_us[int(0.9 * (nn - 1))],
+            "all_us": gpu_times_us,
+        }
+        # RoPE: read input + freqs, write output, sin/cos computation
+        n_bytes = (total + dim // 2 + total) * 4
+        # ~8 flops per pair (mul freq, sin, cos, 2 mul, 2 fma)
+        n_flops = (dim // 2) * seq_len * 8
+        print(format_benchmark_result("rope", result,
+                                       n_bytes=n_bytes, n_flops=n_flops))
 
     # =========================================================================
     # Summary

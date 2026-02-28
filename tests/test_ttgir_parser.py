@@ -1180,3 +1180,120 @@ def test_ttgir_layer_norm_compiles(runner):
     msl = kb.build()
     assert "mean" in msl.lower() or "inv_std" in msl or "var" in msl.lower()
     runner.compile(msl, "layer_norm_kernel")
+
+
+# ---------------------------------------------------------------------------
+# Matmul (tt.dot) TTGIR
+# ---------------------------------------------------------------------------
+
+MATMUL_TTGIR = """
+module {
+  tt.func public @matmul_kernel(%arg0: !tt.ptr<f32> {tt.divisibility = 16 : i32},
+                                 %arg1: !tt.ptr<f32> {tt.divisibility = 16 : i32},
+                                 %arg2: !tt.ptr<f32> {tt.divisibility = 16 : i32},
+                                 %arg3: i32, %arg4: i32, %arg5: i32) {
+    %cst = arith.constant dense<0.000000e+00> : tensor<32x32xf32, #blocked>
+    %0 = tt.get_program_id x : i32
+    %1 = tt.make_range {end = 32 : i32, start = 0 : i32} : tensor<32xi32, #blocked1>
+    %2 = tt.make_range {end = 32 : i32, start = 0 : i32} : tensor<32xi32, #blocked2>
+    %3 = arith.muli %0, %c32_i32 : i32
+    %4 = tt.splat %3 : i32 -> tensor<32xi32, #blocked1>
+    %5 = arith.addi %4, %1 : tensor<32xi32, #blocked1>
+    %6 = tt.addptr %arg0, %5 : !tt.ptr<f32>, tensor<32xi32, #blocked1>
+    %7 = tt.load %6 : !tt.ptr<f32>
+    %8 = tt.addptr %arg1, %2 : !tt.ptr<f32>, tensor<32xi32, #blocked2>
+    %9 = tt.load %8 : !tt.ptr<f32>
+    %10 = "tt.dot"(%7, %9, %cst) {allowTF32 = true} : (tensor<32x32xf32>, tensor<32x32xf32>, tensor<32x32xf32>) -> tensor<32x32xf32>
+    %11 = tt.addptr %arg2, %5 : !tt.ptr<f32>, tensor<32xi32, #blocked1>
+    tt.store %11, %10 : !tt.ptr<f32>
+    tt.return
+  }
+}
+"""
+
+
+def test_ttgir_matmul_detected():
+    """tt.dot operation should be detected as matmul pattern."""
+    from triton_metal.codegen.ttgir_parser import TTGIRParser
+
+    parser = TTGIRParser(MATMUL_TTGIR, FakeOptions())
+    parser._parse_function_signature()
+    parser._parse_body()
+
+    assert len(parser.dot_ops) >= 1, "Should detect tt.dot operation"
+    result_ssa, lhs, rhs, acc = parser.dot_ops[0]
+    assert result_ssa.startswith("%")
+
+
+def test_ttgir_matmul_not_reduction():
+    """Matmul should not be detected as reduction or softmax."""
+    from triton_metal.codegen.ttgir_parser import TTGIRParser
+
+    parser = TTGIRParser(MATMUL_TTGIR, FakeOptions())
+    parser._parse_function_signature()
+    parser._parse_body()
+
+    assert not parser._is_softmax_pattern(), "Matmul should not match softmax"
+    assert len(parser.dot_ops) >= 1, "Should have dot ops"
+
+
+@requires_metal
+def test_ttgir_matmul_compiles(runner):
+    """TTGIR matmul pattern compiles to valid MSL (simdgroup_matmul)."""
+    from triton_metal.codegen.ttgir_parser import parse_ttgir
+
+    kb = parse_ttgir(MATMUL_TTGIR, FakeOptions())
+    msl = kb.build()
+    # Should produce simdgroup_matrix-based MSL
+    assert "simdgroup" in msl or "matmul" in msl.lower()
+    runner.compile(msl, "simdgroup_matmul")
+
+
+@requires_metal
+def test_ttgir_matmul_gpu(runner):
+    """TTGIR-parsed matmul produces correct results on GPU."""
+    from triton_metal.codegen.ttgir_parser import parse_ttgir
+    import random
+
+    kb = parse_ttgir(MATMUL_TTGIR, FakeOptions())
+    msl = kb.build()
+    path = runner.compile(msl, "simdgroup_matmul")
+    pipeline = runner.load(path, "simdgroup_matmul")
+
+    M, N, K = 32, 32, 32
+    random.seed(4444)
+    a_data = [random.uniform(-1.0, 1.0) for _ in range(M * K)]
+    b_data = [random.uniform(-1.0, 1.0) for _ in range(K * N)]
+
+    a_buf = runner.make_float_buffer(a_data)
+    b_buf = runner.make_float_buffer(b_data)
+    c_buf = runner.make_empty_buffer(M * N)
+    m_buf = runner.make_uint_buffer(M)
+    n_buf = runner.make_uint_buffer(N)
+    k_buf = runner.make_uint_buffer(K)
+
+    import Metal
+    cmd = runner.queue.commandBuffer()
+    enc = cmd.computeCommandEncoder()
+    enc.setComputePipelineState_(pipeline)
+    for i, buf in enumerate([a_buf, b_buf, c_buf, m_buf, n_buf, k_buf]):
+        enc.setBuffer_offset_atIndex_(buf, 0, i)
+    enc.dispatchThreadgroups_threadsPerThreadgroup_(
+        Metal.MTLSizeMake(1, 1, 1),  # 1 tile for 32x32
+        Metal.MTLSizeMake(128, 1, 1),
+    )
+    enc.endEncoding()
+    cmd.commit()
+    cmd.waitUntilCompleted()
+    assert cmd.status() == 4, f"Kernel failed, status={cmd.status()}"
+
+    result = runner.read_float_buffer(c_buf, M * N)
+
+    # Reference matmul
+    for i in range(M):
+        for j in range(N):
+            expected = sum(a_data[i * K + k] * b_data[k * N + j] for k in range(K))
+            got = result[i * N + j]
+            assert abs(got - expected) < 0.1, (
+                f"C[{i},{j}]: got {got}, expected {expected}"
+            )

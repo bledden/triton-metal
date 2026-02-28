@@ -79,6 +79,11 @@ class KernelBuilder:
         self._indent = 1
         self._needs_simd_qualifiers = False
         self._threadgroup_arrays = []  # (name, dtype, size) for static tg memory
+        self._prebuilt_msl = None  # Raw MSL string when using pre-made kernels
+
+    def set_prebuilt_msl(self, msl_source):
+        """Set a pre-generated MSL string, bypassing the builder's code gen."""
+        self._prebuilt_msl = msl_source
 
     # -- Argument registration --
 
@@ -324,6 +329,10 @@ class MSLCodeGen:
         self.builder = builder
 
     def emit(self):
+        # Return prebuilt MSL if available (e.g., matmul kernels)
+        if self.builder._prebuilt_msl is not None:
+            return self.builder._prebuilt_msl
+
         lines = []
         lines.append("#include <metal_stdlib>")
         lines.append("using namespace metal;")

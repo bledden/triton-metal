@@ -123,6 +123,9 @@ class TTGIRParser:
         # Reduction tracking
         self.reduce_ops = []  # [(result_ssa, input_ssa, op_kind, axis)]
 
+        # Matmul tracking
+        self.dot_ops = []  # [(result_ssa, lhs_ssa, rhs_ssa, acc_ssa)]
+
         # Loop tracking
         self.scf_for_loops = []  # [(lb_ssa, ub_ssa, step_ssa, body_lines)]
 
@@ -259,11 +262,37 @@ class TTGIRParser:
             self.reduce_ops.append((result_ssa, input_ssa, op_kind, axis))
             self.ssa_values[result_ssa] = ("reduce", input_ssa, op_kind)
 
+    def _scan_dot_ops(self):
+        """Scan for tt.dot operations (matrix multiply-accumulate).
+
+        tt.dot has the form:
+            %result = tt.dot %lhs, %rhs, %acc {options} : type * type -> type
+        or:
+            %result = "tt.dot"(%lhs, %rhs, %acc) {options} : (types) -> type
+        """
+        # Quoted form
+        dot_pattern1 = re.compile(
+            r'%(\w+)\s*=\s*"tt\.dot"\s*\((%\w+)\s*,\s*(%\w+)\s*,\s*(%\w+)\)'
+        )
+        # Unquoted form
+        dot_pattern2 = re.compile(
+            r'%(\w+)\s*=\s*tt\.dot\s+(%\w+)\s*,\s*(%\w+)\s*,\s*(%\w+)'
+        )
+        for pattern in [dot_pattern1, dot_pattern2]:
+            for m in pattern.finditer(self.ir_text):
+                result_ssa = f"%{m.group(1)}"
+                lhs_ssa = m.group(2)
+                rhs_ssa = m.group(3)
+                acc_ssa = m.group(4)
+                self.dot_ops.append((result_ssa, lhs_ssa, rhs_ssa, acc_ssa))
+                self.ssa_values[result_ssa] = ("dot", lhs_ssa, rhs_ssa, acc_ssa)
+
     def _parse_body(self):
         """Walk through the body and classify operations."""
-        # First scan for multi-line blocks (reduce, scf.for)
+        # First scan for multi-line blocks (reduce, scf.for, dot)
         self._scan_scf_for_loops()
         self._scan_reductions()
+        self._scan_dot_ops()
 
         for line in self.lines:
             line = line.strip()
@@ -558,6 +587,10 @@ class TTGIRParser:
         n_arg = None
         for arg_name in self.scalar_args:
             n_arg = arg_name
+
+        # Check if this is a matmul (tt.dot detected)
+        if self.dot_ops:
+            return self._build_matmul_kernel(kb, primary_dtype)
 
         # Check if this is a multi-reduce pattern (softmax/layernorm) or single reduction
         if len(self.reduce_ops) >= 2 and self._is_softmax_pattern():
@@ -863,6 +896,26 @@ class TTGIRParser:
         kb.dedent()
         kb.raw_line("}")
 
+        return kb
+
+    def _build_matmul_kernel(self, kb, primary_dtype):
+        """Generate a tiled matmul kernel from tt.dot pattern.
+
+        Detected from tt.dot operations in the IR. Generates a tiled
+        matmul using simdgroup_matrix hardware (8x8 MMA).
+
+        Expected pointer args: A, B, C (+ optional M, N, K scalars).
+        Dispatch: one threadgroup per 32x32 output tile, 128 threads each.
+        """
+        from triton_metal.codegen.msl_emitter import make_simdgroup_matmul_kernel
+
+        # Determine dtype from the dot operation
+        dtype_map = {"fp32": "fp32", "fp16": "fp16", "bf16": "bf16"}
+        msl_dtype = dtype_map.get(primary_dtype, "fp32")
+
+        # We generate the simdgroup matmul kernel as a standalone MSL
+        # and return it as a "prebuilt" kernel via KernelBuilder's raw MSL mode
+        kb.set_prebuilt_msl(make_simdgroup_matmul_kernel(dtype=msl_dtype))
         return kb
 
     def _find_pre_reduce_op(self, reduce_input_ssa):

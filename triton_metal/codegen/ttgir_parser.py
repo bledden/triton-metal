@@ -471,7 +471,8 @@ class TTGIRParser:
             # Unary math ops
             for op_name, op_key in [("math.exp", "exp"), ("math.log", "log"),
                                      ("math.sqrt", "sqrt"), ("math.rsqrt", "rsqrt"),
-                                     ("math.absf", "abs")]:
+                                     ("math.absf", "abs"), ("math.sin", "sin"),
+                                     ("math.cos", "cos")]:
                 if op_name in line:
                     m = re.match(
                         rf"%(\w+)\s*=\s*{re.escape(op_name)}\s+(%\w+)",
@@ -496,6 +497,14 @@ class TTGIRParser:
                 if m:
                     result = f"%{m.group(1)}"
                     self.ssa_values[result] = ("passthrough", m.group(2))
+                continue
+
+            # arith.extsi / arith.trunci (integer extension/truncation)
+            if "arith.extsi" in line or "arith.trunci" in line:
+                m = re.match(r"%(\w+)\s*=\s*arith\.(?:extsi|trunci)\s+(%\w+)", line)
+                if m:
+                    result = f"%{m.group(1)}"
+                    self.ssa_values[result] = ("int_cast", m.group(2))
                 continue
 
             # tt.reduce (sum/max/min reduction)
@@ -592,6 +601,10 @@ class TTGIRParser:
         if len(self.dot_ops) >= 2 and self._is_flash_attention_pattern():
             return self._build_flash_attention_kernel(kb, primary_dtype)
 
+        # Quantized matmul: dot ops with integer cast (INT8/INT4 weights)
+        if self.dot_ops and self._is_quantized_matmul_pattern():
+            return self._build_quantized_matmul_kernel(kb, primary_dtype)
+
         # Check if this is a matmul (tt.dot detected)
         if self.dot_ops:
             return self._build_matmul_kernel(kb, primary_dtype)
@@ -611,6 +624,14 @@ class TTGIRParser:
             return self._build_layer_norm_kernel(kb, n_arg, primary_dtype)
         if self.reduce_ops:
             return self._build_reduction_kernel(kb, n_arg, primary_dtype)
+
+        # RoPE: sin + cos + mul pattern (no reductions)
+        if self._is_rope_pattern():
+            return self._build_rope_kernel(kb, primary_dtype)
+
+        # Fused MLP: silu(gate) * up pattern (exp + neg + mul, no reductions)
+        if self._is_fused_mlp_pattern():
+            return self._build_fused_mlp_kernel(kb, primary_dtype)
 
         # Standard elementwise pattern
         offsets = kb.make_block_offsets("pid", "offsets")
@@ -1067,6 +1088,82 @@ class TTGIRParser:
         kb.set_prebuilt_msl(make_fused_residual_norm_kernel())
         return kb
 
+    def _is_rope_pattern(self):
+        """Check if IR matches a RoPE (Rotary Position Embedding) pattern.
+
+        RoPE has:
+        - sin and cos operations (for rotation matrix)
+        - Interleaved multiply and add/sub (x_even*cos - x_odd*sin, x_even*sin + x_odd*cos)
+        - No reductions (elementwise operation)
+        """
+        has_sin = any(v[0] == "sin" for v in self.ssa_values.values())
+        has_cos = any(v[0] == "cos" for v in self.ssa_values.values())
+        has_mul = any(v[0] == "mul" for v in self.ssa_values.values())
+        return has_sin and has_cos and has_mul and not self.reduce_ops
+
+    def _build_rope_kernel(self, kb, primary_dtype):
+        """Generate a RoPE kernel from the pattern.
+
+        Delegates to the pre-built RoPE kernel.
+        """
+        from triton_metal.codegen.msl_emitter import make_rope_kernel
+        kb.set_prebuilt_msl(make_rope_kernel())
+        return kb
+
+    def _is_quantized_matmul_pattern(self):
+        """Check if IR matches a quantized matmul pattern.
+
+        Quantized matmul has:
+        - tt.dot ops (matrix multiplication)
+        - arith.extsi or int_cast operations (integer weight dequantization)
+        - Indicates INT8 or INT4 weights being promoted to float for computation
+        """
+        if not self.dot_ops:
+            return False
+        has_int_cast = any(v[0] == "int_cast" for v in self.ssa_values.values())
+        return has_int_cast
+
+    def _build_quantized_matmul_kernel(self, kb, primary_dtype):
+        """Generate a quantized matmul kernel from the pattern.
+
+        Uses INT8 quantized matmul by default. If the IR has group-size
+        related constants, could be INT4, but INT8 is the safer default.
+        """
+        from triton_metal.codegen.msl_emitter import make_int8_matmul_kernel
+        kb.set_prebuilt_msl(make_int8_matmul_kernel())
+        return kb
+
+    def _is_fused_mlp_pattern(self):
+        """Check if IR matches a fused MLP (SwiGLU) pattern.
+
+        Fused MLP has:
+        - exp (for silu/sigmoid: x / (1 + exp(-x)))
+        - multiply (gate * up projection fusion)
+        - divide or reciprocal (for 1 / (1 + exp(-x)))
+        - No reductions (elementwise)
+        - No dot ops (not a matmul)
+        - 2+ input pointer args (gate and up projections)
+        """
+        if self.reduce_ops or self.dot_ops:
+            return False
+        has_exp = any(v[0] == "exp" for v in self.ssa_values.values())
+        has_mul = any(v[0] == "mul" for v in self.ssa_values.values())
+        has_neg = any(v[0] == "neg" for v in self.ssa_values.values())
+        # SiLU requires: exp(-x) → neg + exp, then division
+        has_div = any(v[0] == "div" for v in self.ssa_values.values())
+        # Need at least 2 input pointers (gate + up)
+        n_inputs = sum(1 for _, (_, _, is_out) in self.ptr_args.items() if not is_out)
+        return has_exp and has_mul and n_inputs >= 2 and (has_neg or has_div)
+
+    def _build_fused_mlp_kernel(self, kb, primary_dtype):
+        """Generate a fused MLP (SwiGLU) kernel from the pattern.
+
+        output = silu(gate) * up
+        """
+        from triton_metal.codegen.msl_emitter import make_fused_mlp_kernel
+        kb.set_prebuilt_msl(make_fused_mlp_kernel())
+        return kb
+
     def _find_pre_reduce_op(self, reduce_input_ssa):
         """Check if there's a computation between load and reduce.
 
@@ -1147,12 +1244,16 @@ class TTGIRParser:
             return var_name
 
         # Unary math ops
-        if op in ("exp", "log", "sqrt", "rsqrt", "abs", "neg"):
+        if op in ("exp", "log", "sqrt", "rsqrt", "abs", "neg", "sin", "cos"):
             x_var = self._emit_ssa_value(kb, val_info[1], input_vars, dtype, emitted)
             var_name = f"r_{len(self.computed_values)}"
             kb.unary_op(op, x_var, var_name)
             self.computed_values[ssa] = var_name
             return var_name
+
+        # Integer cast (extsi, trunci) — treat as passthrough
+        if op == "int_cast":
+            return self._emit_ssa_value(kb, val_info[1], input_vars, dtype, emitted)
 
         # Fused multiply-add: fma(a, b, c) = a*b + c
         if op == "fma":

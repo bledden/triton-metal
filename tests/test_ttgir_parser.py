@@ -1607,3 +1607,241 @@ def test_ttgir_fused_residual_norm_compiles(runner):
     msl = kb.build()
     assert "residual" in msl.lower() or "norm" in msl.lower()
     runner.compile(msl, "fused_residual_norm")
+
+
+# ---------------------------------------------------------------------------
+# RoPE TTGIR
+# ---------------------------------------------------------------------------
+
+ROPE_TTGIR = """
+module {
+  tt.func public @rope_kernel(%arg0: !tt.ptr<f32> {tt.divisibility = 16 : i32},
+                               %arg1: !tt.ptr<f32> {tt.divisibility = 16 : i32},
+                               %arg2: !tt.ptr<f32> {tt.divisibility = 16 : i32},
+                               %arg3: i32) {
+    %c256_i32 = arith.constant 256 : i32
+    %0 = tt.get_program_id x : i32
+    %1 = arith.muli %0, %c256_i32 : i32
+    %2 = tt.make_range {end = 256 : i32, start = 0 : i32} : tensor<256xi32>
+    %3 = tt.splat %1 : i32 -> tensor<256xi32>
+    %4 = arith.addi %3, %2 : tensor<256xi32>
+    %5 = arith.cmpi slt, %4, %arg3 : tensor<256xi32>
+    %6 = tt.splat %arg0 : !tt.ptr<f32> -> tensor<256x!tt.ptr<f32>>
+    %7 = tt.addptr %6, %4 : tensor<256x!tt.ptr<f32>>, tensor<256xi32>
+    %8 = tt.load %7, %5 : !tt.ptr<f32>
+
+    // Load frequency table
+    %9 = tt.splat %arg1 : !tt.ptr<f32> -> tensor<256x!tt.ptr<f32>>
+    %10 = tt.addptr %9, %4 : tensor<256x!tt.ptr<f32>>, tensor<256xi32>
+    %11 = tt.load %10, %5 : !tt.ptr<f32>
+
+    // RoPE rotation: x_even * cos(theta) - x_odd * sin(theta)
+    %cos_val = math.cos %11 : tensor<256xf32>
+    %sin_val = math.sin %11 : tensor<256xf32>
+    %rot_even = arith.mulf %8, %cos_val : tensor<256xf32>
+    %rot_odd = arith.mulf %8, %sin_val : tensor<256xf32>
+    %result = arith.subf %rot_even, %rot_odd : tensor<256xf32>
+
+    %12 = tt.splat %arg2 : !tt.ptr<f32> -> tensor<256x!tt.ptr<f32>>
+    %13 = tt.addptr %12, %4 : tensor<256x!tt.ptr<f32>>, tensor<256xi32>
+    tt.store %13, %result, %5 : !tt.ptr<f32>
+    tt.return
+  }
+}
+"""
+
+
+def test_ttgir_rope_detected():
+    """RoPE: sin + cos + mul pattern detected."""
+    from triton_metal.codegen.ttgir_parser import TTGIRParser
+
+    parser = TTGIRParser(ROPE_TTGIR, FakeOptions())
+    parser._parse_function_signature()
+    parser._parse_body()
+
+    assert parser._is_rope_pattern(), "Should match RoPE pattern"
+    assert not parser._is_softmax_pattern(), "Should not match softmax"
+
+
+def test_ttgir_rope_not_mlp():
+    """RoPE should not be detected as fused MLP (has sin/cos, not silu)."""
+    from triton_metal.codegen.ttgir_parser import TTGIRParser
+
+    parser = TTGIRParser(ROPE_TTGIR, FakeOptions())
+    parser._parse_function_signature()
+    parser._parse_body()
+
+    assert parser._is_rope_pattern()
+    assert not parser._is_fused_mlp_pattern(), "RoPE should not match MLP pattern"
+
+
+@requires_metal
+def test_ttgir_rope_compiles(runner):
+    """TTGIR RoPE pattern compiles to valid MSL."""
+    from triton_metal.codegen.ttgir_parser import parse_ttgir
+
+    kb = parse_ttgir(ROPE_TTGIR, FakeOptions())
+    msl = kb.build()
+    assert "rope" in msl.lower() or "sin" in msl.lower() or "cos" in msl.lower()
+    runner.compile(msl, "rope_kernel")
+
+
+# ---------------------------------------------------------------------------
+# Quantized Matmul TTGIR
+# ---------------------------------------------------------------------------
+
+QUANTIZED_MATMUL_TTGIR = """
+module {
+  tt.func public @int8_matmul_kernel(%arg0: !tt.ptr<f32> {tt.divisibility = 16 : i32},
+                                       %arg1: !tt.ptr<i8> {tt.divisibility = 16 : i32},
+                                       %arg2: !tt.ptr<f32> {tt.divisibility = 16 : i32},
+                                       %arg3: !tt.ptr<f32> {tt.divisibility = 16 : i32},
+                                       %arg4: i32, %arg5: i32, %arg6: i32) {
+    %cst = arith.constant dense<0.000000e+00> : tensor<32x32xf32>
+    %0 = tt.get_program_id x : i32
+
+    // Load INT8 weight tile
+    %1 = tt.make_range {end = 32 : i32, start = 0 : i32} : tensor<32xi32>
+    %2 = tt.splat %arg1 : !tt.ptr<i8> -> tensor<32x!tt.ptr<i8>>
+    %3 = tt.addptr %2, %1 : tensor<32x!tt.ptr<i8>>, tensor<32xi32>
+    %4 = tt.load %3 : !tt.ptr<i8>
+
+    // Extend INT8 to INT32 then to FP32
+    %5 = arith.extsi %4 : tensor<32xi8> to tensor<32xi32>
+    %6 = arith.sitofp %5 : tensor<32xi32> to tensor<32xf32>
+
+    // Load FP32 input tile
+    %7 = tt.splat %arg0 : !tt.ptr<f32> -> tensor<32x!tt.ptr<f32>>
+    %8 = tt.addptr %7, %1 : tensor<32x!tt.ptr<f32>>, tensor<32xi32>
+    %9 = tt.load %8 : !tt.ptr<f32>
+
+    // Matmul: A @ dequantized_B
+    %10 = "tt.dot"(%9, %6, %cst) : (tensor<32xf32>, tensor<32xf32>, tensor<32x32xf32>) -> tensor<32x32xf32>
+
+    // Store
+    %11 = tt.splat %arg2 : !tt.ptr<f32> -> tensor<32x!tt.ptr<f32>>
+    %12 = tt.addptr %11, %1 : tensor<32x!tt.ptr<f32>>, tensor<32xi32>
+    tt.store %12, %10 : !tt.ptr<f32>
+    tt.return
+  }
+}
+"""
+
+
+def test_ttgir_quantized_matmul_detected():
+    """Quantized matmul: dot + extsi/int_cast pattern detected."""
+    from triton_metal.codegen.ttgir_parser import TTGIRParser
+
+    parser = TTGIRParser(QUANTIZED_MATMUL_TTGIR, FakeOptions())
+    parser._parse_function_signature()
+    parser._parse_body()
+
+    assert len(parser.dot_ops) >= 1, "Should detect dot ops"
+    assert parser._is_quantized_matmul_pattern(), "Should match quantized matmul"
+
+
+def test_ttgir_quantized_matmul_not_regular():
+    """Quantized matmul should be detected before regular matmul."""
+    from triton_metal.codegen.ttgir_parser import TTGIRParser
+
+    parser = TTGIRParser(QUANTIZED_MATMUL_TTGIR, FakeOptions())
+    parser._parse_function_signature()
+    parser._parse_body()
+
+    assert parser._is_quantized_matmul_pattern()
+    # Regular matmul would also match (has dot ops), but quantized check comes first
+
+
+@requires_metal
+def test_ttgir_quantized_matmul_compiles(runner):
+    """TTGIR quantized matmul pattern compiles to valid MSL."""
+    from triton_metal.codegen.ttgir_parser import parse_ttgir
+
+    kb = parse_ttgir(QUANTIZED_MATMUL_TTGIR, FakeOptions())
+    msl = kb.build()
+    assert "int8" in msl.lower() or "matmul" in msl.lower() or "char" in msl
+    runner.compile(msl, "int8_matmul")
+
+
+# ---------------------------------------------------------------------------
+# Fused MLP (SwiGLU) TTGIR
+# ---------------------------------------------------------------------------
+
+FUSED_MLP_TTGIR = """
+module {
+  tt.func public @fused_mlp_kernel(%arg0: !tt.ptr<f32> {tt.divisibility = 16 : i32},
+                                     %arg1: !tt.ptr<f32> {tt.divisibility = 16 : i32},
+                                     %arg2: !tt.ptr<f32> {tt.divisibility = 16 : i32},
+                                     %arg3: i32) {
+    %0 = tt.get_program_id x : i32
+    %c256_i32 = arith.constant 256 : i32
+    %c1f = arith.constant 1.000000e+00 : f32
+    %1 = arith.muli %0, %c256_i32 : i32
+    %2 = tt.make_range {end = 256 : i32, start = 0 : i32} : tensor<256xi32>
+    %3 = tt.splat %1 : i32 -> tensor<256xi32>
+    %4 = arith.addi %3, %2 : tensor<256xi32>
+    %5 = arith.cmpi slt, %4, %arg3 : tensor<256xi32>
+
+    // Load gate projection
+    %6 = tt.splat %arg0 : !tt.ptr<f32> -> tensor<256x!tt.ptr<f32>>
+    %7 = tt.addptr %6, %4 : tensor<256x!tt.ptr<f32>>, tensor<256xi32>
+    %gate = tt.load %7, %5 : !tt.ptr<f32>
+
+    // Load up projection
+    %8 = tt.splat %arg1 : !tt.ptr<f32> -> tensor<256x!tt.ptr<f32>>
+    %9 = tt.addptr %8, %4 : tensor<256x!tt.ptr<f32>>, tensor<256xi32>
+    %up = tt.load %9, %5 : !tt.ptr<f32>
+
+    // SiLU: gate / (1 + exp(-gate))
+    %neg_gate = arith.negf %gate : tensor<256xf32>
+    %exp_neg = math.exp %neg_gate : tensor<256xf32>
+    %c1_splat = tt.splat %c1f : f32 -> tensor<256xf32>
+    %denom = arith.addf %c1_splat, %exp_neg : tensor<256xf32>
+    %silu_gate = arith.divf %gate, %denom : tensor<256xf32>
+
+    // Output: silu(gate) * up
+    %result = arith.mulf %silu_gate, %up : tensor<256xf32>
+
+    %10 = tt.splat %arg2 : !tt.ptr<f32> -> tensor<256x!tt.ptr<f32>>
+    %11 = tt.addptr %10, %4 : tensor<256x!tt.ptr<f32>>, tensor<256xi32>
+    tt.store %11, %result, %5 : !tt.ptr<f32>
+    tt.return
+  }
+}
+"""
+
+
+def test_ttgir_fused_mlp_detected():
+    """Fused MLP: exp + neg + mul + div pattern detected."""
+    from triton_metal.codegen.ttgir_parser import TTGIRParser
+
+    parser = TTGIRParser(FUSED_MLP_TTGIR, FakeOptions())
+    parser._parse_function_signature()
+    parser._parse_body()
+
+    assert parser._is_fused_mlp_pattern(), "Should match fused MLP pattern"
+    assert not parser._is_rope_pattern(), "Should not match RoPE (no sin/cos)"
+
+
+def test_ttgir_fused_mlp_not_softmax():
+    """Fused MLP should not be detected as softmax (no reductions)."""
+    from triton_metal.codegen.ttgir_parser import TTGIRParser
+
+    parser = TTGIRParser(FUSED_MLP_TTGIR, FakeOptions())
+    parser._parse_function_signature()
+    parser._parse_body()
+
+    assert len(parser.reduce_ops) == 0, "MLP should have no reductions"
+    assert parser._is_fused_mlp_pattern()
+    assert not parser._is_softmax_pattern()
+
+
+@requires_metal
+def test_ttgir_fused_mlp_compiles(runner):
+    """TTGIR fused MLP pattern compiles to valid MSL."""
+    from triton_metal.codegen.ttgir_parser import parse_ttgir
+
+    kb = parse_ttgir(FUSED_MLP_TTGIR, FakeOptions())
+    msl = kb.build()
+    assert "mlp" in msl.lower() or "silu" in msl.lower() or "exp" in msl
+    runner.compile(msl, "fused_mlp")

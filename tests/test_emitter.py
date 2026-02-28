@@ -3063,3 +3063,78 @@ def test_speculative_decode_all_accepted(runner):
     na_view = na_buf.contents().as_buffer(4)
     n_accepted = struct_mod.unpack_from("I", na_view, 0)[0]
     assert n_accepted == 3, f"Expected 3 accepted (all), got {n_accepted}"
+
+
+# ---------------------------------------------------------------------------
+# Fused Residual + Layer Norm tests
+# ---------------------------------------------------------------------------
+
+
+@requires_metal
+def test_fused_residual_norm(runner):
+    """Fused residual add + layer norm: output = LN(input + residual, gamma, beta)."""
+    from triton_metal.codegen.msl_emitter import make_fused_residual_norm_kernel
+
+    n_rows = 4
+    n_cols = 64
+
+    msl = make_fused_residual_norm_kernel(block_size=256)
+    path = runner.compile(msl, "fused_residual_norm")
+    pipeline = runner.load(path, "fused_residual_norm")
+
+    random.seed(3333)
+    input_data = [random.uniform(-1.0, 1.0) for _ in range(n_rows * n_cols)]
+    residual_data = [random.uniform(-1.0, 1.0) for _ in range(n_rows * n_cols)]
+    gamma_data = [random.uniform(0.5, 1.5) for _ in range(n_cols)]
+    beta_data = [random.uniform(-0.5, 0.5) for _ in range(n_cols)]
+
+    in_buf = runner.make_float_buffer(input_data)
+    res_buf = runner.make_float_buffer(residual_data)
+    gamma_buf = runner.make_float_buffer(gamma_data)
+    beta_buf = runner.make_float_buffer(beta_data)
+    out_buf = runner.make_empty_buffer(n_rows * n_cols)
+    res_out_buf = runner.make_empty_buffer(n_rows * n_cols)
+    ncols_buf = runner.make_uint_buffer(n_cols)
+
+    import Metal
+    cmd = runner.queue.commandBuffer()
+    enc = cmd.computeCommandEncoder()
+    enc.setComputePipelineState_(pipeline)
+    for i, buf in enumerate([in_buf, res_buf, gamma_buf, beta_buf, out_buf,
+                              res_out_buf, ncols_buf]):
+        enc.setBuffer_offset_atIndex_(buf, 0, i)
+    enc.dispatchThreadgroups_threadsPerThreadgroup_(
+        Metal.MTLSizeMake(n_rows, 1, 1),
+        Metal.MTLSizeMake(256, 1, 1),
+    )
+    enc.endEncoding()
+    cmd.commit()
+    cmd.waitUntilCompleted()
+    assert cmd.status() == 4, f"Kernel failed, status={cmd.status()}"
+
+    result = runner.read_float_buffer(out_buf, n_rows * n_cols)
+    res_out = runner.read_float_buffer(res_out_buf, n_rows * n_cols)
+    eps = 1e-6
+
+    # Python reference
+    for row in range(n_rows):
+        # x = input + residual
+        x = [input_data[row * n_cols + i] + residual_data[row * n_cols + i]
+             for i in range(n_cols)]
+
+        # Check residual_out
+        for i in range(n_cols):
+            assert abs(res_out[row * n_cols + i] - x[i]) < 0.001, (
+                f"res_out row {row} col {i}: got {res_out[row * n_cols + i]}, expected {x[i]}"
+            )
+
+        mean = sum(x) / n_cols
+        var = sum((xi - mean) ** 2 for xi in x) / n_cols
+        inv_std = 1.0 / math.sqrt(var + eps)
+
+        for i in range(n_cols):
+            expected = (x[i] - mean) * inv_std * gamma_data[i] + beta_data[i]
+            got = result[row * n_cols + i]
+            assert abs(got - expected) < 0.01, (
+                f"row {row} col {i}: got {got}, expected {expected}"
+            )

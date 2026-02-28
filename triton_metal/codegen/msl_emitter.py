@@ -960,6 +960,95 @@ def make_layer_norm_kernel(block_size=256, dtype="fp32", eps=1e-6):
     return kb.build()
 
 
+def make_fused_residual_norm_kernel(block_size=256, dtype="fp32", eps=1e-6):
+    """Generate a fused residual connection + layer normalization kernel.
+
+    output = LayerNorm(input + residual, gamma, beta)
+
+    Combines residual add and layer norm in a single kernel, avoiding
+    a separate elementwise kernel and the intermediate materialization.
+    This is the standard pattern in every transformer block.
+
+    Each threadgroup processes one row. Three passes:
+    1. Compute x = input + residual, accumulate sum for mean
+    2. Compute (x - mean)^2 for variance
+    3. Normalize: (x - mean) * rsqrt(var + eps) * gamma + beta
+
+    Also optionally writes the pre-norm value (input + residual) for
+    use in the next residual connection (common in pre-norm architectures).
+
+    Args:
+        block_size: Threads per threadgroup.
+        dtype: Data type.
+        eps: Epsilon for numerical stability.
+    """
+    n_simd_groups = (block_size + 31) // 32
+
+    kb = KernelBuilder("fused_residual_norm", block_size=block_size)
+    kb.add_ptr_arg("input", dtype=dtype, const=True)
+    kb.add_ptr_arg("residual", dtype=dtype, const=True)
+    kb.add_ptr_arg("gamma", dtype=dtype, const=True)
+    kb.add_ptr_arg("beta", dtype=dtype, const=True)
+    kb.add_ptr_arg("output", dtype=dtype, const=False)
+    kb.add_ptr_arg("residual_out", dtype=dtype, const=False)  # pre-norm output
+    kb.add_scalar_arg("n_cols", dtype="u32")
+
+    kb.declare_threadgroup_array("shared_sum", dtype=dtype, size=n_simd_groups)
+    kb.declare_threadgroup_array("shared_var", dtype=dtype, size=n_simd_groups)
+    # Shared buffer for the fused input+residual (needed for pass 2 & 3)
+    kb.declare_threadgroup_array("tg_x", dtype=dtype, size=block_size)
+
+    # Row base pointer
+    kb._var("row_start", "pid * n_cols", ty="uint")
+
+    # Pass 1: Compute x = input + residual, write residual_out, accumulate sum
+    kb._var("local_sum", "0.0f", ty="float")
+    kb.raw_line(f"for (uint i = lid; i < n_cols; i += {block_size}u) {{")
+    kb.indent()
+    kb.raw_line("float x_val = input[row_start + i] + residual[row_start + i];")
+    kb.raw_line("residual_out[row_start + i] = x_val;")
+    kb.raw_line("local_sum += x_val;")
+    kb.dedent()
+    kb.raw_line("}")
+
+    kb.threadgroup_reduce("sum", "local_sum", "shared_sum", "total_sum")
+
+    kb.begin_if("lid == 0")
+    kb.raw_line("shared_sum[0] = total_sum;")
+    kb.end_block()
+    kb.barrier("threadgroup")
+    kb._var("mean_val", "shared_sum[0] / float(n_cols)", ty="float")
+
+    # Pass 2: Compute variance
+    kb._var("local_var", "0.0f", ty="float")
+    kb.raw_line(f"for (uint i = lid; i < n_cols; i += {block_size}u) {{")
+    kb.indent()
+    kb.raw_line("float x_val = input[row_start + i] + residual[row_start + i];")
+    kb.raw_line("float diff = x_val - mean_val;")
+    kb.raw_line("local_var += diff * diff;")
+    kb.dedent()
+    kb.raw_line("}")
+
+    kb.threadgroup_reduce("sum", "local_var", "shared_var", "total_var")
+
+    kb.begin_if("lid == 0")
+    kb.raw_line("shared_var[0] = total_var;")
+    kb.end_block()
+    kb.barrier("threadgroup")
+    kb._var("var_val", "shared_var[0] / float(n_cols)", ty="float")
+    kb._var("inv_std", f"rsqrt(var_val + {eps}f)", ty="float")
+
+    # Pass 3: Normalize
+    kb.raw_line(f"for (uint i = lid; i < n_cols; i += {block_size}u) {{")
+    kb.indent()
+    kb.raw_line("float x_val = input[row_start + i] + residual[row_start + i];")
+    kb.raw_line("output[row_start + i] = (x_val - mean_val) * inv_std * gamma[i] + beta[i];")
+    kb.dedent()
+    kb.raw_line("}")
+
+    return kb.build()
+
+
 def make_cross_entropy_kernel(block_size=256, dtype="fp32"):
     """Generate a fused cross-entropy loss kernel.
 

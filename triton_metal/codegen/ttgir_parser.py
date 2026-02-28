@@ -1060,17 +1060,11 @@ class TTGIRParser:
 
         output = LayerNorm(input + residual, gamma, beta)
 
-        Delegates to a pre-built kernel that fuses the residual addition
-        with layer normalization in a single pass.
+        Delegates to the dedicated fused kernel that combines residual
+        addition with layer normalization in a single pass.
         """
-        from triton_metal.codegen.msl_emitter import make_layer_norm_kernel
-
-        # For now, use the standard layer_norm kernel as the base.
-        # The residual add will be folded into the first pass by the caller
-        # or optimized in a future dedicated fused kernel.
-        # Using prebuilt layer_norm as a reasonable approximation:
-        # the TTGIR has already fused them, so the caller handles the residual add.
-        kb.set_prebuilt_msl(make_layer_norm_kernel())
+        from triton_metal.codegen.msl_emitter import make_fused_residual_norm_kernel
+        kb.set_prebuilt_msl(make_fused_residual_norm_kernel())
         return kb
 
     def _find_pre_reduce_op(self, reduce_input_ssa):

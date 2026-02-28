@@ -1605,5 +1605,5 @@ def test_ttgir_fused_residual_norm_compiles(runner):
 
     kb = parse_ttgir(FUSED_RESIDUAL_NORM_TTGIR, FakeOptions())
     msl = kb.build()
-    assert "layer_norm" in msl or "norm" in msl.lower()
-    runner.compile(msl, "layer_norm_kernel")
+    assert "residual" in msl.lower() or "norm" in msl.lower()
+    runner.compile(msl, "fused_residual_norm")

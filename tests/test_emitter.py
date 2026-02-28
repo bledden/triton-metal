@@ -2602,3 +2602,103 @@ def test_int4_matmul(runner):
             assert abs(got - expected) < 0.5, (
                 f"C[{i},{j}]: got {got}, expected {expected}"
             )
+
+
+# ---------------------------------------------------------------------------
+# Fused RoPE + Attention tests
+# ---------------------------------------------------------------------------
+
+
+@requires_metal
+def test_rope_attention(runner):
+    """Fused RoPE + single-query attention: applies rotary embeddings to Q and K
+    on-the-fly during attention, validating against a Python reference."""
+    from triton_metal.codegen.msl_emitter import make_rope_attention_kernel
+
+    head_dim = 64
+    seq_len = 16
+    q_pos = 10  # Position of the query token
+
+    msl = make_rope_attention_kernel(head_dim=head_dim, block_size=256)
+    path = runner.compile(msl, "rope_attention")
+    pipeline = runner.load(path, "rope_attention")
+
+    random.seed(8888)
+    half_d = head_dim // 2
+
+    # Q: [head_dim] — single query vector
+    q_data = [random.uniform(-0.5, 0.5) for _ in range(head_dim)]
+    # K_cache: [seq_len, head_dim] — UN-rotated cached keys
+    k_data = [random.uniform(-0.5, 0.5) for _ in range(seq_len * head_dim)]
+    # V_cache: [seq_len, head_dim]
+    v_data = [random.uniform(-0.5, 0.5) for _ in range(seq_len * head_dim)]
+    # freqs: [head_dim/2] — RoPE frequencies: 1/10000^(2i/d)
+    freqs = [1.0 / (10000.0 ** (2.0 * i / head_dim)) for i in range(half_d)]
+
+    q_buf = runner.make_float_buffer(q_data)
+    k_buf = runner.make_float_buffer(k_data)
+    v_buf = runner.make_float_buffer(v_data)
+    freqs_buf = runner.make_float_buffer(freqs)
+    out_buf = runner.make_empty_buffer(head_dim)
+    seq_buf = runner.make_uint_buffer(seq_len)
+    qpos_buf = runner.make_uint_buffer(q_pos)
+
+    # Custom dispatch: single threadgroup
+    import Metal
+    cmd = runner.queue.commandBuffer()
+    enc = cmd.computeCommandEncoder()
+    enc.setComputePipelineState_(pipeline)
+    for i, buf in enumerate([q_buf, k_buf, v_buf, freqs_buf, out_buf,
+                              seq_buf, qpos_buf]):
+        enc.setBuffer_offset_atIndex_(buf, 0, i)
+    enc.dispatchThreadgroups_threadsPerThreadgroup_(
+        Metal.MTLSizeMake(1, 1, 1),
+        Metal.MTLSizeMake(256, 1, 1),
+    )
+    enc.endEncoding()
+    cmd.commit()
+    cmd.waitUntilCompleted()
+    assert cmd.status() == 4, f"Kernel failed, status={cmd.status()}"
+
+    result = runner.read_float_buffer(out_buf, head_dim)
+
+    # Python reference: apply RoPE to Q at q_pos
+    q_rot = [0.0] * head_dim
+    for d in range(half_d):
+        theta = q_pos * freqs[d]
+        cos_t = math.cos(theta)
+        sin_t = math.sin(theta)
+        q_r = q_data[2 * d]
+        q_i = q_data[2 * d + 1]
+        q_rot[2 * d] = q_r * cos_t - q_i * sin_t
+        q_rot[2 * d + 1] = q_r * sin_t + q_i * cos_t
+
+    # Compute attention scores with RoPE on each K[j]
+    scale = 1.0 / math.sqrt(head_dim)
+    scores = []
+    for j in range(seq_len):
+        dot = 0.0
+        for d in range(half_d):
+            theta = j * freqs[d]
+            cos_t = math.cos(theta)
+            sin_t = math.sin(theta)
+            k_r = k_data[j * head_dim + 2 * d]
+            k_i = k_data[j * head_dim + 2 * d + 1]
+            k_rot_r = k_r * cos_t - k_i * sin_t
+            k_rot_i = k_r * sin_t + k_i * cos_t
+            dot += q_rot[2 * d] * k_rot_r + q_rot[2 * d + 1] * k_rot_i
+        scores.append(dot * scale)
+
+    # Softmax
+    max_s = max(scores)
+    exp_s = [math.exp(s - max_s) for s in scores]
+    sum_exp = sum(exp_s)
+    attn = [e / sum_exp for e in exp_s]
+
+    # Weighted V (V is NOT rotated)
+    for d in range(head_dim):
+        expected = sum(attn[j] * v_data[j * head_dim + d] for j in range(seq_len))
+        got = result[d]
+        assert abs(got - expected) < 0.05, (
+            f"dim {d}: got {got}, expected {expected}"
+        )

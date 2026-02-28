@@ -1233,6 +1233,146 @@ kernel void flash_attention(
 """
 
 
+def make_rope_attention_kernel(head_dim=64, block_size=256):
+    """Generate a fused RoPE + single-query attention kernel.
+
+    Applies rotary position embeddings to Q and K on-the-fly during
+    attention computation. This avoids materializing the rotated Q/K
+    tensors, saving memory bandwidth.
+
+    For autoregressive inference (single query token):
+        1. Apply RoPE to Q at position `q_pos`
+        2. For each cached K[j]: apply RoPE at position j, compute dot(Q_rot, K_rot)
+        3. Softmax over scores
+        4. Weighted sum of V
+
+    Layout:
+        Q: [head_dim] — single query vector
+        K_cache: [max_seq_len, head_dim] — cached keys (NOT rotated)
+        V_cache: [max_seq_len, head_dim]
+        freqs: [head_dim/2] — RoPE frequency table (1/10000^(2i/d))
+        O: [head_dim] — output
+
+    Args:
+        head_dim: Dimension per head.
+        block_size: Threads per threadgroup.
+    """
+    return f"""#include <metal_stdlib>
+using namespace metal;
+
+kernel void rope_attention(
+    device const float* Q [[buffer(0)]],
+    device const float* K_cache [[buffer(1)]],
+    device const float* V_cache [[buffer(2)]],
+    device const float* freqs [[buffer(3)]],
+    device float* O [[buffer(4)]],
+    constant uint& seq_len [[buffer(5)]],
+    constant uint& q_pos [[buffer(6)]],
+    uint lid [[thread_position_in_threadgroup]],
+    uint sgitg [[simdgroup_index_in_threadgroup]],
+    uint tiisg [[thread_index_in_simdgroup]]
+) {{
+    const uint D = {head_dim}u;
+    const uint HALF_D = D / 2u;
+    const uint BLOCK = {block_size}u;
+    const float scale = 1.0f / sqrt(float(D));
+
+    // Phase 1: Apply RoPE to Q and compute attention scores
+    // Pre-rotate Q at q_pos
+    threadgroup float tg_q_rot[{head_dim}];
+    for (uint d = lid; d < HALF_D; d += BLOCK) {{
+        float theta = float(q_pos) * freqs[d];
+        float cos_t = cos(theta);
+        float sin_t = sin(theta);
+        float q_r = Q[2u * d];
+        float q_i = Q[2u * d + 1u];
+        tg_q_rot[2u * d] = q_r * cos_t - q_i * sin_t;
+        tg_q_rot[2u * d + 1u] = q_r * sin_t + q_i * cos_t;
+    }}
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Phase 2: Compute attention scores with on-the-fly RoPE on K
+    float local_max = -INFINITY;
+    for (uint j = lid; j < seq_len; j += BLOCK) {{
+        float dot = 0.0f;
+        for (uint d = 0u; d < HALF_D; d++) {{
+            float theta = float(j) * freqs[d];
+            float cos_t = cos(theta);
+            float sin_t = sin(theta);
+            float k_r = K_cache[j * D + 2u * d];
+            float k_i = K_cache[j * D + 2u * d + 1u];
+            float k_rot_r = k_r * cos_t - k_i * sin_t;
+            float k_rot_i = k_r * sin_t + k_i * cos_t;
+            dot += tg_q_rot[2u * d] * k_rot_r + tg_q_rot[2u * d + 1u] * k_rot_i;
+        }}
+        local_max = max(local_max, dot * scale);
+    }}
+
+    // Reduce max
+    float sg_max = simd_max(local_max);
+    threadgroup float shared_max[{(block_size + 31) // 32}];
+    if (sgitg == 0u) shared_max[tiisg] = -INFINITY;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tiisg == 0u) shared_max[sgitg] = sg_max;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float rd_max = shared_max[tiisg];
+    float global_max = simd_max(rd_max);
+
+    // Phase 3: exp(score - max) and sum
+    float local_sum = 0.0f;
+    for (uint j = lid; j < seq_len; j += BLOCK) {{
+        float dot = 0.0f;
+        for (uint d = 0u; d < HALF_D; d++) {{
+            float theta = float(j) * freqs[d];
+            float cos_t = cos(theta);
+            float sin_t = sin(theta);
+            float k_r = K_cache[j * D + 2u * d];
+            float k_i = K_cache[j * D + 2u * d + 1u];
+            float k_rot_r = k_r * cos_t - k_i * sin_t;
+            float k_rot_i = k_r * sin_t + k_i * cos_t;
+            dot += tg_q_rot[2u * d] * k_rot_r + tg_q_rot[2u * d + 1u] * k_rot_i;
+        }}
+        local_sum += exp(dot * scale - global_max);
+    }}
+
+    float sg_sum = simd_sum(local_sum);
+    threadgroup float shared_sum[{(block_size + 31) // 32}];
+    if (sgitg == 0u) shared_sum[tiisg] = 0.0f;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tiisg == 0u) shared_sum[sgitg] = sg_sum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float rd_sum = shared_sum[tiisg];
+    float global_sum = simd_sum(rd_sum);
+    float inv_sum = 1.0f / global_sum;
+
+    // Phase 4: Weighted V sum (V is NOT rotated)
+    for (uint d_start = 0u; d_start < D; d_start += BLOCK) {{
+        uint d = d_start + lid;
+        if (d < D) {{
+            float o_val = 0.0f;
+            for (uint j = 0u; j < seq_len; j++) {{
+                // Recompute attention weight
+                float dot = 0.0f;
+                for (uint dd = 0u; dd < HALF_D; dd++) {{
+                    float theta = float(j) * freqs[dd];
+                    float cos_t = cos(theta);
+                    float sin_t = sin(theta);
+                    float k_r = K_cache[j * D + 2u * dd];
+                    float k_i = K_cache[j * D + 2u * dd + 1u];
+                    float k_rot_r = k_r * cos_t - k_i * sin_t;
+                    float k_rot_i = k_r * sin_t + k_i * cos_t;
+                    dot += tg_q_rot[2u * dd] * k_rot_r + tg_q_rot[2u * dd + 1u] * k_rot_i;
+                }}
+                float attn_w = exp(dot * scale - global_max) * inv_sum;
+                o_val += attn_w * V_cache[j * D + d];
+            }}
+            O[d] = o_val;
+        }}
+    }}
+}}
+"""
+
+
 def make_residual_add_kernel(block_size=256, dtype="fp32", has_bias=True):
     """Generate a fused residual connection kernel.
 

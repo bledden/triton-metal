@@ -808,6 +808,242 @@ def test_matmul_2d_rectangular(runner):
 
 
 # ---------------------------------------------------------------------------
+# Swizzled matmul tests
+# ---------------------------------------------------------------------------
+
+@requires_metal
+def test_matmul_swizzled_small(runner):
+    """Swizzled matmul: 16x16 * 16x16."""
+    from triton_metal.codegen.msl_emitter import make_matmul_swizzled_kernel
+
+    M, N, K = 16, 16, 16
+    block_m, block_n, block_k = 32, 32, 32
+
+    msl = make_matmul_swizzled_kernel(block_m=block_m, block_n=block_n, block_k=block_k)
+    path = runner.compile(msl, "matmul_swizzled")
+    pipeline = runner.load(path, "matmul_swizzled")
+
+    random.seed(2001)
+    A_data = [random.uniform(-1.0, 1.0) for _ in range(M * K)]
+    B_data = [random.uniform(-1.0, 1.0) for _ in range(K * N)]
+
+    A_buf = runner.make_float_buffer(A_data)
+    B_buf = runner.make_float_buffer(B_data)
+    C_buf = runner.make_empty_buffer(M * N)
+    M_buf = runner.make_uint_buffer(M)
+    N_buf = runner.make_uint_buffer(N)
+    K_buf = runner.make_uint_buffer(K)
+
+    n_tile_cols = (N + block_n - 1) // block_n
+    n_tile_rows = (M + block_m - 1) // block_m
+    n_groups = n_tile_rows * n_tile_cols
+    threads_per_tg = block_m * block_n
+
+    import Metal
+    cmd = runner.queue.commandBuffer()
+    enc = cmd.computeCommandEncoder()
+    enc.setComputePipelineState_(pipeline)
+    for i, buf in enumerate([A_buf, B_buf, C_buf, M_buf, N_buf, K_buf]):
+        enc.setBuffer_offset_atIndex_(buf, 0, i)
+    enc.dispatchThreadgroups_threadsPerThreadgroup_(
+        Metal.MTLSizeMake(n_groups, 1, 1),
+        Metal.MTLSizeMake(threads_per_tg, 1, 1),
+    )
+    enc.endEncoding()
+    cmd.commit()
+    cmd.waitUntilCompleted()
+    assert cmd.status() == 4, f"Kernel failed, status={cmd.status()}"
+
+    result = runner.read_float_buffer(C_buf, M * N)
+
+    for i in range(M):
+        for j in range(N):
+            expected = sum(A_data[i * K + k] * B_data[k * N + j] for k in range(K))
+            got = result[i * N + j]
+            assert abs(got - expected) < 1e-2, (
+                f"C[{i},{j}]: got {got}, expected {expected}"
+            )
+
+
+@requires_metal
+def test_matmul_swizzled_large(runner):
+    """Swizzled matmul: 128x128 with group_size=4."""
+    from triton_metal.codegen.msl_emitter import make_matmul_swizzled_kernel
+
+    M, N, K = 128, 128, 64
+    block_m, block_n, block_k = 32, 32, 32
+
+    msl = make_matmul_swizzled_kernel(block_m=block_m, block_n=block_n,
+                                       block_k=block_k, group_size=4)
+    path = runner.compile(msl, "matmul_swizzled")
+    pipeline = runner.load(path, "matmul_swizzled")
+
+    random.seed(2002)
+    A_data = [random.uniform(-0.5, 0.5) for _ in range(M * K)]
+    B_data = [random.uniform(-0.5, 0.5) for _ in range(K * N)]
+
+    A_buf = runner.make_float_buffer(A_data)
+    B_buf = runner.make_float_buffer(B_data)
+    C_buf = runner.make_empty_buffer(M * N)
+    M_buf = runner.make_uint_buffer(M)
+    N_buf = runner.make_uint_buffer(N)
+    K_buf = runner.make_uint_buffer(K)
+
+    n_tile_cols = (N + block_n - 1) // block_n
+    n_tile_rows = (M + block_m - 1) // block_m
+    n_groups = n_tile_rows * n_tile_cols
+    threads_per_tg = block_m * block_n
+
+    import Metal
+    cmd = runner.queue.commandBuffer()
+    enc = cmd.computeCommandEncoder()
+    enc.setComputePipelineState_(pipeline)
+    for i, buf in enumerate([A_buf, B_buf, C_buf, M_buf, N_buf, K_buf]):
+        enc.setBuffer_offset_atIndex_(buf, 0, i)
+    enc.dispatchThreadgroups_threadsPerThreadgroup_(
+        Metal.MTLSizeMake(n_groups, 1, 1),
+        Metal.MTLSizeMake(threads_per_tg, 1, 1),
+    )
+    enc.endEncoding()
+    cmd.commit()
+    cmd.waitUntilCompleted()
+    assert cmd.status() == 4, f"Kernel failed, status={cmd.status()}"
+
+    result = runner.read_float_buffer(C_buf, M * N)
+
+    for i in range(0, M, 16):
+        for j in range(0, N, 16):
+            expected = sum(A_data[i * K + k] * B_data[k * N + j] for k in range(K))
+            got = result[i * N + j]
+            assert abs(got - expected) < 1e-1, (
+                f"C[{i},{j}]: got {got}, expected {expected}"
+            )
+
+
+# ---------------------------------------------------------------------------
+# Activation function tests
+# ---------------------------------------------------------------------------
+
+@requires_metal
+def test_activation_tanh(runner):
+    """Tanh activation kernel."""
+    from triton_metal.codegen.msl_emitter import make_activation_kernel
+
+    n = 1024
+    msl = make_activation_kernel("tanh")
+    path = runner.compile(msl, "tanh_kernel")
+    pipeline = runner.load(path, "tanh_kernel")
+
+    in_data = [float(i - 512) * 0.01 for i in range(n)]
+    in_buf = runner.make_float_buffer(in_data)
+    out_buf = runner.make_empty_buffer(n)
+    n_buf = runner.make_uint_buffer(n)
+
+    runner.run(pipeline, [in_buf, out_buf, n_buf], n)
+    result = runner.read_float_buffer(out_buf, n)
+
+    for i in [0, 100, 512, 900, 1023]:
+        expected = math.tanh(in_data[i])
+        assert abs(result[i] - expected) < 0.001, f"i={i}: {result[i]} != {expected}"
+
+
+@requires_metal
+def test_activation_sigmoid(runner):
+    """Sigmoid activation kernel."""
+    from triton_metal.codegen.msl_emitter import make_activation_kernel
+
+    n = 1024
+    msl = make_activation_kernel("sigmoid")
+    path = runner.compile(msl, "sigmoid_kernel")
+    pipeline = runner.load(path, "sigmoid_kernel")
+
+    in_data = [float(i - 512) * 0.01 for i in range(n)]
+    in_buf = runner.make_float_buffer(in_data)
+    out_buf = runner.make_empty_buffer(n)
+    n_buf = runner.make_uint_buffer(n)
+
+    runner.run(pipeline, [in_buf, out_buf, n_buf], n)
+    result = runner.read_float_buffer(out_buf, n)
+
+    for i in [0, 100, 512, 900, 1023]:
+        x = in_data[i]
+        expected = 1.0 / (1.0 + math.exp(-x))
+        assert abs(result[i] - expected) < 0.001, f"i={i}: {result[i]} != {expected}"
+
+
+@requires_metal
+def test_activation_elu(runner):
+    """ELU activation kernel."""
+    from triton_metal.codegen.msl_emitter import make_activation_kernel
+
+    n = 1024
+    msl = make_activation_kernel("elu")
+    path = runner.compile(msl, "elu_kernel")
+    pipeline = runner.load(path, "elu_kernel")
+
+    in_data = [float(i - 512) * 0.01 for i in range(n)]
+    in_buf = runner.make_float_buffer(in_data)
+    out_buf = runner.make_empty_buffer(n)
+    n_buf = runner.make_uint_buffer(n)
+
+    runner.run(pipeline, [in_buf, out_buf, n_buf], n)
+    result = runner.read_float_buffer(out_buf, n)
+
+    for i in [0, 100, 512, 900, 1023]:
+        x = in_data[i]
+        expected = x if x >= 0 else (math.exp(x) - 1.0)
+        assert abs(result[i] - expected) < 0.001, f"i={i}: {result[i]} != {expected}"
+
+
+@requires_metal
+def test_activation_leaky_relu(runner):
+    """Leaky ReLU activation kernel."""
+    from triton_metal.codegen.msl_emitter import make_activation_kernel
+
+    n = 1024
+    msl = make_activation_kernel("leaky_relu")
+    path = runner.compile(msl, "leaky_relu_kernel")
+    pipeline = runner.load(path, "leaky_relu_kernel")
+
+    in_data = [float(i - 512) * 0.01 for i in range(n)]
+    in_buf = runner.make_float_buffer(in_data)
+    out_buf = runner.make_empty_buffer(n)
+    n_buf = runner.make_uint_buffer(n)
+
+    runner.run(pipeline, [in_buf, out_buf, n_buf], n)
+    result = runner.read_float_buffer(out_buf, n)
+
+    for i in [0, 100, 512, 900, 1023]:
+        x = in_data[i]
+        expected = x if x >= 0 else 0.01 * x
+        assert abs(result[i] - expected) < 0.001, f"i={i}: {result[i]} != {expected}"
+
+
+@requires_metal
+def test_activation_hardswish(runner):
+    """HardSwish activation kernel."""
+    from triton_metal.codegen.msl_emitter import make_activation_kernel
+
+    n = 1024
+    msl = make_activation_kernel("hardswish")
+    path = runner.compile(msl, "hardswish_kernel")
+    pipeline = runner.load(path, "hardswish_kernel")
+
+    in_data = [float(i - 512) * 0.01 for i in range(n)]
+    in_buf = runner.make_float_buffer(in_data)
+    out_buf = runner.make_empty_buffer(n)
+    n_buf = runner.make_uint_buffer(n)
+
+    runner.run(pipeline, [in_buf, out_buf, n_buf], n)
+    result = runner.read_float_buffer(out_buf, n)
+
+    for i in [0, 100, 512, 900, 1023]:
+        x = in_data[i]
+        expected = x * max(0.0, min(1.0, x / 6.0 + 0.5))
+        assert abs(result[i] - expected) < 0.001, f"i={i}: {result[i]} != {expected}"
+
+
+# ---------------------------------------------------------------------------
 # FP16 tests
 # ---------------------------------------------------------------------------
 

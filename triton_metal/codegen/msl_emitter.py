@@ -870,6 +870,148 @@ kernel void matmul_2d(
     return msl
 
 
+def make_matmul_swizzled_kernel(block_m=32, block_n=32, block_k=32, group_size=4, dtype="fp32"):
+    """Generate a tiled matmul kernel with swizzled tile ordering.
+
+    Uses a grouped swizzle pattern to improve L2 cache hit rate on large
+    matrices. Instead of row-major tile traversal, tiles are grouped and
+    columns within each group are traversed before moving to the next group.
+
+    The swizzle pattern:
+        group_id = tile_y / GROUP_SIZE
+        first_tile_m = group_id * GROUP_SIZE
+        group_size_m = min(n_tile_rows - first_tile_m, GROUP_SIZE)
+        tile_y = first_tile_m + (linear_id % group_size_m)
+        tile_x = (linear_id / group_size_m)
+
+    This causes adjacent threadgroups to access adjacent rows of B,
+    maximizing L2 cache reuse.
+
+    Dispatch: 1D with n_groups = n_tile_rows * n_tile_cols
+
+    Args:
+        block_m: Tile height.
+        block_n: Tile width.
+        block_k: Tile depth.
+        group_size: Number of tile rows per swizzle group.
+        dtype: Data type.
+    """
+    msl_ty = triton_type_to_msl(dtype)
+    compute_ty = _msl_compute_type(dtype)
+    threads_per_tg = block_m * block_n
+
+    msl = f"""#include <metal_stdlib>
+using namespace metal;
+
+kernel void matmul_swizzled(
+    device const {msl_ty}* A [[buffer(0)]],
+    device const {msl_ty}* B [[buffer(1)]],
+    device {msl_ty}* C [[buffer(2)]],
+    device const uint* M_buf [[buffer(3)]],
+    device const uint* N_buf [[buffer(4)]],
+    device const uint* K_buf [[buffer(5)]],
+    uint pid [[threadgroup_position_in_grid]],
+    uint lid [[thread_index_in_threadgroup]]
+) {{
+    const uint M = M_buf[0];
+    const uint N = N_buf[0];
+    const uint K = K_buf[0];
+
+    const uint n_tile_cols = (N + {block_n}u - 1u) / {block_n}u;
+    const uint n_tile_rows = (M + {block_m}u - 1u) / {block_m}u;
+
+    // Swizzled tile assignment for L2 cache optimization
+    const uint GROUP_SIZE = {group_size}u;
+    const uint group_id = pid / (GROUP_SIZE * n_tile_cols);
+    const uint first_tile_m = group_id * GROUP_SIZE;
+    const uint group_size_m = min(n_tile_rows - first_tile_m, GROUP_SIZE);
+    const uint linear_in_group = pid % (group_size_m * n_tile_cols);
+    const uint tile_row = first_tile_m + (linear_in_group % group_size_m);
+    const uint tile_col = linear_in_group / group_size_m;
+
+    const uint local_row = lid / {block_n}u;
+    const uint local_col = lid % {block_n}u;
+    const uint global_row = tile_row * {block_m}u + local_row;
+    const uint global_col = tile_col * {block_n}u + local_col;
+
+    threadgroup {msl_ty} tileA[{block_m * block_k}];
+    threadgroup {msl_ty} tileB[{block_k * block_n}];
+
+    {compute_ty} acc = 0.0f;
+    const uint n_tiles_k = (K + {block_k}u - 1u) / {block_k}u;
+
+    for (uint tk = 0; tk < n_tiles_k; tk++) {{
+        uint a_col = tk * {block_k}u + local_col;
+        if (global_row < M && a_col < K) {{
+            tileA[local_row * {block_k}u + local_col] = A[global_row * K + a_col];
+        }} else {{
+            tileA[local_row * {block_k}u + local_col] = 0.0f;
+        }}
+
+        uint b_row = tk * {block_k}u + local_row;
+        if (b_row < K && global_col < N) {{
+            tileB[local_row * {block_n}u + local_col] = B[b_row * N + global_col];
+        }} else {{
+            tileB[local_row * {block_n}u + local_col] = 0.0f;
+        }}
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        for (uint kk = 0; kk < {block_k}u; kk++) {{
+            acc += tileA[local_row * {block_k}u + kk] * tileB[kk * {block_n}u + local_col];
+        }}
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }}
+
+    if (global_row < M && global_col < N) {{
+        C[global_row * N + global_col] = static_cast<{msl_ty}>(acc);
+    }}
+}}
+"""
+    return msl
+
+
+def make_activation_kernel(activation="tanh", block_size=256, dtype="fp32"):
+    """Generate an activation function kernel.
+
+    Supports tanh, sigmoid, elu, leaky_relu, and hardswish activations
+    with optimized implementations.
+
+    Args:
+        activation: One of "tanh", "sigmoid", "elu", "leaky_relu", "hardswish".
+        block_size: Threads per threadgroup.
+        dtype: Data type.
+    """
+    act_map = {
+        "tanh": "tanh(x)",
+        "sigmoid": "1.0f / (1.0f + exp(-x))",
+        "elu": "x >= 0.0f ? x : (exp(x) - 1.0f)",
+        "leaky_relu": "x >= 0.0f ? x : 0.01f * x",
+        "hardswish": "x * clamp(x / 6.0f + 0.5f, 0.0f, 1.0f)",
+    }
+    if activation not in act_map:
+        raise ValueError(f"Unknown activation: {activation}. "
+                         f"Supported: {list(act_map.keys())}")
+
+    msl_ty = triton_type_to_msl(dtype)
+    compute_ty = _msl_compute_type(dtype)
+    act_expr = act_map[activation]
+
+    kb = KernelBuilder(f"{activation}_kernel", block_size=block_size)
+    kb.add_ptr_arg("input", dtype=dtype, const=True)
+    kb.add_ptr_arg("output", dtype=dtype, const=False)
+    kb.add_scalar_arg("n", dtype="u32")
+
+    offsets = kb.make_block_offsets("pid", "offsets")
+    mask = kb.make_mask(offsets, "n", "mask")
+    kb.load("input", offsets, mask, out_var="x", dtype=dtype)
+    kb._var("result", act_expr, ty=compute_ty)
+    kb.store("output", offsets, "result", mask, dtype=dtype)
+
+    return kb.build()
+
+
 def make_rms_norm_kernel(block_size=256, dtype="fp32", eps=1e-6):
     """Generate a fused RMS normalization kernel.
 

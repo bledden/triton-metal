@@ -2172,3 +2172,108 @@ def test_int8_matmul(runner):
             assert abs(got - expected) < 0.5, (
                 f"C[{i},{j}]: got {got}, expected {expected}"
             )
+
+
+# ---------------------------------------------------------------------------
+# Top-K Sampling tests
+# ---------------------------------------------------------------------------
+
+
+@requires_metal
+def test_top_k_basic(runner):
+    """Top-k: find top 5 values from 1024-element vocabulary."""
+    from triton_metal.codegen.msl_emitter import make_top_k_kernel
+    import struct as struct_mod
+
+    vocab_size = 1024
+    k = 5
+
+    msl = make_top_k_kernel(k=k, block_size=256)
+    path = runner.compile(msl, "top_k")
+    pipeline = runner.load(path, "top_k")
+
+    # Create logits with known top-k values
+    random.seed(9999)
+    logits = [random.uniform(-2.0, 2.0) for _ in range(vocab_size)]
+    # Plant known large values at specific indices
+    top_indices = [17, 42, 500, 731, 999]
+    top_values = [10.0, 9.5, 9.0, 8.5, 8.0]
+    for idx, val in zip(top_indices, top_values):
+        logits[idx] = val
+
+    logits_buf = runner.make_float_buffer(logits)
+    out_val_buf = runner.make_empty_buffer(k)
+    # Create uint output buffer for indices
+    import Metal
+    out_idx_buf = runner.device.newBufferWithLength_options_(
+        k * 4, Metal.MTLResourceStorageModeShared
+    )
+    vocab_buf = runner.make_uint_buffer(vocab_size)
+    k_buf = runner.make_uint_buffer(k)
+
+    runner.run(pipeline, [logits_buf, out_val_buf, out_idx_buf, vocab_buf, k_buf],
+               256, block_size=256)
+
+    result_vals = runner.read_float_buffer(out_val_buf, k)
+    # Read uint indices
+    idx_view = out_idx_buf.contents().as_buffer(k * 4)
+    result_idxs = [struct_mod.unpack_from("I", idx_view, i * 4)[0] for i in range(k)]
+
+    # Verify the top-k values are returned in descending order
+    assert result_vals[0] == pytest.approx(10.0, abs=0.01)
+    assert result_vals[1] == pytest.approx(9.5, abs=0.01)
+    assert result_vals[2] == pytest.approx(9.0, abs=0.01)
+    assert result_vals[3] == pytest.approx(8.5, abs=0.01)
+    assert result_vals[4] == pytest.approx(8.0, abs=0.01)
+
+    # Verify indices match
+    assert set(result_idxs) == set(top_indices)
+    assert result_idxs[0] == 17   # index of highest value
+    assert result_idxs[1] == 42
+
+
+@requires_metal
+def test_top_k_large_vocab(runner):
+    """Top-k with a larger vocabulary (32K) and k=10."""
+    from triton_metal.codegen.msl_emitter import make_top_k_kernel
+    import struct as struct_mod
+
+    vocab_size = 32768
+    k = 10
+
+    msl = make_top_k_kernel(k=k, block_size=256)
+    path = runner.compile(msl, "top_k")
+    pipeline = runner.load(path, "top_k")
+
+    random.seed(1234)
+    logits = [random.uniform(-5.0, 5.0) for _ in range(vocab_size)]
+
+    # Reference: sort and take top k
+    indexed = sorted(enumerate(logits), key=lambda x: -x[1])
+    expected_indices = [idx for idx, _ in indexed[:k]]
+    expected_values = [val for _, val in indexed[:k]]
+
+    logits_buf = runner.make_float_buffer(logits)
+    out_val_buf = runner.make_empty_buffer(k)
+    import Metal
+    out_idx_buf = runner.device.newBufferWithLength_options_(
+        k * 4, Metal.MTLResourceStorageModeShared
+    )
+    vocab_buf = runner.make_uint_buffer(vocab_size)
+    k_buf = runner.make_uint_buffer(k)
+
+    runner.run(pipeline, [logits_buf, out_val_buf, out_idx_buf, vocab_buf, k_buf],
+               256, block_size=256)
+
+    result_vals = runner.read_float_buffer(out_val_buf, k)
+    idx_view = out_idx_buf.contents().as_buffer(k * 4)
+    result_idxs = [struct_mod.unpack_from("I", idx_view, i * 4)[0] for i in range(k)]
+
+    # All returned values should match the reference top-k
+    for i in range(k):
+        assert result_vals[i] == pytest.approx(expected_values[i], abs=0.01), (
+            f"top-{i}: got {result_vals[i]}, expected {expected_values[i]}"
+        )
+        assert result_idxs[i] == expected_indices[i], (
+            f"top-{i} index: got {result_idxs[i]}, expected {expected_indices[i]}"
+        )

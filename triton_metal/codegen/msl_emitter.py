@@ -1533,6 +1533,98 @@ kernel void int8_matmul(
 """
 
 
+def make_top_k_kernel(k=50, block_size=256):
+    """Generate a top-k sampling kernel for LLM inference.
+
+    Given logits of shape [vocab_size], finds the top-k largest values
+    and their indices. Uses a parallel partial-sort approach:
+    - Each thread scans a chunk of the vocabulary, maintaining a local
+      top-k candidate (value + index).
+    - Candidates are gathered into shared memory.
+    - A single-threadgroup reduction picks the final top-k.
+
+    For simplicity and correctness, this uses a heap-free approach:
+    each thread finds its single best candidate, then we iteratively
+    collect the top-k from all threads via shared memory reductions.
+
+    Args:
+        k: Number of top elements to select.
+        block_size: Threads per threadgroup (one threadgroup per row).
+    """
+    return f"""#include <metal_stdlib>
+using namespace metal;
+
+kernel void top_k(
+    device const float* logits [[buffer(0)]],
+    device float* out_values [[buffer(1)]],
+    device uint* out_indices [[buffer(2)]],
+    constant uint& vocab_size [[buffer(3)]],
+    constant uint& K_val [[buffer(4)]],
+    uint pid [[threadgroup_position_in_grid]],
+    uint lid [[thread_position_in_threadgroup]]
+) {{
+    // pid = batch row index, each threadgroup handles one row
+    const uint BLOCK = {block_size}u;
+    const uint row_offset = pid * vocab_size;
+
+    // Phase 1: Each thread finds its top-{k} candidates using a min-heap-like array
+    // For simplicity, each thread tracks its best single candidate per iteration
+    // We use shared memory to collect all thread-best candidates
+
+    threadgroup float tg_vals[{block_size}];
+    threadgroup uint tg_idxs[{block_size}];
+
+    // Scratch to mark "already picked" indices
+    threadgroup uint picked[{k}];
+
+    for (uint ki = 0u; ki < K_val && ki < {k}u; ki++) {{
+        // Each thread scans its chunk for the best unpicked element
+        float best_val = -INFINITY;
+        uint best_idx = 0u;
+
+        for (uint v = lid; v < vocab_size; v += BLOCK) {{
+            // Check if already picked
+            bool is_picked = false;
+            for (uint p = 0u; p < ki; p++) {{
+                if (picked[p] == v) {{ is_picked = true; break; }}
+            }}
+            if (!is_picked) {{
+                float val = logits[row_offset + v];
+                if (val > best_val) {{
+                    best_val = val;
+                    best_idx = v;
+                }}
+            }}
+        }}
+
+        tg_vals[lid] = best_val;
+        tg_idxs[lid] = best_idx;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // Parallel reduction to find the global best
+        for (uint stride = BLOCK / 2u; stride > 0u; stride >>= 1u) {{
+            if (lid < stride) {{
+                if (tg_vals[lid + stride] > tg_vals[lid]) {{
+                    tg_vals[lid] = tg_vals[lid + stride];
+                    tg_idxs[lid] = tg_idxs[lid + stride];
+                }}
+            }}
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }}
+
+        // Thread 0 writes the k-th result
+        if (lid == 0u) {{
+            uint out_offset = pid * K_val + ki;
+            out_values[out_offset] = tg_vals[0];
+            out_indices[out_offset] = tg_idxs[0];
+            picked[ki] = tg_idxs[0];
+        }}
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }}
+}}
+"""
+
+
 def make_simdgroup_matmul_kernel(dtype="fp32"):
     """Generate a matmul kernel using Apple's simdgroup_matrix hardware.
 

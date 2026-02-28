@@ -675,9 +675,18 @@ class TTGIRParser:
         if self._is_fused_mlp_pattern():
             return self._build_fused_mlp_kernel(kb, primary_dtype)
 
+        # Scatter: 2 input ptrs (data + indices), 1 output, store uses loaded index
+        # (checked before gather — scatter has more specific store-ptr-from-load check)
+        if self._is_scatter_pattern():
+            return self._build_scatter_kernel(kb, primary_dtype)
+
         # Gather: 2 input ptrs (data + indices) with int arg, 1 output, no cmp/select
         if self._is_gather_pattern():
             return self._build_gather_kernel(kb, primary_dtype)
+
+        # Transpose: 2D grid (two program_id calls), 1 input, 1 output, no math ops
+        if self._is_transpose_pattern():
+            return self._build_transpose_kernel(kb, primary_dtype)
 
         # Activation functions: tanh, sigmoid, elu, leaky_relu, hardswish
         act = self._classify_activation()
@@ -1455,6 +1464,79 @@ class TTGIRParser:
         """Generate a gather kernel from the pattern."""
         from triton_metal.codegen.msl_emitter import make_gather_kernel
         kb.set_prebuilt_msl(make_gather_kernel())
+        return kb
+
+    def _is_scatter_pattern(self):
+        """Check if IR matches a scatter (indexed write) pattern.
+
+        Scatter has:
+        - 2 input pointers (data + indices with int type)
+        - 1 output pointer
+        - No reductions, no dot ops
+        - Store address depends on loaded index (distinguishes from gather where
+          the *load* address depends on loaded index — in scatter, the output
+          pointer is offset by a loaded index value)
+        """
+        if self.reduce_ops or self.dot_ops:
+            return False
+        n_inputs = sum(1 for _, (_, _, is_out) in self.ptr_args.items() if not is_out)
+        n_outputs = sum(1 for _, (_, _, is_out) in self.ptr_args.items() if is_out)
+        if n_inputs != 2 or n_outputs != 1:
+            return False
+        has_int_input = any(
+            dtype in ("i32", "i64") for _, (_, dtype, is_out) in self.ptr_args.items()
+            if not is_out
+        )
+        if not has_int_input:
+            return False
+        # Distinguish from gather: in scatter the store target uses loaded indices.
+        # We detect this by checking that the store pointer SSA was computed from
+        # a loaded value (addptr with a load result).
+        for op in self.ops:
+            if op[0] == "store":
+                store_ptr_ssa = op[1]
+                ptr_val = self.ssa_values.get(store_ptr_ssa)
+                if ptr_val and ptr_val[0] == "addptr":
+                    offset_ssa = ptr_val[2]  # offset operand
+                    offset_val = self.ssa_values.get(offset_ssa)
+                    if offset_val and offset_val[0] == "load":
+                        return True
+        return False
+
+    def _build_scatter_kernel(self, kb, primary_dtype):
+        """Generate a scatter kernel from the pattern."""
+        from triton_metal.codegen.msl_emitter import make_scatter_kernel
+        kb.set_prebuilt_msl(make_scatter_kernel())
+        return kb
+
+    def _is_transpose_pattern(self):
+        """Check if IR matches a transpose pattern.
+
+        Transpose has:
+        - 2 program_id calls (2D grid: x and y)
+        - 1 input pointer, 1 output pointer
+        - No reductions, no dot ops
+        - Typically uses multiply and add for 2D indexing
+        """
+        if self.reduce_ops or self.dot_ops:
+            return False
+        n_inputs = sum(1 for _, (_, _, is_out) in self.ptr_args.items() if not is_out)
+        n_outputs = sum(1 for _, (_, _, is_out) in self.ptr_args.items() if is_out)
+        if n_inputs != 1 or n_outputs != 1:
+            return False
+        # Must have 2 program_id calls (2D grid)
+        pid_count = sum(1 for v in self.ssa_values.values() if v[0] == "program_id")
+        if pid_count < 2:
+            return False
+        # Must have 2+ scalar args (rows, cols dimensions)
+        if len(self.scalar_args) < 2:
+            return False
+        return True
+
+    def _build_transpose_kernel(self, kb, primary_dtype):
+        """Generate a transpose kernel from the pattern."""
+        from triton_metal.codegen.msl_emitter import make_transpose_kernel
+        kb.set_prebuilt_msl(make_transpose_kernel())
         return kb
 
     def _is_dropout_pattern(self):

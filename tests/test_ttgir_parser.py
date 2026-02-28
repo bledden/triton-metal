@@ -2884,3 +2884,137 @@ def test_ttgir_gather_compiles(runner):
     msl = kb.build()
     assert "gather" in msl.lower() or "indices" in msl.lower()
     runner.compile(msl, "gather_kernel")
+
+
+# ---------------------------------------------------------------------------
+# Scatter pattern
+# ---------------------------------------------------------------------------
+
+# Scatter: output[indices[i]] = input[i]
+SCATTER_TTGIR = """
+module {
+  tt.func public @scatter_kernel(%arg0: !tt.ptr<f32> {tt.divisibility = 16 : i32},
+                                  %arg1: !tt.ptr<i32> {tt.divisibility = 16 : i32},
+                                  %arg2: !tt.ptr<f32> {tt.divisibility = 16 : i32, tt.output},
+                                  %arg3: i32) {
+    %0 = tt.get_program_id x : i32
+    %c256 = arith.constant 256 : i32
+    %1 = arith.muli %0, %c256 : i32
+    %2 = tt.make_range {end = 256 : i32, start = 0 : i32}
+    %3 = tt.splat %1
+    %4 = arith.addi %3, %2
+    %5 = tt.splat %arg3
+    %6 = arith.cmpi slt, %4, %5
+    %7 = tt.addptr %arg0, %4
+    %8 = tt.load %7, %6
+    %9 = tt.addptr %arg1, %4
+    %10 = tt.load %9, %6
+    %11 = tt.addptr %arg2, %10
+    tt.store %11, %8, %6
+    tt.return
+  }
+}
+"""
+
+def test_ttgir_scatter_detected():
+    """TTGIR scatter pattern is detected (store ptr uses loaded index)."""
+    from triton_metal.codegen.ttgir_parser import TTGIRParser
+    parser = TTGIRParser(SCATTER_TTGIR, FakeOptions())
+    parser._parse_function_signature()
+    parser._parse_body()
+    parser._classify_stores()
+    assert parser._is_scatter_pattern()
+
+
+def test_ttgir_scatter_not_confused_with_gather():
+    """Scatter (store at loaded index) is not confused with gather (load at loaded index)."""
+    from triton_metal.codegen.ttgir_parser import TTGIRParser
+    # Scatter IR should match scatter, not gather
+    parser = TTGIRParser(SCATTER_TTGIR, FakeOptions())
+    parser._parse_function_signature()
+    parser._parse_body()
+    parser._classify_stores()
+    assert parser._is_scatter_pattern()
+    # Gather IR should NOT match scatter
+    parser2 = TTGIRParser(GATHER_TTGIR, FakeOptions())
+    parser2._parse_function_signature()
+    parser2._parse_body()
+    parser2._classify_stores()
+    assert not parser2._is_scatter_pattern()
+
+
+@requires_metal
+def test_ttgir_scatter_compiles(runner):
+    """TTGIR scatter pattern compiles to valid MSL."""
+    from triton_metal.codegen.ttgir_parser import parse_ttgir
+
+    kb = parse_ttgir(SCATTER_TTGIR, FakeOptions())
+    msl = kb.build()
+    assert "scatter" in msl.lower() or "indices" in msl.lower()
+    runner.compile(msl, "scatter_kernel")
+
+
+# ---------------------------------------------------------------------------
+# Transpose pattern
+# ---------------------------------------------------------------------------
+
+# Transpose: 2D grid with row/col swap
+TRANSPOSE_TTGIR = """
+module {
+  tt.func public @transpose_kernel(%arg0: !tt.ptr<f32> {tt.divisibility = 16 : i32},
+                                    %arg1: !tt.ptr<f32> {tt.divisibility = 16 : i32, tt.output},
+                                    %arg2: i32, %arg3: i32) {
+    %0 = tt.get_program_id x : i32
+    %1 = tt.get_program_id y : i32
+    %c16 = arith.constant 16 : i32
+    %2 = arith.muli %1, %c16 : i32
+    %3 = arith.muli %0, %c16 : i32
+    %4 = tt.make_range {end = 16 : i32, start = 0 : i32}
+    %5 = tt.splat %2
+    %6 = arith.addi %5, %4
+    %7 = tt.splat %3
+    %8 = arith.addi %7, %4
+    %9 = tt.splat %arg3
+    %10 = arith.muli %6, %9
+    %11 = arith.addi %10, %8
+    %12 = tt.addptr %arg0, %11
+    %13 = tt.load %12
+    %14 = arith.muli %8, %arg2
+    %15 = arith.addi %14, %6
+    %16 = tt.addptr %arg1, %15
+    tt.store %16, %13
+    tt.return
+  }
+}
+"""
+
+def test_ttgir_transpose_detected():
+    """TTGIR transpose pattern is detected (2D grid, 1 input, 1 output)."""
+    from triton_metal.codegen.ttgir_parser import TTGIRParser
+    parser = TTGIRParser(TRANSPOSE_TTGIR, FakeOptions())
+    parser._parse_function_signature()
+    parser._parse_body()
+    parser._classify_stores()
+    assert parser._is_transpose_pattern()
+
+
+def test_ttgir_transpose_not_confused_with_elementwise():
+    """Transpose (2D grid) is not confused with 1D elementwise."""
+    from triton_metal.codegen.ttgir_parser import TTGIRParser
+    # Elementwise (1D, single program_id) should not be transpose
+    parser = TTGIRParser(GATHER_TTGIR, FakeOptions())  # gather uses 1D
+    parser._parse_function_signature()
+    parser._parse_body()
+    parser._classify_stores()
+    assert not parser._is_transpose_pattern()
+
+
+@requires_metal
+def test_ttgir_transpose_compiles(runner):
+    """TTGIR transpose pattern compiles to valid MSL."""
+    from triton_metal.codegen.ttgir_parser import parse_ttgir
+
+    kb = parse_ttgir(TRANSPOSE_TTGIR, FakeOptions())
+    msl = kb.build()
+    assert "transpose" in msl.lower()
+    runner.compile(msl, "transpose_kernel")

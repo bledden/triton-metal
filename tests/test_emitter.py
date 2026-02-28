@@ -644,6 +644,170 @@ def test_matmul_multi_tile(runner):
 
 
 # ---------------------------------------------------------------------------
+# 2D dispatch matmul tests
+# ---------------------------------------------------------------------------
+
+@requires_metal
+def test_matmul_2d_small(runner):
+    """2D dispatch matmul: 16x16 * 16x16."""
+    from triton_metal.codegen.msl_emitter import make_matmul_2d_kernel
+
+    M, N, K = 16, 16, 16
+    block_m, block_n, block_k = 32, 32, 32
+
+    msl = make_matmul_2d_kernel(block_m=block_m, block_n=block_n, block_k=block_k)
+    path = runner.compile(msl, "matmul_2d")
+    pipeline = runner.load(path, "matmul_2d")
+
+    random.seed(1001)
+    A_data = [random.uniform(-1.0, 1.0) for _ in range(M * K)]
+    B_data = [random.uniform(-1.0, 1.0) for _ in range(K * N)]
+
+    A_buf = runner.make_float_buffer(A_data)
+    B_buf = runner.make_float_buffer(B_data)
+    C_buf = runner.make_empty_buffer(M * N)
+    M_buf = runner.make_uint_buffer(M)
+    N_buf = runner.make_uint_buffer(N)
+    K_buf = runner.make_uint_buffer(K)
+
+    n_tile_cols = (N + block_n - 1) // block_n
+    n_tile_rows = (M + block_m - 1) // block_m
+    threads_per_tg = block_m * block_n
+
+    import Metal
+    cmd = runner.queue.commandBuffer()
+    enc = cmd.computeCommandEncoder()
+    enc.setComputePipelineState_(pipeline)
+    for i, buf in enumerate([A_buf, B_buf, C_buf, M_buf, N_buf, K_buf]):
+        enc.setBuffer_offset_atIndex_(buf, 0, i)
+    # 2D dispatch: (tile_cols, tile_rows, 1)
+    enc.dispatchThreadgroups_threadsPerThreadgroup_(
+        Metal.MTLSizeMake(n_tile_cols, n_tile_rows, 1),
+        Metal.MTLSizeMake(threads_per_tg, 1, 1),
+    )
+    enc.endEncoding()
+    cmd.commit()
+    cmd.waitUntilCompleted()
+    assert cmd.status() == 4, f"Kernel failed, status={cmd.status()}"
+
+    result = runner.read_float_buffer(C_buf, M * N)
+
+    for i in range(M):
+        for j in range(N):
+            expected = sum(A_data[i * K + k] * B_data[k * N + j] for k in range(K))
+            got = result[i * N + j]
+            assert abs(got - expected) < 1e-2, (
+                f"C[{i},{j}]: got {got}, expected {expected}"
+            )
+
+
+@requires_metal
+def test_matmul_2d_multi_tile(runner):
+    """2D dispatch matmul: 64x64 with 2x2 tile grid."""
+    from triton_metal.codegen.msl_emitter import make_matmul_2d_kernel
+
+    M, N, K = 64, 64, 64
+    block_m, block_n, block_k = 32, 32, 32
+
+    msl = make_matmul_2d_kernel(block_m=block_m, block_n=block_n, block_k=block_k)
+    path = runner.compile(msl, "matmul_2d")
+    pipeline = runner.load(path, "matmul_2d")
+
+    random.seed(1002)
+    A_data = [random.uniform(-0.5, 0.5) for _ in range(M * K)]
+    B_data = [random.uniform(-0.5, 0.5) for _ in range(K * N)]
+
+    A_buf = runner.make_float_buffer(A_data)
+    B_buf = runner.make_float_buffer(B_data)
+    C_buf = runner.make_empty_buffer(M * N)
+    M_buf = runner.make_uint_buffer(M)
+    N_buf = runner.make_uint_buffer(N)
+    K_buf = runner.make_uint_buffer(K)
+
+    n_tile_cols = (N + block_n - 1) // block_n  # 2
+    n_tile_rows = (M + block_m - 1) // block_m  # 2
+    threads_per_tg = block_m * block_n
+
+    import Metal
+    cmd = runner.queue.commandBuffer()
+    enc = cmd.computeCommandEncoder()
+    enc.setComputePipelineState_(pipeline)
+    for i, buf in enumerate([A_buf, B_buf, C_buf, M_buf, N_buf, K_buf]):
+        enc.setBuffer_offset_atIndex_(buf, 0, i)
+    enc.dispatchThreadgroups_threadsPerThreadgroup_(
+        Metal.MTLSizeMake(n_tile_cols, n_tile_rows, 1),
+        Metal.MTLSizeMake(threads_per_tg, 1, 1),
+    )
+    enc.endEncoding()
+    cmd.commit()
+    cmd.waitUntilCompleted()
+    assert cmd.status() == 4, f"Kernel failed, status={cmd.status()}"
+
+    result = runner.read_float_buffer(C_buf, M * N)
+
+    for i in range(0, M, 8):
+        for j in range(0, N, 8):
+            expected = sum(A_data[i * K + k] * B_data[k * N + j] for k in range(K))
+            got = result[i * N + j]
+            assert abs(got - expected) < 1e-1, (
+                f"C[{i},{j}]: got {got}, expected {expected}"
+            )
+
+
+@requires_metal
+def test_matmul_2d_rectangular(runner):
+    """2D dispatch matmul: non-square 48x32 * 32x64."""
+    from triton_metal.codegen.msl_emitter import make_matmul_2d_kernel
+
+    M, N, K = 48, 64, 32
+    block_m, block_n, block_k = 32, 32, 32
+
+    msl = make_matmul_2d_kernel(block_m=block_m, block_n=block_n, block_k=block_k)
+    path = runner.compile(msl, "matmul_2d")
+    pipeline = runner.load(path, "matmul_2d")
+
+    random.seed(1003)
+    A_data = [random.uniform(-1.0, 1.0) for _ in range(M * K)]
+    B_data = [random.uniform(-1.0, 1.0) for _ in range(K * N)]
+
+    A_buf = runner.make_float_buffer(A_data)
+    B_buf = runner.make_float_buffer(B_data)
+    C_buf = runner.make_empty_buffer(M * N)
+    M_buf = runner.make_uint_buffer(M)
+    N_buf = runner.make_uint_buffer(N)
+    K_buf = runner.make_uint_buffer(K)
+
+    n_tile_cols = (N + block_n - 1) // block_n  # 2
+    n_tile_rows = (M + block_m - 1) // block_m  # 2
+    threads_per_tg = block_m * block_n
+
+    import Metal
+    cmd = runner.queue.commandBuffer()
+    enc = cmd.computeCommandEncoder()
+    enc.setComputePipelineState_(pipeline)
+    for i, buf in enumerate([A_buf, B_buf, C_buf, M_buf, N_buf, K_buf]):
+        enc.setBuffer_offset_atIndex_(buf, 0, i)
+    enc.dispatchThreadgroups_threadsPerThreadgroup_(
+        Metal.MTLSizeMake(n_tile_cols, n_tile_rows, 1),
+        Metal.MTLSizeMake(threads_per_tg, 1, 1),
+    )
+    enc.endEncoding()
+    cmd.commit()
+    cmd.waitUntilCompleted()
+    assert cmd.status() == 4, f"Kernel failed, status={cmd.status()}"
+
+    result = runner.read_float_buffer(C_buf, M * N)
+
+    for i in range(0, M, 6):
+        for j in range(0, N, 8):
+            expected = sum(A_data[i * K + k] * B_data[k * N + j] for k in range(K))
+            got = result[i * N + j]
+            assert abs(got - expected) < 1e-1, (
+                f"C[{i},{j}]: got {got}, expected {expected}"
+            )
+
+
+# ---------------------------------------------------------------------------
 # FP16 tests
 # ---------------------------------------------------------------------------
 

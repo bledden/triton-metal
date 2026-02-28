@@ -776,6 +776,100 @@ def make_matmul_kernel(block_m=32, block_n=32, block_k=32, dtype="fp32"):
     return kb.build()
 
 
+def make_matmul_2d_kernel(block_m=32, block_n=32, block_k=32, dtype="fp32"):
+    """Generate a tiled matmul kernel using native 2D threadgroup dispatch.
+
+    Instead of linearizing the 2D tile grid into 1D (pid = row*cols + col),
+    this kernel uses Metal's 2D dispatch directly:
+    - threadgroup_position_in_grid.x → tile column
+    - threadgroup_position_in_grid.y → tile row
+
+    Dispatch with: MTLSizeMake(n_tile_cols, n_tile_rows, 1)
+
+    This enables better hardware scheduling and is the foundation for
+    swizzled dispatch patterns.
+
+    Args:
+        block_m: Tile height (rows of C per threadgroup).
+        block_n: Tile width (cols of C per threadgroup).
+        block_k: Tile depth (K dimension chunk).
+        dtype: Data type ("fp32" or "fp16").
+    """
+    msl_ty = triton_type_to_msl(dtype)
+    compute_ty = _msl_compute_type(dtype)
+    threads_per_tg = block_m * block_n
+
+    msl = f"""#include <metal_stdlib>
+using namespace metal;
+
+kernel void matmul_2d(
+    device const {msl_ty}* A [[buffer(0)]],
+    device const {msl_ty}* B [[buffer(1)]],
+    device {msl_ty}* C [[buffer(2)]],
+    device const uint* M_buf [[buffer(3)]],
+    device const uint* N_buf [[buffer(4)]],
+    device const uint* K_buf [[buffer(5)]],
+    uint2 gid [[threadgroup_position_in_grid]],
+    uint lid [[thread_index_in_threadgroup]]
+) {{
+    const uint M = M_buf[0];
+    const uint N = N_buf[0];
+    const uint K = K_buf[0];
+
+    // 2D tile position from Metal's native 2D dispatch
+    const uint tile_col = gid.x;
+    const uint tile_row = gid.y;
+
+    // Local thread position within tile
+    const uint local_row = lid / {block_n}u;
+    const uint local_col = lid % {block_n}u;
+
+    // Global position
+    const uint global_row = tile_row * {block_m}u + local_row;
+    const uint global_col = tile_col * {block_n}u + local_col;
+
+    // Shared memory tiles
+    threadgroup {msl_ty} tileA[{block_m * block_k}];
+    threadgroup {msl_ty} tileB[{block_k * block_n}];
+
+    {compute_ty} acc = 0.0f;
+    const uint n_tiles_k = (K + {block_k}u - 1u) / {block_k}u;
+
+    for (uint tk = 0; tk < n_tiles_k; tk++) {{
+        // Load A tile
+        uint a_col = tk * {block_k}u + local_col;
+        if (global_row < M && a_col < K) {{
+            tileA[local_row * {block_k}u + local_col] = A[global_row * K + a_col];
+        }} else {{
+            tileA[local_row * {block_k}u + local_col] = 0.0f;
+        }}
+
+        // Load B tile
+        uint b_row = tk * {block_k}u + local_row;
+        if (b_row < K && global_col < N) {{
+            tileB[local_row * {block_n}u + local_col] = B[b_row * N + global_col];
+        }} else {{
+            tileB[local_row * {block_n}u + local_col] = 0.0f;
+        }}
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // Compute partial dot product
+        for (uint kk = 0; kk < {block_k}u; kk++) {{
+            acc += tileA[local_row * {block_k}u + kk] * tileB[kk * {block_n}u + local_col];
+        }}
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }}
+
+    if (global_row < M && global_col < N) {{
+        C[global_row * N + global_col] = static_cast<{msl_ty}>(acc);
+    }}
+}}
+"""
+    return msl
+
+
 def make_rms_norm_kernel(block_size=256, dtype="fp32", eps=1e-6):
     """Generate a fused RMS normalization kernel.
 

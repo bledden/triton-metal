@@ -1133,3 +1133,386 @@ def test_rope(runner):
             assert abs(got1 - exp1) < 1e-4, (
                 f"pos={pos} pair={i}[1]: got {got1}, expected {exp1}"
             )
+
+
+# ---------------------------------------------------------------------------
+# Layer normalization tests
+# ---------------------------------------------------------------------------
+
+@requires_metal
+def test_layer_norm(runner):
+    """Layer norm: output = (x - mean) / sqrt(var + eps) * gamma + beta"""
+    from triton_metal.codegen.msl_emitter import make_layer_norm_kernel
+
+    n_cols = 64
+    n_rows = 4
+    eps = 1e-6
+    msl = make_layer_norm_kernel(block_size=256, eps=eps)
+    path = runner.compile(msl, "layer_norm_kernel")
+    pipeline = runner.load(path, "layer_norm_kernel")
+
+    random.seed(111)
+    input_data = [random.gauss(0, 1) for _ in range(n_rows * n_cols)]
+    gamma_data = [random.uniform(0.5, 1.5) for _ in range(n_cols)]
+    beta_data = [random.uniform(-0.5, 0.5) for _ in range(n_cols)]
+
+    input_buf = runner.make_float_buffer(input_data)
+    gamma_buf = runner.make_float_buffer(gamma_data)
+    beta_buf = runner.make_float_buffer(beta_data)
+    out_buf = runner.make_empty_buffer(n_rows * n_cols)
+    ncols_buf = runner.make_uint_buffer(n_cols)
+
+    import Metal
+    cmd = runner.queue.commandBuffer()
+    enc = cmd.computeCommandEncoder()
+    enc.setComputePipelineState_(pipeline)
+    for i, buf in enumerate([input_buf, gamma_buf, beta_buf, out_buf, ncols_buf]):
+        enc.setBuffer_offset_atIndex_(buf, 0, i)
+    enc.dispatchThreadgroups_threadsPerThreadgroup_(
+        Metal.MTLSizeMake(n_rows, 1, 1),
+        Metal.MTLSizeMake(256, 1, 1),
+    )
+    enc.endEncoding()
+    cmd.commit()
+    cmd.waitUntilCompleted()
+    assert cmd.status() == 4
+
+    result = runner.read_float_buffer(out_buf, n_rows * n_cols)
+
+    for row in range(n_rows):
+        row_in = input_data[row * n_cols:(row + 1) * n_cols]
+        row_out = result[row * n_cols:(row + 1) * n_cols]
+
+        mean = sum(row_in) / n_cols
+        var = sum((x - mean) ** 2 for x in row_in) / n_cols
+        inv_std = 1.0 / math.sqrt(var + eps)
+
+        for j in range(n_cols):
+            expected = (row_in[j] - mean) * inv_std * gamma_data[j] + beta_data[j]
+            tol = max(1e-4, abs(expected) * 1e-3)
+            assert abs(row_out[j] - expected) < tol, (
+                f"Row {row}[{j}] got {row_out[j]}, expected {expected}"
+            )
+
+
+@requires_metal
+def test_layer_norm_large_row(runner):
+    """Layer norm with row larger than block_size."""
+    from triton_metal.codegen.msl_emitter import make_layer_norm_kernel
+
+    n_cols = 512
+    eps = 1e-6
+    msl = make_layer_norm_kernel(block_size=256, eps=eps)
+    path = runner.compile(msl, "layer_norm_kernel")
+    pipeline = runner.load(path, "layer_norm_kernel")
+
+    random.seed(222)
+    input_data = [random.gauss(0, 2) for _ in range(n_cols)]
+    gamma_data = [1.0] * n_cols
+    beta_data = [0.0] * n_cols
+
+    input_buf = runner.make_float_buffer(input_data)
+    gamma_buf = runner.make_float_buffer(gamma_data)
+    beta_buf = runner.make_float_buffer(beta_data)
+    out_buf = runner.make_empty_buffer(n_cols)
+    ncols_buf = runner.make_uint_buffer(n_cols)
+
+    import Metal
+    cmd = runner.queue.commandBuffer()
+    enc = cmd.computeCommandEncoder()
+    enc.setComputePipelineState_(pipeline)
+    for i, buf in enumerate([input_buf, gamma_buf, beta_buf, out_buf, ncols_buf]):
+        enc.setBuffer_offset_atIndex_(buf, 0, i)
+    enc.dispatchThreadgroups_threadsPerThreadgroup_(
+        Metal.MTLSizeMake(1, 1, 1),
+        Metal.MTLSizeMake(256, 1, 1),
+    )
+    enc.endEncoding()
+    cmd.commit()
+    cmd.waitUntilCompleted()
+    assert cmd.status() == 4
+
+    result = runner.read_float_buffer(out_buf, n_cols)
+
+    mean = sum(input_data) / n_cols
+    var = sum((x - mean) ** 2 for x in input_data) / n_cols
+    inv_std = 1.0 / math.sqrt(var + eps)
+
+    for j in range(n_cols):
+        expected = (input_data[j] - mean) * inv_std
+        tol = max(1e-3, abs(expected) * 1e-2)
+        assert abs(result[j] - expected) < tol, (
+            f"[{j}] got {result[j]}, expected {expected}"
+        )
+
+    # Output should have mean ~0 and variance ~1
+    out_mean = sum(result) / n_cols
+    assert abs(out_mean) < 0.05, f"Output mean = {out_mean}, expected ~0"
+
+
+# ---------------------------------------------------------------------------
+# Cross-entropy loss tests
+# ---------------------------------------------------------------------------
+
+@requires_metal
+def test_cross_entropy(runner):
+    """Cross-entropy loss: loss = log_sum_exp(logits) - logits[target]"""
+    from triton_metal.codegen.msl_emitter import make_cross_entropy_kernel
+
+    n_rows = 4
+    vocab_size = 32
+    msl = make_cross_entropy_kernel(block_size=256)
+    path = runner.compile(msl, "cross_entropy_kernel")
+    pipeline = runner.load(path, "cross_entropy_kernel")
+
+    random.seed(333)
+    logits_data = [random.gauss(0, 2) for _ in range(n_rows * vocab_size)]
+    targets_data = [random.randint(0, vocab_size - 1) for _ in range(n_rows)]
+
+    logits_buf = runner.make_float_buffer(logits_data)
+    # targets need int32 buffer
+    import Metal
+    import struct as st
+    targets_buf = runner.device.newBufferWithLength_options_(
+        n_rows * 4, Metal.MTLResourceStorageModeShared
+    )
+    view = targets_buf.contents().as_buffer(n_rows * 4)
+    for i, t in enumerate(targets_data):
+        st.pack_into("i", view, i * 4, t)
+
+    losses_buf = runner.make_empty_buffer(n_rows)
+    vocab_buf = runner.make_uint_buffer(vocab_size)
+
+    cmd = runner.queue.commandBuffer()
+    enc = cmd.computeCommandEncoder()
+    enc.setComputePipelineState_(pipeline)
+    for i, buf in enumerate([logits_buf, targets_buf, losses_buf, vocab_buf]):
+        enc.setBuffer_offset_atIndex_(buf, 0, i)
+    enc.dispatchThreadgroups_threadsPerThreadgroup_(
+        Metal.MTLSizeMake(n_rows, 1, 1),
+        Metal.MTLSizeMake(256, 1, 1),
+    )
+    enc.endEncoding()
+    cmd.commit()
+    cmd.waitUntilCompleted()
+    assert cmd.status() == 4
+
+    result = runner.read_float_buffer(losses_buf, n_rows)
+
+    for row in range(n_rows):
+        row_logits = logits_data[row * vocab_size:(row + 1) * vocab_size]
+        target = targets_data[row]
+
+        # Reference: log_sum_exp - logits[target]
+        mx = max(row_logits)
+        log_sum_exp = mx + math.log(sum(math.exp(x - mx) for x in row_logits))
+        expected = log_sum_exp - row_logits[target]
+
+        assert abs(result[row] - expected) < 1e-3, (
+            f"Row {row}: got {result[row]}, expected {expected}"
+        )
+        # Loss should be non-negative
+        assert result[row] >= -1e-6, f"Row {row}: negative loss {result[row]}"
+
+
+@requires_metal
+def test_cross_entropy_large_vocab(runner):
+    """Cross-entropy with vocab larger than block_size."""
+    from triton_metal.codegen.msl_emitter import make_cross_entropy_kernel
+
+    vocab_size = 1024  # > block_size of 256
+    msl = make_cross_entropy_kernel(block_size=256)
+    path = runner.compile(msl, "cross_entropy_kernel")
+    pipeline = runner.load(path, "cross_entropy_kernel")
+
+    random.seed(444)
+    logits_data = [random.gauss(0, 1) for _ in range(vocab_size)]
+    target = 500  # middle of vocab
+
+    logits_buf = runner.make_float_buffer(logits_data)
+    import Metal
+    import struct as st
+    targets_buf = runner.device.newBufferWithLength_options_(
+        4, Metal.MTLResourceStorageModeShared
+    )
+    view = targets_buf.contents().as_buffer(4)
+    st.pack_into("i", view, 0, target)
+
+    losses_buf = runner.make_empty_buffer(1)
+    vocab_buf = runner.make_uint_buffer(vocab_size)
+
+    cmd = runner.queue.commandBuffer()
+    enc = cmd.computeCommandEncoder()
+    enc.setComputePipelineState_(pipeline)
+    for i, buf in enumerate([logits_buf, targets_buf, losses_buf, vocab_buf]):
+        enc.setBuffer_offset_atIndex_(buf, 0, i)
+    enc.dispatchThreadgroups_threadsPerThreadgroup_(
+        Metal.MTLSizeMake(1, 1, 1),
+        Metal.MTLSizeMake(256, 1, 1),
+    )
+    enc.endEncoding()
+    cmd.commit()
+    cmd.waitUntilCompleted()
+    assert cmd.status() == 4
+
+    result = runner.read_float_buffer(losses_buf, 1)
+
+    mx = max(logits_data)
+    log_sum_exp = mx + math.log(sum(math.exp(x - mx) for x in logits_data))
+    expected = log_sum_exp - logits_data[target]
+
+    assert abs(result[0] - expected) < 1e-2, (
+        f"got {result[0]}, expected {expected}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Flash Attention tests
+# ---------------------------------------------------------------------------
+
+@requires_metal
+def test_flash_attention_single_head(runner):
+    """Flash Attention: single head, short sequence."""
+    from triton_metal.codegen.msl_emitter import make_flash_attention_kernel
+
+    seq_len = 16
+    head_dim = 64
+    n_heads = 1
+    scale = 1.0 / math.sqrt(head_dim)
+
+    msl = make_flash_attention_kernel(head_dim=head_dim, Br=16, Bc=16)
+    path = runner.compile(msl, "flash_attention")
+    pipeline = runner.load(path, "flash_attention")
+
+    random.seed(555)
+    Q_data = [random.gauss(0, 0.5) for _ in range(n_heads * seq_len * head_dim)]
+    K_data = [random.gauss(0, 0.5) for _ in range(n_heads * seq_len * head_dim)]
+    V_data = [random.gauss(0, 0.5) for _ in range(n_heads * seq_len * head_dim)]
+
+    Q_buf = runner.make_float_buffer(Q_data)
+    K_buf = runner.make_float_buffer(K_data)
+    V_buf = runner.make_float_buffer(V_data)
+    O_buf = runner.make_empty_buffer(n_heads * seq_len * head_dim)
+    seq_buf = runner.make_uint_buffer(seq_len)
+    scale_buf = runner.make_float_scalar_buffer(scale)
+
+    n_q_blocks = (seq_len + 15) // 16
+    n_groups = n_heads * n_q_blocks
+
+    import Metal
+    cmd = runner.queue.commandBuffer()
+    enc = cmd.computeCommandEncoder()
+    enc.setComputePipelineState_(pipeline)
+    for i, buf in enumerate([Q_buf, K_buf, V_buf, O_buf, seq_buf, scale_buf]):
+        enc.setBuffer_offset_atIndex_(buf, 0, i)
+    enc.dispatchThreadgroups_threadsPerThreadgroup_(
+        Metal.MTLSizeMake(n_groups, 1, 1),
+        Metal.MTLSizeMake(256, 1, 1),
+    )
+    enc.endEncoding()
+    cmd.commit()
+    cmd.waitUntilCompleted()
+    assert cmd.status() == 4, f"Kernel failed, status={cmd.status()}"
+
+    result = runner.read_float_buffer(O_buf, n_heads * seq_len * head_dim)
+
+    # Reference attention: softmax(Q @ K^T * scale) @ V
+    for h in range(n_heads):
+        ho = h * seq_len * head_dim
+        # Compute S = Q @ K^T
+        S = [[0.0] * seq_len for _ in range(seq_len)]
+        for i in range(seq_len):
+            for j in range(seq_len):
+                dot = 0.0
+                for d in range(head_dim):
+                    dot += Q_data[ho + i * head_dim + d] * K_data[ho + j * head_dim + d]
+                S[i][j] = dot * scale
+
+        # Softmax each row
+        P = []
+        for i in range(seq_len):
+            mx = max(S[i])
+            exps = [math.exp(s - mx) for s in S[i]]
+            s = sum(exps)
+            P.append([e / s for e in exps])
+
+        # O = P @ V
+        for i in range(seq_len):
+            for d in range(head_dim):
+                expected = sum(P[i][j] * V_data[ho + j * head_dim + d] for j in range(seq_len))
+                got = result[ho + i * head_dim + d]
+                tol = max(1e-3, abs(expected) * 1e-2)
+                assert abs(got - expected) < tol, (
+                    f"head={h} pos={i} dim={d}: got {got}, expected {expected}"
+                )
+
+
+@requires_metal
+def test_flash_attention_multi_block(runner):
+    """Flash Attention: sequence longer than one block."""
+    from triton_metal.codegen.msl_emitter import make_flash_attention_kernel
+
+    seq_len = 48  # 3 blocks of 16
+    head_dim = 64
+    n_heads = 1
+    scale = 1.0 / math.sqrt(head_dim)
+
+    msl = make_flash_attention_kernel(head_dim=head_dim, Br=16, Bc=16)
+    path = runner.compile(msl, "flash_attention")
+    pipeline = runner.load(path, "flash_attention")
+
+    random.seed(666)
+    Q_data = [random.gauss(0, 0.3) for _ in range(n_heads * seq_len * head_dim)]
+    K_data = [random.gauss(0, 0.3) for _ in range(n_heads * seq_len * head_dim)]
+    V_data = [random.gauss(0, 0.3) for _ in range(n_heads * seq_len * head_dim)]
+
+    Q_buf = runner.make_float_buffer(Q_data)
+    K_buf = runner.make_float_buffer(K_data)
+    V_buf = runner.make_float_buffer(V_data)
+    O_buf = runner.make_empty_buffer(n_heads * seq_len * head_dim)
+    seq_buf = runner.make_uint_buffer(seq_len)
+    scale_buf = runner.make_float_scalar_buffer(scale)
+
+    n_q_blocks = (seq_len + 15) // 16
+    n_groups = n_heads * n_q_blocks
+
+    import Metal
+    cmd = runner.queue.commandBuffer()
+    enc = cmd.computeCommandEncoder()
+    enc.setComputePipelineState_(pipeline)
+    for i, buf in enumerate([Q_buf, K_buf, V_buf, O_buf, seq_buf, scale_buf]):
+        enc.setBuffer_offset_atIndex_(buf, 0, i)
+    enc.dispatchThreadgroups_threadsPerThreadgroup_(
+        Metal.MTLSizeMake(n_groups, 1, 1),
+        Metal.MTLSizeMake(256, 1, 1),
+    )
+    enc.endEncoding()
+    cmd.commit()
+    cmd.waitUntilCompleted()
+    assert cmd.status() == 4, f"Kernel failed, status={cmd.status()}"
+
+    result = runner.read_float_buffer(O_buf, n_heads * seq_len * head_dim)
+
+    # Reference: full attention
+    S = [[0.0] * seq_len for _ in range(seq_len)]
+    for i in range(seq_len):
+        for j in range(seq_len):
+            dot = sum(Q_data[i * head_dim + d] * K_data[j * head_dim + d] for d in range(head_dim))
+            S[i][j] = dot * scale
+
+    P = []
+    for i in range(seq_len):
+        mx = max(S[i])
+        exps = [math.exp(s - mx) for s in S[i]]
+        s = sum(exps)
+        P.append([e / s for e in exps])
+
+    # Spot-check every 4th position, every 8th dim
+    for i in range(0, seq_len, 4):
+        for d in range(0, head_dim, 8):
+            expected = sum(P[i][j] * V_data[j * head_dim + d] for j in range(seq_len))
+            got = result[i * head_dim + d]
+            tol = max(1e-2, abs(expected) * 0.05)
+            assert abs(got - expected) < tol, (
+                f"pos={i} dim={d}: got {got}, expected {expected}"
+            )

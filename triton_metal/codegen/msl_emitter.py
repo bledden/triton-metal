@@ -13,6 +13,9 @@ Supports:
 - Reductions: sum, max, min via SIMD-group intrinsics + threadgroup shared memory
 - Softmax: fused row-wise max → subtract → exp → sum → divide
 - Matmul: tiled matrix multiplication with threadgroup shared memory
+- Layer norm: mean → variance → normalize with gamma/beta
+- Cross-entropy: fused log-softmax + target selection loss
+- Flash Attention: online softmax with tiled Q@K^T and P@V accumulation
 """
 
 from triton_metal.codegen.msl_types import triton_type_to_msl
@@ -797,6 +800,340 @@ def make_rope_kernel(block_size=256, dtype="fp32"):
     kb.raw_line("}")
 
     return kb.build()
+
+
+def make_layer_norm_kernel(block_size=256, dtype="fp32", eps=1e-6):
+    """Generate a fused layer normalization kernel.
+
+    Standard layer norm used in transformers:
+    output = (x - mean(x)) / sqrt(var(x) + eps) * gamma + beta
+
+    Each threadgroup processes one row. Three passes:
+    1. Compute mean (strided accumulation + threadgroup reduce)
+    2. Compute variance (strided + reduce)
+    3. Normalize: (x - mean) * rsqrt(var + eps) * gamma + beta
+
+    Args:
+        block_size: Threads per threadgroup.
+        dtype: Data type.
+        eps: Epsilon for numerical stability.
+    """
+    n_simd_groups = (block_size + 31) // 32
+
+    kb = KernelBuilder("layer_norm_kernel", block_size=block_size)
+    kb.add_ptr_arg("input", dtype=dtype, const=True)
+    kb.add_ptr_arg("gamma", dtype=dtype, const=True)
+    kb.add_ptr_arg("beta", dtype=dtype, const=True)
+    kb.add_ptr_arg("output", dtype=dtype, const=False)
+    kb.add_scalar_arg("n_cols", dtype="u32")
+
+    kb.declare_threadgroup_array("shared_mean", dtype=dtype, size=n_simd_groups)
+    kb.declare_threadgroup_array("shared_var", dtype=dtype, size=n_simd_groups)
+
+    # Row base pointer
+    kb._var("row_start", "pid * n_cols", ty="uint")
+
+    # Pass 1: Compute mean
+    kb._var("local_sum", "0.0f", ty="float")
+    kb.raw_line(f"for (uint i = lid; i < n_cols; i += {block_size}u) {{")
+    kb.indent()
+    kb.raw_line("local_sum += input[row_start + i];")
+    kb.dedent()
+    kb.raw_line("}")
+
+    kb.threadgroup_reduce("sum", "local_sum", "shared_mean", "total_sum")
+
+    kb.begin_if("lid == 0")
+    kb.raw_line("shared_mean[0] = total_sum;")
+    kb.end_block()
+    kb.barrier("threadgroup")
+    kb._var("mean_val", "shared_mean[0] / float(n_cols)", ty="float")
+
+    # Pass 2: Compute variance
+    kb._var("local_var", "0.0f", ty="float")
+    kb.raw_line(f"for (uint i = lid; i < n_cols; i += {block_size}u) {{")
+    kb.indent()
+    kb._var("diff", "input[row_start + i] - mean_val", ty="float")
+    kb.raw_line("local_var += diff * diff;")
+    kb.dedent()
+    kb.raw_line("}")
+
+    kb.threadgroup_reduce("sum", "local_var", "shared_var", "total_var")
+
+    kb.begin_if("lid == 0")
+    kb.raw_line("shared_var[0] = total_var;")
+    kb.end_block()
+    kb.barrier("threadgroup")
+    kb._var("var_val", "shared_var[0] / float(n_cols)", ty="float")
+    kb._var("inv_std", f"rsqrt(var_val + {eps}f)", ty="float")
+
+    # Pass 3: Normalize
+    kb.raw_line(f"for (uint i = lid; i < n_cols; i += {block_size}u) {{")
+    kb.indent()
+    kb.raw_line("output[row_start + i] = (input[row_start + i] - mean_val) * inv_std * gamma[i] + beta[i];")
+    kb.dedent()
+    kb.raw_line("}")
+
+    return kb.build()
+
+
+def make_cross_entropy_kernel(block_size=256, dtype="fp32"):
+    """Generate a fused cross-entropy loss kernel.
+
+    For each sample (row):
+    1. Compute max(logits) for numerical stability
+    2. Compute log_sum_exp = max + log(sum(exp(logits - max)))
+    3. loss = log_sum_exp - logits[target]
+
+    Each threadgroup processes one sample. Outputs per-sample losses.
+
+    Args:
+        block_size: Threads per threadgroup.
+        dtype: Data type.
+
+    Kernel args:
+        logits: [batch, vocab_size] tensor
+        targets: [batch] int32 tensor (class indices)
+        losses: [batch] float output (per-sample losses)
+        vocab_size: number of classes
+    """
+    n_simd_groups = (block_size + 31) // 32
+
+    kb = KernelBuilder("cross_entropy_kernel", block_size=block_size)
+    kb.add_ptr_arg("logits", dtype=dtype, const=True)
+    kb.add_ptr_arg("targets", dtype="i32", const=True)
+    kb.add_ptr_arg("losses", dtype=dtype, const=False)
+    kb.add_scalar_arg("vocab_size", dtype="u32")
+
+    kb.declare_threadgroup_array("shared_max", dtype=dtype, size=n_simd_groups)
+    kb.declare_threadgroup_array("shared_sum", dtype=dtype, size=n_simd_groups)
+
+    # Row base pointer
+    kb._var("row_start", "pid * vocab_size", ty="uint")
+
+    # Pass 1: Find max logit for numerical stability
+    kb._var("local_max", "-INFINITY", ty="float")
+    kb.raw_line(f"for (uint i = lid; i < vocab_size; i += {block_size}u) {{")
+    kb.indent()
+    kb.raw_line("local_max = max(local_max, logits[row_start + i]);")
+    kb.dedent()
+    kb.raw_line("}")
+
+    kb.threadgroup_reduce("max", "local_max", "shared_max", "row_max")
+
+    kb.begin_if("lid == 0")
+    kb.raw_line("shared_max[0] = row_max;")
+    kb.end_block()
+    kb.barrier("threadgroup")
+    kb._var("max_val", "shared_max[0]", ty="float")
+
+    # Pass 2: Compute sum(exp(logits - max))
+    kb._var("local_exp_sum", "0.0f", ty="float")
+    kb.raw_line(f"for (uint i = lid; i < vocab_size; i += {block_size}u) {{")
+    kb.indent()
+    kb.raw_line("local_exp_sum += exp(logits[row_start + i] - max_val);")
+    kb.dedent()
+    kb.raw_line("}")
+
+    kb.threadgroup_reduce("sum", "local_exp_sum", "shared_sum", "total_exp_sum")
+
+    # Thread 0 computes final loss
+    kb.begin_if("lid == 0")
+    kb._var("target_idx", "targets[pid]", ty="int")
+    kb._var("log_sum_exp", "max_val + log(total_exp_sum)", ty="float")
+    kb._var("target_logit", "logits[row_start + uint(target_idx)]", ty="float")
+    kb.raw_line("losses[pid] = log_sum_exp - target_logit;")
+    kb.end_block()
+
+    return kb.build()
+
+
+def make_flash_attention_kernel(head_dim=64, Br=16, Bc=16, block_size=256):
+    """Generate a fused Flash Attention kernel for Metal.
+
+    Implements the FlashAttention-2 algorithm with online softmax:
+    For each query block:
+        O = 0, l = 0, m = -inf
+        For each KV block:
+            S = Q @ K^T           (Br x Bc scores)
+            m_new = max(m, rowmax(S))
+            P = exp(S - m_new)    (unnormalized attention)
+            l = exp(m - m_new) * l + rowsum(P)
+            O = exp(m - m_new) * O + P @ V
+            m = m_new
+        O = O / l
+
+    Threadgroup memory budget (head_dim=64, Br=Bc=16, fp32):
+        Q:  16x64x4 =  4KB
+        K:  16x64x4 =  4KB
+        V:  16x64x4 =  4KB
+        S:  16x16x4 =  1KB
+        O:  16x64x4 =  4KB
+        l,m: 16x4x2 = 128B
+        Total: ~17KB (well within 32KB)
+
+    Args:
+        head_dim: Head dimension (d). Must be multiple of 8.
+        Br: Query block size (rows of Q per threadgroup).
+        Bc: KV block size (rows of K/V loaded per inner loop step).
+        block_size: Threads per threadgroup.
+
+    Kernel args:
+        Q: [n_heads * seq_len, head_dim]
+        K: [n_heads * seq_len, head_dim]
+        V: [n_heads * seq_len, head_dim]
+        O: [n_heads * seq_len, head_dim]
+        seq_len: sequence length
+        scale: 1/sqrt(head_dim)
+    """
+    return f"""#include <metal_stdlib>
+using namespace metal;
+
+kernel void flash_attention(
+    device const float* Q [[buffer(0)]],
+    device const float* K [[buffer(1)]],
+    device const float* V [[buffer(2)]],
+    device float* O [[buffer(3)]],
+    constant uint& seq_len [[buffer(4)]],
+    constant float& scale [[buffer(5)]],
+    uint pid [[threadgroup_position_in_grid]],
+    uint lid [[thread_position_in_threadgroup]],
+    uint sgitg [[simdgroup_index_in_threadgroup]],
+    uint tiisg [[thread_index_in_simdgroup]]
+) {{
+    // pid encodes (head_idx * n_q_blocks + q_block_idx)
+    // Each threadgroup handles Br={Br} query rows
+    const uint BR = {Br}u;
+    const uint BC = {Bc}u;
+    const uint D = {head_dim}u;
+
+    uint n_q_blocks = (seq_len + BR - 1u) / BR;
+    uint head_idx = pid / n_q_blocks;
+    uint q_block = pid % n_q_blocks;
+    uint q_start = q_block * BR;
+    uint head_offset = head_idx * seq_len * D;
+
+    // Threadgroup memory
+    threadgroup float tg_Q[{Br} * {head_dim}];    // Br x D
+    threadgroup float tg_K[{Bc} * {head_dim}];    // Bc x D
+    threadgroup float tg_V[{Bc} * {head_dim}];    // Bc x D
+    threadgroup float tg_S[{Br} * {Bc}];          // Br x Bc
+    threadgroup float tg_O[{Br} * {head_dim}];    // Br x D
+    threadgroup float tg_m[{Br}];                  // row max
+    threadgroup float tg_l[{Br}];                  // row sum
+
+    // Load Q block into threadgroup memory
+    for (uint i = lid; i < BR * D; i += {block_size}u) {{
+        uint r = i / D;
+        uint c = i % D;
+        uint global_r = q_start + r;
+        tg_Q[i] = (global_r < seq_len) ? Q[head_offset + global_r * D + c] : 0.0f;
+    }}
+
+    // Initialize O, m, l
+    for (uint i = lid; i < BR * D; i += {block_size}u) {{
+        tg_O[i] = 0.0f;
+    }}
+    if (lid < BR) {{
+        tg_m[lid] = -INFINITY;
+        tg_l[lid] = 0.0f;
+    }}
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Iterate over KV blocks
+    uint n_kv_blocks = (seq_len + BC - 1u) / BC;
+    for (uint kv_block = 0u; kv_block < n_kv_blocks; kv_block++) {{
+        uint kv_start = kv_block * BC;
+
+        // Load K block
+        for (uint i = lid; i < BC * D; i += {block_size}u) {{
+            uint r = i / D;
+            uint c = i % D;
+            uint global_r = kv_start + r;
+            tg_K[i] = (global_r < seq_len) ? K[head_offset + global_r * D + c] : 0.0f;
+        }}
+
+        // Load V block
+        for (uint i = lid; i < BC * D; i += {block_size}u) {{
+            uint r = i / D;
+            uint c = i % D;
+            uint global_r = kv_start + r;
+            tg_V[i] = (global_r < seq_len) ? V[head_offset + global_r * D + c] : 0.0f;
+        }}
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // Compute S = Q @ K^T (Br x Bc) — each thread computes one element
+        for (uint i = lid; i < BR * BC; i += {block_size}u) {{
+            uint r = i / BC;
+            uint c = i % BC;
+            float dot = 0.0f;
+            for (uint d = 0u; d < D; d++) {{
+                dot += tg_Q[r * D + d] * tg_K[c * D + d];
+            }}
+            // Mask out-of-bounds KV positions
+            uint kv_pos = kv_start + c;
+            tg_S[i] = (kv_pos < seq_len) ? dot * scale : -INFINITY;
+        }}
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // For each query row: update online softmax and accumulate output
+        // Each thread handles one query row
+        if (lid < BR) {{
+            uint r = lid;
+            float m_prev = tg_m[r];
+            float l_prev = tg_l[r];
+
+            // Row max of S[r, :]
+            float m_new = m_prev;
+            for (uint c = 0u; c < BC; c++) {{
+                m_new = max(m_new, tg_S[r * BC + c]);
+            }}
+
+            // Compute P[r, :] = exp(S[r, :] - m_new) and sum
+            float exp_scale = exp(m_prev - m_new);
+            float l_new = l_prev * exp_scale;
+            for (uint c = 0u; c < BC; c++) {{
+                float p = exp(tg_S[r * BC + c] - m_new);
+                tg_S[r * BC + c] = p;  // store P in place of S
+                l_new += p;
+            }}
+
+            // Rescale existing O and accumulate P @ V
+            for (uint d = 0u; d < D; d++) {{
+                float o_val = tg_O[r * D + d] * exp_scale;
+                for (uint c = 0u; c < BC; c++) {{
+                    o_val += tg_S[r * BC + c] * tg_V[c * D + d];
+                }}
+                tg_O[r * D + d] = o_val;
+            }}
+
+            tg_m[r] = m_new;
+            tg_l[r] = l_new;
+        }}
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }}
+
+    // Final normalization: O = O / l
+    for (uint i = lid; i < BR * D; i += {block_size}u) {{
+        uint r = i / D;
+        float l_val = tg_l[r];
+        if (l_val > 0.0f) {{
+            tg_O[i] /= l_val;
+        }}
+    }}
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Write output
+    for (uint i = lid; i < BR * D; i += {block_size}u) {{
+        uint r = i / D;
+        uint c = i % D;
+        uint global_r = q_start + r;
+        if (global_r < seq_len) {{
+            O[head_offset + global_r * D + c] = tg_O[i];
+        }}
+    }}
+}}
+"""
 
 
 def make_simdgroup_matmul_kernel(dtype="fp32"):

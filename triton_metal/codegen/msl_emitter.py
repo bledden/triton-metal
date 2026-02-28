@@ -358,8 +358,9 @@ class MSLCodeGen:
         lines.append(") {")
 
         # Static threadgroup memory declarations
+        # Use compute type (float) for fp16/bf16 to avoid precision loss in reductions
         for tg_name, tg_dtype, tg_size in self.builder._threadgroup_arrays:
-            msl_ty = triton_type_to_msl(tg_dtype)
+            msl_ty = _msl_compute_type(tg_dtype)
             lines.append(f"    threadgroup {msl_ty} {tg_name}[{tg_size}];")
 
         # Body
@@ -607,6 +608,10 @@ def make_softmax_kernel(block_size=256, dtype="fp32"):
         dtype: Data type.
     """
     n_simd_groups = (block_size + 31) // 32
+    needs_cast = dtype in ("fp16", "bf16")
+    # Wrap buffer reads with float() for half types to avoid ambiguous overloads
+    read_input = "float(input[row_start + i])" if needs_cast else "input[row_start + i]"
+    store_ty = triton_type_to_msl(dtype)
 
     kb = KernelBuilder("softmax_kernel", block_size=block_size)
     kb.add_ptr_arg("input", dtype=dtype, const=True)
@@ -624,7 +629,7 @@ def make_softmax_kernel(block_size=256, dtype="fp32"):
     kb._var("local_max", "-INFINITY", ty="float")
     kb.raw_line(f"for (uint i = lid; i < n_cols; i += {block_size}) {{")
     kb.indent()
-    kb.raw_line("local_max = max(local_max, input[row_start + i]);")
+    kb.raw_line(f"local_max = max(local_max, {read_input});")
     kb.dedent()
     kb.raw_line("}")
 
@@ -642,8 +647,11 @@ def make_softmax_kernel(block_size=256, dtype="fp32"):
     kb._var("local_sum", "0.0f", ty="float")
     kb.raw_line(f"for (uint i = lid; i < n_cols; i += {block_size}) {{")
     kb.indent()
-    kb._var("e", "exp(input[row_start + i] - max_val)", ty="float")
-    kb.raw_line("output[row_start + i] = e;")
+    kb._var("e", f"exp({read_input} - max_val)", ty="float")
+    if needs_cast:
+        kb.raw_line(f"output[row_start + i] = {store_ty}(e);")
+    else:
+        kb.raw_line("output[row_start + i] = e;")
     kb.raw_line("local_sum += e;")
     kb.dedent()
     kb.raw_line("}")
@@ -661,7 +669,10 @@ def make_softmax_kernel(block_size=256, dtype="fp32"):
     # Pass 3: Normalize
     kb.raw_line(f"for (uint i = lid; i < n_cols; i += {block_size}) {{")
     kb.indent()
-    kb.raw_line("output[row_start + i] /= sum_val;")
+    if needs_cast:
+        kb.raw_line(f"output[row_start + i] = {store_ty}(float(output[row_start + i]) / sum_val);")
+    else:
+        kb.raw_line("output[row_start + i] /= sum_val;")
     kb.dedent()
     kb.raw_line("}")
 

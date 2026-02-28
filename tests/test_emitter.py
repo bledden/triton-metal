@@ -4782,3 +4782,123 @@ def test_fused_dropout_output(runner):
     for i in range(n):
         if mask[i] > 0.5:
             assert abs(result[i] - 2.0) < 0.01, f"i={i}: scaled={result[i]} != 2.0"
+
+
+# ---------------------------------------------------------------------------
+# FP16 softmax tests
+# ---------------------------------------------------------------------------
+
+@requires_metal
+def test_softmax_fp16(runner):
+    """FP16 softmax produces valid probability distributions."""
+    from triton_metal.codegen.msl_emitter import make_softmax_kernel
+    import Metal
+
+    n_rows = 2
+    n_cols = 8
+    n = n_rows * n_cols
+
+    msl = make_softmax_kernel(block_size=256, dtype="fp16")
+    path = runner.compile(msl, "softmax_kernel")
+    pipeline = runner.load(path, "softmax_kernel")
+
+    # Simple input: row 0 = [0,1,2,...,7], row 1 = [1,1,1,...,1]
+    data = list(range(n_cols)) + [1.0] * n_cols
+    inp_buf = runner.make_half_buffer(data)
+    out_buf = runner.make_empty_half_buffer(n)
+    ncols_buf = runner.make_uint_buffer(n_cols)
+
+    cmd = runner.queue.commandBuffer()
+    enc = cmd.computeCommandEncoderWithDescriptor_(
+        Metal.MTLComputePassDescriptor.computePassDescriptor()
+    )
+    enc.setComputePipelineState_(pipeline)
+    enc.setBuffer_offset_atIndex_(inp_buf, 0, 0)
+    enc.setBuffer_offset_atIndex_(out_buf, 0, 1)
+    enc.setBuffer_offset_atIndex_(ncols_buf, 0, 2)
+    enc.dispatchThreadgroups_threadsPerThreadgroup_(
+        Metal.MTLSizeMake(n_rows, 1, 1),
+        Metal.MTLSizeMake(256, 1, 1),
+    )
+    enc.endEncoding()
+    cmd.commit()
+    cmd.waitUntilCompleted()
+    assert cmd.status() == 4
+
+    result = runner.read_half_buffer(out_buf, n)
+
+    # Row 0: softmax of [0,1,...,7] — sum should be ~1.0
+    row0 = result[:n_cols]
+    row0_sum = sum(row0)
+    assert abs(row0_sum - 1.0) < 0.05, f"Row 0 sum = {row0_sum}, expected ~1.0"
+    assert all(v >= 0 for v in row0), "All softmax values should be non-negative"
+    # Last element should be largest
+    assert row0[-1] > row0[0], f"row0[-1]={row0[-1]} should be > row0[0]={row0[0]}"
+
+    # Row 1: uniform input → uniform output (each = 1/8 = 0.125)
+    row1 = result[n_cols:]
+    for i, v in enumerate(row1):
+        assert abs(v - 0.125) < 0.02, f"row1[{i}] = {v}, expected ~0.125"
+
+
+# ---------------------------------------------------------------------------
+# FP16 matmul tests
+# ---------------------------------------------------------------------------
+
+@requires_metal
+def test_matmul_fp16_identity(runner):
+    """FP16 matmul with identity matrix produces correct result."""
+    from triton_metal.codegen.msl_emitter import make_matmul_kernel
+    import Metal
+
+    M, N, K = 16, 16, 16
+
+    msl = make_matmul_kernel(block_m=16, block_n=16, block_k=16, dtype="fp16")
+    path = runner.compile(msl, "matmul_kernel")
+    pipeline = runner.load(path, "matmul_kernel")
+
+    # A = identity matrix, B = [1, 2, ..., 16] repeated as rows
+    a_data = []
+    for i in range(M):
+        for j in range(K):
+            a_data.append(1.0 if i == j else 0.0)
+
+    b_data = list(range(1, N + 1)) * K  # Each row is [1..N]
+
+    a_buf = runner.make_half_buffer(a_data)
+    b_buf = runner.make_half_buffer(b_data)
+    c_buf = runner.make_empty_half_buffer(M * N)
+    m_buf = runner.make_uint_buffer(M)
+    n_buf = runner.make_uint_buffer(N)
+    k_buf = runner.make_uint_buffer(K)
+
+    cmd = runner.queue.commandBuffer()
+    enc = cmd.computeCommandEncoderWithDescriptor_(
+        Metal.MTLComputePassDescriptor.computePassDescriptor()
+    )
+    enc.setComputePipelineState_(pipeline)
+    enc.setBuffer_offset_atIndex_(a_buf, 0, 0)
+    enc.setBuffer_offset_atIndex_(b_buf, 0, 1)
+    enc.setBuffer_offset_atIndex_(c_buf, 0, 2)
+    enc.setBuffer_offset_atIndex_(m_buf, 0, 3)
+    enc.setBuffer_offset_atIndex_(n_buf, 0, 4)
+    enc.setBuffer_offset_atIndex_(k_buf, 0, 5)
+    n_tiles = ((M + 15) // 16) * ((N + 15) // 16)
+    enc.dispatchThreadgroups_threadsPerThreadgroup_(
+        Metal.MTLSizeMake(n_tiles, 1, 1),
+        Metal.MTLSizeMake(16 * 16, 1, 1),
+    )
+    enc.endEncoding()
+    cmd.commit()
+    cmd.waitUntilCompleted()
+    assert cmd.status() == 4
+
+    result = runner.read_half_buffer(c_buf, M * N)
+
+    # C = I @ B = B → each row should be [1..N]
+    for row in range(M):
+        for col in range(N):
+            expected = float(col + 1)
+            actual = result[row * N + col]
+            assert abs(actual - expected) < 0.5, \
+                f"C[{row},{col}] = {actual}, expected {expected}"

@@ -5927,3 +5927,293 @@ def test_sliding_window_attention_gpu(runner):
     for d in range(head_dim):
         assert abs(result[d] - expected[d]) < 0.1, \
             f"dim {d}: got {result[d]}, expected {expected[d]}"
+
+
+# ---------------------------------------------------------------------------
+# Matmul and quantized kernel GPU tests
+# ---------------------------------------------------------------------------
+
+
+def _ref_matmul(A, B, M, N, K):
+    """Reference matmul: C[M,N] = A[M,K] @ B[K,N]. All flat lists."""
+    C = [0.0] * (M * N)
+    for i in range(M):
+        for j in range(N):
+            acc = 0.0
+            for k in range(K):
+                acc += A[i * K + k] * B[k * N + j]
+            C[i * N + j] = acc
+    return C
+
+
+@requires_metal
+def test_matmul_gpu(runner):
+    """Tiled matmul kernel: C = A @ B validated against reference."""
+    import Metal
+    from triton_metal.codegen.msl_emitter import make_matmul_kernel
+
+    M, N, K = 8, 8, 8
+    block_m, block_n, block_k = 8, 8, 8
+
+    random.seed(42)
+    A = [random.gauss(0, 1) for _ in range(M * K)]
+    B = [random.gauss(0, 1) for _ in range(K * N)]
+    expected = _ref_matmul(A, B, M, N, K)
+
+    msl = make_matmul_kernel(block_m=block_m, block_n=block_n, block_k=block_k)
+    path = runner.compile(msl, "matmul_kernel")
+    pipeline = runner.load(path, "matmul_kernel")
+
+    a_buf = runner.make_float_buffer(A)
+    b_buf = runner.make_float_buffer(B)
+    c_buf = runner.make_empty_buffer(M * N)
+    m_buf = runner.make_uint_buffer(M)
+    n_buf = runner.make_uint_buffer(N)
+    k_buf = runner.make_uint_buffer(K)
+
+    block_size = block_m * block_n
+    n_tile_cols = (N + block_n - 1) // block_n
+    n_tile_rows = (M + block_m - 1) // block_m
+    n_threadgroups = n_tile_rows * n_tile_cols
+
+    cmd = runner.queue.commandBuffer()
+    enc = cmd.computeCommandEncoder()
+    enc.setComputePipelineState_(pipeline)
+    for i, buf in enumerate([a_buf, b_buf, c_buf, m_buf, n_buf, k_buf]):
+        enc.setBuffer_offset_atIndex_(buf, 0, i)
+    enc.dispatchThreadgroups_threadsPerThreadgroup_(
+        Metal.MTLSizeMake(n_threadgroups, 1, 1),
+        Metal.MTLSizeMake(block_size, 1, 1),
+    )
+    enc.endEncoding()
+    cmd.commit()
+    cmd.waitUntilCompleted()
+    assert cmd.status() == 4
+
+    result = runner.read_float_buffer(c_buf, M * N)
+    for i in range(M * N):
+        assert abs(result[i] - expected[i]) < 0.01, \
+            f"idx {i}: got {result[i]}, expected {expected[i]}"
+
+
+@requires_metal
+def test_matmul_non_square_gpu(runner):
+    """Matmul with non-square dimensions: M=4, N=8, K=16."""
+    import Metal
+    from triton_metal.codegen.msl_emitter import make_matmul_kernel
+
+    M, N, K = 4, 8, 16
+    block_m, block_n, block_k = 8, 8, 8
+
+    random.seed(101)
+    A = [random.gauss(0, 0.5) for _ in range(M * K)]
+    B = [random.gauss(0, 0.5) for _ in range(K * N)]
+    expected = _ref_matmul(A, B, M, N, K)
+
+    msl = make_matmul_kernel(block_m=block_m, block_n=block_n, block_k=block_k)
+    path = runner.compile(msl, "matmul_kernel")
+    pipeline = runner.load(path, "matmul_kernel")
+
+    a_buf = runner.make_float_buffer(A)
+    b_buf = runner.make_float_buffer(B)
+    c_buf = runner.make_empty_buffer(M * N)
+    m_buf = runner.make_uint_buffer(M)
+    n_buf = runner.make_uint_buffer(N)
+    k_buf = runner.make_uint_buffer(K)
+
+    block_size = block_m * block_n
+    n_tile_cols = (N + block_n - 1) // block_n
+    n_tile_rows = (M + block_m - 1) // block_m
+    n_threadgroups = n_tile_rows * n_tile_cols
+
+    cmd = runner.queue.commandBuffer()
+    enc = cmd.computeCommandEncoder()
+    enc.setComputePipelineState_(pipeline)
+    for i, buf in enumerate([a_buf, b_buf, c_buf, m_buf, n_buf, k_buf]):
+        enc.setBuffer_offset_atIndex_(buf, 0, i)
+    enc.dispatchThreadgroups_threadsPerThreadgroup_(
+        Metal.MTLSizeMake(n_threadgroups, 1, 1),
+        Metal.MTLSizeMake(block_size, 1, 1),
+    )
+    enc.endEncoding()
+    cmd.commit()
+    cmd.waitUntilCompleted()
+    assert cmd.status() == 4
+
+    result = runner.read_float_buffer(c_buf, M * N)
+    for i in range(M * N):
+        assert abs(result[i] - expected[i]) < 0.05, \
+            f"idx {i}: got {result[i]}, expected {expected[i]}"
+
+
+@requires_metal
+def test_simdgroup_matmul_gpu(runner):
+    """simdgroup_matrix matmul: hardware-accelerated 8x8 MMA tiles."""
+    import Metal
+    from triton_metal.codegen.msl_emitter import make_simdgroup_matmul_kernel
+
+    # simdgroup matmul requires M,N multiples of 32
+    M, N, K = 32, 32, 32
+
+    random.seed(88)
+    A = [random.gauss(0, 0.5) for _ in range(M * K)]
+    B = [random.gauss(0, 0.5) for _ in range(K * N)]
+    expected = _ref_matmul(A, B, M, N, K)
+
+    msl = make_simdgroup_matmul_kernel(dtype="fp32")
+    path = runner.compile(msl, "simdgroup_matmul")
+    pipeline = runner.load(path, "simdgroup_matmul")
+
+    a_buf = runner.make_float_buffer(A)
+    b_buf = runner.make_float_buffer(B)
+    c_buf = runner.make_empty_buffer(M * N)
+    m_buf = runner.make_uint_buffer(M)
+    n_buf = runner.make_uint_buffer(N)
+    k_buf = runner.make_uint_buffer(K)
+
+    # simdgroup_matmul uses block_size=128, 32x32 tiles
+    block_size = 128
+    n_tile_cols = (N + 31) // 32
+    n_tile_rows = (M + 31) // 32
+    n_threadgroups = n_tile_rows * n_tile_cols
+
+    cmd = runner.queue.commandBuffer()
+    enc = cmd.computeCommandEncoder()
+    enc.setComputePipelineState_(pipeline)
+    for i, buf in enumerate([a_buf, b_buf, c_buf, m_buf, n_buf, k_buf]):
+        enc.setBuffer_offset_atIndex_(buf, 0, i)
+    enc.dispatchThreadgroups_threadsPerThreadgroup_(
+        Metal.MTLSizeMake(n_threadgroups, 1, 1),
+        Metal.MTLSizeMake(block_size, 1, 1),
+    )
+    enc.endEncoding()
+    cmd.commit()
+    cmd.waitUntilCompleted()
+    assert cmd.status() == 4
+
+    result = runner.read_float_buffer(c_buf, M * N)
+    for i in range(M * N):
+        assert abs(result[i] - expected[i]) < 0.1, \
+            f"idx {i}: got {result[i]}, expected {expected[i]}"
+
+
+@requires_metal
+def test_int8_matmul_gpu(runner):
+    """INT8 quantized matmul: float input @ dequant(int8 weight)."""
+    import Metal
+    import struct as _struct
+    from triton_metal.codegen.msl_emitter import make_int8_matmul_kernel
+
+    M, N, K = 2, 4, 8
+
+    random.seed(66)
+    input_data = [random.gauss(0, 1) for _ in range(M * K)]
+    # INT8 weights: values in [-128, 127]
+    weight_int8 = [random.randint(-5, 5) for _ in range(N * K)]
+    # Per-row scale and zero point
+    scales = [random.uniform(0.1, 0.5) for _ in range(N)]
+    zeros = [random.uniform(-1, 1) for _ in range(N)]
+
+    # Reference: dequantize and matmul
+    expected = [0.0] * (M * N)
+    for i in range(M):
+        for j in range(N):
+            acc = 0.0
+            for k in range(K):
+                w_float = (float(weight_int8[j * K + k]) - zeros[j]) * scales[j]
+                acc += input_data[i * K + k] * w_float
+            expected[i * N + j] = acc
+
+    msl = make_int8_matmul_kernel()
+    path = runner.compile(msl, "int8_matmul")
+    pipeline = runner.load(path, "int8_matmul")
+
+    in_buf = runner.make_float_buffer(input_data)
+    # Pack weight as signed chars
+    w_buf = runner.device.newBufferWithLength_options_(
+        N * K, Metal.MTLResourceStorageModeShared
+    )
+    w_view = w_buf.contents().as_buffer(N * K)
+    for i, v in enumerate(weight_int8):
+        _struct.pack_into("b", w_view, i, v)
+    out_buf = runner.make_empty_buffer(M * N)
+    s_buf = runner.make_float_buffer(scales)
+    z_buf = runner.make_float_buffer(zeros)
+    m_buf = runner.make_uint_buffer(M)
+    n_buf = runner.make_uint_buffer(N)
+    k_buf = runner.make_uint_buffer(K)
+
+    n_elements = M * N
+    runner.run(pipeline, [in_buf, w_buf, out_buf, s_buf, z_buf,
+                          m_buf, n_buf, k_buf], n_elements, block_size=256)
+
+    result = runner.read_float_buffer(out_buf, M * N)
+    for i in range(M * N):
+        assert abs(result[i] - expected[i]) < 0.01, \
+            f"idx {i}: got {result[i]}, expected {expected[i]}"
+
+
+@requires_metal
+def test_int4_matmul_gpu(runner):
+    """INT4 quantized matmul: float input @ dequant(int4 weight)."""
+    import Metal
+    import struct as _struct
+    from triton_metal.codegen.msl_emitter import make_int4_matmul_kernel
+
+    M, N, K = 2, 4, 8
+    group_size = 8  # all K elements in one group for simplicity
+
+    random.seed(44)
+    input_data = [random.gauss(0, 1) for _ in range(M * K)]
+    # INT4 weights: values 0-15 (unsigned 4-bit)
+    weight_int4 = [random.randint(0, 15) for _ in range(N * K)]
+    n_groups = (K + group_size - 1) // group_size
+    scales = [random.uniform(0.1, 0.5) for _ in range(N * n_groups)]
+    zeros = [random.uniform(0, 8) for _ in range(N * n_groups)]
+
+    # Reference: dequantize and matmul
+    expected = [0.0] * (M * N)
+    for i in range(M):
+        for j in range(N):
+            acc = 0.0
+            for k in range(K):
+                g = k // group_size
+                s = scales[j * n_groups + g]
+                z = zeros[j * n_groups + g]
+                w = (float(weight_int4[j * K + k]) - z) * s
+                acc += input_data[i * K + k] * w
+            expected[i * N + j] = acc
+
+    msl = make_int4_matmul_kernel(group_size=group_size)
+    path = runner.compile(msl, "int4_matmul")
+    pipeline = runner.load(path, "int4_matmul")
+
+    in_buf = runner.make_float_buffer(input_data)
+    # Pack as pairs of int4 into bytes
+    n_bytes = N * (K // 2)
+    w_buf = runner.device.newBufferWithLength_options_(
+        n_bytes, Metal.MTLResourceStorageModeShared
+    )
+    w_view = w_buf.contents().as_buffer(n_bytes)
+    for j in range(N):
+        for k in range(0, K, 2):
+            lo = weight_int4[j * K + k] & 0x0F
+            hi = weight_int4[j * K + k + 1] & 0x0F
+            packed = lo | (hi << 4)
+            byte_idx = j * (K // 2) + k // 2
+            _struct.pack_into("B", w_view, byte_idx, packed)
+    out_buf = runner.make_empty_buffer(M * N)
+    s_buf = runner.make_float_buffer(scales)
+    z_buf = runner.make_float_buffer(zeros)
+    m_buf = runner.make_uint_buffer(M)
+    n_buf = runner.make_uint_buffer(N)
+    k_buf = runner.make_uint_buffer(K)
+
+    n_elements = M * N
+    runner.run(pipeline, [in_buf, w_buf, out_buf, s_buf, z_buf,
+                          m_buf, n_buf, k_buf], n_elements, block_size=256)
+
+    result = runner.read_float_buffer(out_buf, M * N)
+    for i in range(M * N):
+        assert abs(result[i] - expected[i]) < 0.1, \
+            f"idx {i}: got {result[i]}, expected {expected[i]}"

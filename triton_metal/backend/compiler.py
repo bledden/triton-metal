@@ -178,26 +178,44 @@ class MetalBackend(BaseBackend):
             f.write(src)
 
         # Compile MSL -> AIR
-        subprocess.check_call(
-            [
-                "xcrun", "-sdk", "macosx", "metal",
-                "-c", metal_path,
-                "-o", air_path,
-                "-std=metal3.2",
-                "-O2",
-            ],
-            stderr=subprocess.PIPE,
-        )
+        try:
+            subprocess.run(
+                [
+                    "xcrun", "-sdk", "macosx", "metal",
+                    "-c", metal_path,
+                    "-o", air_path,
+                    "-std=metal3.2",
+                    "-O2",
+                ],
+                capture_output=True,
+                check=True,
+            )
+        except subprocess.CalledProcessError as e:
+            stderr = e.stderr.decode("utf-8", errors="replace") if e.stderr else ""
+            raise RuntimeError(
+                f"Metal shader compilation failed (exit {e.returncode}):\n"
+                f"{stderr}\n"
+                f"Source file: {metal_path}"
+            ) from None
 
         # Link AIR -> metallib
-        subprocess.check_call(
-            [
-                "xcrun", "-sdk", "macosx", "metallib",
-                air_path,
-                "-o", metallib_path,
-            ],
-            stderr=subprocess.PIPE,
-        )
+        try:
+            subprocess.run(
+                [
+                    "xcrun", "-sdk", "macosx", "metallib",
+                    air_path,
+                    "-o", metallib_path,
+                ],
+                capture_output=True,
+                check=True,
+            )
+        except subprocess.CalledProcessError as e:
+            stderr = e.stderr.decode("utf-8", errors="replace") if e.stderr else ""
+            raise RuntimeError(
+                f"Metal library linking failed (exit {e.returncode}):\n"
+                f"{stderr}\n"
+                f"AIR file: {air_path}"
+            ) from None
 
         return metallib_path
 

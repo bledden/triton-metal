@@ -19,6 +19,7 @@ MLIR bindings don't expose a structured walk API.
 """
 
 import re
+import warnings
 from collections import OrderedDict
 
 from triton_metal.codegen.msl_emitter import KernelBuilder
@@ -717,7 +718,29 @@ class TTGIRParser:
         if act:
             return self._build_activation_kernel(kb, act, primary_dtype)
 
-        # Standard elementwise pattern
+        # Standard elementwise fallback — no specific pattern matched.
+        # Only warn if the kernel looks like it might NOT be a simple elementwise
+        # (multiple outputs, reductions, dots, or many scalar args suggest complexity).
+        n_outputs = sum(1 for _, (_, _, o) in self.ptr_args.items() if o)
+        n_inputs = len(self.ptr_args) - n_outputs
+        ssa_ops = {v[0] for v in self.ssa_values.values()} if self.ssa_values else set()
+        suspicious = (
+            n_outputs > 1
+            or len(self.reduce_ops) > 0
+            or len(self.dot_ops) > 0
+            or len(self.scalar_args) > 2
+            or n_inputs > 4
+        )
+        if suspicious:
+            warnings.warn(
+                f"TTGIR pattern not recognized for kernel '{self.kernel_name}'. "
+                f"Falling back to generic elementwise codegen. "
+                f"SSA ops: {sorted(ssa_ops)}. "
+                f"Ptrs: {len(self.ptr_args)} ({n_outputs} out). "
+                f"Reductions: {len(self.reduce_ops)}. Dots: {len(self.dot_ops)}. "
+                f"This kernel may produce incorrect results.",
+                stacklevel=2,
+            )
         offsets = kb.make_block_offsets("pid", "offsets")
         if n_arg:
             mask = kb.make_mask(offsets, n_arg, "mask")
@@ -745,10 +768,14 @@ class TTGIRParser:
     def _build_reduction_kernel(self, kb, n_arg, primary_dtype):
         """Generate a reduction kernel using threadgroup reduce pattern.
 
-        Uses strided accumulation (each thread loops over elements) followed
-        by two-level threadgroup reduction (SIMD intrinsics + shared memory).
+        Supports both 1D reductions (whole-tensor → scalar per program) and
+        2D axis-aware reductions (reduce along rows or columns).
+
+        For axis=1 (row-wise): each program reduces one row of length n_arg.
+        For axis=0 (column-wise): each program reduces one column across n_rows.
+        For 1D (axis=0 single-dim): standard strided accumulation + threadgroup reduce.
         """
-        reduce_result_ssa, reduce_input_ssa, reduce_op, _ = self.reduce_ops[0]
+        reduce_result_ssa, reduce_input_ssa, reduce_op, axis = self.reduce_ops[0]
 
         # Find the input pointer for the reduction
         input_arg = None
@@ -768,6 +795,15 @@ class TTGIRParser:
             # Fallback: can't generate reduction, return empty kernel
             return kb
 
+        # Check if we have a second dimension argument (n_rows or n_cols)
+        n_rows_arg = None
+        n_cols_arg = None
+        scalar_args_list = list(self.scalar_args.items())
+        if len(scalar_args_list) >= 2:
+            # Convention: first scalar is n_rows/n_elements, second is n_cols
+            n_rows_arg = scalar_args_list[0][0]
+            n_cols_arg = scalar_args_list[1][0]
+
         # Shared memory for cross-SIMD-group reduction
         n_simd_groups = (kb.block_size + 31) // 32
         kb.declare_threadgroup_array("shared", dtype=primary_dtype, size=n_simd_groups)
@@ -779,14 +815,63 @@ class TTGIRParser:
         # Check if there's a pre-reduce computation (e.g., exp, mul before sum)
         pre_reduce_op = self._find_pre_reduce_op(reduce_input_ssa)
 
-        # Strided accumulation loop
-        kb._var("acc", identity, ty="float")
-        kb.raw_line(f"for (uint i = lid; i < {n_arg}; i += {kb.block_size}u) {{")
-        kb.indent()
-        kb._var("idx", f"pid * {n_arg} + i", ty="uint")
+        # Determine if this is a 2D reduction with explicit axis
+        is_2d = n_rows_arg is not None and n_cols_arg is not None and axis in (0, 1)
 
+        if is_2d and axis == 1:
+            # Row-wise reduction: each program handles one row
+            # pid indexes rows, reduce across n_cols columns
+            kb._var("row", "pid", ty="uint")
+            kb._var("acc", identity, ty="float")
+            kb.raw_line(f"for (uint c = lid; c < {n_cols_arg}; c += {kb.block_size}u) {{")
+            kb.indent()
+            kb._var("idx", f"row * {n_cols_arg} + c", ty="uint")
+            self._emit_reduce_element(kb, input_arg, pre_reduce_op)
+            self._emit_reduce_combine(kb, combine)
+            kb.dedent()
+            kb.raw_line("}")
+            kb.threadgroup_reduce(reduce_op, "acc", "shared", "total")
+            kb.begin_if("lid == 0")
+            kb.raw_line(f"{output_arg}[row] = total;")
+            kb.end_block()
+
+        elif is_2d and axis == 0:
+            # Column-wise reduction: each program handles one column
+            # pid indexes columns, reduce across n_rows rows
+            kb._var("col", "pid", ty="uint")
+            kb._var("acc", identity, ty="float")
+            kb.raw_line(f"for (uint r = lid; r < {n_rows_arg}; r += {kb.block_size}u) {{")
+            kb.indent()
+            kb._var("idx", f"r * {n_cols_arg} + col", ty="uint")
+            self._emit_reduce_element(kb, input_arg, pre_reduce_op)
+            self._emit_reduce_combine(kb, combine)
+            kb.dedent()
+            kb.raw_line("}")
+            kb.threadgroup_reduce(reduce_op, "acc", "shared", "total")
+            kb.begin_if("lid == 0")
+            kb.raw_line(f"{output_arg}[col] = total;")
+            kb.end_block()
+
+        else:
+            # Standard 1D reduction: each program reduces a contiguous block
+            kb._var("acc", identity, ty="float")
+            kb.raw_line(f"for (uint i = lid; i < {n_arg}; i += {kb.block_size}u) {{")
+            kb.indent()
+            kb._var("idx", f"pid * {n_arg} + i", ty="uint")
+            self._emit_reduce_element(kb, input_arg, pre_reduce_op)
+            self._emit_reduce_combine(kb, combine)
+            kb.dedent()
+            kb.raw_line("}")
+            kb.threadgroup_reduce(reduce_op, "acc", "shared", "total")
+            kb.begin_if("lid == 0")
+            kb.raw_line(f"{output_arg}[pid] = total;")
+            kb.end_block()
+
+        return kb
+
+    def _emit_reduce_element(self, kb, input_arg, pre_reduce_op):
+        """Emit the per-element load + optional transform for reductions."""
         if pre_reduce_op:
-            # Apply pre-reduce operation to each element
             op_kind, op_args = pre_reduce_op
             kb._var("loaded", f"{input_arg}[idx]", ty="float")
             if op_kind in ("exp", "log", "sqrt", "abs"):
@@ -794,26 +879,16 @@ class TTGIRParser:
             elif op_kind in ("mul",) and len(op_args) == 2:
                 kb._var("elem", f"loaded * loaded", ty="float")  # square
             else:
-                kb.raw_line(f"float elem = loaded;")
+                kb.raw_line("float elem = loaded;")
         else:
             kb._var("elem", f"{input_arg}[idx]", ty="float")
 
+    def _emit_reduce_combine(self, kb, combine):
+        """Emit the accumulation step for reductions."""
         if combine == "+":
             kb.raw_line("acc += elem;")
         else:
             kb.raw_line(f"acc = {combine}(acc, elem);")
-        kb.dedent()
-        kb.raw_line("}")
-
-        # Two-level threadgroup reduction
-        kb.threadgroup_reduce(reduce_op, "acc", "shared", "total")
-
-        # Thread 0 writes result
-        kb.begin_if("lid == 0")
-        kb.raw_line(f"{output_arg}[pid] = total;")
-        kb.end_block()
-
-        return kb
 
     def _is_softmax_pattern(self):
         """Check if multi-reduce pattern matches softmax (max + sum)."""
@@ -1981,6 +2056,11 @@ class TTGIRParser:
         if op == "loop_iv":
             return ssa.lstrip("%")
 
+        warnings.warn(
+            f"Unknown SSA op '{op}' for value {ssa} in kernel '{self.kernel_name}'. "
+            f"Substituting 0.0f — this will produce incorrect results.",
+            stacklevel=2,
+        )
         return "0.0f"
 
 

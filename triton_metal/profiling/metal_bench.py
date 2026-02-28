@@ -13,9 +13,12 @@ def metal_do_bench(fn, *, quantiles=None, warmup=25, rep=100, **kwargs):
     Compatible with Triton's benchmarker interface (registered via
     MetalDriver.get_benchmarker()).
 
+    Uses MTLCommandBuffer.GPUStartTime/GPUEndTime when the function
+    returns a command buffer, otherwise falls back to wall-clock timing.
+
     Args:
-        fn: Callable to benchmark. Should dispatch Metal work and
-            call waitUntilCompleted() internally.
+        fn: Callable to benchmark. Should dispatch Metal work.
+            If it returns a MTLCommandBuffer, GPU timestamps are used.
         quantiles: List of quantiles to return (e.g. [0.5, 0.2, 0.8]).
             If None, returns the median time.
         warmup: Number of warmup iterations.
@@ -25,15 +28,27 @@ def metal_do_bench(fn, *, quantiles=None, warmup=25, rep=100, **kwargs):
         If quantiles is None: median time in milliseconds.
         Otherwise: list of times in ms corresponding to each quantile.
     """
+    # Warmup
     for _ in range(warmup):
         fn()
 
     times = []
     for _ in range(rep):
-        start = time.perf_counter()
-        fn()
-        end = time.perf_counter()
-        times.append((end - start) * 1000.0)
+        result = fn()
+        # If fn returns a command buffer, use GPU timestamps
+        if result is not None and hasattr(result, "GPUStartTime"):
+            gpu_start = result.GPUStartTime()
+            gpu_end = result.GPUEndTime()
+            if gpu_end > gpu_start:
+                times.append((gpu_end - gpu_start) * 1000.0)
+                continue
+        # Fallback: wall-clock timing (re-run since we already called fn)
+        if not times or (result is None or not hasattr(result, "GPUStartTime")):
+            # For wall-clock mode, we need to re-measure properly
+            start = time.perf_counter()
+            fn()
+            end = time.perf_counter()
+            times.append((end - start) * 1000.0)
 
     times.sort()
     if quantiles is None:

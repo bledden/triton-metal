@@ -6217,3 +6217,160 @@ def test_int4_matmul_gpu(runner):
     for i in range(M * N):
         assert abs(result[i] - expected[i]) < 0.1, \
             f"idx {i}: got {result[i]}, expected {expected[i]}"
+
+
+# ---------------------------------------------------------------------------
+# 2D axis-aware reduction tests
+# ---------------------------------------------------------------------------
+
+@requires_metal
+def test_row_reduce_sum_gpu(runner):
+    """Row-wise sum: output[row] = sum(input[row, :])"""
+    from triton_metal.codegen.msl_emitter import make_row_reduce_kernel
+    import Metal
+
+    n_rows, n_cols = 8, 64
+    msl = make_row_reduce_kernel("row_sum", "sum", block_size=256)
+    path = runner.compile(msl, "row_sum")
+    pipeline = runner.load(path, "row_sum")
+
+    random.seed(99)
+    data = [random.uniform(-10.0, 10.0) for _ in range(n_rows * n_cols)]
+    in_buf = runner.make_float_buffer(data)
+    out_buf = runner.make_empty_buffer(n_rows)
+    nr_buf = runner.make_uint_buffer(n_rows)
+    nc_buf = runner.make_uint_buffer(n_cols)
+
+    # Dispatch one threadgroup per row
+    cmd = runner.queue.commandBuffer()
+    enc = cmd.computeCommandEncoder()
+    enc.setComputePipelineState_(pipeline)
+    for i, buf in enumerate([in_buf, out_buf, nr_buf, nc_buf]):
+        enc.setBuffer_offset_atIndex_(buf, 0, i)
+    enc.dispatchThreadgroups_threadsPerThreadgroup_(
+        Metal.MTLSizeMake(n_rows, 1, 1),
+        Metal.MTLSizeMake(256, 1, 1),
+    )
+    enc.endEncoding()
+    cmd.commit()
+    cmd.waitUntilCompleted()
+
+    result = runner.read_float_buffer(out_buf, n_rows)
+    for r in range(n_rows):
+        expected = sum(data[r * n_cols:(r + 1) * n_cols])
+        assert abs(result[r] - expected) < 0.5, \
+            f"row {r}: got {result[r]}, expected {expected}"
+
+
+@requires_metal
+def test_row_reduce_max_gpu(runner):
+    """Row-wise max: output[row] = max(input[row, :])"""
+    from triton_metal.codegen.msl_emitter import make_row_reduce_kernel
+    import Metal
+
+    n_rows, n_cols = 4, 128
+    msl = make_row_reduce_kernel("row_max", "max", block_size=256)
+    path = runner.compile(msl, "row_max")
+    pipeline = runner.load(path, "row_max")
+
+    random.seed(100)
+    data = [random.uniform(-50.0, 50.0) for _ in range(n_rows * n_cols)]
+    in_buf = runner.make_float_buffer(data)
+    out_buf = runner.make_empty_buffer(n_rows)
+    nr_buf = runner.make_uint_buffer(n_rows)
+    nc_buf = runner.make_uint_buffer(n_cols)
+
+    cmd = runner.queue.commandBuffer()
+    enc = cmd.computeCommandEncoder()
+    enc.setComputePipelineState_(pipeline)
+    for i, buf in enumerate([in_buf, out_buf, nr_buf, nc_buf]):
+        enc.setBuffer_offset_atIndex_(buf, 0, i)
+    enc.dispatchThreadgroups_threadsPerThreadgroup_(
+        Metal.MTLSizeMake(n_rows, 1, 1),
+        Metal.MTLSizeMake(256, 1, 1),
+    )
+    enc.endEncoding()
+    cmd.commit()
+    cmd.waitUntilCompleted()
+
+    result = runner.read_float_buffer(out_buf, n_rows)
+    for r in range(n_rows):
+        expected = max(data[r * n_cols:(r + 1) * n_cols])
+        assert abs(result[r] - expected) < 1e-3, \
+            f"row {r}: got {result[r]}, expected {expected}"
+
+
+@requires_metal
+def test_col_reduce_sum_gpu(runner):
+    """Column-wise sum: output[col] = sum(input[:, col])"""
+    from triton_metal.codegen.msl_emitter import make_col_reduce_kernel
+    import Metal
+
+    n_rows, n_cols = 32, 16
+    msl = make_col_reduce_kernel("col_sum", "sum", block_size=256)
+    path = runner.compile(msl, "col_sum")
+    pipeline = runner.load(path, "col_sum")
+
+    random.seed(101)
+    data = [random.uniform(-10.0, 10.0) for _ in range(n_rows * n_cols)]
+    in_buf = runner.make_float_buffer(data)
+    out_buf = runner.make_empty_buffer(n_cols)
+    nr_buf = runner.make_uint_buffer(n_rows)
+    nc_buf = runner.make_uint_buffer(n_cols)
+
+    cmd = runner.queue.commandBuffer()
+    enc = cmd.computeCommandEncoder()
+    enc.setComputePipelineState_(pipeline)
+    for i, buf in enumerate([in_buf, out_buf, nr_buf, nc_buf]):
+        enc.setBuffer_offset_atIndex_(buf, 0, i)
+    enc.dispatchThreadgroups_threadsPerThreadgroup_(
+        Metal.MTLSizeMake(n_cols, 1, 1),
+        Metal.MTLSizeMake(256, 1, 1),
+    )
+    enc.endEncoding()
+    cmd.commit()
+    cmd.waitUntilCompleted()
+
+    result = runner.read_float_buffer(out_buf, n_cols)
+    for c in range(n_cols):
+        expected = sum(data[r * n_cols + c] for r in range(n_rows))
+        assert abs(result[c] - expected) < 0.5, \
+            f"col {c}: got {result[c]}, expected {expected}"
+
+
+@requires_metal
+def test_col_reduce_min_gpu(runner):
+    """Column-wise min: output[col] = min(input[:, col])"""
+    from triton_metal.codegen.msl_emitter import make_col_reduce_kernel
+    import Metal
+
+    n_rows, n_cols = 16, 8
+    msl = make_col_reduce_kernel("col_min", "min", block_size=256)
+    path = runner.compile(msl, "col_min")
+    pipeline = runner.load(path, "col_min")
+
+    random.seed(102)
+    data = [random.uniform(-100.0, 100.0) for _ in range(n_rows * n_cols)]
+    in_buf = runner.make_float_buffer(data)
+    out_buf = runner.make_empty_buffer(n_cols)
+    nr_buf = runner.make_uint_buffer(n_rows)
+    nc_buf = runner.make_uint_buffer(n_cols)
+
+    cmd = runner.queue.commandBuffer()
+    enc = cmd.computeCommandEncoder()
+    enc.setComputePipelineState_(pipeline)
+    for i, buf in enumerate([in_buf, out_buf, nr_buf, nc_buf]):
+        enc.setBuffer_offset_atIndex_(buf, 0, i)
+    enc.dispatchThreadgroups_threadsPerThreadgroup_(
+        Metal.MTLSizeMake(n_cols, 1, 1),
+        Metal.MTLSizeMake(256, 1, 1),
+    )
+    enc.endEncoding()
+    cmd.commit()
+    cmd.waitUntilCompleted()
+
+    result = runner.read_float_buffer(out_buf, n_cols)
+    for c in range(n_cols):
+        expected = min(data[r * n_cols + c] for r in range(n_rows))
+        assert abs(result[c] - expected) < 1e-3, \
+            f"col {c}: got {result[c]}, expected {expected}"

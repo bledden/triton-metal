@@ -178,11 +178,27 @@ class MetalLauncher:
                 nbytes = arg.nelement() * arg.element_size()
                 buf = self.utils.make_buffer_from_ptr(ptr, nbytes)
                 buffers.append((buf, 0))
-            elif isinstance(arg, int):
-                # Pack scalar into a small Metal buffer.
+            elif isinstance(arg, bool):
+                # Pack bool as 1-byte int (matches i1 → int8_t mapping).
                 buf = self.utils.make_buffer(4)
                 view = buf.contents().as_buffer(4)
-                struct.pack_into("I", view, 0, arg)
+                struct.pack_into("i", view, 0, int(arg))
+                buffers.append((buf, 0))
+            elif isinstance(arg, int):
+                # Dtype-aware packing: use 8 bytes for values outside
+                # 32-bit unsigned range, signed packing for negatives.
+                if arg < 0 or arg > 0xFFFFFFFF:
+                    buf = self.utils.make_buffer(8)
+                    view = buf.contents().as_buffer(8)
+                    struct.pack_into("q", view, 0, arg)  # int64_t
+                elif arg < 0:
+                    buf = self.utils.make_buffer(4)
+                    view = buf.contents().as_buffer(4)
+                    struct.pack_into("i", view, 0, arg)  # int32_t (signed)
+                else:
+                    buf = self.utils.make_buffer(4)
+                    view = buf.contents().as_buffer(4)
+                    struct.pack_into("I", view, 0, arg)  # uint32_t
                 buffers.append((buf, 0))
             elif isinstance(arg, float):
                 buf = self.utils.make_buffer(4)

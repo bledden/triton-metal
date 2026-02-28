@@ -598,6 +598,112 @@ def make_reduce_kernel(name, op, block_size=256, dtype="fp32"):
     return kb.build()
 
 
+def make_row_reduce_kernel(name, op, block_size=256, dtype="fp32"):
+    """Generate a row-wise 2D reduction: output[row] = reduce(input[row, :]).
+
+    Each threadgroup processes one row. Dispatch n_rows threadgroups.
+
+    Args:
+        name: Kernel function name.
+        op: Reduction operation ("sum", "max", "min").
+        block_size: Threads per threadgroup.
+        dtype: Data type.
+    """
+    n_simd_groups = (block_size + 31) // 32
+
+    kb = KernelBuilder(name, block_size=block_size)
+    kb.add_ptr_arg("input", dtype=dtype, const=True)
+    kb.add_ptr_arg("output", dtype=dtype, const=False)
+    kb.add_scalar_arg("n_rows", dtype="u32")
+    kb.add_scalar_arg("n_cols", dtype="u32")
+
+    kb.declare_threadgroup_array("shared", dtype=dtype, size=n_simd_groups)
+
+    identity = {"sum": "0.0f", "max": "-INFINITY", "min": "INFINITY"}[op]
+    combine = {"sum": "+", "max": "max", "min": "min"}[op]
+
+    kb._var("row", "pid", ty="uint")
+    kb.begin_if("row >= n_rows")
+    kb.raw_line("return;")
+    kb.end_block()
+
+    kb._var("acc", identity, ty="float")
+    kb.raw_line(f"for (uint c = lid; c < n_cols; c += {block_size}u) {{")
+    kb.indent()
+    kb._var("idx", "row * n_cols + c", ty="uint")
+    if combine in ("+",):
+        kb.raw_line("acc += float(input[idx]);")
+    else:
+        kb.raw_line(f"acc = {combine}(acc, float(input[idx]));")
+    kb.dedent()
+    kb.raw_line("}")
+
+    kb.threadgroup_reduce(op, "acc", "shared", "total")
+
+    kb.begin_if("lid == 0")
+    if dtype in ("fp16", "bf16"):
+        store_ty = triton_type_to_msl(dtype)
+        kb.raw_line(f"output[row] = {store_ty}(total);")
+    else:
+        kb.raw_line("output[row] = total;")
+    kb.end_block()
+
+    return kb.build()
+
+
+def make_col_reduce_kernel(name, op, block_size=256, dtype="fp32"):
+    """Generate a column-wise 2D reduction: output[col] = reduce(input[:, col]).
+
+    Each threadgroup processes one column. Dispatch n_cols threadgroups.
+
+    Args:
+        name: Kernel function name.
+        op: Reduction operation ("sum", "max", "min").
+        block_size: Threads per threadgroup.
+        dtype: Data type.
+    """
+    n_simd_groups = (block_size + 31) // 32
+
+    kb = KernelBuilder(name, block_size=block_size)
+    kb.add_ptr_arg("input", dtype=dtype, const=True)
+    kb.add_ptr_arg("output", dtype=dtype, const=False)
+    kb.add_scalar_arg("n_rows", dtype="u32")
+    kb.add_scalar_arg("n_cols", dtype="u32")
+
+    kb.declare_threadgroup_array("shared", dtype=dtype, size=n_simd_groups)
+
+    identity = {"sum": "0.0f", "max": "-INFINITY", "min": "INFINITY"}[op]
+    combine = {"sum": "+", "max": "max", "min": "min"}[op]
+
+    kb._var("col", "pid", ty="uint")
+    kb.begin_if("col >= n_cols")
+    kb.raw_line("return;")
+    kb.end_block()
+
+    kb._var("acc", identity, ty="float")
+    kb.raw_line(f"for (uint r = lid; r < n_rows; r += {block_size}u) {{")
+    kb.indent()
+    kb._var("idx", "r * n_cols + col", ty="uint")
+    if combine in ("+",):
+        kb.raw_line("acc += float(input[idx]);")
+    else:
+        kb.raw_line(f"acc = {combine}(acc, float(input[idx]));")
+    kb.dedent()
+    kb.raw_line("}")
+
+    kb.threadgroup_reduce(op, "acc", "shared", "total")
+
+    kb.begin_if("lid == 0")
+    if dtype in ("fp16", "bf16"):
+        store_ty = triton_type_to_msl(dtype)
+        kb.raw_line(f"output[col] = {store_ty}(total);")
+    else:
+        kb.raw_line("output[col] = total;")
+    kb.end_block()
+
+    return kb.build()
+
+
 def make_softmax_kernel(block_size=256, dtype="fp32"):
     """Generate a fused row-wise softmax kernel.
 

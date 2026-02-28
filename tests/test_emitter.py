@@ -731,3 +731,148 @@ def test_elementwise_mul_fp16(runner):
         assert abs(result[i] - expected) < tol, (
             f"[{i}] got {result[i]}, expected {expected}"
         )
+
+
+# ---------------------------------------------------------------------------
+# simdgroup_matrix matmul tests
+# ---------------------------------------------------------------------------
+
+def _dispatch_simdgroup_matmul(runner, pipeline, buffers, M, N):
+    """Dispatch a simdgroup matmul kernel with correct grid dimensions."""
+    import Metal
+
+    n_tile_cols = (N + 31) // 32
+    n_tile_rows = (M + 31) // 32
+    n_groups = n_tile_rows * n_tile_cols
+
+    cmd = runner.queue.commandBuffer()
+    enc = cmd.computeCommandEncoder()
+    enc.setComputePipelineState_(pipeline)
+    for i, buf in enumerate(buffers):
+        enc.setBuffer_offset_atIndex_(buf, 0, i)
+    enc.dispatchThreadgroups_threadsPerThreadgroup_(
+        Metal.MTLSizeMake(n_groups, 1, 1),
+        Metal.MTLSizeMake(128, 1, 1),  # 4 SIMD groups x 32 threads
+    )
+    enc.endEncoding()
+    cmd.commit()
+    cmd.waitUntilCompleted()
+    assert cmd.status() == 4, f"Kernel failed, status={cmd.status()}"
+
+
+def _ref_matmul(A, B, M, N, K):
+    """Reference matmul for testing."""
+    C = [0.0] * (M * N)
+    for i in range(M):
+        for j in range(N):
+            s = 0.0
+            for k in range(K):
+                s += A[i * K + k] * B[k * N + j]
+            C[i * N + j] = s
+    return C
+
+
+@requires_metal
+def test_simdgroup_matmul_32x32(runner):
+    """simdgroup_matrix matmul: 32x32 @ 32x32 (single tile)."""
+    from triton_metal.codegen.msl_emitter import make_simdgroup_matmul_kernel
+
+    M, N, K = 32, 32, 32
+    msl = make_simdgroup_matmul_kernel()
+    path = runner.compile(msl, "simdgroup_matmul")
+    pipeline = runner.load(path, "simdgroup_matmul")
+
+    random.seed(303)
+    A_data = [random.uniform(-1.0, 1.0) for _ in range(M * K)]
+    B_data = [random.uniform(-1.0, 1.0) for _ in range(K * N)]
+
+    A_buf = runner.make_float_buffer(A_data)
+    B_buf = runner.make_float_buffer(B_data)
+    C_buf = runner.make_empty_buffer(M * N)
+    M_buf = runner.make_uint_buffer(M)
+    N_buf = runner.make_uint_buffer(N)
+    K_buf = runner.make_uint_buffer(K)
+
+    _dispatch_simdgroup_matmul(runner, pipeline,
+                               [A_buf, B_buf, C_buf, M_buf, N_buf, K_buf], M, N)
+
+    result = runner.read_float_buffer(C_buf, M * N)
+    expected = _ref_matmul(A_data, B_data, M, N, K)
+
+    for i in range(M):
+        for j in range(N):
+            idx = i * N + j
+            assert abs(result[idx] - expected[idx]) < 1e-2, (
+                f"C[{i},{j}]: got {result[idx]}, expected {expected[idx]}"
+            )
+
+
+@requires_metal
+def test_simdgroup_matmul_64x64(runner):
+    """simdgroup_matrix matmul: 64x64 @ 64x64 (2x2 tiles)."""
+    from triton_metal.codegen.msl_emitter import make_simdgroup_matmul_kernel
+
+    M, N, K = 64, 64, 64
+    msl = make_simdgroup_matmul_kernel()
+    path = runner.compile(msl, "simdgroup_matmul")
+    pipeline = runner.load(path, "simdgroup_matmul")
+
+    random.seed(404)
+    A_data = [random.uniform(-0.5, 0.5) for _ in range(M * K)]
+    B_data = [random.uniform(-0.5, 0.5) for _ in range(K * N)]
+
+    A_buf = runner.make_float_buffer(A_data)
+    B_buf = runner.make_float_buffer(B_data)
+    C_buf = runner.make_empty_buffer(M * N)
+    M_buf = runner.make_uint_buffer(M)
+    N_buf = runner.make_uint_buffer(N)
+    K_buf = runner.make_uint_buffer(K)
+
+    _dispatch_simdgroup_matmul(runner, pipeline,
+                               [A_buf, B_buf, C_buf, M_buf, N_buf, K_buf], M, N)
+
+    result = runner.read_float_buffer(C_buf, M * N)
+    expected = _ref_matmul(A_data, B_data, M, N, K)
+
+    # Spot-check every 4th element
+    for i in range(0, M, 4):
+        for j in range(0, N, 4):
+            idx = i * N + j
+            assert abs(result[idx] - expected[idx]) < 1e-1, (
+                f"C[{i},{j}]: got {result[idx]}, expected {expected[idx]}"
+            )
+
+
+@requires_metal
+def test_simdgroup_matmul_rectangular(runner):
+    """simdgroup_matrix matmul: 64x32 @ 32x64 (rectangular)."""
+    from triton_metal.codegen.msl_emitter import make_simdgroup_matmul_kernel
+
+    M, N, K = 64, 64, 32
+    msl = make_simdgroup_matmul_kernel()
+    path = runner.compile(msl, "simdgroup_matmul")
+    pipeline = runner.load(path, "simdgroup_matmul")
+
+    random.seed(505)
+    A_data = [random.uniform(-1.0, 1.0) for _ in range(M * K)]
+    B_data = [random.uniform(-1.0, 1.0) for _ in range(K * N)]
+
+    A_buf = runner.make_float_buffer(A_data)
+    B_buf = runner.make_float_buffer(B_data)
+    C_buf = runner.make_empty_buffer(M * N)
+    M_buf = runner.make_uint_buffer(M)
+    N_buf = runner.make_uint_buffer(N)
+    K_buf = runner.make_uint_buffer(K)
+
+    _dispatch_simdgroup_matmul(runner, pipeline,
+                               [A_buf, B_buf, C_buf, M_buf, N_buf, K_buf], M, N)
+
+    result = runner.read_float_buffer(C_buf, M * N)
+    expected = _ref_matmul(A_data, B_data, M, N, K)
+
+    for i in range(0, M, 4):
+        for j in range(0, N, 4):
+            idx = i * N + j
+            assert abs(result[idx] - expected[idx]) < 1e-1, (
+                f"C[{i},{j}]: got {result[idx]}, expected {expected[idx]}"
+            )

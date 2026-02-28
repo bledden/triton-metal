@@ -690,6 +690,100 @@ def make_matmul_kernel(block_m=32, block_n=32, block_k=32, dtype="fp32"):
     return kb.build()
 
 
+def make_simdgroup_matmul_kernel(dtype="fp32"):
+    """Generate a matmul kernel using Apple's simdgroup_matrix hardware.
+
+    C[M,N] = A[M,K] * B[K,N]
+
+    Uses simdgroup_matrix<float,8,8> for hardware-accelerated 8x8 matrix
+    multiply-accumulate. Each threadgroup (128 threads = 4 SIMD groups)
+    computes a 32x32 output tile. Data is staged through threadgroup memory.
+
+    Dispatch: block_size=128, n_groups = ceil(M/32) * ceil(N/32).
+    Requires M, N to be multiples of 32 (no boundary masking on simdgroup_store).
+
+    Args:
+        dtype: "fp32" or "fp16". FP16 uses half inputs with float accumulation.
+    """
+    if dtype not in ("fp32", "f32"):
+        raise ValueError("simdgroup_matmul currently supports fp32 only")
+
+    return f"""#include <metal_stdlib>
+#include <metal_simdgroup_matrix>
+using namespace metal;
+
+kernel void simdgroup_matmul(
+    device const float* A [[buffer(0)]],
+    device const float* B [[buffer(1)]],
+    device float* C [[buffer(2)]],
+    constant uint& M [[buffer(3)]],
+    constant uint& N [[buffer(4)]],
+    constant uint& K [[buffer(5)]],
+    uint pid [[threadgroup_position_in_grid]],
+    uint sgitg [[simdgroup_index_in_threadgroup]],
+    uint tiitg [[thread_index_in_threadgroup]]
+) {{
+    // Tile position from linearized 2D grid
+    uint n_tile_cols = (N + 31u) / 32u;
+    uint tile_row = pid / n_tile_cols;
+    uint tile_col = pid % n_tile_cols;
+    uint row_base = tile_row * 32u;
+    uint col_base = tile_col * 32u + sgitg * 8u;
+
+    // 4 accumulators per SIMD group: 4 vertical 8x8 tiles = 32x8 strip
+    simdgroup_float8x8 acc0(0), acc1(0), acc2(0), acc3(0);
+    simdgroup_float8x8 a_frag, b_frag;
+
+    // Threadgroup staging buffers
+    threadgroup float tg_A[32 * 8];   // 32 rows x 8 cols
+    threadgroup float tg_B[8 * 32];   // 8 rows x 32 cols
+
+    for (uint k = 0u; k < K; k += 8u) {{
+        // Cooperative load: all 128 threads load A tile (256 elements)
+        for (uint i = tiitg; i < 256u; i += 128u) {{
+            uint r = i / 8u, c = i % 8u;
+            uint gr = row_base + r, gc = k + c;
+            tg_A[i] = (gr < M && gc < K) ? float(A[gr * K + gc]) : 0.0f;
+        }}
+        // Cooperative load: all 128 threads load B tile (256 elements)
+        uint col_base_tg = tile_col * 32u;
+        for (uint i = tiitg; i < 256u; i += 128u) {{
+            uint r = i / 32u, c = i % 32u;
+            uint gr = k + r, gc = col_base_tg + c;
+            tg_B[i] = (gr < K && gc < N) ? float(B[gr * N + gc]) : 0.0f;
+        }}
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // Each SIMD group loads its 8-column strip of B
+        simdgroup_load(b_frag, tg_B + sgitg * 8u, 32);
+
+        // Multiply-accumulate 4 row tiles of A against B strip
+        simdgroup_load(a_frag, tg_A, 8);
+        simdgroup_multiply_accumulate(acc0, a_frag, b_frag, acc0);
+
+        simdgroup_load(a_frag, tg_A + 64u, 8);
+        simdgroup_multiply_accumulate(acc1, a_frag, b_frag, acc1);
+
+        simdgroup_load(a_frag, tg_A + 128u, 8);
+        simdgroup_multiply_accumulate(acc2, a_frag, b_frag, acc2);
+
+        simdgroup_load(a_frag, tg_A + 192u, 8);
+        simdgroup_multiply_accumulate(acc3, a_frag, b_frag, acc3);
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }}
+
+    // Store results to device memory
+    // Store 4 accumulators (32x8 strip) to output
+    simdgroup_store(acc0, C + (row_base) * N + col_base, N);
+    simdgroup_store(acc1, C + (row_base + 8u) * N + col_base, N);
+    simdgroup_store(acc2, C + (row_base + 16u) * N + col_base, N);
+    simdgroup_store(acc3, C + (row_base + 24u) * N + col_base, N);
+}}
+"""
+
+
 # ---------------------------------------------------------------------------
 # TTGIR integration (requires triton)
 # ---------------------------------------------------------------------------

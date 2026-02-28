@@ -3828,6 +3828,146 @@ kernel void simdgroup_matmul(
 
 
 # ---------------------------------------------------------------------------
+def make_instance_norm_kernel(block_size=256, dtype="fp32", eps=1e-5):
+    """Generate an instance normalization kernel.
+
+    Normalizes each channel independently across spatial dimensions.
+    Used in style transfer, image generation, and some GANs.
+
+    Input layout: [batch * channels, spatial_size]
+    Each threadgroup handles one (batch, channel) pair.
+
+    output = (x - mean) / sqrt(var + eps) * weight + bias
+
+    Args:
+        block_size: Threads per threadgroup.
+        dtype: Data type.
+        eps: Epsilon for numerical stability.
+    """
+    n_simd_groups = (block_size + 31) // 32
+
+    kb = KernelBuilder("instance_norm_kernel", block_size=block_size)
+    kb.add_ptr_arg("input", dtype=dtype, const=True)
+    kb.add_ptr_arg("weight", dtype=dtype, const=True)
+    kb.add_ptr_arg("bias", dtype=dtype, const=True)
+    kb.add_ptr_arg("output", dtype=dtype, const=False)
+    kb.add_scalar_arg("spatial_size", dtype="u32")
+    kb.add_scalar_arg("n_channels", dtype="u32")
+
+    kb.declare_threadgroup_array("shared", dtype=dtype, size=n_simd_groups)
+
+    # pid indexes (batch * channel) pairs
+    kb._var("ch_idx", "pid % n_channels", ty="uint")
+    kb._var("base_offset", "pid * spatial_size", ty="uint")
+
+    # Pass 1: Compute sum (for mean)
+    kb._var("sum_val", "0.0f", ty="float")
+    kb.raw_line(f"for (uint i = lid; i < spatial_size; i += {block_size}u) {{")
+    kb.indent()
+    kb.raw_line("sum_val += float(input[base_offset + i]);")
+    kb.dedent()
+    kb.raw_line("}")
+
+    kb.threadgroup_reduce("sum", "sum_val", "shared", "total_sum")
+
+    # Broadcast mean
+    kb.begin_if("lid == 0")
+    kb.raw_line("shared[0] = total_sum;")
+    kb.end_block()
+    kb.barrier("threadgroup")
+    kb._var("mean_val", "shared[0] / float(spatial_size)", ty="float")
+
+    # Pass 2: Compute variance
+    kb._var("sq_sum", "0.0f", ty="float")
+    kb.raw_line(f"for (uint i = lid; i < spatial_size; i += {block_size}u) {{")
+    kb.indent()
+    kb._var("diff", "float(input[base_offset + i]) - mean_val", ty="float")
+    kb.raw_line("sq_sum += diff * diff;")
+    kb.dedent()
+    kb.raw_line("}")
+
+    kb.threadgroup_reduce("sum", "sq_sum", "shared", "total_sq")
+
+    # Broadcast variance and compute inv_std
+    kb.begin_if("lid == 0")
+    kb.raw_line("shared[0] = total_sq;")
+    kb.end_block()
+    kb.barrier("threadgroup")
+    kb._var("var_val", "shared[0] / float(spatial_size)", ty="float")
+    kb._var("inv_std", f"rsqrt(var_val + {eps}f)", ty="float")
+
+    # Pass 3: Normalize with per-channel affine transform
+    kb.raw_line(f"for (uint i = lid; i < spatial_size; i += {block_size}u) {{")
+    kb.indent()
+    kb._var("normalized", "(float(input[base_offset + i]) - mean_val) * inv_std", ty="float")
+    kb.raw_line("output[base_offset + i] = normalized * weight[ch_idx] + bias[ch_idx];")
+    kb.dedent()
+    kb.raw_line("}")
+
+    return kb.build()
+
+
+def make_fused_dropout_kernel(block_size=256, dtype="fp32", p=0.5):
+    """Generate a fused dropout + scale kernel.
+
+    Uses a simple counter-based hash (Philox-like) for random number generation.
+    Fuses the masking and scaling into a single pass for efficiency.
+
+    output = (x * mask) / (1 - p)  where mask = (hash(seed, idx) > p)
+
+    Args:
+        block_size: Threads per threadgroup.
+        dtype: Data type.
+        p: Dropout probability (fraction to zero out).
+    """
+    compute_ty = "half" if dtype == "fp16" else "float"
+    scale = 1.0 / (1.0 - p) if p < 1.0 else 0.0
+
+    kb = KernelBuilder("fused_dropout_kernel", block_size=block_size)
+    msl = f"""#include <metal_stdlib>
+using namespace metal;
+
+// Simple hash for pseudo-random dropout mask
+inline uint hash_philox(uint seed, uint idx) {{
+    uint key = seed ^ 0xDEADBEEFu;
+    uint counter = idx;
+    // 4 rounds of Philox-like mixing
+    for (int i = 0; i < 4; i++) {{
+        counter ^= key;
+        counter *= 0x9E3779B9u;
+        counter ^= (counter >> 16u);
+        key += 0x6C078965u;
+    }}
+    return counter;
+}}
+
+kernel void fused_dropout_kernel(
+    device const {compute_ty}* input [[buffer(0)]],
+    device {compute_ty}* output [[buffer(1)]],
+    device {compute_ty}* mask_out [[buffer(2)]],
+    constant uint& n_elements [[buffer(3)]],
+    constant uint& seed [[buffer(4)]],
+    uint pid [[threadgroup_position_in_grid]],
+    uint lid [[thread_position_in_threadgroup]]
+) {{
+    uint gid = pid * {block_size}u + lid;
+    if (gid >= n_elements) return;
+
+    uint h = hash_philox(seed, gid);
+    // Convert hash to uniform [0, 1) float
+    float rnd = float(h) / 4294967296.0f;
+    bool keep = rnd >= {p}f;
+
+    {compute_ty} val = input[gid];
+    {compute_ty} result = keep ? val * {compute_ty}({scale}f) : {compute_ty}(0.0f);
+    output[gid] = result;
+    mask_out[gid] = keep ? {compute_ty}(1.0f) : {compute_ty}(0.0f);
+}}
+"""
+    kb.set_prebuilt_msl(msl)
+    return kb.build()
+
+
 def make_group_norm_kernel(n_groups=32, block_size=256, dtype="fp32", eps=1e-5):
     """Generate a group normalization kernel.
 

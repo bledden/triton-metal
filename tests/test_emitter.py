@@ -4610,3 +4610,175 @@ def test_group_norm_varying_input(runner):
     for i in range(n):
         expected = (data[i] - mean) * inv_std
         assert abs(result[i] - expected) < 0.01, f"i={i}: {result[i]} != {expected}"
+
+
+# ---------------------------------------------------------------------------
+# Instance normalization tests
+# ---------------------------------------------------------------------------
+
+@requires_metal
+def test_instance_norm_uniform(runner):
+    """Instance norm produces correct results for uniform input."""
+    from triton_metal.codegen.msl_emitter import make_instance_norm_kernel
+    import Metal
+
+    spatial = 8
+    n_channels = 2
+    n = n_channels * spatial
+    eps = 1e-5
+
+    msl = make_instance_norm_kernel(block_size=256, eps=eps)
+    path = runner.compile(msl, "instance_norm_kernel")
+    pipeline = runner.load(path, "instance_norm_kernel")
+
+    # Uniform input → mean=1.0, var=0.0, output = 0*weight+bias = bias
+    inp_buf = runner.make_float_buffer([1.0] * n)
+    weight_buf = runner.make_float_buffer([2.0] * n_channels)
+    bias_buf = runner.make_float_buffer([0.5] * n_channels)
+    out_buf = runner.make_empty_buffer(n)
+    spatial_buf = runner.make_uint_buffer(spatial)
+    nchan_buf = runner.make_uint_buffer(n_channels)
+
+    cmd = runner.queue.commandBuffer()
+    enc = cmd.computeCommandEncoderWithDescriptor_(
+        Metal.MTLComputePassDescriptor.computePassDescriptor()
+    )
+    enc.setComputePipelineState_(pipeline)
+    enc.setBuffer_offset_atIndex_(inp_buf, 0, 0)
+    enc.setBuffer_offset_atIndex_(weight_buf, 0, 1)
+    enc.setBuffer_offset_atIndex_(bias_buf, 0, 2)
+    enc.setBuffer_offset_atIndex_(out_buf, 0, 3)
+    enc.setBuffer_offset_atIndex_(spatial_buf, 0, 4)
+    enc.setBuffer_offset_atIndex_(nchan_buf, 0, 5)
+    # n_channels threadgroups (one per channel instance)
+    enc.dispatchThreadgroups_threadsPerThreadgroup_(
+        Metal.MTLSizeMake(n_channels, 1, 1),
+        Metal.MTLSizeMake(256, 1, 1),
+    )
+    enc.endEncoding()
+    cmd.commit()
+    cmd.waitUntilCompleted()
+    assert cmd.status() == 4
+
+    result = runner.read_float_buffer(out_buf, n)
+    for i, v in enumerate(result):
+        assert abs(v - 0.5) < 0.01, f"i={i}: {v} != 0.5"
+
+
+@requires_metal
+def test_instance_norm_varying(runner):
+    """Instance norm normalizes varying input per channel."""
+    from triton_metal.codegen.msl_emitter import make_instance_norm_kernel
+    import Metal
+    import math
+
+    spatial = 4
+    n_channels = 1
+    n = n_channels * spatial
+    eps = 1e-5
+
+    msl = make_instance_norm_kernel(block_size=256, eps=eps)
+    path = runner.compile(msl, "instance_norm_kernel")
+    pipeline = runner.load(path, "instance_norm_kernel")
+
+    data = [1.0, 3.0, 5.0, 7.0]
+    inp_buf = runner.make_float_buffer(data)
+    weight_buf = runner.make_float_buffer([1.0])
+    bias_buf = runner.make_float_buffer([0.0])
+    out_buf = runner.make_empty_buffer(n)
+    spatial_buf = runner.make_uint_buffer(spatial)
+    nchan_buf = runner.make_uint_buffer(n_channels)
+
+    cmd = runner.queue.commandBuffer()
+    enc = cmd.computeCommandEncoderWithDescriptor_(
+        Metal.MTLComputePassDescriptor.computePassDescriptor()
+    )
+    enc.setComputePipelineState_(pipeline)
+    enc.setBuffer_offset_atIndex_(inp_buf, 0, 0)
+    enc.setBuffer_offset_atIndex_(weight_buf, 0, 1)
+    enc.setBuffer_offset_atIndex_(bias_buf, 0, 2)
+    enc.setBuffer_offset_atIndex_(out_buf, 0, 3)
+    enc.setBuffer_offset_atIndex_(spatial_buf, 0, 4)
+    enc.setBuffer_offset_atIndex_(nchan_buf, 0, 5)
+    enc.dispatchThreadgroups_threadsPerThreadgroup_(
+        Metal.MTLSizeMake(n_channels, 1, 1),
+        Metal.MTLSizeMake(256, 1, 1),
+    )
+    enc.endEncoding()
+    cmd.commit()
+    cmd.waitUntilCompleted()
+    assert cmd.status() == 4
+
+    result = runner.read_float_buffer(out_buf, n)
+    mean = sum(data) / len(data)
+    var = sum((x - mean) ** 2 for x in data) / len(data)
+    inv_std = 1.0 / math.sqrt(var + eps)
+    for i in range(n):
+        expected = (data[i] - mean) * inv_std
+        assert abs(result[i] - expected) < 0.01, f"i={i}: {result[i]} != {expected}"
+
+
+# ---------------------------------------------------------------------------
+# Fused dropout tests
+# ---------------------------------------------------------------------------
+
+@requires_metal
+def test_fused_dropout_compiles(runner):
+    """Fused dropout kernel compiles successfully."""
+    from triton_metal.codegen.msl_emitter import make_fused_dropout_kernel
+
+    msl = make_fused_dropout_kernel(block_size=256, p=0.5)
+    runner.compile(msl, "fused_dropout_kernel")
+
+
+@requires_metal
+def test_fused_dropout_output(runner):
+    """Fused dropout zeros ~50% of elements and scales the rest."""
+    from triton_metal.codegen.msl_emitter import make_fused_dropout_kernel
+    import Metal
+
+    n = 4096
+    p = 0.5
+
+    msl = make_fused_dropout_kernel(block_size=256, p=p)
+    path = runner.compile(msl, "fused_dropout_kernel")
+    pipeline = runner.load(path, "fused_dropout_kernel")
+
+    inp_buf = runner.make_float_buffer([1.0] * n)
+    out_buf = runner.make_empty_buffer(n)
+    mask_buf = runner.make_empty_buffer(n)
+    n_buf = runner.make_uint_buffer(n)
+    seed_buf = runner.make_uint_buffer(42)
+
+    cmd = runner.queue.commandBuffer()
+    enc = cmd.computeCommandEncoderWithDescriptor_(
+        Metal.MTLComputePassDescriptor.computePassDescriptor()
+    )
+    enc.setComputePipelineState_(pipeline)
+    enc.setBuffer_offset_atIndex_(inp_buf, 0, 0)
+    enc.setBuffer_offset_atIndex_(out_buf, 0, 1)
+    enc.setBuffer_offset_atIndex_(mask_buf, 0, 2)
+    enc.setBuffer_offset_atIndex_(n_buf, 0, 3)
+    enc.setBuffer_offset_atIndex_(seed_buf, 0, 4)
+    n_groups = (n + 255) // 256
+    enc.dispatchThreadgroups_threadsPerThreadgroup_(
+        Metal.MTLSizeMake(n_groups, 1, 1),
+        Metal.MTLSizeMake(256, 1, 1),
+    )
+    enc.endEncoding()
+    cmd.commit()
+    cmd.waitUntilCompleted()
+    assert cmd.status() == 4
+
+    result = runner.read_float_buffer(out_buf, n)
+    mask = runner.read_float_buffer(mask_buf, n)
+
+    # Check that some elements are zeroed and some are scaled
+    n_zeros = sum(1 for v in result if abs(v) < 1e-6)
+    n_nonzero = n - n_zeros
+    # With p=0.5, expect roughly 50% zeros (allow wide margin for randomness)
+    assert 0.2 * n < n_zeros < 0.8 * n, f"Expected ~50% zeros, got {n_zeros}/{n}"
+    # Non-zero elements should be scaled by 1/(1-p) = 2.0
+    for i in range(n):
+        if mask[i] > 0.5:
+            assert abs(result[i] - 2.0) < 0.01, f"i={i}: scaled={result[i]} != 2.0"

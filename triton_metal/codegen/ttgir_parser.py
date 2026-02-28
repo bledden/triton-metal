@@ -642,6 +642,12 @@ class TTGIRParser:
         # Standard layer norm
         if len(self.reduce_ops) >= 2 and self._is_layer_norm_pattern():
             return self._build_layer_norm_kernel(kb, n_arg, primary_dtype)
+        # RMS norm: single sum reduction + rsqrt, no sub (no mean subtraction)
+        if self.reduce_ops and self._is_rms_norm_pattern():
+            return self._build_rms_norm_kernel(kb, n_arg, primary_dtype)
+        # Group norm: reductions with 3+ input ptrs (input + weight + bias)
+        if self.reduce_ops and self._is_group_norm_pattern():
+            return self._build_group_norm_kernel(kb, primary_dtype)
         if self.reduce_ops:
             return self._build_reduction_kernel(kb, n_arg, primary_dtype)
 
@@ -1357,6 +1363,58 @@ class TTGIRParser:
         """Generate an activation kernel from the classified pattern."""
         from triton_metal.codegen.msl_emitter import make_activation_kernel
         kb.set_prebuilt_msl(make_activation_kernel(activation=activation))
+        return kb
+
+    def _is_rms_norm_pattern(self):
+        """Check if IR matches an RMS norm pattern.
+
+        RMS norm has:
+        - Sum reduction (for sum of squares)
+        - rsqrt operation
+        - mul operation (scale by weight)
+        - NO sub (no mean subtraction — distinguishes from layer norm)
+        - 2-3 input pointers (input, weight, optionally bias)
+        """
+        ssa_ops = {v[0] for v in self.ssa_values.values()}
+        has_rsqrt = "rsqrt" in ssa_ops
+        has_mul = "mul" in ssa_ops
+        has_sub = "sub" in ssa_ops
+        ops_list = [r[2] for r in self.reduce_ops]
+        has_sum = "sum" in ops_list
+        # RMS norm: sum + rsqrt + mul but NO sub
+        return has_sum and has_rsqrt and has_mul and not has_sub
+
+    def _build_rms_norm_kernel(self, kb, n_arg, primary_dtype):
+        """Generate an RMS norm kernel from the pattern."""
+        from triton_metal.codegen.msl_emitter import make_rms_norm_kernel
+        kb.set_prebuilt_msl(make_rms_norm_kernel())
+        return kb
+
+    def _is_group_norm_pattern(self):
+        """Check if IR matches a group normalization pattern.
+
+        Group norm has:
+        - Sum reductions (for mean and variance within groups)
+        - rsqrt or div (normalization step)
+        - 3+ input pointers (input, weight, bias)
+        - 1 output pointer
+        - 2+ scalar args (n_channels, spatial_size)
+        """
+        n_inputs = sum(1 for _, (_, _, is_out) in self.ptr_args.items() if not is_out)
+        n_outputs = sum(1 for _, (_, _, is_out) in self.ptr_args.items() if is_out)
+        if n_inputs < 3 or n_outputs != 1:
+            return False
+        ssa_ops = {v[0] for v in self.ssa_values.values()}
+        has_rsqrt = "rsqrt" in ssa_ops
+        has_div = "div" in ssa_ops
+        ops_list = [r[2] for r in self.reduce_ops]
+        has_sum = "sum" in ops_list
+        return has_sum and (has_rsqrt or has_div) and len(self.scalar_args) >= 2
+
+    def _build_group_norm_kernel(self, kb, primary_dtype):
+        """Generate a group norm kernel from the pattern."""
+        from triton_metal.codegen.msl_emitter import make_group_norm_kernel
+        kb.set_prebuilt_msl(make_group_norm_kernel())
         return kb
 
     def _is_batch_norm_pattern(self):

@@ -1894,3 +1894,105 @@ def test_flash_attention_causal(runner):
         assert abs(got - expected) < tol, (
             f"Causal check: O[0][{d}] = {got}, V[0][{d}] = {expected}"
         )
+
+
+# ---------------------------------------------------------------------------
+# Fused linear kernel tests
+# ---------------------------------------------------------------------------
+
+def _dispatch_fused_linear(runner, pipeline, buffers, M, N):
+    """Dispatch a fused linear kernel with correct grid dimensions."""
+    import Metal
+
+    n_tile_cols = (N + 31) // 32
+    n_tile_rows = (M + 31) // 32
+    n_groups = n_tile_rows * n_tile_cols
+
+    cmd = runner.queue.commandBuffer()
+    enc = cmd.computeCommandEncoder()
+    enc.setComputePipelineState_(pipeline)
+    for i, buf in enumerate(buffers):
+        enc.setBuffer_offset_atIndex_(buf, 0, i)
+    enc.dispatchThreadgroups_threadsPerThreadgroup_(
+        Metal.MTLSizeMake(n_groups, 1, 1),
+        Metal.MTLSizeMake(128, 1, 1),
+    )
+    enc.endEncoding()
+    cmd.commit()
+    cmd.waitUntilCompleted()
+    assert cmd.status() == 4, f"Kernel failed, status={cmd.status()}"
+
+
+@requires_metal
+def test_fused_linear_no_bias(runner):
+    """Fused linear: output = input @ weight^T (no bias)."""
+    from triton_metal.codegen.msl_emitter import make_fused_linear_kernel
+
+    M, N, K = 32, 32, 32
+    msl = make_fused_linear_kernel(has_bias=False)
+    path = runner.compile(msl, "fused_linear")
+    pipeline = runner.load(path, "fused_linear")
+
+    random.seed(1111)
+    input_data = [random.uniform(-1.0, 1.0) for _ in range(M * K)]
+    # weight is [N, K] (row-major)
+    weight_data = [random.uniform(-1.0, 1.0) for _ in range(N * K)]
+
+    input_buf = runner.make_float_buffer(input_data)
+    weight_buf = runner.make_float_buffer(weight_data)
+    C_buf = runner.make_empty_buffer(M * N)
+    M_buf = runner.make_uint_buffer(M)
+    N_buf = runner.make_uint_buffer(N)
+    K_buf = runner.make_uint_buffer(K)
+
+    _dispatch_fused_linear(runner, pipeline,
+                           [input_buf, weight_buf, C_buf, M_buf, N_buf, K_buf], M, N)
+
+    result = runner.read_float_buffer(C_buf, M * N)
+
+    # Reference: output = input @ weight^T
+    for i in range(M):
+        for j in range(N):
+            expected = sum(input_data[i * K + k] * weight_data[j * K + k] for k in range(K))
+            got = result[i * N + j]
+            assert abs(got - expected) < 1e-2, (
+                f"C[{i},{j}]: got {got}, expected {expected}"
+            )
+
+
+@requires_metal
+def test_fused_linear_with_bias(runner):
+    """Fused linear: output = input @ weight^T + bias."""
+    from triton_metal.codegen.msl_emitter import make_fused_linear_kernel
+
+    M, N, K = 32, 32, 32
+    msl = make_fused_linear_kernel(has_bias=True)
+    path = runner.compile(msl, "fused_linear")
+    pipeline = runner.load(path, "fused_linear")
+
+    random.seed(2222)
+    input_data = [random.uniform(-1.0, 1.0) for _ in range(M * K)]
+    weight_data = [random.uniform(-1.0, 1.0) for _ in range(N * K)]
+    bias_data = [random.uniform(-0.5, 0.5) for _ in range(N)]
+
+    input_buf = runner.make_float_buffer(input_data)
+    weight_buf = runner.make_float_buffer(weight_data)
+    C_buf = runner.make_empty_buffer(M * N)
+    bias_buf = runner.make_float_buffer(bias_data)
+    M_buf = runner.make_uint_buffer(M)
+    N_buf = runner.make_uint_buffer(N)
+    K_buf = runner.make_uint_buffer(K)
+
+    _dispatch_fused_linear(runner, pipeline,
+                           [input_buf, weight_buf, C_buf, bias_buf, M_buf, N_buf, K_buf], M, N)
+
+    result = runner.read_float_buffer(C_buf, M * N)
+
+    for i in range(M):
+        for j in range(N):
+            matmul = sum(input_data[i * K + k] * weight_data[j * K + k] for k in range(K))
+            expected = matmul + bias_data[j]
+            got = result[i * N + j]
+            assert abs(got - expected) < 1e-1, (
+                f"C[{i},{j}]: got {got}, expected {expected}"
+            )

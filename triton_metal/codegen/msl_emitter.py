@@ -1548,6 +1548,132 @@ kernel void simdgroup_matmul(
 
 
 # ---------------------------------------------------------------------------
+def make_fused_linear_kernel(has_bias=True):
+    """Generate a fused linear layer kernel: output = input @ weight^T + bias.
+
+    Uses simdgroup_matrix for hardware-accelerated matmul with optional
+    bias addition fused in. Each threadgroup computes a 32x32 output tile.
+
+    This is the most common operation in transformers — used for all
+    attention projections (Q, K, V, O) and FFN layers.
+
+    Layout:
+        input:  [M, K]
+        weight: [N, K] (stored as row-major, transposed during compute)
+        bias:   [N] (optional, broadcast across M dimension)
+        output: [M, N]
+
+    Dispatch: block_size=128, n_groups = ceil(M/32) * ceil(N/32).
+
+    Args:
+        has_bias: Whether to include bias addition.
+    """
+    bias_buffer = ""
+    bias_param = ""
+    bias_add = ""
+
+    if has_bias:
+        bias_param = "    device const float* bias [[buffer(3)]],\n"
+        bias_buffer = ""
+        bias_add = """
+    // Add bias
+    for (uint i = tiitg; i < 32u; i += 128u) {
+        uint r = i / 32u;
+        uint c = i % 32u;
+        uint gc = col_base + c;
+        // Bias is broadcast along M dimension — load once per column
+        if (gc < N) {
+            // For each row in the tile that this thread handles
+            for (uint rr = 0u; rr < 32u; rr++) {
+                uint gr = row_base + rr;
+                if (gr < M) {
+                    C[gr * N + gc] += bias[gc];
+                }
+            }
+        }
+    }"""
+    else:
+        bias_param = ""
+        bias_add = ""
+
+    # Buffer indices shift based on whether bias is present
+    if has_bias:
+        m_idx, n_idx, k_idx = 4, 5, 6
+    else:
+        m_idx, n_idx, k_idx = 3, 4, 5
+
+    return f"""#include <metal_stdlib>
+#include <metal_simdgroup_matrix>
+using namespace metal;
+
+kernel void fused_linear(
+    device const float* input [[buffer(0)]],
+    device const float* weight [[buffer(1)]],
+    device float* C [[buffer(2)]],
+{bias_param}    constant uint& M [[buffer({m_idx})]],
+    constant uint& N [[buffer({n_idx})]],
+    constant uint& K [[buffer({k_idx})]],
+    uint pid [[threadgroup_position_in_grid]],
+    uint sgitg [[simdgroup_index_in_threadgroup]],
+    uint tiitg [[thread_index_in_threadgroup]]
+) {{
+    uint n_tile_cols = (N + 31u) / 32u;
+    uint tile_row = pid / n_tile_cols;
+    uint tile_col = pid % n_tile_cols;
+    uint row_base = tile_row * 32u;
+    uint col_base = tile_col * 32u + sgitg * 8u;
+
+    simdgroup_float8x8 acc0(0), acc1(0), acc2(0), acc3(0);
+    simdgroup_float8x8 a_frag, b_frag;
+
+    threadgroup float tg_A[32 * 8];
+    threadgroup float tg_B[8 * 32];
+
+    for (uint k = 0u; k < K; k += 8u) {{
+        // Load input tile: input[row_base:row_base+32, k:k+8]
+        for (uint i = tiitg; i < 256u; i += 128u) {{
+            uint r = i / 8u, c = i % 8u;
+            uint gr = row_base + r, gc = k + c;
+            tg_A[i] = (gr < M && gc < K) ? input[gr * K + gc] : 0.0f;
+        }}
+        // Load weight tile transposed: weight[col_base:col_base+32, k:k+8]
+        // weight is [N, K], we want W^T, so we load weight[n, k] as B[k, n]
+        uint col_base_tg = tile_col * 32u;
+        for (uint i = tiitg; i < 256u; i += 128u) {{
+            uint r = i / 32u, c = i % 32u;  // r is the K index, c is the N index
+            uint gk = k + r, gn = col_base_tg + c;
+            tg_B[i] = (gk < K && gn < N) ? weight[gn * K + gk] : 0.0f;
+        }}
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        simdgroup_load(b_frag, tg_B + sgitg * 8u, 32);
+
+        simdgroup_load(a_frag, tg_A, 8);
+        simdgroup_multiply_accumulate(acc0, a_frag, b_frag, acc0);
+
+        simdgroup_load(a_frag, tg_A + 64u, 8);
+        simdgroup_multiply_accumulate(acc1, a_frag, b_frag, acc1);
+
+        simdgroup_load(a_frag, tg_A + 128u, 8);
+        simdgroup_multiply_accumulate(acc2, a_frag, b_frag, acc2);
+
+        simdgroup_load(a_frag, tg_A + 192u, 8);
+        simdgroup_multiply_accumulate(acc3, a_frag, b_frag, acc3);
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }}
+
+    simdgroup_store(acc0, C + (row_base) * N + col_base, N);
+    simdgroup_store(acc1, C + (row_base + 8u) * N + col_base, N);
+    simdgroup_store(acc2, C + (row_base + 16u) * N + col_base, N);
+    simdgroup_store(acc3, C + (row_base + 24u) * N + col_base, N);
+{bias_add}
+}}
+"""
+
+
+# ---------------------------------------------------------------------------
 # TTGIR integration (requires triton)
 # ---------------------------------------------------------------------------
 

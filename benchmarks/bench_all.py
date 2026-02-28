@@ -63,6 +63,10 @@ from triton_metal.codegen.msl_emitter import (
     make_matmul_swizzled_kernel,
     make_activation_kernel,
     make_variance_kernel,
+    make_batch_norm_kernel,
+    make_online_softmax_kernel,
+    make_causal_attention_kernel,
+    make_group_norm_kernel,
 )
 
 
@@ -1439,6 +1443,98 @@ def main():
                                         n_rows, 256)
         n_bytes = total * 4 + n_rows * 4
         label = f"variance_{n_rows}x{n_cols}"
+        print(format_benchmark_result(label, result, n_bytes=n_bytes))
+
+    # =========================================================================
+    # Batch Normalization Kernel
+    # =========================================================================
+    print("\n" + "=" * 60)
+    print("BATCH NORMALIZATION BENCHMARKS")
+    print("=" * 60)
+    msl = make_batch_norm_kernel(block_size=256)
+    pipeline = compile_kernel(device, msl, "batch_norm_kernel")
+    for n in [1024, 65536, 262144]:
+        in_buf = make_float_buffer(device, n, "randn")
+        mean_buf = make_float_buffer(device, n, "randn")
+        var_buf = make_float_buffer(device, n, "const", 1.0)
+        weight_buf = make_float_buffer(device, n, "const", 1.0)
+        bias_buf = make_float_buffer(device, n, "const", 0.0)
+        out_buf = make_empty_buffer(device, n)
+        n_buf = make_uint_buffer(device, n)
+
+        result = bench(pipeline, [in_buf, mean_buf, var_buf, weight_buf, bias_buf, out_buf, n_buf], n)
+        n_bytes = n * 4 * 6  # 5 reads + 1 write
+        print(format_benchmark_result(f"batch_norm_{n}", result, n_bytes=n_bytes))
+
+    # =========================================================================
+    # Online Softmax Kernel
+    # =========================================================================
+    print("\n" + "=" * 60)
+    print("ONLINE SOFTMAX BENCHMARKS")
+    print("=" * 60)
+    msl = make_online_softmax_kernel(block_size=256)
+    pipeline = compile_kernel(device, msl, "online_softmax_kernel")
+    for n_rows, n_cols in [(128, 256), (512, 1024), (1024, 2048)]:
+        total = n_rows * n_cols
+        in_buf = make_float_buffer(device, total, "randn")
+        out_buf = make_empty_buffer(device, total)
+        ncols_buf = make_uint_buffer(device, n_cols)
+
+        result = bench_custom_dispatch(bench, pipeline,
+                                        [in_buf, out_buf, ncols_buf],
+                                        n_rows, 256)
+        n_bytes = total * 4 * 2  # read + write
+        label = f"online_softmax_{n_rows}x{n_cols}"
+        print(format_benchmark_result(label, result, n_bytes=n_bytes))
+
+    # =========================================================================
+    # Causal Attention Kernel
+    # =========================================================================
+    print("\n" + "=" * 60)
+    print("CAUSAL ATTENTION BENCHMARKS")
+    print("=" * 60)
+    for n_heads, head_dim in [(4, 32), (8, 64)]:
+        msl = make_causal_attention_kernel(n_heads=n_heads, head_dim=head_dim, block_size=128)
+        pipeline = compile_kernel(device, msl, "causal_attention")
+        seq_len = 64
+        total_q = n_heads * seq_len * head_dim
+        total_kv = n_heads * seq_len * head_dim
+        q_buf = make_float_buffer(device, total_q, "randn")
+        k_buf = make_float_buffer(device, total_kv, "randn")
+        v_buf = make_float_buffer(device, total_kv, "randn")
+        out_buf = make_empty_buffer(device, total_q)
+        seq_buf = make_uint_buffer(device, seq_len)
+
+        result = bench_custom_dispatch(bench, pipeline,
+                                        [q_buf, k_buf, v_buf, out_buf, seq_buf],
+                                        n_heads, 128)
+        n_bytes = (total_q + total_kv * 2 + total_q) * 4
+        label = f"causal_attn_h{n_heads}_d{head_dim}_s{seq_len}"
+        print(format_benchmark_result(label, result, n_bytes=n_bytes))
+
+    # =========================================================================
+    # Group Normalization Kernel
+    # =========================================================================
+    print("\n" + "=" * 60)
+    print("GROUP NORMALIZATION BENCHMARKS")
+    print("=" * 60)
+    for n_groups, channels, spatial in [(32, 128, 256), (32, 256, 1024)]:
+        msl = make_group_norm_kernel(n_groups=n_groups, block_size=256)
+        pipeline = compile_kernel(device, msl, "group_norm_kernel")
+        total = channels * spatial
+        in_buf = make_float_buffer(device, total, "randn")
+        weight_buf = make_float_buffer(device, channels, "const", 1.0)
+        bias_buf = make_float_buffer(device, channels, "const", 0.0)
+        out_buf = make_empty_buffer(device, total)
+        nchan_buf = make_uint_buffer(device, channels)
+        spatial_buf = make_uint_buffer(device, spatial)
+
+        result = bench_custom_dispatch(bench, pipeline,
+                                        [in_buf, weight_buf, bias_buf, out_buf,
+                                         nchan_buf, spatial_buf],
+                                        n_groups, 256)
+        n_bytes = total * 4 * 2 + channels * 4 * 2  # input/output + weight/bias
+        label = f"group_norm_g{n_groups}_c{channels}_s{spatial}"
         print(format_benchmark_result(label, result, n_bytes=n_bytes))
 
     # =========================================================================

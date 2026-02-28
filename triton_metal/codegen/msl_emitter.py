@@ -1654,6 +1654,178 @@ kernel void int8_matmul(
 """
 
 
+def make_int4_matmul_kernel(group_size=128):
+    """Generate a weight-only INT4 quantized matmul kernel (GPTQ/AWQ style).
+
+    output = input(float) @ dequant(weight_int4, scale, zeros)
+
+    Per-group quantization: every `group_size` elements in the K dimension
+    share a scale and zero_point. Two int4 values are packed per byte
+    (low nibble = even index, high nibble = odd index).
+
+    Layout:
+        input: [M, K] float
+        weight: [N, K/2] uchar (2 int4s per byte, unsigned)
+        scales: [N, K/group_size] float
+        zeros: [N, K/group_size] float
+        output: [M, N] float
+
+    Args:
+        group_size: Number of K elements per quantization group (typically 128).
+    """
+    return f"""#include <metal_stdlib>
+using namespace metal;
+
+kernel void int4_matmul(
+    device const float* input [[buffer(0)]],
+    device const uchar* weight [[buffer(1)]],
+    device float* output [[buffer(2)]],
+    device const float* scales [[buffer(3)]],
+    device const float* zeros [[buffer(4)]],
+    constant uint& M [[buffer(5)]],
+    constant uint& N [[buffer(6)]],
+    constant uint& K [[buffer(7)]],
+    uint gid [[thread_position_in_grid]]
+) {{
+    const uint GROUP_SIZE = {group_size}u;
+    uint row = gid / N;
+    uint col = gid % N;
+    if (row >= M || col >= N) return;
+
+    uint n_groups = (K + GROUP_SIZE - 1u) / GROUP_SIZE;
+    float acc = 0.0f;
+
+    for (uint k = 0u; k < K; k++) {{
+        // Unpack int4 from byte: even indices in low nibble, odd in high
+        uint byte_idx = col * (K / 2u) + k / 2u;
+        uchar packed = weight[byte_idx];
+        uint w4;
+        if (k % 2u == 0u) {{
+            w4 = uint(packed & 0x0Fu);  // low nibble (0-15)
+        }} else {{
+            w4 = uint((packed >> 4u) & 0x0Fu);  // high nibble (0-15)
+        }}
+
+        // Dequantize: w_float = (w4 - zero) * scale
+        uint group_idx = k / GROUP_SIZE;
+        float s = scales[col * n_groups + group_idx];
+        float z = zeros[col * n_groups + group_idx];
+        float w = (float(w4) - z) * s;
+
+        acc += input[row * K + k] * w;
+    }}
+
+    output[row * N + col] = acc;
+}}
+"""
+
+
+def make_concat_kernel(n_inputs=2, block_size=256):
+    """Generate a kernel that concatenates tensors along axis 0.
+
+    output = concat(input_0, input_1, ...) along the first dimension.
+    Each input is a flat 1D buffer. The kernel copies all inputs
+    sequentially into the output buffer.
+
+    For 2 inputs: output[0:n0] = input_0, output[n0:n0+n1] = input_1.
+
+    Args:
+        n_inputs: Number of input tensors to concatenate (2, 3, or 4).
+        block_size: Threads per threadgroup.
+    """
+    # Generate buffer params for each input + its size
+    input_params = []
+    for i in range(n_inputs):
+        input_params.append(f"    device const float* input_{i} [[buffer({i})]]")
+    out_idx = n_inputs
+    input_params.append(f"    device float* output [[buffer({out_idx})]]")
+    # Size params for each input
+    size_params = []
+    for i in range(n_inputs):
+        size_params.append(f"    constant uint& n_{i} [[buffer({out_idx + 1 + i})]]")
+
+    all_params = ",\n".join(input_params + size_params + [
+        "    uint gid [[thread_position_in_grid]]"
+    ])
+
+    # Build the copy logic
+    copy_logic = ""
+    offset_expr = "0u"
+    for i in range(n_inputs):
+        if i == 0:
+            copy_logic += f"""
+    if (gid < n_0) {{
+        output[gid] = input_0[gid];
+        return;
+    }}"""
+            offset_expr = "n_0"
+        else:
+            prev_offset = offset_expr
+            offset_expr = f"{prev_offset} + n_{i}"
+            copy_logic += f"""
+    if (gid < {offset_expr}) {{
+        output[gid] = input_{i}[gid - ({prev_offset})];
+        return;
+    }}"""
+
+    return f"""#include <metal_stdlib>
+using namespace metal;
+
+kernel void concat_kernel(
+{all_params}
+) {{{copy_logic}
+}}
+"""
+
+
+def make_split_kernel(n_outputs=2, block_size=256):
+    """Generate a kernel that splits a tensor into equal chunks along axis 0.
+
+    Given input of size N, splits into n_outputs chunks of size N/n_outputs.
+    Each thread copies one element from input to the appropriate output.
+
+    Args:
+        n_outputs: Number of output chunks.
+        block_size: Threads per threadgroup.
+    """
+    out_params = []
+    for i in range(n_outputs):
+        out_params.append(f"    device float* output_{i} [[buffer({i + 1})]]")
+
+    all_params = ",\n".join(
+        ["    device const float* input [[buffer(0)]]"] +
+        out_params +
+        [f"    constant uint& chunk_size [[buffer({n_outputs + 1})]]",
+         "    uint gid [[thread_position_in_grid]]"]
+    )
+
+    # Build dispatch logic
+    dispatch = ""
+    for i in range(n_outputs):
+        if i == 0:
+            dispatch += f"""
+    if (gid < chunk_size) {{
+        output_0[gid] = input[gid];
+        return;
+    }}"""
+        else:
+            dispatch += f"""
+    if (gid < {i + 1}u * chunk_size) {{
+        uint local_idx = gid - {i}u * chunk_size;
+        output_{i}[local_idx] = input[gid];
+        return;
+    }}"""
+
+    return f"""#include <metal_stdlib>
+using namespace metal;
+
+kernel void split_kernel(
+{all_params}
+) {{{dispatch}
+}}
+"""
+
+
 def make_top_k_kernel(k=50, block_size=256):
     """Generate a top-k sampling kernel for LLM inference.
 

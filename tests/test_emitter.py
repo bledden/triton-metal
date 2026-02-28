@@ -2175,6 +2175,78 @@ def test_int8_matmul(runner):
 
 
 # ---------------------------------------------------------------------------
+# Concat and Split tests
+# ---------------------------------------------------------------------------
+
+
+@requires_metal
+def test_concat_two_tensors(runner):
+    """Concatenate two 1D tensors into one."""
+    from triton_metal.codegen.msl_emitter import make_concat_kernel
+
+    n0 = 128
+    n1 = 256
+    total = n0 + n1
+
+    msl = make_concat_kernel(n_inputs=2)
+    path = runner.compile(msl, "concat_kernel")
+    pipeline = runner.load(path, "concat_kernel")
+
+    a_data = [float(i) for i in range(n0)]
+    b_data = [float(i + 1000) for i in range(n1)]
+
+    a_buf = runner.make_float_buffer(a_data)
+    b_buf = runner.make_float_buffer(b_data)
+    out_buf = runner.make_empty_buffer(total)
+    n0_buf = runner.make_uint_buffer(n0)
+    n1_buf = runner.make_uint_buffer(n1)
+
+    runner.run(pipeline, [a_buf, b_buf, out_buf, n0_buf, n1_buf],
+               total, block_size=256)
+
+    result = runner.read_float_buffer(out_buf, total)
+
+    # First n0 elements should be a_data
+    for i in range(n0):
+        assert result[i] == pytest.approx(a_data[i], abs=0.01), (
+            f"idx {i}: got {result[i]}, expected {a_data[i]}"
+        )
+    # Next n1 elements should be b_data
+    for i in range(n1):
+        assert result[n0 + i] == pytest.approx(b_data[i], abs=0.01), (
+            f"idx {n0+i}: got {result[n0+i]}, expected {b_data[i]}"
+        )
+
+
+@requires_metal
+def test_split_two_chunks(runner):
+    """Split a tensor into two equal chunks."""
+    from triton_metal.codegen.msl_emitter import make_split_kernel
+
+    chunk_size = 128
+    total = chunk_size * 2
+
+    msl = make_split_kernel(n_outputs=2)
+    path = runner.compile(msl, "split_kernel")
+    pipeline = runner.load(path, "split_kernel")
+
+    data = [float(i) for i in range(total)]
+    in_buf = runner.make_float_buffer(data)
+    out0_buf = runner.make_empty_buffer(chunk_size)
+    out1_buf = runner.make_empty_buffer(chunk_size)
+    cs_buf = runner.make_uint_buffer(chunk_size)
+
+    runner.run(pipeline, [in_buf, out0_buf, out1_buf, cs_buf],
+               total, block_size=256)
+
+    r0 = runner.read_float_buffer(out0_buf, chunk_size)
+    r1 = runner.read_float_buffer(out1_buf, chunk_size)
+
+    for i in range(chunk_size):
+        assert r0[i] == pytest.approx(data[i], abs=0.01)
+        assert r1[i] == pytest.approx(data[chunk_size + i], abs=0.01)
+
+# ---------------------------------------------------------------------------
 # Top-K Sampling tests
 # ---------------------------------------------------------------------------
 
@@ -2451,3 +2523,82 @@ def test_batched_kv_decode(runner):
                 assert abs(got - expected) < 0.05, (
                     f"batch {b} head {h} dim {d}: got {got}, expected {expected}"
                 )
+
+
+# ---------------------------------------------------------------------------
+# INT4 Quantized Matmul tests
+# ---------------------------------------------------------------------------
+
+
+@requires_metal
+def test_int4_matmul(runner):
+    """INT4 weight-only quantized matmul with per-group scale/zero_point."""
+    from triton_metal.codegen.msl_emitter import make_int4_matmul_kernel
+    import struct as struct_mod
+
+    M, N, K = 8, 8, 16  # K must be even for int4 packing
+    group_size = 16  # One group covers entire K
+    msl = make_int4_matmul_kernel(group_size=group_size)
+    path = runner.compile(msl, "int4_matmul")
+    pipeline = runner.load(path, "int4_matmul")
+
+    random.seed(7070)
+    # Input: float [M, K]
+    input_data = [random.uniform(-1.0, 1.0) for _ in range(M * K)]
+    # INT4 weights: values 0-15, packed 2 per byte
+    # Generate random 4-bit values
+    weight_int4 = [random.randint(0, 15) for _ in range(N * K)]
+    # Pack into bytes: even=low nibble, odd=high nibble
+    packed_bytes = []
+    for n in range(N):
+        for k_pair in range(K // 2):
+            low = weight_int4[n * K + k_pair * 2]
+            high = weight_int4[n * K + k_pair * 2 + 1]
+            packed_bytes.append((high << 4) | low)
+
+    # Scale and zero per group
+    n_groups = (K + group_size - 1) // group_size
+    scale = 0.1
+    zero_point = 8.0  # center of uint4 range
+    scale_data = [scale] * (N * n_groups)
+    zp_data = [zero_point] * (N * n_groups)
+
+    # Create packed weight buffer
+    import Metal
+    w_buf = runner.device.newBufferWithLength_options_(
+        len(packed_bytes), Metal.MTLResourceStorageModeShared
+    )
+    w_view = w_buf.contents().as_buffer(len(packed_bytes))
+    for i, val in enumerate(packed_bytes):
+        struct_mod.pack_into("B", w_view, i, val)
+
+    input_buf = runner.make_float_buffer(input_data)
+    out_buf = runner.make_empty_buffer(M * N)
+    scale_buf = runner.make_float_buffer(scale_data)
+    zp_buf = runner.make_float_buffer(zp_data)
+    M_buf = runner.make_uint_buffer(M)
+    N_buf = runner.make_uint_buffer(N)
+    K_buf = runner.make_uint_buffer(K)
+
+    total = M * N
+    block_size = 256
+    n_threadgroups = (total + block_size - 1) // block_size
+    runner.run(pipeline,
+               [input_buf, w_buf, out_buf, scale_buf, zp_buf,
+                M_buf, N_buf, K_buf],
+               total, block_size=block_size)
+
+    result = runner.read_float_buffer(out_buf, M * N)
+
+    # Reference: dequantize and matmul
+    for i in range(M):
+        for j in range(N):
+            expected = sum(
+                input_data[i * K + k] *
+                (float(weight_int4[j * K + k]) - zero_point) * scale
+                for k in range(K)
+            )
+            got = result[i * N + j]
+            assert abs(got - expected) < 0.5, (
+                f"C[{i},{j}]: got {got}, expected {expected}"
+            )

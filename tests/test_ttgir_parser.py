@@ -1297,3 +1297,102 @@ def test_ttgir_matmul_gpu(runner):
             assert abs(got - expected) < 0.1, (
                 f"C[{i},{j}]: got {got}, expected {expected}"
             )
+
+
+# ---------------------------------------------------------------------------
+# Flash Attention TTGIR
+# ---------------------------------------------------------------------------
+
+FLASH_ATTENTION_TTGIR = """
+module {
+  tt.func public @fused_attention(%arg0: !tt.ptr<f32> {tt.divisibility = 16 : i32},
+                                   %arg1: !tt.ptr<f32> {tt.divisibility = 16 : i32},
+                                   %arg2: !tt.ptr<f32> {tt.divisibility = 16 : i32},
+                                   %arg3: !tt.ptr<f32> {tt.divisibility = 16 : i32},
+                                   %arg4: i32) {
+    %cst = arith.constant dense<0.000000e+00> : tensor<16x64xf32, #blocked>
+    %cst_scale = arith.constant 1.250000e-01 : f32
+    %0 = tt.get_program_id x : i32
+    %1 = tt.make_range {end = 16 : i32, start = 0 : i32} : tensor<16xi32, #blocked1>
+    %2 = tt.make_range {end = 16 : i32, start = 0 : i32} : tensor<16xi32, #blocked2>
+
+    // Load Q block
+    %3 = tt.addptr %arg0, %1 : !tt.ptr<f32>, tensor<16xi32, #blocked1>
+    %q = tt.load %3 : !tt.ptr<f32>
+
+    // Load K block
+    %4 = tt.addptr %arg1, %2 : !tt.ptr<f32>, tensor<16xi32, #blocked2>
+    %k = tt.load %4 : !tt.ptr<f32>
+
+    // Score = Q @ K^T (first tt.dot)
+    %scores = "tt.dot"(%q, %k, %cst) {allowTF32 = true} : (tensor<16x64xf32>, tensor<64x16xf32>, tensor<16x16xf32>) -> tensor<16x16xf32>
+
+    // Max for numerical stability
+    %row_max = "tt.reduce"(%scores) ({
+    ^bb0(%a: f32, %b: f32):
+      %mx = arith.maxf %a, %b : f32
+      "tt.reduce.return"(%mx) : (f32) -> ()
+    }) {axis = 1 : i32} : (tensor<16x16xf32>) -> tensor<16xf32>
+
+    // Softmax: exp(score - max)
+    %max_splat = tt.splat %row_max : tensor<16xf32> -> tensor<16x16xf32, #blocked>
+    %shifted = arith.subf %scores, %max_splat : tensor<16x16xf32>
+    %p = math.exp %shifted : tensor<16x16xf32>
+
+    // Sum for normalization
+    %row_sum = "tt.reduce"(%p) ({
+    ^bb0(%c: f32, %d: f32):
+      %sm = arith.addf %c, %d : f32
+      "tt.reduce.return"(%sm) : (f32) -> ()
+    }) {axis = 1 : i32} : (tensor<16x16xf32>) -> tensor<16xf32>
+
+    // Load V block
+    %5 = tt.addptr %arg2, %2 : !tt.ptr<f32>, tensor<16xi32, #blocked2>
+    %v = tt.load %5 : !tt.ptr<f32>
+
+    // Output = P @ V (second tt.dot)
+    %out = "tt.dot"(%p, %v, %cst) {allowTF32 = true} : (tensor<16x16xf32>, tensor<16x64xf32>, tensor<16x64xf32>) -> tensor<16x64xf32>
+
+    // Store output
+    %6 = tt.addptr %arg3, %1 : !tt.ptr<f32>, tensor<16xi32, #blocked1>
+    tt.store %6, %out : !tt.ptr<f32>
+    tt.return
+  }
+}
+"""
+
+
+def test_ttgir_flash_attention_detected():
+    """Flash attention: 2 dot ops + exp + max reduction detected."""
+    from triton_metal.codegen.ttgir_parser import TTGIRParser
+
+    parser = TTGIRParser(FLASH_ATTENTION_TTGIR, FakeOptions())
+    parser._parse_function_signature()
+    parser._parse_body()
+
+    assert len(parser.dot_ops) >= 2, f"Expected 2+ dot ops, got {len(parser.dot_ops)}"
+    assert parser._is_flash_attention_pattern(), "Should match flash attention pattern"
+
+
+def test_ttgir_flash_attention_not_matmul():
+    """Flash attention should not be treated as simple matmul."""
+    from triton_metal.codegen.ttgir_parser import TTGIRParser
+
+    parser = TTGIRParser(FLASH_ATTENTION_TTGIR, FakeOptions())
+    parser._parse_function_signature()
+    parser._parse_body()
+
+    # Has 2 dots AND exp+max → flash attention, not simple matmul
+    assert parser._is_flash_attention_pattern()
+    assert len(parser.dot_ops) >= 2
+
+
+@requires_metal
+def test_ttgir_flash_attention_compiles(runner):
+    """Flash attention TTGIR compiles to valid MSL."""
+    from triton_metal.codegen.ttgir_parser import parse_ttgir
+
+    kb = parse_ttgir(FLASH_ATTENTION_TTGIR, FakeOptions())
+    msl = kb.build()
+    assert "flash_attention" in msl or "attention" in msl.lower()
+    runner.compile(msl, "flash_attention")

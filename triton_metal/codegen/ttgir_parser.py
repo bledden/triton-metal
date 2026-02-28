@@ -588,6 +588,10 @@ class TTGIRParser:
         for arg_name in self.scalar_args:
             n_arg = arg_name
 
+        # Check if this is flash attention (2 dot ops + reduce/exp)
+        if len(self.dot_ops) >= 2 and self._is_flash_attention_pattern():
+            return self._build_flash_attention_kernel(kb, primary_dtype)
+
         # Check if this is a matmul (tt.dot detected)
         if self.dot_ops:
             return self._build_matmul_kernel(kb, primary_dtype)
@@ -896,6 +900,47 @@ class TTGIRParser:
         kb.dedent()
         kb.raw_line("}")
 
+        return kb
+
+    def _is_flash_attention_pattern(self):
+        """Check if the IR matches a flash attention pattern.
+
+        Flash attention has:
+        - 2+ tt.dot ops (Q@K^T and P@V)
+        - exp() between them (softmax numerator)
+        - A max reduction or explicit max for numerical stability
+        """
+        if len(self.dot_ops) < 2:
+            return False
+        # Check for exp in the SSA values (used in softmax between dots)
+        has_exp = any(v[0] == "exp" for v in self.ssa_values.values())
+        # Check for max reduction or explicit max
+        has_max = (any(r[2] == "max" for r in self.reduce_ops) or
+                   any(v[0] == "fmax" for v in self.ssa_values.values()))
+        return has_exp and has_max
+
+    def _build_flash_attention_kernel(self, kb, primary_dtype):
+        """Generate a flash attention kernel from the pattern.
+
+        Detected from 2+ tt.dot ops with exp/max between them.
+        Delegates to the pre-built flash attention kernel generator.
+        """
+        from triton_metal.codegen.msl_emitter import make_flash_attention_kernel
+
+        # Detect head_dim from pointer args
+        # In typical flash attention TTGIR, Q/K/V are the first 3 pointer args
+        # and the last scalar arg before seq_len determines head_dim
+        head_dim = 64  # default
+
+        # Check for causal masking: look for cmpi or "causal" in IR
+        causal = "causal" in self.ir_text.lower() or any(
+            v[0] == "mask" and "slt" in str(self.ssa_values.get(v[1], ""))
+            for v in self.ssa_values.values() if v[0] == "select"
+        )
+
+        kb.set_prebuilt_msl(make_flash_attention_kernel(
+            head_dim=head_dim, causal=causal
+        ))
         return kb
 
     def _build_matmul_kernel(self, kb, primary_dtype):

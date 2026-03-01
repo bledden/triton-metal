@@ -172,6 +172,19 @@ class MetalUtils:
             raise RuntimeError(f"Failed to allocate Metal buffer ({nbytes} bytes)")
         return buf
 
+    def make_buffer_with_data(self, data, nbytes):
+        """Create a Metal buffer by copying data (single-copy via Metal API)."""
+        import Metal
+
+        buf = self.device.newBufferWithBytes_length_options_(
+            data, nbytes, Metal.MTLResourceStorageModeShared
+        )
+        if buf is None:
+            raise RuntimeError(
+                f"Failed to create Metal buffer with data ({nbytes} bytes)"
+            )
+        return buf
+
     def get_device_properties(self, device=0):
         return {
             "max_shared_mem": 32768,  # 32 KB threadgroup memory
@@ -233,9 +246,10 @@ class MetalLauncher:
         block_size = kernel_metadata[3] if kernel_metadata and len(kernel_metadata) > 3 else num_warps * 32
 
         # Pack arguments into Metal buffers.
-        # For tensors, we copy data into Metal-allocated buffers to avoid
-        # NoCopy's page-alignment requirement (ARM64 pages are 16 KB).
-        # After dispatch, we copy output data back.
+        # For tensors: try zero-copy (NoCopy) when pointer and size are
+        # 16 KB page-aligned; otherwise use newBufferWithBytes (single copy).
+        # NoCopy shares UMA memory, avoiding any data movement.
+        PAGE_SIZE = 16384  # ARM64 page size
         buffers = []
         tensor_copies = []  # (metal_buf, tensor, nbytes) for output writeback
 
@@ -243,14 +257,19 @@ class MetalLauncher:
             if hasattr(arg, "data_ptr"):
                 ptr = arg.data_ptr()
                 nbytes = arg.nelement() * arg.element_size()
-                # Allocate Metal buffer and copy tensor data in.
-                buf = utils.make_buffer(nbytes)
-                src = (ctypes.c_char * nbytes).from_address(ptr)
-                dst = buf.contents().as_buffer(nbytes)
-                dst[:] = bytes(src)
-                buffers.append((buf, 0))
-                # Track all tensor args for output writeback.
-                tensor_copies.append((buf, arg, nbytes))
+                page_aligned = (ptr % PAGE_SIZE == 0) and (nbytes % PAGE_SIZE == 0)
+
+                if page_aligned and nbytes >= PAGE_SIZE:
+                    # Zero-copy: wrap existing memory as Metal buffer.
+                    buf = utils.make_buffer_from_ptr(ptr, nbytes)
+                    buffers.append((buf, 0))
+                    # No copy-back needed — same physical memory (UMA).
+                else:
+                    # Copy path: use newBufferWithBytes for single-copy.
+                    src = (ctypes.c_char * nbytes).from_address(ptr)
+                    buf = utils.make_buffer_with_data(src, nbytes)
+                    buffers.append((buf, 0))
+                    tensor_copies.append((buf, arg, nbytes))
             elif isinstance(arg, bool):
                 buf = utils.make_buffer(4)
                 view = buf.contents().as_buffer(4)
@@ -290,9 +309,8 @@ class MetalLauncher:
         # Copy results back from Metal buffers to tensor memory.
         for metal_buf, tensor, nbytes in tensor_copies:
             src_view = metal_buf.contents().as_buffer(nbytes)
-            dst_ptr = tensor.data_ptr()
-            dst = (ctypes.c_char * nbytes).from_address(dst_ptr)
-            dst[:] = bytes(src_view)
+            dst = (ctypes.c_char * nbytes).from_address(tensor.data_ptr())
+            ctypes.memmove(dst, (ctypes.c_char * nbytes).from_buffer(src_view), nbytes)
 
         if launch_exit_hook:
             launch_exit_hook(kernel_metadata, launch_metadata)

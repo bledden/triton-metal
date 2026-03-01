@@ -697,3 +697,122 @@ def test_triton_jit_gelu():
     assert torch.allclose(output, expected, atol=1e-5), (
         f"GELU max error: {(output - expected).abs().max().item()}"
     )
+
+
+@requires_metal
+@requires_triton
+def test_triton_jit_vector_add_fp16():
+    """@triton.jit vector_add with FP16 tensors."""
+    import torch
+
+    @triton.jit
+    def add_kernel_fp16(a_ptr, b_ptr, out_ptr, n,
+                        BLOCK_SIZE: triton.language.constexpr):
+        pid = triton.language.program_id(0)
+        offsets = pid * BLOCK_SIZE + triton.language.arange(0, BLOCK_SIZE)
+        mask = offsets < n
+        a = triton.language.load(a_ptr + offsets, mask=mask)
+        b = triton.language.load(b_ptr + offsets, mask=mask)
+        triton.language.store(out_ptr + offsets, a + b, mask=mask)
+
+    n = 1024
+    a = torch.randn(n, dtype=torch.float16)
+    b = torch.randn(n, dtype=torch.float16)
+    out = torch.zeros(n, dtype=torch.float16)
+
+    add_kernel_fp16[(triton.cdiv(n, 256),)](a, b, out, n, BLOCK_SIZE=256)
+
+    expected = a + b
+    assert torch.allclose(out, expected, atol=1e-3), (
+        f"FP16 add max error: {(out - expected).abs().max().item()}"
+    )
+
+
+@requires_metal
+@requires_triton
+def test_triton_jit_non_power_of_2():
+    """@triton.jit with non-power-of-2 tensor sizes (edge case masking)."""
+    import torch
+
+    @triton.jit
+    def add_kernel(a_ptr, b_ptr, out_ptr, n,
+                   BLOCK_SIZE: triton.language.constexpr):
+        pid = triton.language.program_id(0)
+        offsets = pid * BLOCK_SIZE + triton.language.arange(0, BLOCK_SIZE)
+        mask = offsets < n
+        a = triton.language.load(a_ptr + offsets, mask=mask)
+        b = triton.language.load(b_ptr + offsets, mask=mask)
+        triton.language.store(out_ptr + offsets, a + b, mask=mask)
+
+    for n in [100, 300, 500, 997]:
+        a = torch.randn(n)
+        b = torch.randn(n)
+        out = torch.zeros(n)
+
+        add_kernel[(triton.cdiv(n, 256),)](a, b, out, n, BLOCK_SIZE=256)
+
+        expected = a + b
+        assert torch.allclose(out, expected, atol=1e-5), (
+            f"n={n} max error: {(out - expected).abs().max().item()}"
+        )
+
+
+@requires_metal
+@requires_triton
+def test_triton_jit_elementwise_mul():
+    """@triton.jit elementwise multiply (2 inputs, 1 output)."""
+    import torch
+
+    @triton.jit
+    def mul_kernel(a_ptr, b_ptr, out_ptr, n,
+                   BLOCK_SIZE: triton.language.constexpr):
+        pid = triton.language.program_id(0)
+        offsets = pid * BLOCK_SIZE + triton.language.arange(0, BLOCK_SIZE)
+        mask = offsets < n
+        a = triton.language.load(a_ptr + offsets, mask=mask)
+        b = triton.language.load(b_ptr + offsets, mask=mask)
+        triton.language.store(out_ptr + offsets, a * b, mask=mask)
+
+    n = 1024
+    a = torch.randn(n)
+    b = torch.randn(n)
+    out = torch.empty(n)
+    mul_kernel[(triton.cdiv(n, 256),)](a, b, out, n, BLOCK_SIZE=256)
+
+    expected = a * b
+    assert torch.allclose(out, expected, atol=1e-5), (
+        f"Mul max error: {(out - expected).abs().max().item()}"
+    )
+
+
+
+
+@requires_metal
+@requires_triton
+def test_triton_jit_fused_add_relu():
+    """@triton.jit fused add + ReLU (2 inputs, 1 output, select op)."""
+    import torch
+
+    @triton.jit
+    def fused_add_relu_kernel(a_ptr, b_ptr, out_ptr, n,
+                              BLOCK_SIZE: triton.language.constexpr):
+        pid = triton.language.program_id(0)
+        offsets = pid * BLOCK_SIZE + triton.language.arange(0, BLOCK_SIZE)
+        mask = offsets < n
+        a = triton.language.load(a_ptr + offsets, mask=mask)
+        b = triton.language.load(b_ptr + offsets, mask=mask)
+        x = a + b
+        zero = 0.0
+        output = triton.language.where(x > zero, x, zero)
+        triton.language.store(out_ptr + offsets, output, mask=mask)
+
+    n = 1024
+    a = torch.randn(n)
+    b = torch.randn(n)
+    out = torch.empty(n)
+    fused_add_relu_kernel[(triton.cdiv(n, 256),)](a, b, out, n, BLOCK_SIZE=256)
+
+    expected = torch.nn.functional.relu(a + b)
+    assert torch.allclose(out, expected, atol=1e-5), (
+        f"Fused add+ReLU max error: {(out - expected).abs().max().item()}"
+    )

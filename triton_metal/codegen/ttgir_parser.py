@@ -464,7 +464,7 @@ class TTGIRParser:
                     result = f"%{m.group(1)}"
                     pred = m.group(2)  # slt, sle, sgt, sge, eq, ne, ult, ule, ugt, uge
                     self.mask_var = result
-                    self.ssa_values[result] = ("mask", m.group(3), m.group(4))
+                    self.ssa_values[result] = ("mask", pred, m.group(3), m.group(4))
                 continue
 
             # arith.cmpf (float comparison — used for activation conditionals)
@@ -472,7 +472,8 @@ class TTGIRParser:
                 m = re.match(r"%(\w+)\s*=\s*arith\.cmpf\s+(\w+)\s*,\s*(%\w+)\s*,\s*(%\w+)", line)
                 if m:
                     result = f"%{m.group(1)}"
-                    self.ssa_values[result] = ("mask", m.group(3), m.group(4))
+                    pred = m.group(2)  # ogt, oge, olt, ole, oeq, one, etc.
+                    self.ssa_values[result] = ("mask", pred, m.group(3), m.group(4))
                 continue
 
             # arith.select (ternary: cond ? true_val : false_val)
@@ -2235,6 +2236,23 @@ class TTGIRParser:
             var_name = f"r_{len(self.computed_values)}"
             msl_op = "max" if op == "fmax" else "min"
             kb._var(var_name, f"{msl_op}({lhs_var}, {rhs_var})", ty="float")
+            self.computed_values[ssa] = var_name
+            return var_name
+
+        # Mask (comparison result)
+        if op == "mask":
+            pred = val_info[1]
+            lhs_var = self._emit_ssa_value(kb, val_info[2], input_vars, dtype, emitted)
+            rhs_var = self._emit_ssa_value(kb, val_info[3], input_vars, dtype, emitted)
+            pred_map = {
+                "ogt": ">", "oge": ">=", "olt": "<", "ole": "<=",
+                "oeq": "==", "one": "!=",
+                "slt": "<", "sle": "<=", "sgt": ">", "sge": ">=",
+                "eq": "==", "ne": "!=",
+            }
+            msl_op = pred_map.get(pred, ">")
+            var_name = f"r_{len(self.computed_values)}"
+            kb._var(var_name, f"{lhs_var} {msl_op} {rhs_var}", ty="bool")
             self.computed_values[ssa] = var_name
             return var_name
 

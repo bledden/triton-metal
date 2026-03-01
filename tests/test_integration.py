@@ -816,3 +816,62 @@ def test_triton_jit_fused_add_relu():
     assert torch.allclose(out, expected, atol=1e-5), (
         f"Fused add+ReLU max error: {(out - expected).abs().max().item()}"
     )
+
+
+@requires_metal
+@requires_triton
+def test_triton_jit_fused_mul_add():
+    """@triton.jit fused multiply-add: out = a * b + c."""
+    import torch
+
+    @triton.jit
+    def fma_kernel(a_ptr, b_ptr, c_ptr, out_ptr, n,
+                   BLOCK_SIZE: triton.language.constexpr):
+        pid = triton.language.program_id(0)
+        offsets = pid * BLOCK_SIZE + triton.language.arange(0, BLOCK_SIZE)
+        mask = offsets < n
+        a = triton.language.load(a_ptr + offsets, mask=mask)
+        b = triton.language.load(b_ptr + offsets, mask=mask)
+        c = triton.language.load(c_ptr + offsets, mask=mask)
+        triton.language.store(out_ptr + offsets, a * b + c, mask=mask)
+
+    n = 1024
+    a = torch.randn(n)
+    b = torch.randn(n)
+    c = torch.randn(n)
+    out = torch.empty(n)
+    fma_kernel[(triton.cdiv(n, 256),)](a, b, c, out, n, BLOCK_SIZE=256)
+
+    expected = a * b + c
+    assert torch.allclose(out, expected, atol=1e-5), (
+        f"FMA max error: {(out - expected).abs().max().item()}"
+    )
+
+
+@requires_metal
+@requires_triton
+def test_triton_jit_squared_diff():
+    """@triton.jit squared difference: out = (a - b)^2."""
+    import torch
+
+    @triton.jit
+    def sq_diff_kernel(a_ptr, b_ptr, out_ptr, n,
+                       BLOCK_SIZE: triton.language.constexpr):
+        pid = triton.language.program_id(0)
+        offsets = pid * BLOCK_SIZE + triton.language.arange(0, BLOCK_SIZE)
+        mask = offsets < n
+        a = triton.language.load(a_ptr + offsets, mask=mask)
+        b = triton.language.load(b_ptr + offsets, mask=mask)
+        diff = a - b
+        triton.language.store(out_ptr + offsets, diff * diff, mask=mask)
+
+    n = 1024
+    a = torch.randn(n)
+    b = torch.randn(n)
+    out = torch.empty(n)
+    sq_diff_kernel[(triton.cdiv(n, 256),)](a, b, out, n, BLOCK_SIZE=256)
+
+    expected = (a - b) ** 2
+    assert torch.allclose(out, expected, atol=1e-5), (
+        f"Squared diff max error: {(out - expected).abs().max().item()}"
+    )

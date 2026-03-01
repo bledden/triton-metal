@@ -1192,3 +1192,181 @@ def test_triton_jit_softmax_large():
             f"{n_rows}x{n_cols} softmax max error: "
             f"{(out - expected).abs().max().item()}"
         )
+
+
+@requires_metal
+@requires_triton
+def test_triton_jit_swiglu():
+    """@triton.jit SwiGLU activation: out = silu(gate) * up."""
+    import torch
+
+    @triton.jit
+    def swiglu_kernel(gate_ptr, up_ptr, out_ptr, n,
+                      BLOCK_SIZE: triton.language.constexpr):
+        pid = triton.language.program_id(0)
+        offsets = pid * BLOCK_SIZE + triton.language.arange(0, BLOCK_SIZE)
+        mask = offsets < n
+        gate = triton.language.load(gate_ptr + offsets, mask=mask)
+        up = triton.language.load(up_ptr + offsets, mask=mask)
+        # SiLU(gate) * up
+        silu_gate = gate * triton.language.sigmoid(gate)
+        triton.language.store(out_ptr + offsets, silu_gate * up, mask=mask)
+
+    n = 1024
+    gate = torch.randn(n)
+    up = torch.randn(n)
+    out = torch.empty(n)
+    swiglu_kernel[(triton.cdiv(n, 256),)](gate, up, out, n, BLOCK_SIZE=256)
+
+    expected = torch.nn.functional.silu(gate) * up
+    assert torch.allclose(out, expected, atol=1e-5), (
+        f"SwiGLU max error: {(out - expected).abs().max().item()}"
+    )
+
+
+@requires_metal
+@requires_triton
+def test_triton_jit_weighted_sum():
+    """@triton.jit weighted sum: out = a * w_a + b * w_b (linear combination)."""
+    import torch
+
+    @triton.jit
+    def weighted_sum_kernel(a_ptr, b_ptr, out_ptr, w_a, w_b, n,
+                            BLOCK_SIZE: triton.language.constexpr):
+        pid = triton.language.program_id(0)
+        offsets = pid * BLOCK_SIZE + triton.language.arange(0, BLOCK_SIZE)
+        mask = offsets < n
+        a = triton.language.load(a_ptr + offsets, mask=mask)
+        b = triton.language.load(b_ptr + offsets, mask=mask)
+        triton.language.store(out_ptr + offsets, a * w_a + b * w_b, mask=mask)
+
+    n = 1024
+    a = torch.randn(n)
+    b = torch.randn(n)
+    out = torch.empty(n)
+    w_a, w_b = 0.6, 0.4
+    weighted_sum_kernel[(triton.cdiv(n, 256),)](a, b, out, w_a, w_b, n, BLOCK_SIZE=256)
+
+    expected = a * w_a + b * w_b
+    assert torch.allclose(out, expected, atol=1e-5), (
+        f"Weighted sum max error: {(out - expected).abs().max().item()}"
+    )
+
+
+@requires_metal
+@requires_triton
+def test_triton_jit_residual_add():
+    """@triton.jit residual connection: out = x + residual."""
+    import torch
+
+    @triton.jit
+    def residual_kernel(x_ptr, residual_ptr, out_ptr, n,
+                        BLOCK_SIZE: triton.language.constexpr):
+        pid = triton.language.program_id(0)
+        offsets = pid * BLOCK_SIZE + triton.language.arange(0, BLOCK_SIZE)
+        mask = offsets < n
+        x = triton.language.load(x_ptr + offsets, mask=mask)
+        residual = triton.language.load(residual_ptr + offsets, mask=mask)
+        triton.language.store(out_ptr + offsets, x + residual, mask=mask)
+
+    n = 1024
+    x = torch.randn(n)
+    residual = torch.randn(n)
+    out = torch.empty(n)
+    residual_kernel[(triton.cdiv(n, 256),)](x, residual, out, n, BLOCK_SIZE=256)
+
+    expected = x + residual
+    assert torch.allclose(out, expected, atol=1e-5), (
+        f"Residual add max error: {(out - expected).abs().max().item()}"
+    )
+
+
+@requires_metal
+@requires_triton
+def test_triton_jit_type_cast_fp16():
+    """@triton.jit FP16 input → FP32 compute → FP16 output."""
+    import torch
+
+    @triton.jit
+    def cast_compute_kernel(x_ptr, y_ptr, out_ptr, n,
+                            BLOCK_SIZE: triton.language.constexpr):
+        pid = triton.language.program_id(0)
+        offsets = pid * BLOCK_SIZE + triton.language.arange(0, BLOCK_SIZE)
+        mask = offsets < n
+        x = triton.language.load(x_ptr + offsets, mask=mask).to(triton.language.float32)
+        y = triton.language.load(y_ptr + offsets, mask=mask).to(triton.language.float32)
+        result = (x * y + x) * 0.5
+        triton.language.store(out_ptr + offsets, result.to(triton.language.float16), mask=mask)
+
+    n = 1024
+    x = torch.randn(n, dtype=torch.float16)
+    y = torch.randn(n, dtype=torch.float16)
+    out = torch.empty(n, dtype=torch.float16)
+    cast_compute_kernel[(triton.cdiv(n, 256),)](x, y, out, n, BLOCK_SIZE=256)
+
+    expected = ((x.float() * y.float() + x.float()) * 0.5).half()
+    assert torch.allclose(out, expected, atol=1e-3), (
+        f"FP16 cast max error: {(out - expected).abs().max().item()}"
+    )
+
+
+@requires_metal
+@requires_triton
+def test_triton_jit_matmul_rectangular():
+    """@triton.jit matmul with non-square matrices."""
+    import torch
+
+    @triton.jit
+    def matmul_kernel(
+        a_ptr, b_ptr, c_ptr,
+        M, N, K,
+        stride_am, stride_ak,
+        stride_bk, stride_bn,
+        stride_cm, stride_cn,
+        BLOCK_M: triton.language.constexpr,
+        BLOCK_N: triton.language.constexpr,
+        BLOCK_K: triton.language.constexpr,
+    ):
+        pid_m = triton.language.program_id(0)
+        pid_n = triton.language.program_id(1)
+        offs_m = pid_m * BLOCK_M + triton.language.arange(0, BLOCK_M)
+        offs_n = pid_n * BLOCK_N + triton.language.arange(0, BLOCK_N)
+        offs_k = triton.language.arange(0, BLOCK_K)
+        a_ptrs = (a_ptr + offs_m[:, None] * stride_am
+                  + offs_k[None, :] * stride_ak)
+        b_ptrs = (b_ptr + offs_k[:, None] * stride_bk
+                  + offs_n[None, :] * stride_bn)
+        acc = triton.language.zeros((BLOCK_M, BLOCK_N), dtype=triton.language.float32)
+        for k in range(0, K, BLOCK_K):
+            a_mask = (offs_m[:, None] < M) & ((k + offs_k[None, :]) < K)
+            b_mask = ((k + offs_k[:, None]) < K) & (offs_n[None, :] < N)
+            a = triton.language.load(a_ptrs, mask=a_mask, other=0.0)
+            b = triton.language.load(b_ptrs, mask=b_mask, other=0.0)
+            acc += triton.language.dot(a, b)
+            a_ptrs += BLOCK_K * stride_ak
+            b_ptrs += BLOCK_K * stride_bk
+        c_ptrs = (c_ptr + offs_m[:, None] * stride_cm
+                  + offs_n[None, :] * stride_cn)
+        c_mask = (offs_m[:, None] < M) & (offs_n[None, :] < N)
+        triton.language.store(c_ptrs, acc, mask=c_mask)
+
+    # Rectangular: 64x96 @ 96x128
+    M, N, K = 64, 128, 96
+    a = torch.randn(M, K)
+    b = torch.randn(K, N)
+    c = torch.zeros(M, N)
+
+    grid = (M // 32, N // 32)
+    matmul_kernel[grid](
+        a, b, c,
+        M, N, K,
+        a.stride(0), a.stride(1),
+        b.stride(0), b.stride(1),
+        c.stride(0), c.stride(1),
+        BLOCK_M=32, BLOCK_N=32, BLOCK_K=32,
+    )
+
+    expected = a @ b
+    assert torch.allclose(c, expected, atol=1e-2), (
+        f"Rectangular matmul max error: {(c - expected).abs().max().item()}"
+    )

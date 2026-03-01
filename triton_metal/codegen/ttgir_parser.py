@@ -2189,9 +2189,11 @@ class TTGIRParser:
 
         op = val_info[0]
 
-        # Passthrough (extf, truncf)
+        # Passthrough (extf, truncf) — cache for reuse
         if op == "passthrough":
-            return self._emit_ssa_value(kb, val_info[1], input_vars, dtype, emitted)
+            result = self._emit_ssa_value(kb, val_info[1], input_vars, dtype, emitted)
+            self.computed_values[ssa] = result
+            return result
 
         # Load — map to the loaded variable
         if op == "load":
@@ -2220,9 +2222,11 @@ class TTGIRParser:
             self.computed_values[ssa] = var_name
             return var_name
 
-        # Integer cast (extsi, trunci) — treat as passthrough
+        # Integer cast (extsi, trunci) — treat as passthrough, cache for reuse
         if op == "int_cast":
-            return self._emit_ssa_value(kb, val_info[1], input_vars, dtype, emitted)
+            result = self._emit_ssa_value(kb, val_info[1], input_vars, dtype, emitted)
+            self.computed_values[ssa] = result
+            return result
 
         # Fused multiply-add: fma(a, b, c) = a*b + c
         if op == "fma":

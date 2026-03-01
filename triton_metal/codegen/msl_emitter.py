@@ -1105,17 +1105,18 @@ kernel void matmul_swizzled(
 def make_activation_kernel(activation="tanh", block_size=256, dtype="fp32"):
     """Generate an activation function kernel.
 
-    Supports tanh, sigmoid, elu, leaky_relu, and hardswish activations
+    Supports tanh, sigmoid, silu, elu, leaky_relu, and hardswish activations
     with optimized implementations.
 
     Args:
-        activation: One of "tanh", "sigmoid", "elu", "leaky_relu", "hardswish".
+        activation: One of "tanh", "sigmoid", "silu", "elu", "leaky_relu", "hardswish".
         block_size: Threads per threadgroup.
         dtype: Data type.
     """
     act_map = {
         "tanh": "tanh(x)",
         "sigmoid": "1.0f / (1.0f + exp(-x))",
+        "silu": "x / (1.0f + exp(-x))",
         "elu": "x >= 0.0f ? x : (exp(x) - 1.0f)",
         "leaky_relu": "x >= 0.0f ? x : 0.01f * x",
         "hardswish": "x * clamp(x / 6.0f + 0.5f, 0.0f, 1.0f)",

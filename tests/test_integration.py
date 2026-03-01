@@ -614,3 +614,86 @@ def test_triton_jit_matmul():
         assert torch.allclose(c, expected, atol=1e-2), (
             f"{size}x{size} max error: {(c - expected).abs().max().item()}"
         )
+
+
+@requires_metal
+@requires_triton
+def test_triton_jit_silu():
+    """@triton.jit SiLU (x * sigmoid(x)) compiles and runs via Metal backend."""
+    import torch
+
+    @triton.jit
+    def silu_kernel(x_ptr, output_ptr, n_elements, BLOCK_SIZE: triton.language.constexpr):
+        pid = triton.language.program_id(0)
+        offsets = pid * BLOCK_SIZE + triton.language.arange(0, BLOCK_SIZE)
+        mask = offsets < n_elements
+        x = triton.language.load(x_ptr + offsets, mask=mask)
+        output = x * triton.language.sigmoid(x)
+        triton.language.store(output_ptr + offsets, output, mask=mask)
+
+    n = 1024
+    x = torch.randn(n)
+    output = torch.empty(n)
+    silu_kernel[(triton.cdiv(n, 256),)](x, output, n, BLOCK_SIZE=256)
+
+    expected = torch.nn.functional.silu(x)
+    assert torch.allclose(output, expected, atol=1e-5), (
+        f"SiLU max error: {(output - expected).abs().max().item()}"
+    )
+
+
+@requires_metal
+@requires_triton
+def test_triton_jit_sigmoid():
+    """@triton.jit sigmoid compiles and runs via Metal backend."""
+    import torch
+
+    @triton.jit
+    def sigmoid_kernel(x_ptr, output_ptr, n_elements, BLOCK_SIZE: triton.language.constexpr):
+        pid = triton.language.program_id(0)
+        offsets = pid * BLOCK_SIZE + triton.language.arange(0, BLOCK_SIZE)
+        mask = offsets < n_elements
+        x = triton.language.load(x_ptr + offsets, mask=mask)
+        output = triton.language.sigmoid(x)
+        triton.language.store(output_ptr + offsets, output, mask=mask)
+
+    n = 1024
+    x = torch.randn(n)
+    output = torch.empty(n)
+    sigmoid_kernel[(triton.cdiv(n, 256),)](x, output, n, BLOCK_SIZE=256)
+
+    expected = torch.sigmoid(x)
+    assert torch.allclose(output, expected, atol=1e-5), (
+        f"Sigmoid max error: {(output - expected).abs().max().item()}"
+    )
+
+
+@requires_metal
+@requires_triton
+def test_triton_jit_gelu():
+    """@triton.jit GELU compiles and runs via Metal backend."""
+    import torch
+
+    @triton.jit
+    def gelu_kernel(x_ptr, output_ptr, n_elements, BLOCK_SIZE: triton.language.constexpr):
+        pid = triton.language.program_id(0)
+        offsets = pid * BLOCK_SIZE + triton.language.arange(0, BLOCK_SIZE)
+        mask = offsets < n_elements
+        x = triton.language.load(x_ptr + offsets, mask=mask)
+        # GELU tanh approximation using exp-based tanh:
+        # tanh(z) = (exp(2z) - 1) / (exp(2z) + 1)
+        z = 0.7978845608028654 * (x + 0.044715 * x * x * x)
+        e2z = triton.language.exp(2.0 * z)
+        tanh_z = (e2z - 1.0) / (e2z + 1.0)
+        output = 0.5 * x * (1.0 + tanh_z)
+        triton.language.store(output_ptr + offsets, output, mask=mask)
+
+    n = 1024
+    x = torch.randn(n)
+    output = torch.empty(n)
+    gelu_kernel[(triton.cdiv(n, 256),)](x, output, n, BLOCK_SIZE=256)
+
+    expected = torch.nn.functional.gelu(x, approximate="tanh")
+    assert torch.allclose(output, expected, atol=1e-5), (
+        f"GELU max error: {(output - expected).abs().max().item()}"
+    )

@@ -1551,8 +1551,8 @@ class TTGIRParser:
     def _classify_activation(self):
         """Classify the activation function from the IR ops.
 
-        Returns the activation name ("tanh", "sigmoid", "elu", "leaky_relu",
-        "hardswish") or None if no activation pattern matches.
+        Returns the activation name ("tanh", "silu", "sigmoid", "elu",
+        "leaky_relu", "hardswish") or None if no activation pattern matches.
 
         Requirements for activation detection:
         - No reductions, no dot ops (elementwise only)
@@ -1566,12 +1566,23 @@ class TTGIRParser:
             return None
 
         ssa_ops = {v[0] for v in self.ssa_values.values()}
+        # Count arithmetic SSA values (excluding constants and loads).
+        arith_ops = {"neg", "exp", "add", "sub", "mul", "div", "fma",
+                     "tanh", "rsqrt", "sqrt", "log", "sin", "cos", "abs",
+                     "max", "min", "select", "mask"}
+        n_arith = sum(1 for v in self.ssa_values.values() if v[0] in arith_ops)
 
         # tanh: explicit tanh op
         if "tanh" in ssa_ops:
             return "tanh"
-        # sigmoid: exp + div (or neg+exp+add+div), no tanh, single input
-        if "exp" in ssa_ops and "div" in ssa_ops and "select" not in ssa_ops:
+        # silu (x * sigmoid(x)): exp + div + mul, no tanh, no select
+        # Guard: SiLU has exactly 5 arithmetic ops (neg, exp, add, div, mul).
+        # More complex patterns (GELU etc.) have 8+ and should use generic codegen.
+        if ("exp" in ssa_ops and "div" in ssa_ops and "mul" in ssa_ops
+                and "select" not in ssa_ops and n_arith <= 7):
+            return "silu"
+        # sigmoid: exp + div, no mul (pure sigmoid has no final multiply)
+        if "exp" in ssa_ops and "div" in ssa_ops and "select" not in ssa_ops and n_arith <= 5:
             return "sigmoid"
         # elu: exp + select (x > 0 ? x : alpha*(exp(x)-1))
         if "exp" in ssa_ops and "select" in ssa_ops:
@@ -2241,10 +2252,18 @@ class TTGIRParser:
         if op == "constant":
             # Try to extract numeric value
             val_str = val_info[1]
-            m = re.search(r"([\d.e+-]+)\s*:\s*\w+", val_str)
-            if m:
-                return f"{float(m.group(1))}f"
-            return "0.0f"
+            result = "0.0f"
+            # Tensor constant: dense<VALUE> : tensor<...>
+            m_dense = re.search(r"dense<([\d.e+-]+)>", val_str)
+            if m_dense:
+                result = f"{float(m_dense.group(1))}f"
+            else:
+                # Scalar constant: VALUE : type
+                m_scalar = re.search(r"([\d.e+-]+)\s*:\s*\w+", val_str)
+                if m_scalar:
+                    result = f"{float(m_scalar.group(1))}f"
+            self.computed_values[ssa] = result
+            return result
 
         # Splat of a scalar arg
         if op == "splat":

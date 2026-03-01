@@ -279,7 +279,10 @@ class MetalLauncher:
                 raise TypeError(f"Unsupported argument type: {type(arg)}")
 
         threads_per_tg = block_size
-        grid = (gridX, gridY, gridZ)
+        # Flatten grid to 1D. Our MSL kernels use scalar uint pid
+        # (threadgroup_position_in_grid gives x-component only).
+        # Prebuilt kernels decompose the flat index internally.
+        grid = (gridX * gridY * gridZ, 1, 1)
         threadgroup_size = (threads_per_tg, 1, 1)
 
         utils.launch(function, grid, threadgroup_size, buffers)

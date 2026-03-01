@@ -593,21 +593,24 @@ def test_triton_jit_matmul():
         c_mask = (offs_m[:, None] < M) & (offs_n[None, :] < N)
         triton.language.store(c_ptrs, acc, mask=c_mask)
 
-    M, N, K = 32, 32, 32
-    a = torch.randn(M, K)
-    b = torch.randn(K, N)
-    c = torch.zeros(M, N)
+    # Test multiple sizes: single-tile and multi-tile.
+    for size in [32, 64, 128]:
+        M = N = K = size
+        a = torch.randn(M, K)
+        b = torch.randn(K, N)
+        c = torch.zeros(M, N)
 
-    matmul_kernel[(1, 1)](
-        a, b, c,
-        M, N, K,
-        a.stride(0), a.stride(1),
-        b.stride(0), b.stride(1),
-        c.stride(0), c.stride(1),
-        BLOCK_M=32, BLOCK_N=32, BLOCK_K=32,
-    )
+        grid = (M // 32, N // 32)
+        matmul_kernel[grid](
+            a, b, c,
+            M, N, K,
+            a.stride(0), a.stride(1),
+            b.stride(0), b.stride(1),
+            c.stride(0), c.stride(1),
+            BLOCK_M=32, BLOCK_N=32, BLOCK_K=32,
+        )
 
-    expected = a @ b
-    assert torch.allclose(c, expected, atol=1e-2), (
-        f"Max error: {(c - expected).abs().max().item()}"
-    )
+        expected = a @ b
+        assert torch.allclose(c, expected, atol=1e-2), (
+            f"{size}x{size} max error: {(c - expected).abs().max().item()}"
+        )

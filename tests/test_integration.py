@@ -875,3 +875,320 @@ def test_triton_jit_squared_diff():
     assert torch.allclose(out, expected, atol=1e-5), (
         f"Squared diff max error: {(out - expected).abs().max().item()}"
     )
+
+
+@requires_metal
+@requires_triton
+def test_triton_jit_max_reduction():
+    """@triton.jit max reduction compiles and runs via Metal backend."""
+    import torch
+
+    @triton.jit
+    def max_kernel(input_ptr, output_ptr, n_elements,
+                   BLOCK_SIZE: triton.language.constexpr):
+        pid = triton.language.program_id(0)
+        offsets = pid * BLOCK_SIZE + triton.language.arange(0, BLOCK_SIZE)
+        mask = offsets < n_elements
+        x = triton.language.load(input_ptr + offsets, mask=mask,
+                                  other=-float('inf'))
+        result = triton.language.max(x, axis=0)
+        if pid == 0:
+            triton.language.store(output_ptr, result)
+
+    n = 256
+    a = torch.randn(n)
+    out = torch.zeros(1)
+
+    max_kernel[(1,)](a, out, n, BLOCK_SIZE=256)
+
+    expected = a.max()
+    assert torch.allclose(out, expected.unsqueeze(0), atol=1e-5), (
+        f"Max: got {out.item()}, expected {expected.item()}"
+    )
+
+
+@requires_metal
+@requires_triton
+def test_triton_jit_negation():
+    """@triton.jit unary negation: out = -x."""
+    import torch
+
+    @triton.jit
+    def neg_kernel(x_ptr, out_ptr, n,
+                   BLOCK_SIZE: triton.language.constexpr):
+        pid = triton.language.program_id(0)
+        offsets = pid * BLOCK_SIZE + triton.language.arange(0, BLOCK_SIZE)
+        mask = offsets < n
+        x = triton.language.load(x_ptr + offsets, mask=mask)
+        triton.language.store(out_ptr + offsets, -x, mask=mask)
+
+    n = 1024
+    x = torch.randn(n)
+    out = torch.empty(n)
+    neg_kernel[(triton.cdiv(n, 256),)](x, out, n, BLOCK_SIZE=256)
+
+    expected = -x
+    assert torch.allclose(out, expected, atol=1e-5), (
+        f"Negation max error: {(out - expected).abs().max().item()}"
+    )
+
+
+@requires_metal
+@requires_triton
+def test_triton_jit_exp_log():
+    """@triton.jit exp and log: out = log(exp(x)) ≈ x for moderate x."""
+    import torch
+
+    @triton.jit
+    def exp_log_kernel(x_ptr, out_ptr, n,
+                       BLOCK_SIZE: triton.language.constexpr):
+        pid = triton.language.program_id(0)
+        offsets = pid * BLOCK_SIZE + triton.language.arange(0, BLOCK_SIZE)
+        mask = offsets < n
+        x = triton.language.load(x_ptr + offsets, mask=mask)
+        e = triton.language.exp(x)
+        result = triton.language.log(e)
+        triton.language.store(out_ptr + offsets, result, mask=mask)
+
+    n = 1024
+    # Use moderate range to avoid overflow in exp
+    x = torch.randn(n).clamp(-5, 5)
+    out = torch.empty(n)
+    exp_log_kernel[(triton.cdiv(n, 256),)](x, out, n, BLOCK_SIZE=256)
+
+    # log(exp(x)) ≈ x
+    assert torch.allclose(out, x, atol=1e-5), (
+        f"exp→log max error: {(out - x).abs().max().item()}"
+    )
+
+
+@requires_metal
+@requires_triton
+def test_triton_jit_leaky_relu():
+    """@triton.jit leaky ReLU: out = x if x > 0 else 0.01 * x."""
+    import torch
+
+    @triton.jit
+    def leaky_relu_kernel(x_ptr, out_ptr, n,
+                          BLOCK_SIZE: triton.language.constexpr):
+        pid = triton.language.program_id(0)
+        offsets = pid * BLOCK_SIZE + triton.language.arange(0, BLOCK_SIZE)
+        mask = offsets < n
+        x = triton.language.load(x_ptr + offsets, mask=mask)
+        zero = 0.0
+        output = triton.language.where(x > zero, x, 0.01 * x)
+        triton.language.store(out_ptr + offsets, output, mask=mask)
+
+    n = 1024
+    x = torch.randn(n)
+    out = torch.empty(n)
+    leaky_relu_kernel[(triton.cdiv(n, 256),)](x, out, n, BLOCK_SIZE=256)
+
+    expected = torch.nn.functional.leaky_relu(x, negative_slope=0.01)
+    assert torch.allclose(out, expected, atol=1e-5), (
+        f"Leaky ReLU max error: {(out - expected).abs().max().item()}"
+    )
+
+
+@requires_metal
+@requires_triton
+def test_triton_jit_clamp():
+    """@triton.jit clamp: out = clamp(x, -1, 1)."""
+    import torch
+
+    @triton.jit
+    def clamp_kernel(x_ptr, out_ptr, n,
+                     BLOCK_SIZE: triton.language.constexpr):
+        pid = triton.language.program_id(0)
+        offsets = pid * BLOCK_SIZE + triton.language.arange(0, BLOCK_SIZE)
+        mask = offsets < n
+        x = triton.language.load(x_ptr + offsets, mask=mask)
+        lo = -1.0
+        hi = 1.0
+        # Double where: clamp to [lo, hi]
+        clamped = triton.language.where(x < lo, lo, x)
+        clamped = triton.language.where(clamped > hi, hi, clamped)
+        triton.language.store(out_ptr + offsets, clamped, mask=mask)
+
+    n = 1024
+    x = torch.randn(n) * 3  # wider range so clamping actually activates
+    out = torch.empty(n)
+    clamp_kernel[(triton.cdiv(n, 256),)](x, out, n, BLOCK_SIZE=256)
+
+    expected = x.clamp(-1, 1)
+    assert torch.allclose(out, expected, atol=1e-5), (
+        f"Clamp max error: {(out - expected).abs().max().item()}"
+    )
+
+
+@requires_metal
+@requires_triton
+def test_triton_jit_scalar_multiply():
+    """@triton.jit scalar multiply: out = 2.5 * x."""
+    import torch
+
+    @triton.jit
+    def scale_kernel(x_ptr, out_ptr, n,
+                     BLOCK_SIZE: triton.language.constexpr):
+        pid = triton.language.program_id(0)
+        offsets = pid * BLOCK_SIZE + triton.language.arange(0, BLOCK_SIZE)
+        mask = offsets < n
+        x = triton.language.load(x_ptr + offsets, mask=mask)
+        triton.language.store(out_ptr + offsets, 2.5 * x, mask=mask)
+
+    n = 1024
+    x = torch.randn(n)
+    out = torch.empty(n)
+    scale_kernel[(triton.cdiv(n, 256),)](x, out, n, BLOCK_SIZE=256)
+
+    expected = 2.5 * x
+    assert torch.allclose(out, expected, atol=1e-5), (
+        f"Scalar mul max error: {(out - expected).abs().max().item()}"
+    )
+
+
+@requires_metal
+@requires_triton
+def test_triton_jit_rms_norm():
+    """@triton.jit RMS normalization: out = x / sqrt(mean(x^2) + eps) * weight."""
+    import torch
+
+    @triton.jit
+    def rms_norm_kernel(x_ptr, weight_ptr, out_ptr, n_cols,
+                        eps: triton.language.constexpr,
+                        BLOCK_SIZE: triton.language.constexpr):
+        row_idx = triton.language.program_id(0)
+        row_start = row_idx * n_cols
+        offsets = triton.language.arange(0, BLOCK_SIZE)
+        mask = offsets < n_cols
+        x = triton.language.load(x_ptr + row_start + offsets, mask=mask, other=0.0)
+        w = triton.language.load(weight_ptr + offsets, mask=mask, other=0.0)
+        # RMS: sqrt(mean(x^2) + eps)
+        x_sq = x * x
+        mean_sq = triton.language.sum(x_sq, axis=0) / n_cols
+        rms = 1.0 / triton.language.sqrt(mean_sq + eps)
+        out = x * rms * w
+        triton.language.store(out_ptr + row_start + offsets, out, mask=mask)
+
+    n_rows, n_cols = 4, 64
+    x = torch.randn(n_rows, n_cols)
+    weight = torch.randn(n_cols)
+    out = torch.zeros(n_rows, n_cols)
+
+    rms_norm_kernel[(n_rows,)](x, weight, out, n_cols, eps=1e-6, BLOCK_SIZE=128)
+
+    # Reference RMS norm
+    rms = torch.sqrt(x.pow(2).mean(dim=1, keepdim=True) + 1e-6)
+    expected = x / rms * weight
+    assert torch.allclose(out, expected, atol=1e-4), (
+        f"RMS norm max error: {(out - expected).abs().max().item()}"
+    )
+
+
+@requires_metal
+@requires_triton
+def test_triton_jit_layer_norm():
+    """@triton.jit layer normalization: out = (x - mean) / sqrt(var + eps) * w + b."""
+    import torch
+
+    @triton.jit
+    def layer_norm_kernel(x_ptr, w_ptr, b_ptr, out_ptr, n_cols,
+                          eps: triton.language.constexpr,
+                          BLOCK_SIZE: triton.language.constexpr):
+        row_idx = triton.language.program_id(0)
+        row_start = row_idx * n_cols
+        offsets = triton.language.arange(0, BLOCK_SIZE)
+        mask = offsets < n_cols
+        x = triton.language.load(x_ptr + row_start + offsets, mask=mask, other=0.0)
+        w = triton.language.load(w_ptr + offsets, mask=mask, other=0.0)
+        b = triton.language.load(b_ptr + offsets, mask=mask, other=0.0)
+        # Mean
+        mean = triton.language.sum(x, axis=0) / n_cols
+        centered = x - mean
+        # Variance
+        var = triton.language.sum(centered * centered, axis=0) / n_cols
+        inv_std = 1.0 / triton.language.sqrt(var + eps)
+        out = centered * inv_std * w + b
+        triton.language.store(out_ptr + row_start + offsets, out, mask=mask)
+
+    n_rows, n_cols = 4, 64
+    x = torch.randn(n_rows, n_cols)
+    w = torch.randn(n_cols)
+    b = torch.randn(n_cols)
+    out = torch.zeros(n_rows, n_cols)
+
+    layer_norm_kernel[(n_rows,)](x, w, b, out, n_cols, eps=1e-6, BLOCK_SIZE=128)
+
+    expected = torch.layer_norm(x, [n_cols], weight=w, bias=b, eps=1e-6)
+    assert torch.allclose(out, expected, atol=1e-4), (
+        f"Layer norm max error: {(out - expected).abs().max().item()}"
+    )
+
+
+@requires_metal
+@requires_triton
+def test_triton_jit_min_reduction():
+    """@triton.jit min reduction compiles and runs via Metal backend."""
+    import torch
+
+    @triton.jit
+    def min_kernel(input_ptr, output_ptr, n_elements,
+                   BLOCK_SIZE: triton.language.constexpr):
+        pid = triton.language.program_id(0)
+        offsets = pid * BLOCK_SIZE + triton.language.arange(0, BLOCK_SIZE)
+        mask = offsets < n_elements
+        x = triton.language.load(input_ptr + offsets, mask=mask,
+                                  other=float('inf'))
+        result = triton.language.min(x, axis=0)
+        if pid == 0:
+            triton.language.store(output_ptr, result)
+
+    n = 256
+    a = torch.randn(n)
+    out = torch.zeros(1)
+
+    min_kernel[(1,)](a, out, n, BLOCK_SIZE=256)
+
+    expected = a.min()
+    assert torch.allclose(out, expected.unsqueeze(0), atol=1e-5), (
+        f"Min: got {out.item()}, expected {expected.item()}"
+    )
+
+
+@requires_metal
+@requires_triton
+def test_triton_jit_softmax_large():
+    """@triton.jit softmax with larger rows (stress test)."""
+    import torch
+
+    @triton.jit
+    def softmax_kernel(input_ptr, output_ptr, n_cols,
+                       BLOCK_SIZE: triton.language.constexpr):
+        row_idx = triton.language.program_id(0)
+        row_start = row_idx * n_cols
+        offsets = triton.language.arange(0, BLOCK_SIZE)
+        mask = offsets < n_cols
+        row = triton.language.load(
+            input_ptr + row_start + offsets, mask=mask, other=-float('inf')
+        )
+        row_max = triton.language.max(row, axis=0)
+        shifted = row - row_max
+        exp_vals = triton.language.exp(shifted)
+        exp_sum = triton.language.sum(exp_vals, axis=0)
+        softmax_out = exp_vals / exp_sum
+        triton.language.store(
+            output_ptr + row_start + offsets, softmax_out, mask=mask
+        )
+
+    # Test with larger dimensions
+    for n_rows, n_cols, block in [(8, 128, 128), (16, 256, 256)]:
+        a = torch.randn(n_rows, n_cols)
+        out = torch.zeros(n_rows, n_cols)
+
+        softmax_kernel[(n_rows,)](a, out, n_cols, BLOCK_SIZE=block)
+
+        expected = torch.softmax(a, dim=1)
+        assert torch.allclose(out, expected, atol=1e-4), (
+            f"{n_rows}x{n_cols} softmax max error: "
+            f"{(out - expected).abs().max().item()}"
+        )

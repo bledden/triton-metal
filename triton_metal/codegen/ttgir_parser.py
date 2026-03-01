@@ -1019,9 +1019,11 @@ class TTGIRParser:
         ops = [r[2] for r in self.reduce_ops]
         # Layer norm: two sum reductions (NOT softmax which has max+sum)
         if ops.count("sum") >= 2 and "max" not in ops:
-            # Check for subtract or rsqrt between/after reductions
-            return ("sub" in [v[0] for v in self.ssa_values.values()]
-                    or "rsqrt" in [v[0] for v in self.ssa_values.values()])
+            ssa_ops = {v[0] for v in self.ssa_values.values()}
+            # Check for subtract or rsqrt/sqrt (normalization step)
+            return ("sub" in ssa_ops
+                    or "rsqrt" in ssa_ops
+                    or "sqrt" in ssa_ops)
         return False
 
     def _build_softmax_kernel(self, kb, n_arg, primary_dtype):
@@ -1365,7 +1367,7 @@ class TTGIRParser:
         - 2 sum reductions (for mean and for sum of squared diffs)
         - subtract (x - mean)
         - multiply (diff * diff, i.e. squaring)
-        - NO rsqrt (that would be layer norm)
+        - NO rsqrt or sqrt (those indicate normalization, not plain variance)
         - 1 output pointer (variance values)
         """
         if len(self.reduce_ops) < 2:
@@ -1377,8 +1379,9 @@ class TTGIRParser:
         has_sub = "sub" in ssa_ops
         has_mul = "mul" in ssa_ops
         has_rsqrt = "rsqrt" in ssa_ops
-        # Variance = 2 sums + sub + mul, but NO rsqrt
-        return has_sub and has_mul and not has_rsqrt
+        has_sqrt = "sqrt" in ssa_ops
+        # Variance = 2 sums + sub + mul, but NO rsqrt/sqrt (normalization)
+        return has_sub and has_mul and not has_rsqrt and not has_sqrt
 
     def _build_variance_kernel(self, kb, n_arg, primary_dtype):
         """Generate a variance kernel from the pattern."""
@@ -1608,19 +1611,21 @@ class TTGIRParser:
 
         RMS norm has:
         - Sum reduction (for sum of squares)
-        - rsqrt operation
+        - rsqrt or sqrt+div (inverse square root)
         - mul operation (scale by weight)
         - NO sub (no mean subtraction — distinguishes from layer norm)
         - 2-3 input pointers (input, weight, optionally bias)
         """
         ssa_ops = {v[0] for v in self.ssa_values.values()}
         has_rsqrt = "rsqrt" in ssa_ops
+        # 1/sqrt(x) is equivalent to rsqrt(x), Triton may emit either form
+        has_sqrt_div = "sqrt" in ssa_ops and "div" in ssa_ops
         has_mul = "mul" in ssa_ops
         has_sub = "sub" in ssa_ops
         ops_list = [r[2] for r in self.reduce_ops]
         has_sum = "sum" in ops_list
-        # RMS norm: sum + rsqrt + mul but NO sub
-        return has_sum and has_rsqrt and has_mul and not has_sub
+        # RMS norm: sum + (rsqrt or sqrt+div) + mul but NO sub
+        return has_sum and (has_rsqrt or has_sqrt_div) and has_mul and not has_sub
 
     def _build_rms_norm_kernel(self, kb, n_arg, primary_dtype):
         """Generate an RMS norm kernel from the pattern."""

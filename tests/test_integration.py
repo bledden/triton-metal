@@ -1370,3 +1370,98 @@ def test_triton_jit_matmul_rectangular():
     assert torch.allclose(c, expected, atol=1e-2), (
         f"Rectangular matmul max error: {(c - expected).abs().max().item()}"
     )
+
+
+@requires_metal
+@requires_triton
+def test_triton_jit_online_softmax():
+    """@triton.jit online (numerically stable) softmax with 3-pass pattern."""
+    import torch
+
+    @triton.jit
+    def online_softmax_kernel(input_ptr, output_ptr, n_cols,
+                              BLOCK_SIZE: triton.language.constexpr):
+        row_idx = triton.language.program_id(0)
+        row_start = row_idx * n_cols
+        offsets = triton.language.arange(0, BLOCK_SIZE)
+        mask = offsets < n_cols
+        row = triton.language.load(
+            input_ptr + row_start + offsets, mask=mask, other=-float('inf')
+        )
+        # Numerically stable: subtract max, exp, normalize
+        row_max = triton.language.max(row, axis=0)
+        numerator = triton.language.exp(row - row_max)
+        denominator = triton.language.sum(numerator, axis=0)
+        softmax_out = numerator / denominator
+        triton.language.store(
+            output_ptr + row_start + offsets, softmax_out, mask=mask
+        )
+
+    n_rows, n_cols = 8, 64
+    a = torch.randn(n_rows, n_cols)
+    out = torch.zeros(n_rows, n_cols)
+
+    online_softmax_kernel[(n_rows,)](a, out, n_cols, BLOCK_SIZE=128)
+
+    expected = torch.softmax(a, dim=1)
+    assert torch.allclose(out, expected, atol=1e-4), (
+        f"Online softmax max error: {(out - expected).abs().max().item()}"
+    )
+
+
+@requires_metal
+@requires_triton
+def test_triton_jit_abs_value():
+    """@triton.jit absolute value using tl.abs."""
+    import torch
+
+    @triton.jit
+    def abs_kernel(x_ptr, out_ptr, n,
+                   BLOCK_SIZE: triton.language.constexpr):
+        pid = triton.language.program_id(0)
+        offsets = pid * BLOCK_SIZE + triton.language.arange(0, BLOCK_SIZE)
+        mask = offsets < n
+        x = triton.language.load(x_ptr + offsets, mask=mask)
+        triton.language.store(out_ptr + offsets, triton.language.abs(x), mask=mask)
+
+    n = 1024
+    x = torch.randn(n)
+    out = torch.empty(n)
+    abs_kernel[(triton.cdiv(n, 256),)](x, out, n, BLOCK_SIZE=256)
+
+    expected = x.abs()
+    assert torch.allclose(out, expected, atol=1e-5), (
+        f"Abs max error: {(out - expected).abs().max().item()}"
+    )
+
+
+@requires_metal
+@requires_triton
+def test_triton_jit_hardswish():
+    """@triton.jit HardSwish: out = x * clamp(x/6 + 0.5, 0, 1)."""
+    import torch
+
+    @triton.jit
+    def hardswish_kernel(x_ptr, out_ptr, n,
+                         BLOCK_SIZE: triton.language.constexpr):
+        pid = triton.language.program_id(0)
+        offsets = pid * BLOCK_SIZE + triton.language.arange(0, BLOCK_SIZE)
+        mask = offsets < n
+        x = triton.language.load(x_ptr + offsets, mask=mask)
+        inner = x / 6.0 + 0.5
+        zero = 0.0
+        one = 1.0
+        clamped = triton.language.where(inner < zero, zero, inner)
+        clamped = triton.language.where(clamped > one, one, clamped)
+        result = x * clamped
+        triton.language.store(out_ptr + offsets, result, mask=mask)
+
+    n = 1024
+    x = torch.randn(n) * 5
+    out = torch.empty(n)
+    hardswish_kernel[(triton.cdiv(n, 256),)](x, out, n, BLOCK_SIZE=256)
+
+    expected = torch.nn.functional.hardswish(x)
+    assert torch.allclose(out, expected, atol=1e-4), (
+        f"HardSwish max error: {(out - expected).abs().max().item()}"
+    )

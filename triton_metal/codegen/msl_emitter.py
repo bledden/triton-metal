@@ -329,9 +329,18 @@ class MSLCodeGen:
         self.builder = builder
 
     def emit(self):
-        # Return prebuilt MSL if available (e.g., matmul kernels)
+        # Return prebuilt MSL if available (e.g., matmul kernels).
+        # Substitute the kernel function name to match the TTGIR function name.
         if self.builder._prebuilt_msl is not None:
-            return self.builder._prebuilt_msl
+            msl = self.builder._prebuilt_msl
+            import re as _re
+            msl = _re.sub(
+                r'kernel\s+void\s+\w+\s*\(',
+                f'kernel void {self.builder.name}(',
+                msl,
+                count=1,
+            )
+            return msl
 
         lines = []
         lines.append("#include <metal_stdlib>")

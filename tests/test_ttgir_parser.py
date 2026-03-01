@@ -1244,9 +1244,9 @@ def test_ttgir_matmul_compiles(runner):
 
     kb = parse_ttgir(MATMUL_TTGIR, FakeOptions())
     msl = kb.build()
-    # Should produce simdgroup_matrix-based MSL
+    # Should produce simdgroup_matrix-based MSL with the TTGIR function name
     assert "simdgroup" in msl or "matmul" in msl.lower()
-    runner.compile(msl, "simdgroup_matmul")
+    runner.compile(msl, "matmul_kernel")
 
 
 @requires_metal
@@ -1257,8 +1257,8 @@ def test_ttgir_matmul_gpu(runner):
 
     kb = parse_ttgir(MATMUL_TTGIR, FakeOptions())
     msl = kb.build()
-    path = runner.compile(msl, "simdgroup_matmul")
-    pipeline = runner.load(path, "simdgroup_matmul")
+    path = runner.compile(msl, "matmul_kernel")
+    pipeline = runner.load(path, "matmul_kernel")
 
     M, N, K = 32, 32, 32
     random.seed(4444)

@@ -487,3 +487,127 @@ def test_triton_jit_vector_add():
 
     expected = a + b
     assert torch.allclose(out, expected, atol=1e-5)
+
+
+@requires_triton
+@requires_metal
+def test_triton_jit_sum_reduction():
+    """@triton.jit sum reduction compiles and runs via Metal backend."""
+    import torch
+
+    @triton.jit
+    def sum_kernel(input_ptr, output_ptr, n_elements,
+                   BLOCK_SIZE: triton.language.constexpr):
+        pid = triton.language.program_id(0)
+        offsets = pid * BLOCK_SIZE + triton.language.arange(0, BLOCK_SIZE)
+        mask = offsets < n_elements
+        x = triton.language.load(input_ptr + offsets, mask=mask, other=0.0)
+        result = triton.language.sum(x, axis=0)
+        if pid == 0:
+            triton.language.store(output_ptr, result)
+
+    n = 256
+    a = torch.randn(n)
+    out = torch.zeros(1)
+
+    sum_kernel[(1,)](a, out, n, BLOCK_SIZE=256)
+
+    expected = a.sum()
+    assert torch.allclose(out, expected.unsqueeze(0), atol=1e-4), (
+        f"Sum: got {out.item()}, expected {expected.item()}"
+    )
+
+
+@requires_triton
+@requires_metal
+def test_triton_jit_softmax():
+    """@triton.jit fused softmax compiles and runs via Metal backend."""
+    import torch
+
+    @triton.jit
+    def softmax_kernel(input_ptr, output_ptr, n_cols,
+                       BLOCK_SIZE: triton.language.constexpr):
+        row_idx = triton.language.program_id(0)
+        row_start = row_idx * n_cols
+        offsets = triton.language.arange(0, BLOCK_SIZE)
+        mask = offsets < n_cols
+        row = triton.language.load(
+            input_ptr + row_start + offsets, mask=mask, other=-float('inf')
+        )
+        row_max = triton.language.max(row, axis=0)
+        shifted = row - row_max
+        exp_vals = triton.language.exp(shifted)
+        exp_sum = triton.language.sum(exp_vals, axis=0)
+        softmax_out = exp_vals / exp_sum
+        triton.language.store(
+            output_ptr + row_start + offsets, softmax_out, mask=mask
+        )
+
+    n_rows, n_cols = 4, 64
+    a = torch.randn(n_rows, n_cols)
+    out = torch.zeros(n_rows, n_cols)
+
+    softmax_kernel[(n_rows,)](a, out, n_cols, BLOCK_SIZE=128)
+
+    expected = torch.softmax(a, dim=1)
+    assert torch.allclose(out, expected, atol=1e-4)
+
+
+@requires_triton
+@requires_metal
+def test_triton_jit_matmul():
+    """@triton.jit tiled matmul compiles and runs via Metal backend."""
+    import torch
+
+    @triton.jit
+    def matmul_kernel(
+        a_ptr, b_ptr, c_ptr,
+        M, N, K,
+        stride_am, stride_ak,
+        stride_bk, stride_bn,
+        stride_cm, stride_cn,
+        BLOCK_M: triton.language.constexpr,
+        BLOCK_N: triton.language.constexpr,
+        BLOCK_K: triton.language.constexpr,
+    ):
+        pid_m = triton.language.program_id(0)
+        pid_n = triton.language.program_id(1)
+        offs_m = pid_m * BLOCK_M + triton.language.arange(0, BLOCK_M)
+        offs_n = pid_n * BLOCK_N + triton.language.arange(0, BLOCK_N)
+        offs_k = triton.language.arange(0, BLOCK_K)
+        a_ptrs = (a_ptr + offs_m[:, None] * stride_am
+                  + offs_k[None, :] * stride_ak)
+        b_ptrs = (b_ptr + offs_k[:, None] * stride_bk
+                  + offs_n[None, :] * stride_bn)
+        acc = triton.language.zeros((BLOCK_M, BLOCK_N), dtype=triton.language.float32)
+        for k in range(0, K, BLOCK_K):
+            a_mask = (offs_m[:, None] < M) & ((k + offs_k[None, :]) < K)
+            b_mask = ((k + offs_k[:, None]) < K) & (offs_n[None, :] < N)
+            a = triton.language.load(a_ptrs, mask=a_mask, other=0.0)
+            b = triton.language.load(b_ptrs, mask=b_mask, other=0.0)
+            acc += triton.language.dot(a, b)
+            a_ptrs += BLOCK_K * stride_ak
+            b_ptrs += BLOCK_K * stride_bk
+        c_ptrs = (c_ptr + offs_m[:, None] * stride_cm
+                  + offs_n[None, :] * stride_cn)
+        c_mask = (offs_m[:, None] < M) & (offs_n[None, :] < N)
+        triton.language.store(c_ptrs, acc, mask=c_mask)
+
+    M, N, K = 32, 32, 32
+    a = torch.randn(M, K)
+    b = torch.randn(K, N)
+    c = torch.zeros(M, N)
+
+    matmul_kernel[(1, 1)](
+        a, b, c,
+        M, N, K,
+        a.stride(0), a.stride(1),
+        b.stride(0), b.stride(1),
+        c.stride(0), c.stride(1),
+        BLOCK_M=32, BLOCK_N=32, BLOCK_K=32,
+    )
+
+    expected = a @ b
+    assert torch.allclose(c, expected, atol=1e-2), (
+        f"Max error: {(c - expected).abs().max().item()}"
+    )

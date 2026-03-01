@@ -86,7 +86,9 @@ class MetalBackend(BaseBackend):
         )
 
     def get_codegen_implementation(self, options):
-        return {}
+        return {
+            "min_dot_size": lambda lhs_type, rhs_type: (1, 1, 1),
+        }
 
     def get_module_map(self) -> Dict[str, ModuleType]:
         return {}

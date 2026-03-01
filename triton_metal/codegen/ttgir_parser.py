@@ -70,14 +70,18 @@ def _strip_layout_annotations(text):
         #blocked = #ttg.blocked<{sizePerThread = [2], ...}>
     and tensor types like:
         tensor<256xf32, #blocked>
+        tensor<256x!tt.ptr<f32>, #blocked>
 
     We strip the definition lines entirely and remove the
     ', #identifier' from tensor types.
     """
     # Remove definition lines: #name = #ttg.blocked<{...}>
     text = re.sub(r'^#\w+\s*=\s*#ttg\.\w+<\{[^}]*\}>.*$', '', text, flags=re.MULTILINE)
-    # Remove layout reference in tensor types: tensor<256xf32, #blocked>
-    text = re.sub(r'(tensor<[^,>]+),\s*#\w+>', r'\1>', text)
+    # Remove layout reference in tensor types.
+    # Must handle nested angle brackets (e.g., tensor<256x!tt.ptr<f32>, #blocked>).
+    text = re.sub(r',\s*#\w+>', '>', text)
+    # Remove residual #loc lines left after loc() stripping.
+    text = re.sub(r'^#\w+\s*=\s*$', '', text, flags=re.MULTILINE)
     return text
 
 
@@ -290,21 +294,55 @@ class TTGIRParser:
     def _scan_reductions(self):
         """Scan for tt.reduce multi-line blocks in the IR text.
 
-        tt.reduce has a nested region:
+        tt.reduce has two forms:
+
+        Triton 3.6+ (axis in angle brackets before body):
+            %result = "tt.reduce"(%input) <{axis = 0 : i32}> ({
+            ^bb0(%a: f32, %b: f32):
+              %combined = arith.addf %a, %b : f32
+              tt.reduce.return %combined : f32
+            }) : (tensor<...>) -> f32
+
+        Older format (axis in braces after body):
             %result = "tt.reduce"(%input) ({
             ^bb0(%a: f32, %b: f32):
               %combined = arith.addf %a, %b : f32
               "tt.reduce.return"(%combined) : (f32) -> ()
             }) {axis = 0 : i32} : (tensor<...>) -> f32
         """
-        # Match the reduce block: result = "tt.reduce"(input) ({ ... body ... })
-        reduce_pattern = re.compile(
+        # Triton 3.6+: axis in <{...}> before the body
+        reduce_pattern_new = re.compile(
+            r'%(\w+)\s*=\s*"tt\.reduce"\s*\((%\w+)\)\s*<\{axis\s*=\s*(\d+)\s*:\s*i32\}>\s*\(\{'
+            r'(.*?)'
+            r'\}\)\s*:',
+            re.DOTALL
+        )
+        # Older format: axis in {...} after the body
+        reduce_pattern_old = re.compile(
             r'%(\w+)\s*=\s*"tt\.reduce"\s*\((%\w+)\)\s*\(\{'
             r'(.*?)'
             r'\}\)\s*\{axis\s*=\s*(\d+)',
             re.DOTALL
         )
-        for m in reduce_pattern.finditer(self.ir_text):
+        for m in reduce_pattern_new.finditer(self.ir_text):
+            result_ssa = f"%{m.group(1)}"
+            input_ssa = m.group(2)
+            axis = int(m.group(3))
+            body = m.group(4)
+
+            if "arith.addf" in body:
+                op_kind = "sum"
+            elif "arith.maxf" in body or "arith.maxnumf" in body:
+                op_kind = "max"
+            elif "arith.minf" in body or "arith.minnumf" in body:
+                op_kind = "min"
+            else:
+                op_kind = "sum"
+
+            self.reduce_ops.append((result_ssa, input_ssa, op_kind, axis))
+            self.ssa_values[result_ssa] = ("reduce", input_ssa, op_kind)
+
+        for m in reduce_pattern_old.finditer(self.ir_text):
             result_ssa = f"%{m.group(1)}"
             input_ssa = m.group(2)
             body = m.group(3)

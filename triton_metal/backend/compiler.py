@@ -10,7 +10,6 @@ from types import ModuleType
 
 from triton.backends.compiler import BaseBackend, GPUTarget
 
-from triton_metal.backend.device_detect import DeviceInfo, get_device_info
 
 
 @dataclass(frozen=True)
@@ -253,6 +252,7 @@ class MetalBackend(BaseBackend):
 
         # Resolve Metal standard version for compilation.
         if options.target_metal_version == "auto":
+            from triton_metal.backend.device_detect import get_device_info
             metal_std_flag = get_device_info().metal_std_flag
         else:
             metal_std_flag = f"-std=metal{options.target_metal_version}"
@@ -265,6 +265,7 @@ class MetalBackend(BaseBackend):
                     "-c", metal_path,
                     "-o", air_path,
                     metal_std_flag,
+                    "-mmacosx-version-min=15.0",
                     "-O2",
                 ],
                 capture_output=True,

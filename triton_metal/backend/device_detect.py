@@ -105,21 +105,91 @@ def _detect_sdk_version() -> Optional[str]:
         return None
 
 
+def _probe_metal_compiler() -> Optional[str]:
+    """Probe xcrun metal to find the highest *usable* -std=metalX.Y version.
+
+    Tries versions from newest to oldest.  For each candidate the probe:
+      1. compiles a trivial kernel to .air,
+      2. links it into a .metallib,
+      3. attempts to load the .metallib via the Metal runtime.
+
+    Step 3 is critical because the compiler may accept a version that the
+    current OS runtime cannot load (e.g. metal4.0 compiles on SDK 26.2
+    but MTLDevice refuses to load the library until macOS 26.4+).
+
+    This is more reliable than guessing from SDK version numbers (which
+    jumped from 15.x to 26.x with macOS Tahoe).
+    """
+    import tempfile, os
+    candidates = ["4.1", "4.0", "3.2", "3.1", "3.0"]
+    test_src = "kernel void _probe() {}\n"
+    for ver in candidates:
+        air_path = None
+        lib_path = None
+        metal_path = None
+        try:
+            # Write source
+            with tempfile.NamedTemporaryFile(suffix=".metal", mode="w", delete=False) as f:
+                f.write(test_src)
+                metal_path = f.name
+            air_path = metal_path.replace(".metal", ".air")
+            lib_path = metal_path.replace(".metal", ".metallib")
+
+            # Step 1: compile to .air
+            subprocess.run(
+                ["xcrun", "-sdk", "macosx", "metal", "-std=metal" + ver,
+                 "-c", metal_path, "-o", air_path],
+                capture_output=True, timeout=10, check=True,
+            )
+            # Step 2: link to .metallib
+            subprocess.run(
+                ["xcrun", "-sdk", "macosx", "metallib", air_path, "-o", lib_path],
+                capture_output=True, timeout=10, check=True,
+            )
+            # Step 3: verify the OS runtime can load it
+            try:
+                import Metal, Foundation
+                device = Metal.MTLCreateSystemDefaultDevice()
+                if device is not None:
+                    url = Foundation.NSURL.fileURLWithPath_(lib_path)
+                    lib, error = device.newLibraryWithURL_error_(url, None)
+                    if error is not None:
+                        continue  # Runtime rejected this version
+            except ImportError:
+                pass  # No Metal/Foundation module — trust the compiler result
+
+            return ver
+        except (subprocess.CalledProcessError, FileNotFoundError,
+                subprocess.TimeoutExpired, OSError):
+            continue
+        finally:
+            for p in (metal_path, air_path, lib_path):
+                if p:
+                    try:
+                        os.unlink(p)
+                    except OSError:
+                        pass
+    return None
+
+
 def _infer_metal_version(sdk_version: Optional[str], chip_family: str) -> str:
     """Infer the highest supported Metal Shading Language version.
 
-    The mapping is based on the macOS SDK version (which correlates with
-    the Xcode toolchain shipping the Metal compiler):
-
-        macOS 16.0+  (Xcode 17) -> Metal 4.1  (M5 tensor ops)
-        macOS 15.4+  (Xcode 16.3) -> Metal 4.0
-        macOS 15.0+  (Xcode 16) -> Metal 3.2
-        macOS 14.0+  (Xcode 15) -> Metal 3.1
-        macOS 13.0+  (Xcode 14) -> Metal 3.0
-        older / unknown          -> Metal 3.0
-
-    Additionally, Metal 4.x features require M4+ hardware.
+    First tries to probe the compiler directly (most reliable).  Falls
+    back to SDK-version heuristics if probing fails.  Metal 4.x is
+    clamped to 3.2 on pre-M4 hardware.
     """
+    # Prefer runtime probe — works regardless of SDK version numbering.
+    probed = _probe_metal_compiler()
+    if probed is not None:
+        # Clamp Metal 4.x to 3.2 on pre-M4 chips.
+        if probed.startswith("4"):
+            chip_gen = _chip_generation(chip_family)
+            if chip_gen < 4:
+                return "3.2"
+        return probed
+
+    # Fallback: guess from SDK version.
     if sdk_version is None:
         return "3.0"
 
@@ -130,9 +200,9 @@ def _infer_metal_version(sdk_version: Optional[str], chip_family: str) -> str:
     except (ValueError, IndexError):
         return "3.0"
 
-    # Determine max MSL version the SDK toolchain supports.
-    if major >= 16:
-        sdk_metal = "4.1"
+    # macOS Tahoe uses SDK version 26.x.  Older macOS used 14.x / 15.x.
+    if major >= 26:
+        sdk_metal = "4.0"
     elif major == 15 and minor >= 4:
         sdk_metal = "4.0"
     elif major >= 15:
@@ -142,11 +212,11 @@ def _infer_metal_version(sdk_version: Optional[str], chip_family: str) -> str:
     else:
         sdk_metal = "3.0"
 
-    # Metal 4.x requires M4+ hardware.  Clamp to 3.2 on older chips.
+    # Metal 4.x requires M4+ hardware.
     if sdk_metal.startswith("4"):
         chip_gen = _chip_generation(chip_family)
         if chip_gen < 4:
-            return "3.2" if major >= 15 else ("3.1" if major >= 14 else "3.0")
+            return "3.2" if major >= 15 or major >= 26 else ("3.1" if major >= 14 else "3.0")
 
     return sdk_metal
 

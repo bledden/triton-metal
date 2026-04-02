@@ -64,7 +64,8 @@ print(f"Max error: {(out - (x + y)).abs().max():.2e}")
 
 ```python
 import torch
-import triton_metal.inductor  # registers the "metal" backend
+import triton_metal.inductor
+triton_metal.inductor.register_metal_triton_backend()
 
 model = torch.nn.Sequential(
     torch.nn.Linear(256, 512),

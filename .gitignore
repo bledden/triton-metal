@@ -17,7 +17,20 @@ torch_compile_debug/
 /tmp/
 triton_metal_cache/
 
-# Debug scripts (local only)
+# Secrets and credentials
+.env
+.env.*
+*.pem
+*.key
+*.cert
+credentials*
+secrets.*
+
+# Debug artifacts
+*_debug.log
 debug_*.py
 test_cmpf_dump.py
 test_constexpr_ir.py
+
+# Raw test output (contains local paths)
+reports/upstream_test_core_raw.txt

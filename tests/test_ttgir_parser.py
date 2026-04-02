@@ -1039,11 +1039,28 @@ def test_fp64_handled_in_parser():
 
 
 def test_fp64_downcast_in_msl_types():
-    """MSL type mapper downcasts FP64 to float."""
+    """MSL type mapper downcasts FP64 to float and emits a warning."""
+    import warnings
     from triton_metal.codegen.msl_types import triton_type_to_msl
 
-    assert triton_type_to_msl("fp64") == "float"
-    assert triton_type_to_msl("*fp64") == "device float*"
+    with warnings.catch_warnings(record=True) as w:
+        warnings.simplefilter("always")
+        assert triton_type_to_msl("fp64") == "float"
+        assert len(w) == 1
+        assert issubclass(w[0].category, UserWarning)
+        assert "downcast to float32" in str(w[0].message)
+
+    with warnings.catch_warnings(record=True) as w:
+        warnings.simplefilter("always")
+        assert triton_type_to_msl("*fp64") == "device float*"
+        assert len(w) == 1
+        assert "downcast to float32" in str(w[0].message)
+
+    # Non-FP64 types must NOT warn.
+    with warnings.catch_warnings(record=True) as w:
+        warnings.simplefilter("always")
+        assert triton_type_to_msl("fp32") == "float"
+        assert len(w) == 0
 
 
 def test_fp64_downcast_in_emitter():

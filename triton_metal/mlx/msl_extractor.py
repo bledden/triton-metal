@@ -29,6 +29,7 @@ class MSLExtraction:
     uses_simd: bool = False
     uses_2d: bool = False
     uses_tpg: bool = False
+    tpg_axes: Set[int] = None  # Which grid axes tpg is needed for (0, 1, 2)
 
 
 def extract_msl_for_mlx(
@@ -90,7 +91,27 @@ def extract_msl_for_mlx(
     # Detect features
     uses_simd = 'sgitg' in thread_vars or 'tiisg' in thread_vars
     uses_2d = 'pid3' in sig_text or 'pid_y' in raw_body
-    uses_tpg = 'tpg' in thread_vars
+    uses_tpg = 'tpg' in thread_vars or 'tpg3' in thread_vars
+
+    # Detect which tpg axes are needed (from body references and signature)
+    tpg_axes: Set[int] = set()
+    if uses_tpg:
+        tpg_axes.add(0)  # tpg (axis 0) always present when uses_tpg
+    # Check for multi-axis tpg in the body (emitted as tpg_y, tpg_z)
+    if re.search(r'\btpg_y\b', raw_body):
+        tpg_axes.add(1)
+        uses_tpg = True
+    if re.search(r'\btpg_z\b', raw_body):
+        tpg_axes.add(2)
+        uses_tpg = True
+
+    # Add synthetic scalar args for tpg dimensions.
+    # These are injected by MLXLauncher at dispatch time.
+    if uses_tpg:
+        for axis in sorted(tpg_axes):
+            tpg_scalar_name = f"__tpg_dim{axis}"
+            scalar_names.append(tpg_scalar_name)
+            scalar_types.append("uint")
 
     # Build header (device functions only — MLX provides metal_stdlib)
     header_parts = []
@@ -142,9 +163,21 @@ def extract_msl_for_mlx(
 
     if uses_tpg:
         # tpg (threadgroups_per_grid) isn't auto-injected by MLX.
-        # We compute it from grid/threadgroup sizes.
-        preamble_lines.append('    uint tpg = thread_position_in_grid.x / threads_per_threadgroup.x;')
-        # TODO: this is wrong — needs to be passed as a scalar instead
+        # Metal's [[threadgroups_per_grid]] attribute is not available through
+        # MLX's metal_kernel API, so we pass the grid dimensions as scalar
+        # arguments injected by the launcher at dispatch time.
+        if 0 in tpg_axes:
+            preamble_lines.append('    uint tpg = __tpg_dim0;')
+        if 1 in tpg_axes:
+            preamble_lines.append('    uint tpg_y = __tpg_dim1;')
+        if 2 in tpg_axes:
+            preamble_lines.append('    uint tpg_z = __tpg_dim2;')
+
+        # Strip the original tpg decomposition lines from the body
+        # (emitted by msl_emitter for the 2D case: uint tpg = tpg3.x; etc.)
+        raw_body = re.sub(r'\s*uint\s+tpg\s*=\s*tpg3\.x\s*;\n?', '\n', raw_body)
+        raw_body = re.sub(r'\s*uint\s+tpg_y\s*=\s*tpg3\.y\s*;\n?', '\n', raw_body)
+        raw_body = re.sub(r'\s*uint\s+tpg_z\s*=\s*tpg3\.z\s*;\n?', '\n', raw_body)
 
     body = '\n'.join(preamble_lines) + '\n' + raw_body
 
@@ -160,6 +193,7 @@ def extract_msl_for_mlx(
         uses_simd=uses_simd,
         uses_2d=uses_2d,
         uses_tpg=uses_tpg,
+        tpg_axes=tpg_axes if tpg_axes else None,
     )
 
 

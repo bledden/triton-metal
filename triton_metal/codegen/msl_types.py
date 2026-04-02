@@ -1,7 +1,9 @@
 """Triton type to MSL type mappings."""
 
-# FP64 is silently downcast to FP32 — Metal has no double precision.
-_UNSUPPORTED_TYPES = set()
+import warnings
+
+# FP64 types that Metal cannot represent — downcast to float32 with a warning.
+_FP64_TYPES = {"fp64", "f64"}
 
 # Triton dtype string -> MSL type string
 _TYPE_MAP = {
@@ -27,13 +29,21 @@ _TYPE_MAP = {
 _PTR_QUALIFIER = "device"
 
 
-def _check_fp64(triton_type: str):
-    """Reject FP64 types — Apple Silicon GPUs have no FP64 hardware."""
+def _warn_fp64_downcast(triton_type: str):
+    """Warn when FP64 types are downcast to float32 on Metal.
+
+    Apple Silicon GPUs have no FP64 hardware, so double-precision types are
+    silently mapped to float32.  This warning lets users know about the
+    precision loss so they can decide whether the downcast is acceptable.
+    """
     base = triton_type.lstrip("*").strip()
-    if base in _UNSUPPORTED_TYPES:
-        raise TypeError(
+    if base in _FP64_TYPES:
+        warnings.warn(
             f"FP64 (double) is not supported on Apple Silicon GPUs. "
-            f"Got type '{triton_type}'. Cast to float32 before running on Metal."
+            f"Type '{triton_type}' will be downcast to float32. "
+            f"Cast to float32 explicitly to silence this warning.",
+            UserWarning,
+            stacklevel=3,
         )
 
 
@@ -46,10 +56,10 @@ def triton_type_to_msl(triton_type: str) -> str:
     Returns:
         MSL type string, e.g. "float", "device half*", "int"
 
-    Raises:
-        TypeError: If the type is FP64 (not supported on Apple Silicon).
+    Warns:
+        UserWarning: If the type is FP64, which is downcast to float32 on Metal.
     """
-    _check_fp64(triton_type)
+    _warn_fp64_downcast(triton_type)
     if triton_type.startswith("*"):
         inner = triton_type[1:]
         msl_inner = _TYPE_MAP.get(inner, inner)

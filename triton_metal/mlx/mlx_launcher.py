@@ -132,6 +132,17 @@ class MLXLauncher:
                 else:
                     input_arrays.append(arg)
 
+        # Inject tpg (threadgroups_per_grid) scalar values if needed.
+        # These correspond to the __tpg_dimN scalar args added by the extractor.
+        if self.ext.tpg_axes:
+            grid_dims = {
+                0: grid[0] if len(grid) > 0 else 1,
+                1: grid[1] if len(grid) > 1 else 1,
+                2: grid[2] if len(grid) > 2 else 1,
+            }
+            for axis in sorted(self.ext.tpg_axes):
+                input_arrays.append(grid_dims[axis])
+
         # Compute Metal grid (total threads, not threadgroup counts)
         gridX = grid[0] if len(grid) > 0 else 1
         gridY = grid[1] if len(grid) > 1 else 1

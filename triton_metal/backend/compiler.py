@@ -10,6 +10,8 @@ from types import ModuleType
 
 from triton.backends.compiler import BaseBackend, GPUTarget
 
+from triton_metal.backend.device_detect import DeviceInfo, get_device_info
+
 
 @dataclass(frozen=True)
 class MetalOptions:
@@ -34,6 +36,9 @@ class MetalOptions:
     launch_cooperative_grid: bool = False
     launch_pdl: bool = False
     instrumentation_mode: str = ""
+    # Metal Shading Language version for xcrun compilation.
+    # "auto" (default) detects from the current device and SDK.
+    target_metal_version: str = "auto"
 
     @staticmethod
     def _make_hashable(value):
@@ -246,6 +251,12 @@ class MetalBackend(BaseBackend):
         with open(metal_path, "w") as f:
             f.write(src)
 
+        # Resolve Metal standard version for compilation.
+        if options.target_metal_version == "auto":
+            metal_std_flag = get_device_info().metal_std_flag
+        else:
+            metal_std_flag = f"-std=metal{options.target_metal_version}"
+
         # Compile MSL -> AIR
         try:
             subprocess.run(
@@ -253,7 +264,7 @@ class MetalBackend(BaseBackend):
                     "xcrun", "-sdk", "macosx", "metal",
                     "-c", metal_path,
                     "-o", air_path,
-                    "-std=metal3.2",
+                    metal_std_flag,
                     "-O2",
                 ],
                 capture_output=True,

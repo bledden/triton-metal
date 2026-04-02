@@ -55,11 +55,29 @@ class MetalUtils:
     @property
     def device(self):
         if self._device is None:
+            import sys
             import Metal
+            from triton_metal.backend.device_detect import get_device_info
+            from triton_metal.debug import _debug_level
 
             self._device = Metal.MTLCreateSystemDefaultDevice()
             if self._device is None:
                 raise RuntimeError("No Metal GPU device found")
+
+            # Log device info at debug level 1+.
+            if _debug_level() >= 1:
+                info = get_device_info()
+                print(
+                    f"[triton-metal] device: {info.chip_family} {info.chip_variant} "
+                    f"| GPU cores: {info.gpu_core_count} "
+                    f"| Metal {info.metal_version} "
+                    f"| max threads/tg: {info.max_threads_per_threadgroup} "
+                    f"| bf16: {info.has_bfloat16} "
+                    f"| Metal4: {info.supports_metal4} "
+                    f"| neural accel: {info.has_neural_accelerator} "
+                    f"| tensor ops: {info.supports_tensor_ops}",
+                    file=sys.stderr,
+                )
         return self._device
 
     @property

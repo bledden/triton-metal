@@ -1,14 +1,17 @@
 """Triton type to MSL type mappings."""
 
-# Types that Apple Silicon GPUs do not support.
-_UNSUPPORTED_TYPES = {"fp64", "f64"}
+# FP64 is silently downcast to FP32 — Metal has no double precision.
+_UNSUPPORTED_TYPES = set()
 
 # Triton dtype string -> MSL type string
 _TYPE_MAP = {
     "fp16": "half",
+    "f16": "half",
     "bf16": "bfloat",  # Metal 3.1+ supports bfloat
     "fp32": "float",
     "f32": "float",
+    "fp64": "float",  # Metal has no double — downcast to float32
+    "f64": "float",   # Metal has no double — downcast to float32
     "i1": "bool",
     "i8": "char",
     "i16": "short",

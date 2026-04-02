@@ -13,3 +13,11 @@ build/
 *.air
 *.metal
 !triton_metal/**/*.metal
+torch_compile_debug/
+/tmp/
+triton_metal_cache/
+
+# Debug scripts (local only)
+debug_*.py
+test_cmpf_dump.py
+test_constexpr_ir.py

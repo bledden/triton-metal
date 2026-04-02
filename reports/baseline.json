@@ -1,0 +1,8 @@
+{
+    "pass_count": 4280,
+    "fail_count": 0,
+    "skip_count": 5054,
+    "total": 9334,
+    "date": "2026-03-10",
+    "note": "After tt.map_elementwise + cf.cond_br support (+1)"
+}

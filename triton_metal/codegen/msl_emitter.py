@@ -18,6 +18,8 @@ Supports:
 - Flash Attention: online softmax with tiled Q@K^T and P@V accumulation
 """
 
+import os
+
 from triton_metal.codegen.msl_types import triton_type_to_msl
 
 
@@ -57,29 +59,54 @@ class Arg:
         self.const = const  # Read-only buffer
 
     def msl_param(self, index):
-        """Emit MSL kernel parameter declaration."""
+        """Emit MSL kernel parameter declaration.
+
+        Non-const pointers use 'volatile device' to prevent the Metal shader
+        compiler from hoisting loads out of while/for loops, which breaks
+        read-modify-write patterns on the same memory location.
+        """
         if self.is_ptr:
             inner = triton_type_to_msl(self.dtype)
-            qual = "const " if self.const else ""
-            return f"device {qual}{inner}* {self.name} [[buffer({index})]]"
+            if self.const:
+                return f"device const {inner}* {self.name} [[buffer({index})]]"
+            else:
+                return f"volatile device {inner}* {self.name} [[buffer({index})]]"
         else:
             msl_ty = triton_type_to_msl(self.dtype)
             return f"constant {msl_ty}& {self.name} [[buffer({index})]]"
+
+
+def _sanitize_msl_name(name: str) -> str:
+    """Ensure a kernel name doesn't clash with MSL reserved words."""
+    if name in _MSL_RESERVED:
+        return f"{name}_fn"
+    return name
+
+
+_MSL_RESERVED = frozenset({
+    "kernel", "vertex", "fragment", "device", "constant", "threadgroup",
+    "thread", "texture", "sampler", "float", "half", "int", "uint",
+    "bool", "char", "short", "void", "using", "namespace", "metal",
+    "return", "if", "else", "for", "while", "do", "switch", "case",
+    "break", "continue", "struct", "class", "enum", "true", "false",
+})
 
 
 class KernelBuilder:
     """Describes a compute kernel's structure for MSL emission."""
 
     def __init__(self, name, block_size=256):
-        self.name = name
+        self.name = _sanitize_msl_name(name)
         self.block_size = block_size
         self.args = []
         self._body_lines = []
         self._locals = {}
         self._indent = 1
         self._needs_simd_qualifiers = False
+        self._needs_num_programs = False  # Whether kernel uses tt.get_num_programs
         self._threadgroup_arrays = []  # (name, dtype, size) for static tg memory
         self._prebuilt_msl = None  # Raw MSL string when using pre-made kernels
+        self._device_functions = []  # List of MSL device function source strings
 
     def set_prebuilt_msl(self, msl_source):
         """Set a pre-generated MSL string, bypassing the builder's code gen."""
@@ -297,8 +324,10 @@ class KernelBuilder:
         # Step 1: SIMD-level reduction
         self._var(simd_var, f"{intrinsic}({val_var})", ty="float")
 
-        # Step 2: Initialize shared memory
-        self.begin_if("sgitg == 0")
+        n_simd_groups = (self.block_size + 31) // 32
+
+        # Step 2: Initialize shared memory (bounds-guarded)
+        self.begin_if(f"sgitg == 0 && tiisg < {n_simd_groups}u")
         self._emit(f"{shared_var}[tiisg] = {identity};")
         self.end_block()
         self.barrier("threadgroup")
@@ -309,8 +338,8 @@ class KernelBuilder:
         self.end_block()
         self.barrier("threadgroup")
 
-        # Step 4: SIMD group 0 reads back and does final reduction
-        self._var(read_var, f"{shared_var}[tiisg]", ty="float")
+        # Step 4: SIMD group 0 reads back and does final reduction (bounds-guarded)
+        self._var(read_var, f"(tiisg < {n_simd_groups}u) ? {shared_var}[tiisg] : {identity}", ty="float")
         self._var(out_var, f"{intrinsic}({read_var})", ty="float")
         return out_var
 
@@ -347,24 +376,58 @@ class MSLCodeGen:
         lines.append("using namespace metal;")
         lines.append("")
 
+        # Device functions (noinline callees) — must appear before the kernel
+        for dev_fn in self.builder._device_functions:
+            lines.append(dev_fn)
+            lines.append("")
+
         # Kernel signature
         params = []
         for i, arg in enumerate(self.builder.args):
             params.append(f"    {arg.msl_param(i)}")
 
-        # Thread position qualifiers
-        params.append("    uint pid [[threadgroup_position_in_grid]]")
-        params.append("    uint lid [[thread_position_in_threadgroup]]")
-        params.append("    uint tid [[thread_position_in_grid]]")
+        # Thread position qualifiers — Metal requires all position attrs same type
+        used_axes = getattr(self.builder, '_used_pid_axes', {0})
+        if used_axes and max(used_axes) > 0:
+            params.append("    uint3 pid3 [[threadgroup_position_in_grid]]")
+            params.append("    uint3 lid3 [[thread_position_in_threadgroup]]")
+            params.append("    uint3 tid3 [[thread_position_in_grid]]")
+        else:
+            params.append("    uint pid [[threadgroup_position_in_grid]]")
+            params.append("    uint lid [[thread_position_in_threadgroup]]")
+            params.append("    uint tid [[thread_position_in_grid]]")
 
         # SIMD qualifiers (only when reductions are used)
         if self.builder._needs_simd_qualifiers:
             params.append("    uint sgitg [[simdgroup_index_in_threadgroup]]")
             params.append("    uint tiisg [[thread_index_in_simdgroup]]")
 
+        # Grid size (when kernel uses tt.get_num_programs)
+        if self.builder._needs_num_programs:
+            if used_axes and max(used_axes) > 0:
+                params.append("    uint3 tpg3 [[threadgroups_per_grid]]")
+            else:
+                params.append("    uint tpg [[threadgroups_per_grid]]")
+
         lines.append(f"kernel void {self.builder.name}(")
         lines.append(",\n".join(params))
         lines.append(") {")
+
+        # Decompose uint3 position attrs into scalar values
+        if used_axes and max(used_axes) > 0:
+            lines.append("    uint pid = pid3.x;")
+            lines.append("    uint lid = lid3.x;")
+            lines.append("    uint tid = tid3.x;")
+            if 1 in used_axes:
+                lines.append("    uint pid_y = pid3.y;")
+            if 2 in used_axes:
+                lines.append("    uint pid_z = pid3.z;")
+            if self.builder._needs_num_programs:
+                lines.append("    uint tpg = tpg3.x;")
+                if 1 in used_axes:
+                    lines.append("    uint tpg_y = tpg3.y;")
+                if 2 in used_axes:
+                    lines.append("    uint tpg_z = tpg3.z;")
 
         # Static threadgroup memory declarations
         # Use compute type (float) for fp16/bf16 to avoid precision loss in reductions
@@ -838,8 +901,7 @@ def make_matmul_kernel(block_m=32, block_n=32, block_k=32, dtype="fp32"):
     kb._var("local_row", f"lid / {block_n}u", ty="uint")
     kb._var("local_col", f"lid % {block_n}u", ty="uint")
 
-    # Global tile position: pid encodes the 2D tile index.
-    # We use a linearized 2D grid: pid = tile_row * n_tile_cols + tile_col
+    # Global tile position: pid encodes the 2D tile index (grid is flattened 1D).
     kb._var("n_tile_cols", f"(N + {block_n}u - 1u) / {block_n}u", ty="uint")
     kb._var("tile_row", "pid / n_tile_cols", ty="uint")
     kb._var("tile_col", "pid % n_tile_cols", ty="uint")
@@ -5106,6 +5168,9 @@ def emit_msl(mod, metadata, options):
 
     This is the entry point called by MetalBackend.make_msl().
 
+    Uses the MLIR walker + generic op-by-op lowerer. Falls back to
+    the legacy text-based parser only if the new pipeline fails.
+
     Args:
         mod: The MLIR module after TTGIR passes.
         metadata: Compilation metadata dict.
@@ -5114,11 +5179,44 @@ def emit_msl(mod, metadata, options):
     Returns:
         MSL source code as a string.
     """
+    # Primary path: new walker + generic lowerer
+    try:
+        from triton_metal.codegen.mlir_walker import walk_ttgir
+        from triton_metal.codegen.generic_lowerer import lower_ir_graph
+
+        graph = walk_ttgir(mod, options)
+        metadata["name"] = _sanitize_msl_name(graph.func_name)
+
+        from triton_metal.codegen.generic_lowerer import GenericLowerer
+        lowerer = GenericLowerer(graph, options)
+        msl_src = lowerer.lower()
+
+        # Use lowerer's effective block_size (may differ from graph for matmul templates)
+        metadata["block_size"] = lowerer.effective_block_size
+
+        # Verify no UNSUPPORTED markers in output
+        if "UNSUPPORTED" not in msl_src:
+            metadata["output_arg_indices"] = lowerer.get_output_arg_indices()
+            # Flag whether the kernel uses multi-axis program_id (needs 2D/3D grid)
+            used_axes = getattr(lowerer, '_used_pid_axes', {0})
+            metadata["needs_2d_grid"] = max(used_axes) > 0 if used_axes else False
+            return msl_src
+
+        # Fall through to legacy parser if unsupported ops remain
+    except Exception as e:
+        import warnings
+        warnings.warn(
+            f"emit_msl: generic lowerer failed: {e}. "
+            "Falling back to legacy text-based parser.",
+            stacklevel=2,
+        )
+
+    # Legacy fallback: text-based parser + pattern matchers
     from triton_metal.codegen.ttgir_parser import parse_ttgir
 
     ir_text = str(mod)
     kernel_name = _extract_kernel_name(ir_text)
-    metadata["name"] = kernel_name
+    metadata["name"] = _sanitize_msl_name(kernel_name)
 
     kb = parse_ttgir(ir_text, options)
     metadata["block_size"] = kb.block_size

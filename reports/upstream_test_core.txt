@@ -1,0 +1,69 @@
+Triton Upstream Test Results: test_core.py
+Backend: metal
+==================================================
+
+Total:   9320
+Passed:  1404 (15.1%)
+Failed:  7625
+Skipped: 291
+Errors:  0
+
+Failure Categories:
+  Other: 1435
+  Numerical mismatch: 780
+  Type error: 92
+  Runtime error: 46
+  Triton compilation error: 5
+  No FP64 support: 4
+
+Pytest summary (cross-check):
+  error: 2
+  failed: 7625
+  passed: 1404
+  skipped: 305
+  warning: 1
+  warnings: 1133
+
+Sample passing tests:
+  unit/language/test_core.py::test_scalar_overflow
+  unit/language/test_core.py::test_dtype_codegen
+  unit/language/test_core.py::test_bin_op[1-int8-uint8-/]
+  unit/language/test_core.py::test_bin_op[1-int8-uint16-/]
+  unit/language/test_core.py::test_bin_op[1-int8-uint32-/]
+  unit/language/test_core.py::test_bin_op[1-int8-uint64-/]
+  unit/language/test_core.py::test_bin_op[1-int16-uint8-/]
+  unit/language/test_core.py::test_bin_op[1-int16-uint16-/]
+  unit/language/test_core.py::test_bin_op[1-int16-uint32-/]
+  unit/language/test_core.py::test_bin_op[1-int16-uint64-/]
+  unit/language/test_core.py::test_bin_op[1-int32-uint8-/]
+  unit/language/test_core.py::test_bin_op[1-int32-uint16-/]
+  unit/language/test_core.py::test_bin_op[1-int32-uint32-/]
+  unit/language/test_core.py::test_bin_op[1-int32-uint64-/]
+  unit/language/test_core.py::test_bin_op[1-int64-uint8-/]
+  unit/language/test_core.py::test_bin_op[1-int64-uint16-/]
+  unit/language/test_core.py::test_bin_op[1-int64-uint32-/]
+  unit/language/test_core.py::test_bin_op[1-int64-uint64-/]
+  unit/language/test_core.py::test_bin_op[1-uint8-int8-/]
+  unit/language/test_core.py::test_bin_op[1-uint8-int16-/]
+
+Sample failing tests:
+  unit/language/test_core.py::test_bin_op[1-int8-int8-+]
+  unit/language/test_core.py::test_bin_op[1-int8-int16-+]
+  unit/language/test_core.py::test_bin_op[1-int8-int32-+]
+  unit/language/test_core.py::test_bin_op[1-int8-int64-+]
+  unit/language/test_core.py::test_bin_op[1-int8-uint8-+]
+  unit/language/test_core.py::test_bin_op[1-int8-uint16-+]
+  unit/language/test_core.py::test_bin_op[1-int8-uint32-+]
+  unit/language/test_core.py::test_bin_op[1-int8-uint64-+]
+  unit/language/test_core.py::test_bin_op[1-int8-float16-+]
+  unit/language/test_core.py::test_bin_op[1-int8-float32-+]
+  unit/language/test_core.py::test_bin_op[1-int8-float64-+]
+  unit/language/test_core.py::test_bin_op[1-int8-bfloat16-+]
+  unit/language/test_core.py::test_bin_op[1-int16-int8-+]
+  unit/language/test_core.py::test_bin_op[1-int16-int16-+]
+  unit/language/test_core.py::test_bin_op[1-int16-int32-+]
+  unit/language/test_core.py::test_bin_op[1-int16-int64-+]
+  unit/language/test_core.py::test_bin_op[1-int16-uint8-+]
+  unit/language/test_core.py::test_bin_op[1-int16-uint16-+]
+  unit/language/test_core.py::test_bin_op[1-int16-uint32-+]
+  unit/language/test_core.py::test_bin_op[1-int16-uint64-+]

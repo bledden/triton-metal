@@ -1,0 +1,82 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install ruff
+        run: pip install ruff>=0.4.0
+
+      - name: Lint
+        run: ruff check triton_metal/ tests/
+
+  test:
+    runs-on: macos-14  # M1 Apple Silicon with Metal GPU
+    timeout-minutes: 30
+    strategy:
+      matrix:
+        python-version: ['3.10', '3.12']
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip
+          pip install -e ".[dev]"
+          pip install torch --index-url https://download.pytorch.org/whl/cpu
+
+      - name: Install Triton
+        run: pip install "triton>=3.6.0,<4.0.0"
+        continue-on-error: true  # macOS wheels may not be available
+
+      - name: Install test dependencies
+        run: pip install transformers torchvision
+        continue-on-error: true  # Optional for model validation tests
+
+      - name: Run unit tests
+        run: pytest tests/ -v --timeout=120 -m "not slow and not stress"
+
+      - name: Run stress tests
+        run: pytest tests/test_stress.py -v --timeout=180
+
+      - name: Run GPU correctness tests
+        run: pytest tests/test_gpu_correctness.py -v --timeout=60
+
+      - name: Performance regression check
+        run: python benchmarks/bench_regression.py
+        continue-on-error: true  # Advisory until perf baseline is stable
+
+      - name: Upstream Triton subset (smoke test)
+        run: |
+          python scripts/run_upstream_tests.py \
+            --test-file test_core.py \
+            --report-dir reports/ \
+            --timeout 600
+        continue-on-error: true  # Informational, not gating
+
+      - name: Check upstream regression
+        run: python scripts/check_upstream_regression.py --report-dir reports/
+
+      - name: Upload test reports
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: test-reports-py${{ matrix.python-version }}
+          path: reports/

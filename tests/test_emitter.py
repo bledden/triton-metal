@@ -4292,12 +4292,12 @@ def test_variance_kernel(runner):
 
 
 @requires_metal
-def test_fp64_rejection():
-    """FP64 types should be rejected by the parser."""
+def test_fp64_downcast():
+    """FP64 types should be mapped to fp64 (downcast to float in MSL)."""
     from triton_metal.codegen.ttgir_parser import _mlir_type_to_triton_dtype
 
-    with pytest.raises(TypeError, match="FP64.*not supported"):
-        _mlir_type_to_triton_dtype("f64")
+    result = _mlir_type_to_triton_dtype("f64")
+    assert result == "fp64", f"Expected 'fp64', got '{result}'"
 
 
 @requires_metal

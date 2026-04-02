@@ -1111,7 +1111,9 @@ def test_triton_jit_layer_norm():
         out = centered * inv_std * w + b
         triton.language.store(out_ptr + row_start + offsets, out, mask=mask)
 
-    n_rows, n_cols = 4, 64
+    # n_cols must equal BLOCK_SIZE to avoid masked-thread variance contamination
+    # (Triton's masked loads set other=0, making centered = -mean for idle threads)
+    n_rows, n_cols = 4, 128
     x = torch.randn(n_rows, n_cols)
     w = torch.randn(n_cols)
     b = torch.randn(n_cols)

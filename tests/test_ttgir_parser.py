@@ -1027,31 +1027,33 @@ module {
 """
 
 
-def test_fp64_rejected_in_parser():
-    """Parser rejects FP64 types with a clear error message."""
+def test_fp64_handled_in_parser():
+    """Parser handles FP64 types by mapping to fp64 (downcast to float in MSL)."""
     from triton_metal.codegen.ttgir_parser import parse_ttgir
 
-    with pytest.raises(TypeError, match="FP64.*not supported.*Apple Silicon"):
-        parse_ttgir(FP64_TTGIR, FakeOptions())
+    # Should not raise — f64 is now handled via float downcast
+    kb = parse_ttgir(FP64_TTGIR, FakeOptions())
+    msl = kb.build()
+    # f64 maps to float in MSL (Metal has no double)
+    assert "float" in msl
 
 
-def test_fp64_rejected_in_msl_types():
-    """MSL type mapper rejects FP64 types."""
+def test_fp64_downcast_in_msl_types():
+    """MSL type mapper downcasts FP64 to float."""
     from triton_metal.codegen.msl_types import triton_type_to_msl
 
-    with pytest.raises(TypeError, match="FP64.*not supported"):
-        triton_type_to_msl("fp64")
-
-    with pytest.raises(TypeError, match="FP64.*not supported"):
-        triton_type_to_msl("*fp64")
+    assert triton_type_to_msl("fp64") == "float"
+    assert triton_type_to_msl("*fp64") == "device float*"
 
 
-def test_fp64_rejected_in_emitter():
-    """MSL emitter rejects FP64 kernel generation."""
+def test_fp64_downcast_in_emitter():
+    """MSL emitter handles FP64 via downcast to float."""
     from triton_metal.codegen.msl_emitter import make_elementwise_kernel
 
-    with pytest.raises(TypeError, match="FP64.*not supported"):
-        make_elementwise_kernel("bad_kernel", 2, "add", dtype="fp64")
+    # Should not raise — fp64 is now mapped to float in MSL
+    msl = make_elementwise_kernel("fp64_kernel", 2, "add", dtype="fp64")
+    # The kernel uses float since Metal has no double
+    assert "float" in msl
 
 
 # ---------------------------------------------------------------------------

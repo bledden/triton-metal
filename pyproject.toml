@@ -4,9 +4,26 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "triton-metal"
-version = "0.1.0"
+version = "0.1.0a1"
 description = "Metal (Apple Silicon) backend for Triton"
+readme = "README.md"
+license = {text = "MIT"}
 requires-python = ">=3.10"
+authors = [
+    {name = "Blake Ledden", email = "bledden@users.noreply.github.com"},
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: MacOS",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
 dependencies = [
     "pyobjc-core>=10.0; sys_platform == 'darwin'",
     "pyobjc-framework-Metal>=10.0; sys_platform == 'darwin'",
@@ -16,9 +33,36 @@ dependencies = [
 
 [project.optional-dependencies]
 triton = [
-    "triton>=3.2.0",
+    "triton>=3.6.0",
 ]
 dev = [
     "pytest>=7.0",
+    "pytest-timeout",
     "ruff>=0.4.0",
 ]
+
+[project.urls]
+Homepage = "https://github.com/bledden/triton-metal"
+Repository = "https://github.com/bledden/triton-metal"
+Issues = "https://github.com/bledden/triton-metal/issues"
+Changelog = "https://github.com/bledden/triton-metal/blob/main/CHANGELOG.md"
+
+[project.entry-points."triton.backends"]
+metal = "triton_metal.backend"
+
+[tool.setuptools.packages.find]
+include = ["triton_metal*"]
+
+[tool.pytest.ini_options]
+markers = [
+    "slow: marks tests as slow (deselect with '-m \"not slow\"')",
+    "stress: marks stress tests (deselect with '-m \"not stress\"')",
+    "benchmark: marks benchmark tests",
+]
+
+[tool.ruff]
+line-length = 120
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "W"]

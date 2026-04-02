@@ -241,3 +241,59 @@ def test_autotune_handles_compile_error():
     failed = [r for r in result.all_results if r["config"].block_size == 512]
     assert len(failed) == 1
     assert "error" in failed[0]["status"]
+
+
+# ---------------------------------------------------------------------------
+# @triton.autotune + @triton.jit integration tests
+# ---------------------------------------------------------------------------
+
+try:
+    import triton
+    import triton.language as tl
+    HAS_TRITON = True
+except ImportError:
+    HAS_TRITON = False
+
+try:
+    import torch
+    HAS_TORCH = torch.backends.mps.is_available() if hasattr(torch.backends, "mps") else False
+except ImportError:
+    HAS_TORCH = False
+
+requires_triton_metal = pytest.mark.skipif(
+    not (HAS_METAL and HAS_TRITON and HAS_TORCH),
+    reason="Requires Metal + Triton + PyTorch MPS"
+)
+
+
+@requires_triton_metal
+def test_triton_autotune_vector_add():
+    """End-to-end: @triton.autotune selects a config for vector_add on Metal."""
+    @triton.autotune(
+        configs=[
+            triton.Config({"BLOCK_SIZE": 128}, num_warps=4),
+            triton.Config({"BLOCK_SIZE": 256}, num_warps=8),
+        ],
+        key=["n_elements"],
+    )
+    @triton.jit
+    def add_kernel(x_ptr, y_ptr, out_ptr, n_elements, BLOCK_SIZE: tl.constexpr):
+        pid = tl.program_id(0)
+        offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+        mask = offsets < n_elements
+        x = tl.load(x_ptr + offsets, mask=mask)
+        y = tl.load(y_ptr + offsets, mask=mask)
+        tl.store(out_ptr + offsets, x + y, mask=mask)
+
+    n = 4096
+    x = torch.randn(n, device="cpu", dtype=torch.float32)
+    y = torch.randn(n, device="cpu", dtype=torch.float32)
+    out = torch.empty(n, device="cpu", dtype=torch.float32)
+
+    grid = lambda meta: (triton.cdiv(n, meta["BLOCK_SIZE"]),)
+    add_kernel[grid](x, y, out, n)
+
+    expected = x + y
+    assert torch.allclose(out, expected, atol=1e-5), \
+        f"Max diff: {(out - expected).abs().max()}"
+    print("@triton.autotune vector_add: PASS")

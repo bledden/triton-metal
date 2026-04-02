@@ -95,15 +95,11 @@ def _mlir_type_to_triton_dtype(mlir_type):
     Raises TypeError if the type is FP64 (not supported on Apple Silicon).
     """
     mlir_type = mlir_type.strip()
-    if mlir_type == "f64":
-        raise TypeError(
-            "FP64 (double) is not supported on Apple Silicon GPUs. "
-            "Got MLIR type 'f64'. Cast to float32 before running on Metal."
-        )
     _map = {
         "f32": "fp32",
         "f16": "fp16",
         "bf16": "bf16",
+        "f64": "fp64",  # Metal has no double — will be emitted as float
         "i1": "i1",
         "i8": "i8",
         "i16": "i16",

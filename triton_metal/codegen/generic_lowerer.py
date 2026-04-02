@@ -120,6 +120,20 @@ def _msl_int_type(elem_type: str, unsigned: bool = False) -> tuple:
     return _INT_TYPE_MAP.get(elem_type, ("int", "i32"))
 
 
+def _shape_numel(shape: tuple) -> int:
+    """Return the total number of elements in a shape tuple.
+
+    Examples:
+        () -> 1 (scalar)
+        (32,) -> 32
+        (32, 64) -> 2048
+    """
+    result = 1
+    for d in shape:
+        result *= d
+    return result
+
+
 # ---------------------------------------------------------------------------
 # Generic Lowerer
 # ---------------------------------------------------------------------------
@@ -162,6 +176,74 @@ class GenericLowerer:
         name = f"{prefix}_{self._var_counter}"
         self._var_counter += 1
         return name
+
+    # -- Shape tracking helpers --------------------------------------------------
+
+    def _get_shape(self, ssa_id: int) -> tuple:
+        """Return the tracked shape for an SSA value.
+
+        Returns the shape tuple from env_shapes if tracked, otherwise
+        attempts to infer from the op's type_str via _extract_shape.
+        Falls back to () (scalar) if no shape information is available.
+        """
+        if ssa_id in self.env_shapes:
+            return self.env_shapes[ssa_id]
+        # Try to infer from the op's type_str
+        for op in self.graph.ops:
+            if op.id == ssa_id and op.type_str:
+                shape = _extract_shape(op.type_str)
+                if shape:
+                    self.env_shapes[ssa_id] = shape
+                    return shape
+        return ()
+
+    def _is_scalar(self, ssa_id: int) -> bool:
+        """Check if an SSA value has scalar shape (no dimensions).
+
+        A value is scalar if its shape is () — i.e., it has no tensor
+        dimensions.  Scalars don't need per-thread indexing; they are
+        the same value on every thread.
+        """
+        return self._get_shape(ssa_id) == ()
+
+    def _propagate_shape_from_type(self, ssa: SSAValue):
+        """Set env_shapes[ssa.id] from the op's result type_str.
+
+        Used as a common shape-propagation step after lowering an op.
+        If the type_str contains a tensor shape, record it; otherwise
+        the value is implicitly scalar (shape = ()).
+        """
+        if ssa.type_str:
+            shape = _extract_shape(ssa.type_str)
+            if shape:
+                self.env_shapes[ssa.id] = shape
+                return
+        # No tensor type → scalar
+        self.env_shapes[ssa.id] = ()
+
+    def _propagate_shape_elementwise(self, ssa: SSAValue):
+        """Propagate shape for element-wise ops (arith, math, select, etc.).
+
+        Element-wise ops inherit the shape of their operands.  When operands
+        have different shapes (e.g., scalar + vector due to implicit broadcast),
+        we take the "largest" shape — the one with the most elements.
+
+        Falls back to _propagate_shape_from_type if no operand shapes are
+        available.
+        """
+        best_shape = ()
+        for op_id in ssa.operand_ids:
+            s = self._get_shape(op_id)
+            if len(s) > len(best_shape):
+                best_shape = s
+            elif len(s) == len(best_shape):
+                # Same rank — pick the one with more total elements
+                if _shape_numel(s) > _shape_numel(best_shape):
+                    best_shape = s
+        if best_shape != ():
+            self.env_shapes[ssa.id] = best_shape
+        else:
+            self._propagate_shape_from_type(ssa)
 
     @property
     def _lid_expr(self):
@@ -1414,6 +1496,10 @@ class GenericLowerer:
                 self.kb.add_scalar_arg(arg.name, dtype=triton_dtype)
             self.env[arg.id] = arg.name
             self.env_types[arg.id] = triton_dtype
+            # Shape: function arguments are always scalar (pointers are
+            # base addresses, scalars are single values).  tt.splat lifts
+            # them to tensor shapes downstream.
+            self.env_shapes[arg.id] = ()
 
     def _lookup(self, ssa_id: int) -> str:
         """Look up MSL variable name for an SSA value."""
@@ -1534,6 +1620,8 @@ class GenericLowerer:
             self._lower_precise_math(ssa, "sqrt")
         elif op == "tt.precise_divf":
             self._lower_precise_math(ssa, "divf")
+        elif op == "tt.extern_elementwise":
+            self._lower_extern_elementwise(ssa)
         elif op == "tt.assert":
             pass  # Runtime bounds check — skip in MSL
         else:
@@ -1557,6 +1645,8 @@ class GenericLowerer:
         else:
             self.env[ssa.id] = "pid_z"
         self.env_types[ssa.id] = "i32"
+        # Shape: program_id is always scalar
+        self.env_shapes[ssa.id] = ()
 
     def _lower_get_num_programs(self, ssa: SSAValue):
         """tt.get_num_programs → grid dimension (threadgroups_per_grid).
@@ -1580,6 +1670,8 @@ class GenericLowerer:
         self._used_pid_axes.add(axis)
         # Flag that we need the threadgroups_per_grid parameter
         self._needs_num_programs = True
+        # Shape: num_programs is always scalar
+        self.env_shapes[ssa.id] = ()
 
     def _lower_make_range(self, ssa: SSAValue):
         """tt.make_range → lid or 2D index expression.
@@ -1665,6 +1757,11 @@ class GenericLowerer:
         Special case: splatting a pointer arg without addptr (e.g. for
         scalar loads like tl.load(X)) registers the result with offset "0"
         so that tt.load reads from index 0 for all threads.
+
+        Shape tracking: the source is scalar (), the result gets the tensor
+        shape from type_str (e.g. tensor<256xf32> → (256,)).  This records
+        that the value has been "splatted" but each thread still holds a
+        single scalar copy.
         """
         if ssa.operand_ids:
             src_id = ssa.operand_ids[0]
@@ -1679,6 +1776,13 @@ class GenericLowerer:
                 # Splatting a raw pointer arg (no addptr) — all threads
                 # point to the same address, so offset is 0
                 self.env_is_ptr[ssa.id] = (self._lookup(src_id), "0")
+        # Track splat output shape from result type
+        shape = _extract_shape(ssa.type_str)
+        if shape:
+            self.env_shapes[ssa.id] = shape
+        else:
+            # Scalar splat (no tensor wrapper) — record as scalar
+            self.env_shapes[ssa.id] = ()
 
     def _lower_expand_dims(self, ssa: SSAValue):
         """tt.expand_dims → passthrough with shape tracking.
@@ -1686,9 +1790,21 @@ class GenericLowerer:
         In the 2D model, expand_dims inserts a size-1 dimension.
         The per-thread value doesn't change (index remapping was done
         at make_range level by the 2D pre-pass), so this is a passthrough.
+
+        Shape tracking: records the new shape with the inserted dimension.
+        For example, tensor<64xi32> with axis=1 → tensor<64x1xi32>,
+        giving shape (64, 1).
+
+        TODO(2D codegen): When the source is a 1D range and expand_dims
+        inserts a new axis, this is where the value semantically transitions
+        from 1D to 2D.  In full 2D codegen, this is the point where we'd
+        need to decide whether this value represents row indices or column
+        indices based on the axis parameter.  Currently, the make_range
+        pre-pass handles this heuristically, but a proper implementation
+        would use the expand_dims axis to assign dimensions explicitly.
         """
         self._emit_passthrough(ssa)
-        # Track shape from the result type
+        # Track shape from the result type (overrides passthrough shape)
         shape = _extract_shape(ssa.type_str)
         if shape:
             self.env_shapes[ssa.id] = shape
@@ -1703,9 +1819,23 @@ class GenericLowerer:
 
         This works because each thread's value is already the correct
         broadcast result based on the 2D index computed at make_range time.
+
+        Shape tracking: records the broadcast target shape.  For example,
+        tensor<64x1xi32> broadcast to tensor<64x128xi32> gives shape
+        (64, 128).  The source shape (64, 1) → target shape (64, 128)
+        tells us dimension 1 was broadcast.
+
+        TODO(2D codegen): In full 2D support, broadcast is where we'd
+        need to handle replication.  When a value with shape (M, 1) is
+        broadcast to (M, N), each thread in a row should get the same
+        value.  Currently the 1D per-thread model makes this implicit
+        (all threads independently compute) but a proper 2D model would
+        need to ensure the column index is ignored for broadcast dims.
+        The shape tracking infrastructure enables detecting these cases
+        by comparing source shape to target shape to find broadcast dims.
         """
         self._emit_passthrough(ssa)
-        # Track shape from the result type
+        # Track shape from the result type (overrides passthrough shape)
         shape = _extract_shape(ssa.type_str)
         if shape:
             self.env_shapes[ssa.id] = shape
@@ -1733,6 +1863,12 @@ class GenericLowerer:
                 ptr_var = self._lookup(ptr_id)
                 self.env_is_ptr[ssa.id] = (ptr_var, offset_var)
                 self.env[ssa.id] = f"{ptr_var}[{offset_var}]"
+            # Shape: addptr inherits shape from its operands (typically the
+            # offset tensor dictates the shape, or the pointer tensor from splat).
+            # TODO(2D codegen): For 2D addptr, the offset computation encodes
+            # the memory layout (row * stride + col).  When both operands have
+            # shapes, use the larger one.
+            self._propagate_shape_elementwise(ssa)
 
     # -- Load and Store --
 
@@ -1787,9 +1923,25 @@ class GenericLowerer:
 
         self.env[ssa.id] = var_name
         self.env_types[ssa.id] = dtype
+        # Shape: load inherits shape from pointer operand.
+        # TODO(2D codegen): When shape is 2D+, emit proper row/col indexing
+        # instead of flat lid-based offset.  For shape (M, N):
+        #   row = lid / N, col = lid % N
+        #   offset = row_offsets[row] + col_offsets[col]
+        ptr_shape = self.env_shapes.get(ptr_id)
+        if ptr_shape:
+            self.env_shapes[ssa.id] = ptr_shape
+        else:
+            self._propagate_shape_from_type(ssa)
 
     def _lower_store(self, ssa: SSAValue):
-        """tt.store → masked buffer write."""
+        """tt.store → masked buffer write.
+
+        TODO(2D codegen): When ptr shape is 2D+, emit proper row/col
+        indexing for the store offset instead of flat lid-based offset.
+        The shape information from env_shapes can be used to decompose
+        the flat thread index into multi-dimensional coordinates.
+        """
         if len(ssa.operand_ids) < 2:
             return
 
@@ -1932,6 +2084,7 @@ class GenericLowerer:
             # Unknown constant — use 0
             self.env[ssa.id] = "0"
             self.env_types[ssa.id] = "i32"
+            self.env_shapes[ssa.id] = ()
             return
 
         # Check if this is a hex integer that should be interpreted as float
@@ -1953,10 +2106,12 @@ class GenericLowerer:
             if ssa.is_tensor:
                 self.env[ssa.id] = msl_val
                 self.env_types[ssa.id] = "fp32"
+                self._propagate_shape_from_type(ssa)
                 return
             self.kb.raw_line(f"    float {var_name} = {msl_val};")
             self.env[ssa.id] = var_name
             self.env_types[ssa.id] = "fp32"
+            self.env_shapes[ssa.id] = ()
             return
 
         # Determine type and format
@@ -1967,6 +2122,7 @@ class GenericLowerer:
                 int_val = "1" if bool_val == "true" else "0"
                 self.env[ssa.id] = int_val
                 self.env_types[ssa.id] = "i1"
+                self._propagate_shape_from_type(ssa)
                 return
             self.kb.raw_line(f"    bool {var_name} = {bool_val};")
             self.env[ssa.id] = var_name
@@ -1978,6 +2134,7 @@ class GenericLowerer:
             if ssa.is_tensor:
                 self.env[ssa.id] = str(value)
                 self.env_types[ssa.id] = int_dtype
+                self._propagate_shape_from_type(ssa)
                 return
             self.kb.raw_line(f"    {int_type} {var_name} = {value};")
             self.env[ssa.id] = var_name
@@ -1992,6 +2149,7 @@ class GenericLowerer:
             if ssa.is_tensor:
                 self.env[ssa.id] = msl_val
                 self.env_types[ssa.id] = "fp32"
+                self._propagate_shape_from_type(ssa)
                 return
             self.kb.raw_line(f"    float {var_name} = {msl_val};")
             self.env[ssa.id] = var_name
@@ -1999,6 +2157,8 @@ class GenericLowerer:
         else:
             self.env[ssa.id] = str(value)
             self.env_types[ssa.id] = "i32"
+        # Shape: constants are scalar unless they have a tensor type
+        self._propagate_shape_from_type(ssa)
 
     # -- Arithmetic ops --
 
@@ -2120,6 +2280,8 @@ class GenericLowerer:
             self.kb.raw_line(f"    {ty} {var_name} = {a} {op_str} {b};")
         self.env[ssa.id] = var_name
         self.env_types[ssa.id] = dtype
+        # Shape: element-wise binary inherits shape from operands
+        self._propagate_shape_elementwise(ssa)
 
     def _is_float_op(self, ssa: SSAValue) -> bool:
         """Check if an SSA op produces a float result."""
@@ -2145,6 +2307,8 @@ class GenericLowerer:
         self.kb.raw_line(f"    float {var_name} = {op_str}{a};")
         self.env[ssa.id] = var_name
         self.env_types[ssa.id] = "fp32"
+        # Shape: unary inherits shape from its operand
+        self._propagate_shape_elementwise(ssa)
 
     def _emit_builtin_binary(self, ssa: SSAValue, fn_name: str, force_unsigned=False):
         """Emit a builtin binary function: result = fn(a, b)."""
@@ -2168,6 +2332,8 @@ class GenericLowerer:
             self.kb.raw_line(f"    {ty} {var_name} = {fn_name}({a}, {b});")
         self.env[ssa.id] = var_name
         self.env_types[ssa.id] = dtype
+        # Shape: element-wise builtin binary inherits shape from operands
+        self._propagate_shape_elementwise(ssa)
 
     def _emit_nan_propagating_minmax(self, ssa: SSAValue, fn_name: str):
         """Emit NaN-propagating min/max: if either operand is NaN, result is NaN."""
@@ -2182,6 +2348,8 @@ class GenericLowerer:
         )
         self.env[ssa.id] = var_name
         self.env_types[ssa.id] = "fp32"
+        # Shape: element-wise binary inherits shape from operands
+        self._propagate_shape_elementwise(ssa)
 
     def _lower_clampf(self, ssa: SSAValue):
         """tt.clampf → clamp(x, min, max) with optional NaN propagation.
@@ -2209,6 +2377,8 @@ class GenericLowerer:
             )
         self.env[ssa.id] = var_name
         self.env_types[ssa.id] = "fp32"
+        # Shape: clamp is element-wise
+        self._propagate_shape_elementwise(ssa)
 
     def _lower_tt_bitcast(self, ssa: SSAValue):
         """tt.bitcast → reinterpret bits or change pointer element type.
@@ -2261,14 +2431,16 @@ class GenericLowerer:
             self.kb.raw_line(f"    {msl_ty} {var_name} = as_type<{msl_ty}>({src_var});")
             self.env[ssa.id] = var_name
             self.env_types[ssa.id] = dtype
+            self._propagate_shape_elementwise(ssa)
         elif not src_is_float and dst_is_float:
             # int -> float bitcast: as_type<float>(val)
             var_name = self._next_var("bc")
             self.kb.raw_line(f"    float {var_name} = as_type<float>({src_var});")
             self.env[ssa.id] = var_name
             self.env_types[ssa.id] = "fp32"
+            self._propagate_shape_elementwise(ssa)
         else:
-            # Same category — passthrough
+            # Same category — passthrough (shape propagation handled inside)
             self._emit_passthrough(ssa)
             # Update type to reflect the destination type
             self.env_types[ssa.id] = _mlir_to_triton_dtype(dst_elem)
@@ -2283,6 +2455,8 @@ class GenericLowerer:
         self.kb.raw_line(f"    uint {var_name} = mulhi(as_type<uint>({a}), as_type<uint>({b}));")
         self.env[ssa.id] = var_name
         self.env_types[ssa.id] = "i32"
+        # Shape: element-wise binary
+        self._propagate_shape_elementwise(ssa)
 
     def _emit_passthrough(self, ssa: SSAValue):
         """Emit a type conversion that's a no-op in MSL (extf, truncf, etc.)."""
@@ -2295,6 +2469,16 @@ class GenericLowerer:
                 self.env_is_mask[ssa.id] = True
             if src_id in self.env_is_ptr:
                 self.env_is_ptr[ssa.id] = self.env_is_ptr[src_id]
+            # Propagate shape: passthrough preserves shape from source,
+            # unless the result type has a different shape (e.g. reshape).
+            if ssa.type_str:
+                out_shape = _extract_shape(ssa.type_str)
+                if out_shape:
+                    self.env_shapes[ssa.id] = out_shape
+                elif src_id in self.env_shapes:
+                    self.env_shapes[ssa.id] = self.env_shapes[src_id]
+            elif src_id in self.env_shapes:
+                self.env_shapes[ssa.id] = self.env_shapes[src_id]
 
     def _emit_cast(self, ssa: SSAValue, target_type: str, dtype: str = None):
         """Emit a type cast."""
@@ -2311,6 +2495,8 @@ class GenericLowerer:
         else:
             # Use the elem_type from MLIR when available
             self.env_types[ssa.id] = _mlir_to_triton_dtype(ssa.elem_type) if ssa.elem_type else "i32"
+        # Shape: cast preserves shape from source operand
+        self._propagate_shape_elementwise(ssa)
 
     def _emit_uitofp(self, ssa: SSAValue):
         """Emit unsigned-int-to-float conversion.
@@ -2348,6 +2534,8 @@ class GenericLowerer:
             )
         self.env[ssa.id] = var_name
         self.env_types[ssa.id] = "fp32"
+        # Shape: uitofp preserves shape
+        self._propagate_shape_elementwise(ssa)
 
     def _emit_int_cast(self, ssa: SSAValue, unsigned: bool = False):
         """Emit an integer sign-extend, zero-extend, or truncation cast.
@@ -2399,6 +2587,8 @@ class GenericLowerer:
             self.env_is_mask[ssa.id] = True
         if src_id in self.env_is_ptr:
             self.env_is_ptr[ssa.id] = self.env_is_ptr[src_id]
+        # Shape: integer cast preserves shape
+        self._propagate_shape_elementwise(ssa)
 
     def _lower_cmpi(self, ssa: SSAValue):
         """arith.cmpi → comparison with unsigned cast when needed.
@@ -2439,6 +2629,8 @@ class GenericLowerer:
         self.env[ssa.id] = var_name
         self.env_is_mask[ssa.id] = True
         self.env_types[ssa.id] = "i1"
+        # Shape: comparison inherits shape from operands
+        self._propagate_shape_elementwise(ssa)
 
     def _lower_cmpf(self, ssa: SSAValue):
         """arith.cmpf → float comparison with NaN-aware unordered predicates.
@@ -2487,6 +2679,8 @@ class GenericLowerer:
         self.env[ssa.id] = var_name
         self.env_is_mask[ssa.id] = True
         self.env_types[ssa.id] = "i1"
+        # Shape: comparison inherits shape from operands
+        self._propagate_shape_elementwise(ssa)
 
     def _lower_select(self, ssa: SSAValue):
         """arith.select → ternary operator with inferred type."""
@@ -2512,6 +2706,8 @@ class GenericLowerer:
         self.kb.raw_line(f"    {ty} {var_name} = {cond} ? {true_val} : {false_val};")
         self.env[ssa.id] = var_name
         self.env_types[ssa.id] = dtype
+        # Shape: select inherits shape from operands (cond, true, false)
+        self._propagate_shape_elementwise(ssa)
 
     # -- Math ops --
 
@@ -2625,8 +2821,27 @@ class GenericLowerer:
             self.env[ssa.id] = var_name
             self.env_types[ssa.id] = "fp32"
 
+        elif op == "math.log1p":
+            # log1p(x) = log(1 + x), more numerically stable near zero
+            a = self._lookup(ssa.operand_ids[0])
+            var_name = self._next_var("r")
+            self.kb.raw_line(f"    float {var_name} = log(1.0f + {a});")
+            self.env[ssa.id] = var_name
+            self.env_types[ssa.id] = "fp32"
+
+        elif op == "math.expm1":
+            # expm1(x) = exp(x) - 1, more numerically stable near zero
+            a = self._lookup(ssa.operand_ids[0])
+            var_name = self._next_var("r")
+            self.kb.raw_line(f"    float {var_name} = (exp({a}) - 1.0f);")
+            self.env[ssa.id] = var_name
+            self.env_types[ssa.id] = "fp32"
+
         else:
             self.kb.comment(f"UNSUPPORTED math: {op}")
+            return
+        # Shape: all math ops are element-wise — inherit from operands
+        self._propagate_shape_elementwise(ssa)
 
     def _lower_precise_math(self, ssa: SSAValue, kind: str):
         """Lower tt.precise_sqrt / tt.precise_divf to MSL."""
@@ -2643,6 +2858,61 @@ class GenericLowerer:
             self.kb.raw_line(f"    float {var_name} = precise::divide({a}, {b});")
             self.env[ssa.id] = var_name
             self.env_types[ssa.id] = "fp32"
+        # Shape: precise math is element-wise
+        self._propagate_shape_elementwise(ssa)
+
+    # -- Extern elementwise --
+
+    def _lower_extern_elementwise(self, ssa: SSAValue):
+        """tt.extern_elementwise → direct MSL function call.
+
+        Handles the common case where the extern function maps to a Metal
+        standard library function (e.g., sin, cos, exp, etc.).
+
+        The symbol name is extracted from the op's attributes. The TTGIR text
+        typically contains: tt.extern_elementwise ... {symbol = "func_name", ...}
+        The walker stores raw attributes, so we check for 'symbol', 'libname',
+        and 'pure' attributes.
+        """
+        # Extract function name from attributes
+        func_name = ssa.attrs.get("symbol", "")
+        if not func_name:
+            func_name = ssa.attrs.get("libname", "")
+        if not func_name:
+            # Fallback: try to extract from the raw_line or op string
+            self.kb.comment(f"UNSUPPORTED: tt.extern_elementwise (no symbol)")
+            return
+
+        # Sanitize function name for MSL (strip leading underscores from __nv_* etc.)
+        # Common pattern: __nv_sinf → sin, __nv_expf → exp
+        safe_name = func_name
+        if safe_name.startswith("__nv_"):
+            # CUDA libdevice function — strip prefix and trailing 'f' if present
+            stripped = safe_name[5:]  # remove "__nv_"
+            if stripped.endswith("f") and len(stripped) > 1:
+                stripped = stripped[:-1]
+            safe_name = stripped
+
+        # Build argument list
+        args = [self._lookup(oid) for oid in ssa.operand_ids]
+        args_str = ", ".join(args)
+
+        # Determine result type
+        elem = ssa.elem_type or "f32"
+        triton_dtype = _mlir_to_triton_dtype(elem)
+        if triton_dtype.startswith("fp") or triton_dtype.startswith("bf"):
+            msl_ty = "float"
+        elif triton_dtype.startswith("u"):
+            msl_ty = "uint"
+        elif triton_dtype == "i64":
+            msl_ty = "long"
+        else:
+            msl_ty = triton_type_to_msl(triton_dtype)
+
+        var_name = self._next_var("r")
+        self.kb.raw_line(f"    {msl_ty} {var_name} = {safe_name}({args_str});")
+        self.env[ssa.id] = var_name
+        self.env_types[ssa.id] = triton_dtype
 
     # -- Transpose --
 
@@ -4149,11 +4419,17 @@ class GenericLowerer:
             # First block arg is induction variable
             self.env[block_arg_ids[0]] = loop_var
             self.env_types[block_arg_ids[0]] = start_type
+            self.env_shapes[block_arg_ids[0]] = ()  # induction var is scalar
             # Remaining block args are iter_args
             for i, var in enumerate(iter_vars):
                 if i + 1 < len(block_arg_ids):
-                    self.env[block_arg_ids[i + 1]] = var
-                    self.env_types[block_arg_ids[i + 1]] = iter_dtypes[i] if i < len(iter_dtypes) else "fp32"
+                    ba_id = block_arg_ids[i + 1]
+                    self.env[ba_id] = var
+                    self.env_types[ba_id] = iter_dtypes[i] if i < len(iter_dtypes) else "fp32"
+                    # Propagate shape from init value to block arg
+                    init_id = init_ids[i] if i < len(init_ids) else None
+                    if init_id is not None and init_id in self.env_shapes:
+                        self.env_shapes[ba_id] = self.env_shapes[init_id]
 
         # Process body ops
         if ssa.region_ops:
@@ -4175,15 +4451,23 @@ class GenericLowerer:
         if ssa.result_ids:
             for i, var in enumerate(iter_vars):
                 if i < len(ssa.result_ids):
-                    self.env[ssa.result_ids[i]] = var
-                    self.env_types[ssa.result_ids[i]] = iter_dtypes[i] if i < len(iter_dtypes) else "fp32"
+                    rid = ssa.result_ids[i]
+                    self.env[rid] = var
+                    self.env_types[rid] = iter_dtypes[i] if i < len(iter_dtypes) else "fp32"
+                    # Propagate shape from init value to result
+                    if i < len(init_ids) and init_ids[i] in self.env_shapes:
+                        self.env_shapes[rid] = self.env_shapes[init_ids[i]]
         elif n_iter_args == 1 and iter_vars:
             self.env[ssa.id] = iter_vars[0]
             self.env_types[ssa.id] = iter_dtypes[0] if iter_dtypes else "fp32"
+            if init_ids and init_ids[0] in self.env_shapes:
+                self.env_shapes[ssa.id] = self.env_shapes[init_ids[0]]
         elif iter_vars:
             # Fallback: single result maps to first iter_var
             self.env[ssa.id] = iter_vars[0]
             self.env_types[ssa.id] = iter_dtypes[0] if iter_dtypes else "fp32"
+            if init_ids and init_ids[0] in self.env_shapes:
+                self.env_shapes[ssa.id] = self.env_shapes[init_ids[0]]
 
     def _lower_scf_if(self, ssa: SSAValue):
         """scf.if → MSL if/else block with optional results."""
@@ -4839,7 +5123,9 @@ class _DeviceFuncLowerer:
         elif op in ("scf.yield", "scf.condition"):
             pass
         elif op == "scf.for":
-            self._emit(f"// UNSUPPORTED: scf.for in device func")
+            self._lower_scf_for(ssa)
+        elif op == "tt.extern_elementwise":
+            self._lower_extern_elementwise(ssa)
         elif op.startswith("ttg.") or op in ("tt.reshape", "tt.expand_dims",
                                                "tt.unsplat", "tt.make_range"):
             self._emit_passthrough(ssa)
@@ -5059,10 +5345,13 @@ class _DeviceFuncLowerer:
         ids = ssa.operand_ids
 
         math_map = {
-            "math.exp": "exp", "math.log": "log", "math.sqrt": "sqrt",
+            "math.exp": "exp", "math.exp2": "exp2",
+            "math.log": "log", "math.log2": "log2",
+            "math.sqrt": "sqrt",
             "math.rsqrt": "rsqrt", "math.abs": "abs", "math.absf": "abs",
             "math.ceil": "ceil", "math.floor": "floor",
             "math.sin": "sin", "math.cos": "cos", "math.tanh": "tanh",
+            "math.round": "round", "math.roundeven": "rint", "math.trunc": "trunc",
             "math.fma": "fma",
         }
 
@@ -5075,12 +5364,151 @@ class _DeviceFuncLowerer:
             self._emit(f"float {var} = fma({a}, {b}, {c});")
             self.env[ssa.id] = var
             self.env_types[ssa.id] = "fp32"
+        elif op == "math.log1p" and len(ids) >= 1:
+            a = self._lookup(ids[0])
+            var = self._next_var("r")
+            self._emit(f"float {var} = log(1.0f + {a});")
+            self.env[ssa.id] = var
+            self.env_types[ssa.id] = "fp32"
+        elif op == "math.expm1" and len(ids) >= 1:
+            a = self._lookup(ids[0])
+            var = self._next_var("r")
+            self._emit(f"float {var} = (exp({a}) - 1.0f);")
+            self.env[ssa.id] = var
+            self.env_types[ssa.id] = "fp32"
         elif len(ids) >= 1:
             a = self._lookup(ids[0])
             var = self._next_var("r")
             self._emit(f"float {var} = {func}({a});")
             self.env[ssa.id] = var
             self.env_types[ssa.id] = "fp32"
+
+    def _lower_extern_elementwise(self, ssa: SSAValue):
+        """tt.extern_elementwise → direct MSL function call in device func."""
+        func_name = ssa.attrs.get("symbol", "")
+        if not func_name:
+            func_name = ssa.attrs.get("libname", "")
+        if not func_name:
+            self._emit(f"// UNSUPPORTED: tt.extern_elementwise (no symbol)")
+            return
+
+        # Sanitize __nv_* CUDA libdevice names to Metal equivalents
+        safe_name = func_name
+        if safe_name.startswith("__nv_"):
+            stripped = safe_name[5:]
+            if stripped.endswith("f") and len(stripped) > 1:
+                stripped = stripped[:-1]
+            safe_name = stripped
+
+        args = [self._lookup(oid) for oid in ssa.operand_ids]
+        args_str = ", ".join(args)
+
+        elem = ssa.elem_type or "f32"
+        triton_dtype = _mlir_to_triton_dtype(elem)
+        if triton_dtype.startswith("fp") or triton_dtype.startswith("bf"):
+            msl_ty = "float"
+        elif triton_dtype.startswith("u"):
+            msl_ty = "uint"
+        elif triton_dtype == "i64":
+            msl_ty = "long"
+        else:
+            msl_ty = triton_type_to_msl(triton_dtype)
+
+        var = self._next_var("r")
+        self._emit(f"{msl_ty} {var} = {safe_name}({args_str});")
+        self.env[ssa.id] = var
+        self.env_types[ssa.id] = triton_dtype
+
+    def _lower_scf_for(self, ssa: SSAValue):
+        """scf.for → MSL for loop with iter_args in device function.
+
+        Reuses the same logic as GenericLowerer._lower_scf_for():
+        scf.for has operands: [start, end, step, init_0, init_1, ...]
+        Results: [result_0, result_1, ...] (same count as iter_args)
+        Body block args: [induction_var, iter_arg_0, iter_arg_1, ...]
+        """
+        if len(ssa.operand_ids) < 3:
+            return
+
+        start_var = self._lookup(ssa.operand_ids[0])
+        end_var = self._lookup(ssa.operand_ids[1])
+        step_var = self._lookup(ssa.operand_ids[2])
+
+        # iter_args initial values: operands[3:]
+        init_ids = ssa.operand_ids[3:]
+        n_iter_args = len(init_ids)
+
+        # Declare and initialize iter_arg variables
+        iter_vars = []
+        iter_dtypes = []
+        result_elem = ssa.elem_type or "f32"
+        for i, init_id in enumerate(init_ids):
+            var_name = self._next_var("iter")
+            init_val = self._lookup(init_id)
+            init_type = self.env_types.get(init_id, "fp32")
+            if result_elem in ("i64",) and init_type in ("i32", "fp32"):
+                init_type = result_elem
+            if init_type.startswith("f") or init_type.startswith("bf"):
+                msl_type = "float"
+            elif init_type in ("i64",):
+                msl_type = "long"
+            elif init_type.startswith("u"):
+                msl_type = "uint"
+            else:
+                msl_type = "int"
+            self._emit(f"{msl_type} {var_name} = {init_val};")
+            iter_vars.append(var_name)
+            iter_dtypes.append(init_type)
+
+        # Emit for loop
+        start_type = self.env_types.get(ssa.operand_ids[0], "i32")
+        is_i64 = start_type == "i64" or "i64" in (ssa.type_str or "")
+        loop_type = "long" if is_i64 else "int"
+        loop_var = self._next_var("k")
+
+        self._emit(
+            f"for ({loop_type} {loop_var} = {start_var}; "
+            f"{loop_var} < {end_var}; {loop_var} += {step_var}) {{"
+        )
+
+        # Map block args to MSL variables
+        block_arg_ids = ssa.attrs.get("block_arg_ids", [])
+        if block_arg_ids:
+            # First block arg is induction variable
+            self.env[block_arg_ids[0]] = loop_var
+            self.env_types[block_arg_ids[0]] = start_type
+            # Remaining block args are iter_args
+            for i, var in enumerate(iter_vars):
+                if i + 1 < len(block_arg_ids):
+                    self.env[block_arg_ids[i + 1]] = var
+                    self.env_types[block_arg_ids[i + 1]] = iter_dtypes[i] if i < len(iter_dtypes) else "fp32"
+
+        # Process body ops
+        if ssa.region_ops:
+            for body_op in ssa.region_ops:
+                if body_op.op == "scf.yield":
+                    # Update iter_arg variables from yield operands
+                    for i, yield_id in enumerate(body_op.operand_ids):
+                        if i < len(iter_vars):
+                            yield_val = self._lookup(yield_id)
+                            self._emit(f"    {iter_vars[i]} = {yield_val};")
+                else:
+                    self._lower_op(body_op)
+
+        self._emit("}")
+
+        # Map scf.for results to iter_arg variables
+        if ssa.result_ids:
+            for i, var in enumerate(iter_vars):
+                if i < len(ssa.result_ids):
+                    self.env[ssa.result_ids[i]] = var
+                    self.env_types[ssa.result_ids[i]] = iter_dtypes[i] if i < len(iter_dtypes) else "fp32"
+        elif n_iter_args == 1 and iter_vars:
+            self.env[ssa.id] = iter_vars[0]
+            self.env_types[ssa.id] = iter_dtypes[0] if iter_dtypes else "fp32"
+        elif iter_vars:
+            self.env[ssa.id] = iter_vars[0]
+            self.env_types[ssa.id] = iter_dtypes[0] if iter_dtypes else "fp32"
 
     def _lower_scf_if(self, ssa: SSAValue):
         """scf.if in a device function.
@@ -5147,6 +5575,9 @@ class _DeviceFuncLowerer:
                 self.env_is_mask[ssa.id] = True
             if src_id in self.env_is_ptr:
                 self.env_is_ptr[ssa.id] = self.env_is_ptr[src_id]
+            # Propagate shape through passthrough
+            if src_id in self.env_shapes:
+                self.env_shapes[ssa.id] = self.env_shapes[src_id]
 
 
 # ---------------------------------------------------------------------------

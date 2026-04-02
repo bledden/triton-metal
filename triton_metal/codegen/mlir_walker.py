@@ -159,6 +159,7 @@ class _ModuleTextIndex:
         self.call_targets = self._parse_call_targets()
         self.func_defs = self._parse_func_defs()
         self.cond_br_ops = self._parse_cond_br_ops()
+        self.extern_elementwise_ops = self._parse_extern_elementwise_ops()
 
     def _parse_func_name(self) -> str:
         m = re.search(
@@ -386,6 +387,37 @@ class _ModuleTextIndex:
             }
         return result
 
+    def _parse_extern_elementwise_ops(self) -> List[Dict[str, Any]]:
+        """Parse tt.extern_elementwise ops and return attrs in text order.
+
+        The TTGIR text typically looks like:
+            %0 = tt.extern_elementwise %arg {symbol = "func", libname = "lib", pure = true} : ...
+
+        Returns list of dicts with 'symbol' and 'libname' keys in text order,
+        suitable for walk-order matching.
+        """
+        results = []
+        for m in re.finditer(
+            r'tt\.extern_elementwise\b[^{]*\{([^}]*)\}',
+            self.text
+        ):
+            attrs_text = m.group(1)
+            info = {}
+            # Extract symbol = "..."
+            sm = re.search(r'symbol\s*=\s*"([^"]*)"', attrs_text)
+            if sm:
+                info["symbol"] = sm.group(1)
+            # Extract libname = "..."
+            lm = re.search(r'libname\s*=\s*"([^"]*)"', attrs_text)
+            if lm:
+                info["libname"] = lm.group(1)
+            # Extract pure = true/false
+            pm = re.search(r'pure\s*=\s*(true|false)', attrs_text)
+            if pm:
+                info["pure"] = pm.group(1) == "true"
+            results.append(info)
+        return results
+
     def _parse_cond_br_ops(self) -> list:
         """Parse cf.cond_br ops to extract branch arg counts.
 
@@ -480,6 +512,9 @@ class MLIRWalker:
 
         # cf.cond_br matching: branch arg counts by text order
         self._cond_br_walk_index = 0
+
+        # tt.extern_elementwise matching: symbol/libname by text order
+        self._extern_elementwise_walk_index = 0
 
     def _get_constant_ssa_names_in_order(self) -> List[str]:
         """Get arith.constant SSA names in text order."""
@@ -1186,6 +1221,19 @@ class MLIRWalker:
             if idx < len(self._call_targets_in_order):
                 attrs["callee"] = self._call_targets_in_order[idx]
             self._call_walk_index += 1
+
+        elif name == "tt.extern_elementwise":
+            # Look up symbol/libname from pre-parsed module text by walk order
+            idx = self._extern_elementwise_walk_index
+            if idx < len(self._text_index.extern_elementwise_ops):
+                info = self._text_index.extern_elementwise_ops[idx]
+                if "symbol" in info:
+                    attrs["symbol"] = info["symbol"]
+                if "libname" in info:
+                    attrs["libname"] = info["libname"]
+                if "pure" in info:
+                    attrs["pure"] = info["pure"]
+            self._extern_elementwise_walk_index += 1
 
         return attrs
 

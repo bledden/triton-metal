@@ -698,3 +698,119 @@ def test_lower_gelu_sigmoid():
     assert "kernel void" in msl
     assert "UNSUPPORTED" not in msl
     assert _validate_msl_compiles(msl), "MSL failed to compile"
+
+
+# ---------------------------------------------------------------------------
+# sizePerThread tests — wrapping loop when Triton expects fewer threads
+# ---------------------------------------------------------------------------
+
+@requires_triton
+@requires_metal
+def test_size_per_thread_emits_element_loop():
+    """When sizePerThread > 1 on elementwise kernels, codegen emits a per-thread loop.
+
+    For BLOCK_SIZE=1024 with sizePerThread=4 and num_warps=4, Triton expects
+    128 threads (4*32) each handling multiple elements. The lowerer should set
+    effective_block_size to num_warps*32 and emit a for-loop over elements.
+
+    NOTE: Wrapping is only applied to elementwise (non-reduction) kernels because
+    threadgroup_barrier/SIMD reductions cannot be placed inside a per-thread loop.
+    """
+    @triton.jit
+    def scale_kernel(x_ptr, out_ptr, n, BLOCK_SIZE: tl.constexpr):
+        pid = tl.program_id(0)
+        offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+        mask = offsets < n
+        x = tl.load(x_ptr + offsets, mask=mask)
+        tl.store(out_ptr + offsets, x * 2.0, mask=mask)
+
+    sig = {"x_ptr": "*fp32", "out_ptr": "*fp32", "n": "i32"}
+    mod, metadata, options = _compile_to_ttgir(
+        scale_kernel, sig, constexprs={"BLOCK_SIZE": 1024}
+    )
+
+    msl, graph = _lower_to_msl(mod, metadata, options)
+    print(f"\n=== Generated MSL for scale_kernel sizePerThread ===")
+    print(msl)
+
+    # With sizePerThread > 1 from TTGIR, the lowerer should use fewer threads
+    # and emit a wrapping loop (_loop_e) for multi-element-per-thread dispatch.
+    if graph.size_per_thread and max(graph.size_per_thread) > 1:
+        assert "_loop_e" in msl, (
+            "Expected wrapping loop variable '_loop_e' in MSL when sizePerThread > 1"
+        )
+        num_threads = graph.num_warps * 32
+        print(f"  size_per_thread={graph.size_per_thread}, "
+              f"num_warps={graph.num_warps}, num_threads={num_threads}")
+
+    assert "kernel void" in msl
+    assert "UNSUPPORTED" not in msl
+    assert _validate_msl_compiles(msl), "MSL failed to compile"
+
+
+@requires_triton
+@requires_metal
+def test_size_per_thread_skipped_for_reductions():
+    """Kernels with reductions should NOT use wrapping when sizePerThread > 1.
+
+    Reductions use threadgroup_barrier and SIMD intrinsics which cannot be
+    placed inside a per-thread element loop. The codegen should fall back
+    to using block_size threads (one per element) for reduction kernels.
+    """
+    @triton.jit
+    def softmax_kernel(x_ptr, out_ptr, n, BLOCK_SIZE: tl.constexpr):
+        pid = tl.program_id(0)
+        offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+        mask = offsets < n
+        x = tl.load(x_ptr + offsets, mask=mask, other=float('-inf'))
+        x_max = tl.max(x, axis=0)
+        x_shifted = x - x_max
+        numerator = tl.exp(x_shifted)
+        denominator = tl.sum(numerator, axis=0)
+        result = numerator / denominator
+        tl.store(out_ptr + offsets, result, mask=mask)
+
+    sig = {"x_ptr": "*fp32", "out_ptr": "*fp32", "n": "i32"}
+    mod, metadata, options = _compile_to_ttgir(
+        softmax_kernel, sig, constexprs={"BLOCK_SIZE": 1024}
+    )
+
+    msl, graph = _lower_to_msl(mod, metadata, options)
+    print(f"\n=== Generated MSL for softmax (no wrapping) ===")
+    print(msl)
+
+    # Even with sizePerThread > 1, wrapping should be skipped for reductions
+    assert "_loop_e" not in msl, (
+        "Wrapping loop should NOT be emitted for kernels with reductions"
+    )
+    assert "kernel void" in msl
+    assert "UNSUPPORTED" not in msl
+    assert _validate_msl_compiles(msl), "MSL failed to compile"
+
+
+@requires_triton
+@requires_metal
+def test_size_per_thread_softmax_correctness():
+    """Softmax produces correct results when sizePerThread > 1 in TTGIR."""
+    import torch
+
+    @triton.jit
+    def _softmax(x_ptr, out_ptr, n_cols, BLOCK_SIZE: tl.constexpr):
+        row = tl.program_id(0)
+        offsets = tl.arange(0, BLOCK_SIZE)
+        mask = offsets < n_cols
+        x = tl.load(x_ptr + row * n_cols + offsets, mask=mask, other=-float("inf"))
+        x_max = tl.max(x, axis=0)
+        x = x - x_max
+        x_exp = tl.exp(x)
+        x_sum = tl.sum(x_exp, axis=0)
+        out = x_exp / x_sum
+        tl.store(out_ptr + row * n_cols + offsets, out, mask=mask)
+
+    for cols in [128, 256, 512, 1024]:
+        x = torch.randn(8, cols, device="cpu")
+        out = torch.empty_like(x)
+        _softmax[(8,)](x, out, cols, BLOCK_SIZE=1024)
+        expected = torch.softmax(x, dim=-1)
+        diff = (out - expected).abs().max().item()
+        assert diff < 1e-5, f"cols={cols}: max_diff={diff}"

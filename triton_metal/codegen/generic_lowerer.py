@@ -303,14 +303,34 @@ class GenericLowerer:
         if max_tensor_size > block_size and max_tensor_size <= 1024:
             block_size = max_tensor_size
 
-        # If total elements > 1024, use a wrapping loop so each thread
-        # processes multiple elements. Metal max is 1024 threads/threadgroup.
+        # If total elements exceed the thread count, use a wrapping loop so
+        # each thread processes multiple elements.
         self._needs_wrapping = False
         self._total_elements = block_size
-        if block_size > 1024:
+
+        # Determine optimal thread count from TTGIR layout.
+        # When sizePerThread > 1, Triton expects fewer threads each handling
+        # multiple elements. Use num_warps * warp_size as the thread count
+        # and emit a per-thread loop for the extra elements.
+        # NOTE: The wrapping loop cannot be used with reductions because
+        # threadgroup_barrier / SIMD reductions inside a for-loop produce
+        # incorrect results. Only apply to purely elementwise kernels.
+        size_per_thread = 1
+        if self.graph.size_per_thread:
+            for s in self.graph.size_per_thread:
+                size_per_thread *= s
+
+        has_reduce = any(ssa.op == "tt.reduce" for ssa in self.graph.ops)
+        num_threads = self.graph.num_warps * 32
+        if size_per_thread > 1 and block_size > num_threads and not has_reduce:
+            self._needs_wrapping = True
+            self._total_elements = block_size
+            block_size = num_threads
+        elif block_size > 1024:
             self._needs_wrapping = True
             self._total_elements = block_size
             block_size = 1024  # Cap dispatch to Metal max
+
         self.effective_block_size = block_size
 
         self.kb = KernelBuilder(self.graph.func_name, block_size=block_size)

@@ -735,13 +735,14 @@ def test_size_per_thread_emits_element_loop():
 
     # With sizePerThread > 1 from TTGIR, the lowerer should use fewer threads
     # and emit a wrapping loop (_loop_e) for multi-element-per-thread dispatch.
-    if graph.size_per_thread and max(graph.size_per_thread) > 1:
-        assert "_loop_e" in msl, (
-            "Expected wrapping loop variable '_loop_e' in MSL when sizePerThread > 1"
-        )
-        num_threads = graph.num_warps * 32
-        print(f"  size_per_thread={graph.size_per_thread}, "
-              f"num_warps={graph.num_warps}, num_threads={num_threads}")
+    assert graph.size_per_thread and max(graph.size_per_thread) > 1, \
+        "Expected sizePerThread > 1 from TTGIR for BLOCK_SIZE=1024"
+    assert "_loop_e" in msl, (
+        "Expected wrapping loop variable '_loop_e' in MSL when sizePerThread > 1"
+    )
+    num_threads = graph.num_warps * 32
+    print(f"  size_per_thread={graph.size_per_thread}, "
+          f"num_warps={graph.num_warps}, num_threads={num_threads}")
 
     assert "kernel void" in msl
     assert "UNSUPPORTED" not in msl

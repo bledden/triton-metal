@@ -320,9 +320,12 @@ class GenericLowerer:
             for s in self.graph.size_per_thread:
                 size_per_thread *= s
 
-        has_reduce = any(ssa.op == "tt.reduce" for ssa in self.graph.ops)
+        has_barrier_ops = any(
+            ssa.op in ("tt.reduce", "tt.scan", "tt.debug_barrier", "tt.trans")
+            for ssa in self.graph.ops
+        )
         num_threads = self.graph.num_warps * 32
-        if size_per_thread > 1 and block_size > num_threads and not has_reduce:
+        if size_per_thread > 1 and block_size > num_threads and not has_barrier_ops:
             self._needs_wrapping = True
             self._total_elements = block_size
             block_size = num_threads

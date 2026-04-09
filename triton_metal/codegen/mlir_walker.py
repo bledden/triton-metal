@@ -66,6 +66,7 @@ class IRGraph:
     block_size: int = 256         # From tt.make_range end attribute
     num_warps: int = 4            # From module attribute
     called_funcs: Optional[List[CalledFunc]] = None  # Noinline function defs
+    size_per_thread: Optional[List[int]] = None  # From #ttg.blocked layout
 
 
 # ---------------------------------------------------------------------------
@@ -139,6 +140,32 @@ def _extract_shape(type_str: str) -> tuple:
 # ---------------------------------------------------------------------------
 # Module text parsing (for info not exposed by bindings)
 # ---------------------------------------------------------------------------
+
+def _parse_blocked_layout(mod_text: str) -> Optional[Dict[str, List[int]]]:
+    """Extract sizePerThread, threadsPerWarp, warpsPerCTA from TTGIR text.
+
+    Parses layout attributes like:
+        #blocked = #ttg.blocked<{sizePerThread = [4], threadsPerWarp = [32],
+                                 warpsPerCTA = [4], order = [0]}>
+
+    Returns a dict with keys 'size_per_thread', 'threads_per_warp',
+    'warps_per_cta' (lists of ints), or None if no blocked layout found.
+    """
+    m = re.search(
+        r"#ttg\.blocked<\{[^}]*"
+        r"sizePerThread\s*=\s*\[([^\]]+)\]"
+        r"[^}]*threadsPerWarp\s*=\s*\[([^\]]+)\]"
+        r"[^}]*warpsPerCTA\s*=\s*\[([^\]]+)\]",
+        mod_text,
+    )
+    if not m:
+        return None
+    return {
+        "size_per_thread": [int(x.strip()) for x in m.group(1).split(",")],
+        "threads_per_warp": [int(x.strip()) for x in m.group(2).split(",")],
+        "warps_per_cta": [int(x.strip()) for x in m.group(3).split(",")],
+    }
+
 
 class _ModuleTextIndex:
     """Pre-parsed index of module text for fast constant/predicate lookup.
@@ -490,6 +517,7 @@ class MLIRWalker:
         # Parse module text once for supplementary info
         self._mod_text = str(module)
         self._text_index = _ModuleTextIndex(self._mod_text)
+        self._layout = _parse_blocked_layout(self._mod_text)
 
         # Constant matching: we match constants by walk order
         # Walk visits entry block ops in forward order, same as text
@@ -582,6 +610,7 @@ class MLIRWalker:
             block_size=self._block_size,
             num_warps=self._num_warps,
             called_funcs=called_funcs if called_funcs else None,
+            size_per_thread=self._layout["size_per_thread"] if self._layout else None,
         )
 
     def _attach_nested_ops(self, ops, nested_ops, block_args_map):

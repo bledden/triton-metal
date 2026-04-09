@@ -331,3 +331,38 @@ def test_walker_comparison():
     for c in cmp_ops:
         print(f"  {c.op}: predicate={c.attrs.get('predicate')}, "
               f"name={c.attrs.get('predicate_name')}")
+
+
+# ---------------------------------------------------------------------------
+# _parse_blocked_layout unit tests (no Triton/Metal required)
+# ---------------------------------------------------------------------------
+
+def test_parse_blocked_layout():
+    """_parse_blocked_layout extracts sizePerThread from TTGIR text."""
+    from triton_metal.codegen.mlir_walker import _parse_blocked_layout
+
+    text = '#blocked = #ttg.blocked<{sizePerThread = [4], threadsPerWarp = [32], warpsPerCTA = [4], order = [0]}>'
+    layout = _parse_blocked_layout(text)
+    assert layout is not None
+    assert layout["size_per_thread"] == [4]
+    assert layout["threads_per_warp"] == [32]
+    assert layout["warps_per_cta"] == [4]
+
+
+def test_parse_blocked_layout_2d():
+    """_parse_blocked_layout handles 2D layouts."""
+    from triton_metal.codegen.mlir_walker import _parse_blocked_layout
+
+    text = '#blocked = #ttg.blocked<{sizePerThread = [1, 4], threadsPerWarp = [8, 4], warpsPerCTA = [4, 1], order = [1, 0]}>'
+    layout = _parse_blocked_layout(text)
+    assert layout is not None
+    assert layout["size_per_thread"] == [1, 4]
+    assert layout["threads_per_warp"] == [8, 4]
+    assert layout["warps_per_cta"] == [4, 1]
+
+
+def test_parse_blocked_layout_missing():
+    """_parse_blocked_layout returns None when no layout present."""
+    from triton_metal.codegen.mlir_walker import _parse_blocked_layout
+
+    assert _parse_blocked_layout("no layout here") is None

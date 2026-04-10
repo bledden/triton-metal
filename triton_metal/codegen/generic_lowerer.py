@@ -463,7 +463,18 @@ class GenericLowerer:
             if next_reduce:
                 combine_op, identity = self._get_reduce_combine_info(next_reduce)
                 acc_var = f"_local_acc_{self._shared_counter}"
-                self.kb.raw_line(f"    float {acc_var} = {identity};")
+                # Determine accumulator type from the reduce input
+                reduce_input_dtype = self.env_types.get(
+                    next_reduce.operand_ids[0], "fp32") if next_reduce.operand_ids else "fp32"
+                is_int_reduce = not (
+                    reduce_input_dtype.startswith("fp") or reduce_input_dtype.startswith("bf")
+                )
+                acc_msl_type = "int" if is_int_reduce else "float"
+                # Use type-appropriate identity values
+                if is_int_reduce:
+                    int_identities = {"sum": "0", "max": "INT_MIN", "min": "INT_MAX"}
+                    identity = int_identities.get(combine_op, "0")
+                self.kb.raw_line(f"    {acc_msl_type} {acc_var} = {identity};")
 
             # Open the per-element loop
             self._needs_wrapping = True
@@ -484,12 +495,14 @@ class GenericLowerer:
             if next_reduce and acc_var:
                 reduce_input_id = next_reduce.operand_ids[0]
                 input_var = self._lookup(reduce_input_id)
+                # Cast input to accumulator type to avoid Metal ambiguity
+                cast_input = f"({acc_msl_type}){input_var}"
                 if combine_op == "sum":
-                    self.kb.raw_line(f"        {acc_var} += {input_var};")
+                    self.kb.raw_line(f"        {acc_var} += {cast_input};")
                 elif combine_op == "max":
-                    self.kb.raw_line(f"        {acc_var} = max({acc_var}, {input_var});")
+                    self.kb.raw_line(f"        {acc_var} = max({acc_var}, {cast_input});")
                 elif combine_op == "min":
-                    self.kb.raw_line(f"        {acc_var} = min({acc_var}, {input_var});")
+                    self.kb.raw_line(f"        {acc_var} = min({acc_var}, {cast_input});")
 
             # Close the loop
             self.kb.raw_line(f"    }}")
@@ -573,6 +586,13 @@ class GenericLowerer:
             ssa.op in ("tt.reduce", "tt.scan", "tt.debug_barrier", "tt.trans")
             for ssa in self.graph.ops
         )
+        # Multi-value reduces (argmin/argmax) need per-element indices which
+        # are incompatible with the multi-pass accumulation loop (the loop
+        # variable goes out of scope before the reduce handler runs).
+        has_multivalue_reduce = any(
+            ssa.op == "tt.reduce" and ssa.result_ids and len(ssa.result_ids) >= 2
+            for ssa in self.graph.ops
+        )
         num_threads = self.graph.num_warps * 32
 
         # Detect if this 2D kernel has axis-specific reductions that produce
@@ -609,6 +629,11 @@ class GenericLowerer:
         if has_2d_axis_reduce and block_size <= 1024:
             # Skip multipass; use full block_size with one element per thread.
             # _lower_reduce_2d handles the sequential reduction internally.
+            pass
+        elif has_multivalue_reduce and block_size <= 1024:
+            # Multi-value reduces (argmin/argmax) need per-element indices that
+            # go out of scope in the multi-pass accumulation loop. Use full
+            # block_size with one element per thread.
             pass
         elif size_per_thread > 1 and block_size > num_threads:
             if has_reduce_ops:

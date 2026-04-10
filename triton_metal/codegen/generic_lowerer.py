@@ -2066,31 +2066,19 @@ class GenericLowerer:
             return
 
         # 1D make_range in a 2D kernel: this range is used for a 1D operation
-        # (like a load or store of a reduced result) that operates within
-        # one dimension of the 2D layout.
-        #
-        # The indexing convention must match the 2D mapped make_ranges:
-        #   dim 0 (rows): lid / N  (blocked — threads 0..N-1 in row 0, etc.)
-        #   dim 1 (cols): lid % N  (modular — threads cycle through columns)
-        #
-        # When range_size matches dim 0 (M), use lid / N for row-major
-        # consistency. When range_size matches dim 1 (N), use lid % N.
-        # Otherwise fall back to lid % range_size.
+        # (like a load) that later gets expand_dims'd to 2D. The range values
+        # need to cycle within [start, end) for each thread, so use modular
+        # indexing: lid % range_size. This gives each column/row of threads
+        # a valid index within the original 1D array.
         range_size = end - start
         total = getattr(self, "_total_elements", self.effective_block_size)
         if self._is_2d and range_size < total:
             lid = self._lid_expr
             var_name = self._next_var("idx")
-            shape = self._effective_2d_shape
-            if shape and len(shape) >= 2 and range_size == shape[0] and shape[1] > 1:
-                # Row dimension: use lid / N (blocked layout)
-                N = shape[1]
-                expr = f"{lid} / {N}u"
-            else:
-                # Column dimension or unknown: use lid % range_size
-                expr = f"{lid} % {range_size}u"
             if start != 0:
-                expr = f"({expr} + {start}u)"
+                expr = f"({lid} % {range_size}u + {start}u)"
+            else:
+                expr = f"{lid} % {range_size}u"
             self.kb.raw_line(f"    uint {var_name} = {expr};")
             self.env[ssa.id] = var_name
             self.env_types[ssa.id] = "i32"
@@ -2389,15 +2377,18 @@ class GenericLowerer:
 
         if store_1d_guard is not None:
             lid = self._lid_expr
-            # In 2D kernels with row-major layout, a 1D store of M elements
-            # (e.g. reduce result) needs one write per row. Rows are blocked:
-            # threads [0..N-1] in row 0, [N..2N-1] in row 1, etc.
-            # Guard: first thread in each row block (lid % N == 0)
-            # Index: row number (lid / N)
+            # After a 2D reduce (axis=1), the result is per-row and the
+            # broadcast uses lid / N (blocked). The store index from the
+            # output make_range uses lid % M (modular). When M != N these
+            # disagree, and when M == N the modular index cycles columns
+            # instead of rows. Fix: use lid / N as the store index and
+            # select one thread per row block.
             shape = self._effective_2d_shape
             if (shape and len(shape) >= 2 and store_1d_guard == shape[0]
-                    and shape[1] > 1):
+                    and shape[1] > 0):
                 N = shape[1]
+                # Override the store offset to use row-major blocked index
+                offsets = f"({lid} / {N}u)"
                 guard = f"{lid} % {N}u == 0u && {lid} / {N}u < {store_1d_guard}u"
             else:
                 guard = f"{lid} < {store_1d_guard}u"
@@ -4326,10 +4317,14 @@ class GenericLowerer:
 
         self.kb.raw_line(f"    threadgroup_barrier(mem_flags::mem_threadgroup);")
 
-        # Broadcast result
-        rmod = M if axis == 1 else N
-        self.kb.raw_line(f"    {result_val_var} = {result_val_shared}[lid % {rmod}u];")
-        self.kb.raw_line(f"    {result_idx_var} = {result_idx_shared}[lid % {rmod}u];")
+        # Broadcast result to all threads.
+        # Row-major: threads [0..N-1] in row 0, [N..2N-1] in row 1.
+        if axis == 1:
+            self.kb.raw_line(f"    {result_val_var} = {result_val_shared}[lid / {N}u];")
+            self.kb.raw_line(f"    {result_idx_var} = {result_idx_shared}[lid / {N}u];")
+        else:
+            self.kb.raw_line(f"    {result_val_var} = {result_val_shared}[lid % {N}u];")
+            self.kb.raw_line(f"    {result_idx_var} = {result_idx_shared}[lid % {N}u];")
 
         # Store results
         self.env[ssa.id] = result_val_var
@@ -4413,8 +4408,7 @@ class GenericLowerer:
             self.kb.raw_line(f"    }}")
             self.kb.raw_line(f"    threadgroup_barrier(mem_flags::mem_threadgroup);")
             # All threads read their row's result.
-            # Row-major layout: threads [0..N-1] are in row 0, [N..2N-1] in row 1.
-            # The row index is lid / N.
+            # Row-major: threads [0..N-1] in row 0, [N..2N-1] in row 1.
             self.kb.raw_line(f"    {result_var} = {result_shared}[lid / {N}u];")
         else:
             # Reduce along rows: each column reduces M values → N results

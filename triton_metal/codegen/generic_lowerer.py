@@ -575,13 +575,42 @@ class GenericLowerer:
         )
         num_threads = self.graph.num_warps * 32
 
+        # Detect if this 2D kernel has axis-specific reductions that produce
+        # per-row/per-column results (not full-array reductions).
+        # Multipass is incompatible with these because the per-thread
+        # accumulator mixes values from different rows/columns.
+        has_2d_axis_reduce = False
+        if self._is_2d and self._effective_2d_shape and has_reduce_ops:
+            for ssa in self.graph.ops:
+                if ssa.op == "tt.reduce" and ssa.operand_ids:
+                    reduce_axis = ssa.attrs.get("axis", 0)
+                    # Extract shape from the reduce input's type_str in the IR
+                    inp_type = self._find_op_type_str(ssa.operand_ids[0])
+                    inp_shape = _extract_shape(inp_type) if inp_type else None
+                    # A true 2D reduce: multi-row/col input with axis-specific reduction
+                    if inp_shape and len(inp_shape) >= 2:
+                        if inp_shape[0] > 1 and reduce_axis == 1:
+                            has_2d_axis_reduce = True
+                        elif inp_shape[1] > 1 and reduce_axis == 0:
+                            has_2d_axis_reduce = True
+
         # Decide wrapping strategy:
         # 1. sizePerThread > 1 with reductions → multi-pass reduction
         # 2. sizePerThread > 1 without barriers → simple wrapping loop
         # 3. block_size > 1024 with reductions → multi-pass reduction
         # 4. block_size > 1024 without reductions → simple wrapping loop (capped at 1024)
+        #
+        # EXCEPTION: 2D kernels with axis-specific reductions (dim_0 > 1)
+        # cannot use multipass because the per-thread accumulator mixes
+        # values across rows. For these, keep block_size = total (up to 1024)
+        # so each thread handles exactly one element and _lower_reduce_2d
+        # can correctly collect all values in shared memory.
         use_multipass = False
-        if size_per_thread > 1 and block_size > num_threads:
+        if has_2d_axis_reduce and block_size <= 1024:
+            # Skip multipass; use full block_size with one element per thread.
+            # _lower_reduce_2d handles the sequential reduction internally.
+            pass
+        elif size_per_thread > 1 and block_size > num_threads:
             if has_reduce_ops:
                 use_multipass = True
                 self._total_elements = block_size
@@ -2246,25 +2275,30 @@ class GenericLowerer:
         # Detect reduce keep_dims pattern: store to (M, 1) or (1, N) shaped pointer
         # where the value comes from a reduce. The generic 2D index decomposition
         # is broken for this case, so we use guarded lid-based indexing instead.
+        # Skip when dim_0 == 1 (triton_per_* pattern): the ptr already has
+        # the row offset from addptr, and using base_ptr[idx] would lose it.
         ptr_shape = self.env_shapes.get(ptr_id)
         val_shape = self.env_shapes.get(val_id)
         if (self._is_2d and ptr_shape and len(ptr_shape) == 2
                 and (ptr_shape[0] == 1 or ptr_shape[1] == 1)
-                and ptr_shape[0] != ptr_shape[1]):
+                and ptr_shape[0] != ptr_shape[1]
+                and ptr_shape[0] != 1):
             result_size = max(ptr_shape)
             ptr_info = self.env_is_ptr.get(ptr_id)
             if ptr_info:
-                base_ptr = ptr_info[0]
+                base_ptr, offsets = ptr_info
             else:
                 base_ptr = self._lookup(ptr_id)
+                offsets = self._lid_expr
             val_var = self._lookup(val_id)
             store_dtype = self._trace_ptr_dtype(ptr_id)
             store_type = triton_type_to_msl(store_dtype)
             compute_type = _msl_compute_type(store_dtype)
             needs_cast = (store_type != compute_type)
             cast_val = f"static_cast<{store_type}>({val_var})" if needs_cast else val_var
+            idx = self._lid_expr
             self.kb.raw_line(
-                f"    if (lid < {result_size}u) {base_ptr}[lid] = {cast_val};")
+                f"    if ({idx} < {result_size}u) {base_ptr}[{offsets}] = {cast_val};")
             return
 
         ptr_info = self.env_is_ptr.get(ptr_id)
@@ -2308,7 +2342,7 @@ class GenericLowerer:
                 store_1d_guard = store_shape[0]
 
         if store_1d_guard is not None:
-            guard = f"lid < {store_1d_guard}u"
+            guard = f"{self._lid_expr} < {store_1d_guard}u"
             if mask_var:
                 self.kb.raw_line(f"    if ({guard} && {mask_var}) {{ {base_ptr}[{offsets}] = {cast_val}; }}")
             else:
@@ -3874,9 +3908,16 @@ class GenericLowerer:
             return
 
         if self._is_2d and input_shape and len(input_shape) >= 2:
-            self._lower_reduce_2d(ssa, input_var, axis, combine_op,
-                                  msl_type, shared_dtype, input_shape)
-            return
+            # For triton_per_* kernels with shape (1, N) or (XBLOCK, R_BLOCK)
+            # where dim_0 == 1 and axis == 1, this is really a 1D reduction
+            # along the reduction dimension.  Use the efficient SIMD path,
+            # not the slow sequential shared memory path.
+            if input_shape[0] == 1 and axis == 1:
+                pass  # Fall through to 1D SIMD reduction below
+            else:
+                self._lower_reduce_2d(ssa, input_var, axis, combine_op,
+                                      msl_type, shared_dtype, input_shape)
+                return
 
         # Cast bool (i1) to int before reduction — MSL SIMD intrinsics reject bool
         if input_dtype == "i1" or (isinstance(input_var, str) and input_var in ("true", "false", "1", "0")):
@@ -3961,8 +4002,11 @@ class GenericLowerer:
                     self._find_op_type_str(ssa.operand_ids[0]))
             if input_shape and len(input_shape) == 2 and self._is_2d:
                 axis = ssa.attrs.get("axis", 0)
-                self._lower_reduce_2d_argminmax(ssa, axis, input_shape)
-                return
+                # Skip 2D dispatch when first dim is 1 and axis is 1
+                # (really a 1D reduction, same logic as _lower_reduce)
+                if not (input_shape[0] == 1 and axis == 1):
+                    self._lower_reduce_2d_argminmax(ssa, axis, input_shape)
+                    return
 
         self._lower_reduce_argminmax(ssa)
 
@@ -4311,9 +4355,8 @@ class GenericLowerer:
             self.kb.raw_line(f"    }}")
             self.kb.raw_line(f"    threadgroup_barrier(mem_flags::mem_threadgroup);")
             # All threads read their row's result.
-            # Use lid % M (not lid / N) to match 1D store indexing:
-            # subsequent tl.store(Z + range_m, z) uses range_m = lid % M.
-            self.kb.raw_line(f"    {result_var} = {result_shared}[lid % {M}u];")
+            # Row-major layout: thread lid is in row lid/N.
+            self.kb.raw_line(f"    {result_var} = {result_shared}[lid / {N}u];")
         else:
             # Reduce along rows: each column reduces M values → N results
             result_size = N

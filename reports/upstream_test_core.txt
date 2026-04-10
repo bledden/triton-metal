@@ -2,68 +2,61 @@ Triton Upstream Test Results: test_core.py
 Backend: metal
 ==================================================
 
-Total:   9320
-Passed:  1404 (15.1%)
-Failed:  7625
-Skipped: 291
+Total:   8952
+Passed:  4237 (47.3%)
+Failed:  43
+Skipped: 4672
 Errors:  0
 
 Failure Categories:
-  Other: 1435
-  Numerical mismatch: 780
-  Type error: 92
-  Runtime error: 46
-  Triton compilation error: 5
-  No FP64 support: 4
+  Numerical mismatch: 6
 
 Pytest summary (cross-check):
-  error: 2
-  failed: 7625
-  passed: 1404
-  skipped: 305
-  warning: 1
-  warnings: 1133
+  failed: 43
+  passed: 4237
+  skipped: 5054
+  warnings: 1578
 
 Sample passing tests:
   unit/language/test_core.py::test_scalar_overflow
   unit/language/test_core.py::test_dtype_codegen
-  unit/language/test_core.py::test_bin_op[1-int8-uint8-/]
-  unit/language/test_core.py::test_bin_op[1-int8-uint16-/]
-  unit/language/test_core.py::test_bin_op[1-int8-uint32-/]
-  unit/language/test_core.py::test_bin_op[1-int8-uint64-/]
-  unit/language/test_core.py::test_bin_op[1-int16-uint8-/]
-  unit/language/test_core.py::test_bin_op[1-int16-uint16-/]
-  unit/language/test_core.py::test_bin_op[1-int16-uint32-/]
-  unit/language/test_core.py::test_bin_op[1-int16-uint64-/]
-  unit/language/test_core.py::test_bin_op[1-int32-uint8-/]
-  unit/language/test_core.py::test_bin_op[1-int32-uint16-/]
-  unit/language/test_core.py::test_bin_op[1-int32-uint32-/]
-  unit/language/test_core.py::test_bin_op[1-int32-uint64-/]
-  unit/language/test_core.py::test_bin_op[1-int64-uint8-/]
-  unit/language/test_core.py::test_bin_op[1-int64-uint16-/]
-  unit/language/test_core.py::test_bin_op[1-int64-uint32-/]
-  unit/language/test_core.py::test_bin_op[1-int64-uint64-/]
-  unit/language/test_core.py::test_bin_op[1-uint8-int8-/]
-  unit/language/test_core.py::test_bin_op[1-uint8-int16-/]
-
-Sample failing tests:
   unit/language/test_core.py::test_bin_op[1-int8-int8-+]
   unit/language/test_core.py::test_bin_op[1-int8-int16-+]
   unit/language/test_core.py::test_bin_op[1-int8-int32-+]
-  unit/language/test_core.py::test_bin_op[1-int8-int64-+]
   unit/language/test_core.py::test_bin_op[1-int8-uint8-+]
   unit/language/test_core.py::test_bin_op[1-int8-uint16-+]
   unit/language/test_core.py::test_bin_op[1-int8-uint32-+]
-  unit/language/test_core.py::test_bin_op[1-int8-uint64-+]
   unit/language/test_core.py::test_bin_op[1-int8-float16-+]
   unit/language/test_core.py::test_bin_op[1-int8-float32-+]
-  unit/language/test_core.py::test_bin_op[1-int8-float64-+]
   unit/language/test_core.py::test_bin_op[1-int8-bfloat16-+]
   unit/language/test_core.py::test_bin_op[1-int16-int8-+]
   unit/language/test_core.py::test_bin_op[1-int16-int16-+]
   unit/language/test_core.py::test_bin_op[1-int16-int32-+]
-  unit/language/test_core.py::test_bin_op[1-int16-int64-+]
   unit/language/test_core.py::test_bin_op[1-int16-uint8-+]
   unit/language/test_core.py::test_bin_op[1-int16-uint16-+]
   unit/language/test_core.py::test_bin_op[1-int16-uint32-+]
-  unit/language/test_core.py::test_bin_op[1-int16-uint64-+]
+  unit/language/test_core.py::test_bin_op[1-int16-float16-+]
+  unit/language/test_core.py::test_bin_op[1-int16-float32-+]
+  unit/language/test_core.py::test_bin_op[1-int16-bfloat16-+]
+
+Sample failing tests:
+  unit/language/test_core.py::test_tensor_atomic_rmw[shape8-1-1-float32-True]
+  unit/language/test_core.py::test_tensor_atomic_rmw[shape20-1-1-float32-True]
+  unit/language/test_core.py::test_tensor_atomic_rmw[shape32-1-1-float32-True]
+  unit/language/test_core.py::test_tensor_atomic_rmw[shape44-1-1-float32-True]
+  unit/language/test_core.py::test_tensor_atomic_rmw[shape56-1-1-float32-True]
+  unit/language/test_core.py::test_join
+  unit/language/test_core.py::test_split
+  unit/language/test_core.py::test_reduce[1-min-float32-shape61-1-False]
+  unit/language/test_core.py::test_reduce[1-min-float32-shape63-1-False]
+  unit/language/test_core.py::test_reduce[1-min-float32-shape65-1-False]
+  unit/language/test_core.py::test_reduce[1-max-float32-shape67-1-False]
+  unit/language/test_core.py::test_reduce[1-max-float32-shape69-1-False]
+  unit/language/test_core.py::test_reduce[1-max-float32-shape71-1-False]
+  unit/language/test_core.py::test_reduce[1-sum-float32-shape73-1-False]
+  unit/language/test_core.py::test_reduce[1-sum-float32-shape75-1-False]
+  unit/language/test_core.py::test_reduce[1-sum-float32-shape77-1-False]
+  unit/language/test_core.py::test_reduce[1-sum-float32-shape140--1-False]
+  unit/language/test_core.py::test_reduce[1-argmin-float32-shape148-1-True]
+  unit/language/test_core.py::test_reduce[1-argmax-float32-shape150-1-True]
+  unit/language/test_core.py::test_reduce[1-xor_sum-bool-shape175-1-False]

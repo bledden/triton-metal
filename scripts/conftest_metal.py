@@ -72,122 +72,29 @@ UNSUPPORTED_PRECISIONS = {"tf32"}
 # Features not yet implemented in the Metal backend.
 # These tests are skipped (not failed) because the backend doesn't support
 # them yet — they represent future work, not bugs.
-#
-# NOTE: Several ops below have lowering implementations in generic_lowerer.py
-# (e.g. _lower_tt_histogram, _lower_tt_join, _lower_tt_cat, _lower_tt_split,
-# _lower_tt_gather, _lower_map_elementwise, _lower_scan). However, many
-# upstream tests exercise 2D/multi-dim tensor patterns, scalar operands, or
-# multi-output modes that the 1D-per-thread Metal model does not handle.
-# Each entry below documents why it remains skipped despite partial impl.
 UNIMPLEMENTED_FEATURES = {
-    # Histogram — _lower_tt_histogram exists (1D threadgroup atomics), but
-    # test_histogram creates a 2D bias via tl.full([M, N], ...) and broadcasts
-    # (z + bias), requiring 2D tensor support. test_histogram_mask uses 2*M
-    # block with masking. test_histogram_silent_data_corruption verifies
-    # out-of-bounds safety not validated for Metal atomics path.
-    "test_histogram",
-    "test_histogram_mask",
+    # Histogram — out-of-bounds safety not validated for Metal atomics path
     "test_histogram_silent_data_corruption",
-    # 2D scan — _lower_scan exists with axis support, but test uses full 2D
-    # load/store indexing (range_m[:, None] * BLOCK_N + range_n[None, :])
-    # which requires inter-thread shuffle not implemented in 1D-per-thread model
-    "test_scan2d",
-    # Multi-dimensional operations — not supported in 1D-per-thread model
-    "test_trans_4d",
-    "test_trans_2d",
+    # 2D broadcast bug — optimize_thread_locality still fails
     "test_optimize_thread_locality",
-    "test_dot_multidim",
-    # Tensor atomic ops requiring 2D tensor support
-    "test_tensor_atomic_rmw_block",  # 2D matrix access (8x8)
-    "test_tensor_atomic_add_non_exclusive_offset",  # 2D non-exclusive offset
-    "test_tensor_atomic_add_access_patterns",  # 2D access patterns
+    # Base join/split tests fail (parametrized variants pass)
+    "test_join",
+    "test_split",
+    # Multi-dimensional transpose — 4D not yet supported
+    "test_trans_4d",
     # scaled_dot — requires microscaling format support
     "test_scaled_dot",
-    # cat_nd — uses TensorDescriptor (CUDA TMA) and multi-dim shapes/dim arg;
-    # _lower_tt_cat only handles 1D two-operand cat without dim parameter
-    "test_cat_nd",
+    # Map elementwise pack mode — pack=2 with 4 inputs/4 outputs not handled
+    "test_map_elementwise_pack",
     # Features requiring CUDA-specific infrastructure
     "test_num_programs",
     "test_tensor_descriptor",
     "test_tma",
-    # Multi-dim indexing/reshape/permute — requires 2D+ tensor support
-    "test_index1d",
-    "test_reshape",
-    "test_permute",
-    "test_trans_reshape",
-    # Gather — _lower_tt_gather exists for 1D, but test is parametrized with
-    # 2D shapes ([4,4], [128,64], etc.) in 3 of 4 cases; 1D impl can't handle
-    "test_gather",
-    # Interleave — no _lower_tt_interleave implementation exists
-    "test_interleave",
-    "test_interleave_scalars",
-    # Join — _lower_tt_join exists (fused cat and standalone), but:
-    # test_join stores with 2D indexing (N[:,None]*2 + arange(0,2)[None,:])
-    # test_join_scalars uses 0-dim scalar operands not handled by shape logic
-    # test_join_with_mma uses 2D+3D tensors, reshape, and tl.dot
-    "test_join",
-    "test_join_scalars",
-    "test_join_with_mma",
-    # Split — _lower_tt_split exists for tensor<Nx2>, but:
-    # test_split requires tl.reshape (1D->2D) before split; test_reshape is
-    # itself skipped, so the reshape prerequisite isn't met
-    # test_split_to_scalar produces 0-dim scalar outputs not handled
-    "test_split",
-    "test_split_to_scalar",
-    # Chained reductions — multi-dim reduce
-    "test_chained_reductions",
-    # Map elementwise — _lower_map_elementwise exists and handles the
-    # cf.cond_br decision tree for single-output 1D ops.
-    # REMOVED: test_map_elementwise — 1D int32 compare function, single output,
-    #   fully covered by _lower_map_elementwise + _lower_map_elementwise_cond_br.
-    # test_map_elementwise_pack uses pack=2 with 4 inputs/4 outputs (not handled)
-    # test_map_elementwise_multiple_outputs returns 2 values but impl only
-    #   binds a single result via self.env[ssa.id]
-    "test_map_elementwise_pack",
-    "test_map_elementwise_multiple_outputs",
     # LLIR/PTX-specific tests
     "test_disable_licm",
     "test_assume",
     "test_poison_return",
     "test_ptx_cast",
-    # Misc unimplemented
-    "test_dot_mulbroadcasted",
-    "test_generic_reduction",
-    "test_where_broadcast",
-    "test_cumsum_dtype",
-    "test_sum_dtype",
-    "test_umulhi",
-    "test_math_divide_op",
-    "test_unsplat",
-    "test_no_rematerialization_op",
-    "test_load_store_same_ptr",
-    # Noinline "shared" mode uses tl.dot inside noinline function which
-    # requires 2D matmul support in device functions (not yet implemented)
-    "test_noinline[shared]",
-    # While loops — scf.while now implemented
-    # "test_while",
-    # "test_nested_while",
-    # atomic_cas test uses while loop internally (serialized_add kernel)
-    "test_atomic_cas",
-    # tl.range — loop fusion not implemented
-    "test_tl_range_fuse",
-    "test_tl_range_fuse_dependent",
-    "test_tl_range_num_stages",
-    # i64 compute — Metal GPU pipeline compiler doesn't support int64
-    "test_for_iv",
-    # test_if_call "jit_if" variant uses early return → cf.cond_br
-    "test_if_call[jit_if]",
-    # num_warps validation — not enforced in Metal backend
-    "test_num_warps_pow2",
-    # Early return → cf.cond_br (unstructured control flow not implemented)
-    "test_nested_if_else_return",
-    # Misc
-    "test_optimize_thread_locality",
-    "test_unsigned_name_mangling",
-    "test_zero_strided_tensors",
-    "test_pointer_arguments",
-    "test_masked_load_shared_memory",
-    "test_dot_without_load",
 }
 
 

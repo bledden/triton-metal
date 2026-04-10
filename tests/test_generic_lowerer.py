@@ -755,12 +755,13 @@ def test_size_per_thread_wrapping_decision():
 
 @requires_triton
 @requires_metal
-def test_size_per_thread_skipped_for_reductions():
-    """Kernels with reductions should NOT use wrapping when sizePerThread > 1.
+def test_size_per_thread_no_wrapping_when_fits():
+    """Reduction kernels that fit in 1024 threads should use standard (no-loop) path.
 
-    Reductions use threadgroup_barrier and SIMD intrinsics which cannot be
-    placed inside a per-thread element loop. The codegen should fall back
-    to using block_size threads (one per element) for reduction kernels.
+    When sizePerThread=1 and block_size <= 1024, no wrapping or multi-pass is
+    needed. Each thread handles one element, and reductions use standard SIMD +
+    shared memory. The multi-pass optimization only activates when sizePerThread > 1
+    or block_size > 1024.
     """
     @triton.jit
     def softmax_kernel(x_ptr, out_ptr, n, BLOCK_SIZE: tl.constexpr):
@@ -781,12 +782,12 @@ def test_size_per_thread_skipped_for_reductions():
     )
 
     msl, graph = _lower_to_msl(mod, metadata, options)
-    print(f"\n=== Generated MSL for softmax (no wrapping) ===")
+    print(f"\n=== Generated MSL for softmax (no wrapping, sizePerThread=1) ===")
     print(msl)
 
-    # Even with sizePerThread > 1, wrapping should be skipped for reductions
+    # With sizePerThread=1 and block_size=1024, no wrapping needed
     assert "_loop_e" not in msl, (
-        "Wrapping loop should NOT be emitted for kernels with reductions"
+        "No wrapping loop when sizePerThread=1 and block_size fits in 1024 threads"
     )
     assert "kernel void" in msl
     assert "UNSUPPORTED" not in msl
@@ -819,3 +820,93 @@ def test_size_per_thread_softmax_correctness():
         expected = torch.softmax(x, dim=-1)
         diff = (out - expected).abs().max().item()
         assert diff < 1e-5, f"cols={cols}: max_diff={diff}"
+
+
+@requires_triton
+@requires_metal
+def test_multipass_reduction_softmax():
+    """Multi-pass reduction for softmax with BLOCK_SIZE > 1024.
+
+    When BLOCK_SIZE exceeds Metal's 1024-thread limit and the kernel has
+    reductions, the codegen should emit a multi-pass kernel:
+    per-element loops separated by reductions, with local accumulators.
+    """
+    @triton.jit
+    def softmax_kernel(x_ptr, out_ptr, n, BLOCK_SIZE: tl.constexpr):
+        pid = tl.program_id(0)
+        offsets = tl.arange(0, BLOCK_SIZE)
+        mask = offsets < n
+        x = tl.load(x_ptr + pid * n + offsets, mask=mask, other=-float("inf"))
+        x_max = tl.max(x, axis=0)
+        x_shifted = x - x_max
+        numerator = tl.exp(x_shifted)
+        denominator = tl.sum(numerator, axis=0)
+        result = numerator / denominator
+        tl.store(out_ptr + pid * n + offsets, result, mask=mask)
+
+    sig = {"x_ptr": "*fp32", "out_ptr": "*fp32", "n": "i32"}
+    mod, metadata, options = _compile_to_ttgir(
+        softmax_kernel, sig, constexprs={"BLOCK_SIZE": 2048}
+    )
+
+    msl, graph = _lower_to_msl(mod, metadata, options)
+    print(f"\n=== Generated MSL for multipass softmax (BLOCK=2048) ===")
+    print(msl)
+
+    # Multi-pass should be active: multiple loops and no barriers inside loops
+    assert "_loop_e" in msl, "Multi-pass should use _loop_e loop variable"
+    assert "kernel void" in msl
+    assert "UNSUPPORTED" not in msl
+    assert "_local_acc_" in msl, "Multi-pass should declare local accumulators"
+    assert _validate_msl_compiles(msl), "MSL failed to compile"
+
+
+@requires_triton
+@requires_metal
+def test_multipass_reduction_correctness():
+    """Multi-pass softmax produces correct results with BLOCK_SIZE > 1024."""
+    import torch
+
+    @triton.jit
+    def _softmax(x_ptr, out_ptr, n_cols, BLOCK_SIZE: tl.constexpr):
+        row = tl.program_id(0)
+        offsets = tl.arange(0, BLOCK_SIZE)
+        mask = offsets < n_cols
+        x = tl.load(x_ptr + row * n_cols + offsets, mask=mask, other=-float("inf"))
+        x_max = tl.max(x, axis=0)
+        x = x - x_max
+        x_exp = tl.exp(x)
+        x_sum = tl.sum(x_exp, axis=0)
+        out = x_exp / x_sum
+        tl.store(out_ptr + row * n_cols + offsets, out, mask=mask)
+
+    for cols in [256, 512, 1024, 2048]:
+        x = torch.randn(8, cols, device="cpu")
+        out = torch.empty_like(x)
+        _softmax[(8,)](x, out, cols, BLOCK_SIZE=2048)
+        expected = torch.softmax(x, dim=-1)
+        diff = (out - expected).abs().max().item()
+        assert diff < 1e-4, f"BLOCK=2048, cols={cols}: max_diff={diff}"
+
+
+@requires_triton
+@requires_metal
+def test_multipass_sum_reduce():
+    """Multi-pass sum reduction produces correct results."""
+    import torch
+
+    @triton.jit
+    def _sum_reduce(x_ptr, out_ptr, n, BLOCK_SIZE: tl.constexpr):
+        offsets = tl.arange(0, BLOCK_SIZE)
+        mask = offsets < n
+        x = tl.load(x_ptr + offsets, mask=mask, other=0.0)
+        result = tl.sum(x, axis=0)
+        tl.store(out_ptr, result)
+
+    for n in [512, 1024, 2048]:
+        x = torch.randn(n, device="cpu")
+        out = torch.zeros(1, device="cpu")
+        _sum_reduce[(1,)](x, out, n, BLOCK_SIZE=2048)
+        expected = x.sum().item()
+        diff = abs(out.item() - expected)
+        assert diff < 1e-2, f"Sum reduce n={n}: diff={diff}"

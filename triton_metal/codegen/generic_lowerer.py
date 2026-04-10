@@ -254,6 +254,255 @@ class GenericLowerer:
         """
         return "_loop_e" if getattr(self, "_needs_wrapping", False) else "lid"
 
+    # -- Multi-pass reduction helpers ------------------------------------------
+
+    def _split_ops_by_reductions(self):
+        """Split ops into phases separated by tt.reduce ops.
+
+        Returns a list of (ops_list, is_reduce) tuples. Reduce ops are
+        isolated in their own single-element phases so they can be emitted
+        between per-element loops.
+        """
+        phases = []
+        current_phase = []
+        for ssa in self.graph.ops:
+            if ssa.op == "tt.reduce":
+                if current_phase:
+                    phases.append((current_phase, False))
+                phases.append(([ssa], True))
+                current_phase = []
+            else:
+                current_phase.append(ssa)
+        if current_phase:
+            phases.append((current_phase, False))
+        return phases
+
+    def _get_reduce_combine_info(self, ssa):
+        """Extract combine op and identity from a tt.reduce's body region.
+
+        Returns (combine_op, identity_literal) where combine_op is one of
+        'sum', 'max', 'min' and identity_literal is the MSL identity value.
+        """
+        combine_op = "sum"
+        if ssa.region_ops:
+            has_cmpf_gt = False
+            has_cmpf_lt = False
+            for body_op in ssa.region_ops:
+                op_name = body_op.op
+                if "addf" in op_name or "addi" in op_name:
+                    combine_op = "sum"
+                elif "max" in op_name:
+                    combine_op = "max"
+                elif "min" in op_name:
+                    combine_op = "min"
+                elif op_name == "arith.cmpf":
+                    pred = body_op.attrs.get("predicate_name", "")
+                    if "gt" in pred:
+                        has_cmpf_gt = True
+                    elif "lt" in pred:
+                        has_cmpf_lt = True
+            if combine_op == "sum" and has_cmpf_gt:
+                combine_op = "max"
+            elif combine_op == "sum" and has_cmpf_lt:
+                combine_op = "min"
+
+        identities = {"sum": "0.0f", "max": "-INFINITY", "min": "INFINITY"}
+        return combine_op, identities.get(combine_op, "0.0f")
+
+    def _collect_tensor_deps(self, target_ops, all_preceding_ops, reduce_result_ids):
+        """Find all ops from earlier phases needed to compute target_ops.
+
+        Walks backward through operand_ids from target_ops, collecting any
+        ops from all_preceding_ops whose results are tensor-shaped (per-element)
+        and therefore must be re-computed inside the current loop.
+
+        Args:
+            target_ops: ops in the current phase that need per-element inputs
+            all_preceding_ops: all ops from earlier phases (ordered)
+            reduce_result_ids: set of SSA IDs that are reduce results (scalars,
+                available outside loops)
+
+        Returns:
+            List of ops (in original order) that must be re-emitted in the loop.
+        """
+        # Build lookup: SSA ID → op
+        op_by_id = {}
+        for ssa in all_preceding_ops:
+            op_by_id[ssa.id] = ssa
+
+        # Collect IDs we need by walking dependencies backward
+        needed_ids = set()
+        worklist = []
+        for ssa in target_ops:
+            for dep_id in ssa.operand_ids:
+                if dep_id in op_by_id and dep_id not in reduce_result_ids:
+                    worklist.append(dep_id)
+
+        while worklist:
+            dep_id = worklist.pop()
+            if dep_id in needed_ids:
+                continue
+            if dep_id in reduce_result_ids:
+                continue
+            if dep_id not in op_by_id:
+                continue
+            needed_ids.add(dep_id)
+            dep_op = op_by_id[dep_id]
+            for sub_id in dep_op.operand_ids:
+                if sub_id not in needed_ids and sub_id in op_by_id:
+                    worklist.append(sub_id)
+
+        # Return in original order
+        return [op for op in all_preceding_ops if op.id in needed_ids]
+
+    @staticmethod
+    def _is_scalar_op(ssa):
+        """Return True if an op produces a scalar value (not per-element).
+
+        Scalar ops can be emitted outside loops because they don't depend
+        on the per-element index. This includes program_id, scalar
+        constants, scalar arithmetic, and passthrough ops like splat on
+        a scalar. Tensor ops (loads, stores, tensor arithmetic) must go
+        inside per-element loops.
+        """
+        # Tensor-flagged ops are per-element
+        if ssa.is_tensor:
+            return False
+        # Loads and stores are always per-element
+        if ssa.op in ("tt.load", "tt.store", "tt.atomic_rmw", "tt.atomic_cas"):
+            return False
+        # tt.reduce is handled separately
+        if ssa.op == "tt.reduce":
+            return False
+        return True
+
+    def _lower_multipass_reduction(self, block_size):
+        """Emit multi-pass reduction: per-element loops separated by reductions.
+
+        When a kernel has both per-element ops and reductions, we cannot wrap
+        everything in a single loop (threadgroup_barrier inside a loop is UB).
+        Instead, split into phases:
+        - Non-reduce phases: wrap per-element ops in a for-loop with local
+          accumulation for the next reduce
+        - Reduce phases: emit SIMD + shared memory reduction outside any loop
+
+        Each phase loop re-computes per-element values from scratch (re-loads
+        data) because per-element variables from earlier loops are out of scope.
+        Scalar ops are hoisted before their phase's loop so that their variables
+        remain in scope for later phases.
+        """
+        total = self._total_elements
+        phases = self._split_ops_by_reductions()
+
+        # Collect all reduce result SSA IDs (scalars available across phases)
+        reduce_result_ids = set()
+        for ops, is_reduce in phases:
+            if is_reduce:
+                for ssa in ops:
+                    reduce_result_ids.add(ssa.id)
+                    if ssa.result_ids:
+                        for rid in ssa.result_ids:
+                            reduce_result_ids.add(rid)
+
+        # Also include function arg IDs as "always available" scalars
+        arg_ids = {a.id for a in self.graph.args}
+
+        # Track all preceding non-reduce ops for dependency resolution
+        all_preceding_ops = []
+        # Track which scalar ops have already been lowered (by SSA id)
+        lowered_scalar_ids = set()
+
+        for phase_idx, (phase_ops, is_reduce) in enumerate(phases):
+            if is_reduce:
+                # Lower the reduce op outside any loop.
+                # The reduce's input is already set to the accumulator variable
+                # (overridden in self.env by the preceding phase's accumulation).
+                for ssa in phase_ops:
+                    self._lower_op(ssa)
+                continue
+
+            # Determine if the next phase is a reduce (need accumulation)
+            next_reduce = None
+            if phase_idx + 1 < len(phases) and phases[phase_idx + 1][1]:
+                next_reduce = phases[phase_idx + 1][0][0]
+
+            # Separate scalar ops (hoist before loop) from tensor ops (inside loop)
+            scalar_ops = [op for op in phase_ops if self._is_scalar_op(op)]
+            tensor_ops = [op for op in phase_ops if not self._is_scalar_op(op)]
+
+            # Check if this phase has any tensor ops that need a loop
+            has_tensor_ops = len(tensor_ops) > 0
+
+            # Emit scalar ops BEFORE the loop (they stay in function scope)
+            for ssa in scalar_ops:
+                if ssa.id not in lowered_scalar_ids:
+                    self._lower_op(ssa)
+                    lowered_scalar_ids.add(ssa.id)
+
+            if not has_tensor_ops and next_reduce is None:
+                # Pure scalar phase — no loop needed
+                all_preceding_ops.extend(phase_ops)
+                continue
+
+            # Determine which earlier ops need to be re-emitted in this loop
+            # for their per-element values to be available
+            replay_ops = self._collect_tensor_deps(
+                tensor_ops, all_preceding_ops, reduce_result_ids | arg_ids | lowered_scalar_ids
+            )
+
+            # Also hoist scalar deps from replay_ops before the loop
+            replay_scalar = [op for op in replay_ops if self._is_scalar_op(op)]
+            replay_tensor = [op for op in replay_ops if not self._is_scalar_op(op)]
+            for ssa in replay_scalar:
+                if ssa.id not in lowered_scalar_ids:
+                    self._lower_op(ssa)
+                    lowered_scalar_ids.add(ssa.id)
+
+            # If this phase precedes a reduce, declare the accumulator
+            acc_var = None
+            if next_reduce:
+                combine_op, identity = self._get_reduce_combine_info(next_reduce)
+                acc_var = f"_local_acc_{self._shared_counter}"
+                self.kb.raw_line(f"    float {acc_var} = {identity};")
+
+            # Open the per-element loop
+            self._needs_wrapping = True
+            self.kb.raw_line(
+                f"    for (uint _loop_e = lid; _loop_e < {total}u; "
+                f"_loop_e += {block_size}u) {{"
+            )
+
+            # Re-emit tensor dependency ops from earlier phases
+            for ssa in replay_tensor:
+                self._lower_op(ssa)
+
+            # Emit this phase's tensor ops inside the loop
+            for ssa in tensor_ops:
+                self._lower_op(ssa)
+
+            # Accumulate into the local variable for the next reduce
+            if next_reduce and acc_var:
+                reduce_input_id = next_reduce.operand_ids[0]
+                input_var = self._lookup(reduce_input_id)
+                if combine_op == "sum":
+                    self.kb.raw_line(f"        {acc_var} += {input_var};")
+                elif combine_op == "max":
+                    self.kb.raw_line(f"        {acc_var} = max({acc_var}, {input_var});")
+                elif combine_op == "min":
+                    self.kb.raw_line(f"        {acc_var} = min({acc_var}, {input_var});")
+
+            # Close the loop
+            self.kb.raw_line(f"    }}")
+            self._needs_wrapping = False
+
+            # Override the reduce's input to point to the accumulator
+            if next_reduce and acc_var:
+                reduce_input_id = next_reduce.operand_ids[0]
+                self.env[reduce_input_id] = acc_var
+
+            # Add this phase's ops to the preceding ops for future phases
+            all_preceding_ops.extend(phase_ops)
+
     def lower(self) -> str:
         """Lower the IRGraph to MSL source code."""
         # Check for tt.dot — switch to prebuilt matmul template
@@ -312,27 +561,44 @@ class GenericLowerer:
         # When sizePerThread > 1, Triton expects fewer threads each handling
         # multiple elements. Use num_warps * warp_size as the thread count
         # and emit a per-thread loop for the extra elements.
-        # NOTE: The wrapping loop cannot be used with reductions because
-        # threadgroup_barrier / SIMD reductions inside a for-loop produce
-        # incorrect results. Only apply to purely elementwise kernels.
         size_per_thread = 1
         if self.graph.size_per_thread:
             for s in self.graph.size_per_thread:
                 size_per_thread *= s
 
+        has_reduce_ops = any(
+            ssa.op == "tt.reduce" for ssa in self.graph.ops
+        )
         has_barrier_ops = any(
             ssa.op in ("tt.reduce", "tt.scan", "tt.debug_barrier", "tt.trans")
             for ssa in self.graph.ops
         )
         num_threads = self.graph.num_warps * 32
-        if size_per_thread > 1 and block_size > num_threads and not has_barrier_ops:
-            self._needs_wrapping = True
-            self._total_elements = block_size
-            block_size = num_threads
+
+        # Decide wrapping strategy:
+        # 1. sizePerThread > 1 with reductions → multi-pass reduction
+        # 2. sizePerThread > 1 without barriers → simple wrapping loop
+        # 3. block_size > 1024 with reductions → multi-pass reduction
+        # 4. block_size > 1024 without reductions → simple wrapping loop (capped at 1024)
+        use_multipass = False
+        if size_per_thread > 1 and block_size > num_threads:
+            if has_reduce_ops:
+                use_multipass = True
+                self._total_elements = block_size
+                block_size = num_threads
+            elif not has_barrier_ops:
+                self._needs_wrapping = True
+                self._total_elements = block_size
+                block_size = num_threads
         elif block_size > 1024:
-            self._needs_wrapping = True
-            self._total_elements = block_size
-            block_size = 1024  # Cap dispatch to Metal max
+            if has_reduce_ops:
+                use_multipass = True
+                self._total_elements = block_size
+                block_size = 1024
+            else:
+                self._needs_wrapping = True
+                self._total_elements = block_size
+                block_size = 1024  # Cap dispatch to Metal max
 
         self.effective_block_size = block_size
 
@@ -348,17 +614,23 @@ class GenericLowerer:
         # Register function arguments
         self._register_args()
 
-        # Emit wrapping loop if total elements exceed Metal's 1024 thread limit
-        if self._needs_wrapping:
-            self.kb.raw_line(f"    for (uint _loop_e = lid; _loop_e < {self._total_elements}u; _loop_e += {block_size}u) {{")
+        if use_multipass:
+            # Multi-pass reduction: split kernel into phases separated by
+            # reductions, wrap each phase in a per-element loop, emit
+            # reductions between loops operating on thread-local accumulators.
+            self._lower_multipass_reduction(block_size)
+        else:
+            # Standard path: single wrapping loop or no loop
+            if self._needs_wrapping:
+                self.kb.raw_line(f"    for (uint _loop_e = lid; _loop_e < {self._total_elements}u; _loop_e += {block_size}u) {{")
 
-        # Lower each op
-        for ssa in self.graph.ops:
-            self._lower_op(ssa)
+            # Lower each op
+            for ssa in self.graph.ops:
+                self._lower_op(ssa)
 
-        # Close wrapping loop
-        if self._needs_wrapping:
-            self.kb.raw_line(f"    }}")
+            # Close wrapping loop
+            if self._needs_wrapping:
+                self.kb.raw_line(f"    }}")
 
         # Propagate flags to KernelBuilder for MSL emission
         if self._needs_num_programs:

@@ -1,11 +1,19 @@
 # triton-metal Implementation Roadmap
 
-> Last updated: 2026-04-01
+> Last updated: 2026-04-09
 >
-> Current state: **0.1.0-alpha** -- 4,279/9,334 upstream tests passing, 32/32 torch.compile, 15/15 MLX.
-> Codebase: ~5,200 LOC generic_lowerer.py, ~5,200 LOC msl_emitter.py, ~1,200 LOC mlir_walker.py, ~740 LOC driver.py.
+> Current state: **0.1.0-alpha** -- 4,280/8,952 upstream tests passing (47.8%), 23/32 torch.compile (9 regressions from PyTorch 2.11 2D patterns), 14/15 MLX.
+> Codebase: ~5,600 LOC generic_lowerer.py, ~5,200 LOC msl_emitter.py, ~1,300 LOC mlir_walker.py, ~740 LOC driver.py.
 
 This document tracks every remaining work item for triton-metal, organized into phased delivery with explicit dependencies, scope estimates, and file-level change lists.
+
+### Strategic Principles (from TorchTPU, TurboQuant, kforge research)
+
+1. **Framework compatibility > kernel performance.** Getting more models working at 0.5x native speed is more valuable than peak GFLOP/s. Prioritize by "models unlocked" not "upstream tests passed."
+2. **Never silently produce wrong results.** Graceful CPU fallback for unsupported patterns (Phase 0h). TorchTPU falls back for every unlowered op.
+3. **MMA intrinsics are our competitive advantage.** `mx.fast.metal_kernel()` cannot access `simdgroup_matrix_multiply_accumulate` or MPP tensor ops. triton-metal CAN. This makes Phase 1C/3A the primary differentiator.
+4. **Profile before optimizing kernels.** TurboQuant's biggest win (14x) was architectural, not codegen.
+5. **Correctness-first validation.** Tolerance-based testing (cosine similarity > 0.99, or abs/rel error < 0.01 on 100 random inputs).
 
 ---
 
@@ -35,6 +43,10 @@ Items actively being implemented. These should land before any Phase 1 work begi
 | 0d | **tt.extern_elementwise** | Handle `tt.extern_elementwise` by dispatching to a user-provided MSL function name or a built-in libdevice shim. Unblocks upstream tests that use `tl.extra.cuda.libdevice.*`. | ~60 LOC | `triton_metal/codegen/generic_lowerer.py` (`_lower_op_dispatch`), `triton_metal/inductor/metal_libdevice.py` | -- |
 | 0e | **scf.for in device functions** | Currently emits `// UNSUPPORTED: scf.for in device func`. Port `_lower_scf_for` logic from `GenericLowerer` into `_DeviceFuncLowerer` so noinline callees can contain loops. | ~80 LOC | `triton_metal/codegen/generic_lowerer.py` (`_DeviceFuncLowerer._lower_op`) | -- |
 | 0f | **conftest skip list update** | Update `scripts/conftest_metal.py` skip predicates to reflect newly-passing test categories (atomics, while loops, 2D reduce, etc.). Reduces noise in upstream test runs. | ~30 LOC | `scripts/conftest_metal.py` | -- |
+| 0g | **macOS 26 (Tahoe) compatibility** | Verify `device_detect.py` handles macOS 26+ version strings correctly. PyTorch MPS broke on Tahoe due to version parsing ("26.0" not parsed as >= "14.0"). Ensure our Metal version probing, deployment target flags, and `xcrun` invocations work on macOS 26.x. | ~40 LOC | `triton_metal/backend/device_detect.py`, `triton_metal/backend/compiler.py` | 0b |
+| 0h | **Graceful fallback for unsupported kernels** | When a Triton kernel fails to compile to MSL (e.g., unsupported 2D patterns from PyTorch 2.11 inductor), fall back to CPU execution with a logged warning instead of silently producing wrong results. Lesson from TorchTPU: every unlowered op falls back to CPU. Currently our torch.compile path produces *wrong values* for unsupported patterns — the worst failure mode. | ~80 LOC | `triton_metal/backend/compiler.py`, `triton_metal/inductor/__init__.py` | -- |
+| 0i | **Persistent compilation cache** | Move metallib cache from `/tmp/` to `~/.cache/triton_metal/` so compiled kernels survive reboots. Cache `emit_msl()` output too (TTGIR hash → MSL string). Lesson from TorchTPU (shared compilation cache) and TurboQuant (kernel caching pattern). | ~60 LOC | `triton_metal/backend/compiler.py`, `triton_metal/debug.py` | -- |
+| 0j | **sizePerThread handling** | **DONE.** Extract `sizePerThread` from TTGIR blocked layout, multi-pass reduction for reduction kernels. Softmax 18% faster (0.98ms → 0.78ms). | Commits: 47e1810..615b638 | `triton_metal/codegen/mlir_walker.py`, `triton_metal/codegen/generic_lowerer.py` | -- |
 
 **Exit criterion for Phase 0:** All items merged to main, CI green, upstream test count unchanged or increased.
 
@@ -43,6 +55,8 @@ Items actively being implemented. These should land before any Phase 1 work begi
 ## Phase 1: Core Architecture
 
 The critical path. These items transform the lowerer from a 1D-per-thread model into a 2D-capable compiler that can generically lower `tt.dot` without a prebuilt template.
+
+**Primary success metric: torch.compile model coverage.** Phase 1A should be prioritized by restoring 32/32 torch.compile tests (9 regressions from PyTorch 2.11's `triton_per_*` 2D reduction patterns) and unlocking new models, not just upstream test_core.py pass rate. Framework compatibility drives adoption more than benchmark numbers.
 
 ### 1A. Full 2D Tensor Semantics in Codegen
 

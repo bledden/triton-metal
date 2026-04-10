@@ -2297,8 +2297,17 @@ class GenericLowerer:
             needs_cast = (store_type != compute_type)
             cast_val = f"static_cast<{store_type}>({val_var})" if needs_cast else val_var
             idx = self._lid_expr
+            # In 2D kernels, lid maps to row index via lid/N where N is the
+            # inner dimension.  The guard must cover all threads whose
+            # lid/N < result_size, i.e. lid < result_size * N.  Using just
+            # result_size (the number of rows) cuts off the upper threads
+            # and leaves half the rows unwritten when N > 1.
+            guard_size = result_size
+            if self._effective_2d_shape and len(self._effective_2d_shape) == 2:
+                inner_N = self._effective_2d_shape[1]
+                guard_size = result_size * inner_N
             self.kb.raw_line(
-                f"    if ({idx} < {result_size}u) {base_ptr}[{offsets}] = {cast_val};")
+                f"    if ({idx} < {guard_size}u) {base_ptr}[{offsets}] = {cast_val};")
             return
 
         ptr_info = self.env_is_ptr.get(ptr_id)

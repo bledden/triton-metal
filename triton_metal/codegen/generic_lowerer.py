@@ -5509,6 +5509,7 @@ class GenericLowerer:
         # Trace back to find the reduce that produced this value and get
         # its input inner dim.
         N_reduced = None
+        reduce_axis = None
         src_id = ssa.operand_ids[0]
         # Trace through passthroughs (addf, etc.) to find the reduce
         visited = set()
@@ -5518,29 +5519,33 @@ class GenericLowerer:
             for op in self.graph.ops:
                 if op.id == trace_id:
                     if op.op == "tt.reduce":
-                        # Found the reduce — get its input shape's inner dim
                         if op.operand_ids:
                             inp_shape = self.env_shapes.get(op.operand_ids[0])
                             if not inp_shape:
                                 inp_type = self._find_op_type_str(op.operand_ids[0])
                                 inp_shape = _extract_shape(inp_type) if inp_type else None
                             if inp_shape and len(inp_shape) >= 2:
-                                axis = op.attrs.get("axis", 0)
-                                if axis == 1:
+                                reduce_axis = op.attrs.get("axis", 0)
+                                if reduce_axis == 1:
                                     N_reduced = inp_shape[1]
-                                elif axis == 0:
+                                elif reduce_axis == 0:
                                     N_reduced = inp_shape[0]
                         break
                     elif op.operand_ids:
-                        # Follow through passthroughs
                         trace_id = op.operand_ids[0]
                     break
 
         if N_reduced and N_reduced > 1:
-            # Source is from a reduce result — broadcast used lid / N_reduced
-            src_idx = f"lid / {N_reduced}u"
-            self.kb.raw_line(f"    if (lid % {N_reduced}u == 0u && lid / {N_reduced}u < {N}u)")
-            self.kb.raw_line(f"        {shared_name}[{src_idx}] = {src_var};")
+            if reduce_axis == 1:
+                # axis=1: broadcast used lid / N_reduced (blocked row)
+                src_idx = f"lid / {N_reduced}u"
+                self.kb.raw_line(f"    if (lid % {N_reduced}u == 0u && lid / {N_reduced}u < {N}u)")
+                self.kb.raw_line(f"        {shared_name}[{src_idx}] = {src_var};")
+            else:
+                # axis=0: broadcast used lid % N (modular column)
+                src_idx = f"lid % {N}u"
+                self.kb.raw_line(f"    if (lid < {N}u)")
+                self.kb.raw_line(f"        {shared_name}[{src_idx}] = {src_var};")
         else:
             # Standard modular mapping or no reduce found
             self.kb.raw_line(f"    if (lid < {N}u)")

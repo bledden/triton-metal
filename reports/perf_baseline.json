@@ -1,25 +1,25 @@
 {
   "vector_add_16M": {
     "name": "vector_add_16M",
-    "min_ms": 1.553,
-    "avg_ms": 1.854,
-    "throughput_gbps": 129.6
+    "min_ms": 1.86,
+    "avg_ms": 2.048,
+    "throughput_gbps": 108.2
   },
   "softmax_8Kx1K": {
     "name": "softmax_8Kx1K",
-    "min_ms": 0.775,
-    "avg_ms": 0.995,
-    "throughput_gbps": 86.5
+    "min_ms": 0.777,
+    "avg_ms": 0.947,
+    "throughput_gbps": 86.4
   },
   "sum_reduce_1K": {
     "name": "sum_reduce_1K",
-    "min_ms": 0.171,
-    "avg_ms": 0.203
+    "min_ms": 0.169,
+    "avg_ms": 0.223
   },
   "dispatch_overhead": {
     "name": "dispatch_overhead",
-    "total_ms": 19.5,
-    "per_kernel_ms": 0.195,
+    "total_ms": 19.7,
+    "per_kernel_ms": 0.197,
     "n_dispatches": 100
   }
 }

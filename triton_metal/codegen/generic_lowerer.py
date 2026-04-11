@@ -3465,17 +3465,21 @@ class GenericLowerer:
             self.kb.declare_threadgroup_array(shared_a, dtype=shared_dtype, size=N)
             self.kb.declare_threadgroup_array(shared_b, dtype=shared_dtype, size=N)
 
-            # Stage from threads 0..N-1
+            # Stage input values to shared memory — use lid (not loop var)
+            # since we need all N values staged before any interleaving.
+            # Each thread loads one element (lid < N).
             self.kb.raw_line(f"    if (lid < {N}u) {{")
             self.kb.raw_line(f"        {shared_a}[lid] = {a_var};")
             self.kb.raw_line(f"        {shared_b}[lid] = {b_var};")
             self.kb.raw_line(f"    }}")
             self.kb.raw_line(f"    threadgroup_barrier(mem_flags::mem_threadgroup);")
             # Interleave: join[i, 0] = a[i], join[i, 1] = b[i]
-            # Linear (row-major): join[lid] = a[lid/2] if lid%2==0, b[lid/2] if lid%2==1
+            # Linear (row-major): join[e] = a[e/2] if e%2==0, b[e/2] if e%2==1
+            # Use _lid_expr so the loop variable covers all 2*N output elements
+            elem = self._lid_expr
             self.kb.raw_line(
-                f"    {msl_type} {result_var} = (lid % 2u == 0u) ? "
-                f"{shared_a}[lid / 2u] : {shared_b}[lid / 2u];"
+                f"    {msl_type} {result_var} = ({elem} % 2u == 0u) ? "
+                f"{shared_a}[{elem} / 2u] : {shared_b}[{elem} / 2u];"
             )
             self.env[ssa.id] = result_var
             self.env_types[ssa.id] = input_dtype
@@ -3586,18 +3590,42 @@ class GenericLowerer:
         self._shared_counter += 1
         self.kb.declare_threadgroup_array(shared_name, dtype=shared_dtype, size=total)
 
-        # Stage all values to shared memory
-        self.kb.raw_line(f"    {shared_name}[lid] = {src_var};")
-        self.kb.raw_line(f"    threadgroup_barrier(mem_flags::mem_threadgroup);")
+        # Stage all values to shared memory.
+        # Must use a separate write loop + barrier BEFORE reading, because
+        # all 2*N values need to be staged before any de-interleaving.
+        elem = self._lid_expr  # _loop_e in wrapping mode
+        bs = self.effective_block_size
+        if self._needs_wrapping or total > bs:
+            # Close the current wrapping loop temporarily
+            # Actually — we can't easily close/reopen the wrapping loop.
+            # Instead, stage using lid with a stride loop OUTSIDE the
+            # wrapping context. Since we're inside the wrapping loop,
+            # use the current element index for write, but ensure ALL
+            # elements are written before reading by using the wrapping
+            # loop's coverage guarantee: each element is visited exactly once.
+            # The barrier syncs after each batch of writes.
+            # Issue: reads in the same iteration can access unwritten slots.
+            # Fix: break into two separate barriers — first write all, then read.
+            self.kb.raw_line(f"    if ({elem} < {total}u) {shared_name}[{elem}] = {src_var};")
+            # Need all elements written — close loop, barrier, reopen
+            self.kb.raw_line(f"    }}")  # close wrapping loop
+            self.kb.raw_line(f"    threadgroup_barrier(mem_flags::mem_threadgroup);")
+            # Reopen for reads
+            self.kb.raw_line(
+                f"    for (uint _loop_e = lid; _loop_e < {total}u; _loop_e += {bs}u) {{"
+            )
+        else:
+            self.kb.raw_line(f"    {shared_name}[{elem}] = {src_var};")
+            self.kb.raw_line(f"    threadgroup_barrier(mem_flags::mem_threadgroup);")
 
         # Read de-interleaved: z1 = even elements, z2 = odd elements
         z1_var = self._next_var("split")
         z2_var = self._next_var("split")
         self.kb.raw_line(
-            f"    {msl_type} {z1_var} = {shared_name}[(lid % {N}u) * 2u];"
+            f"    {msl_type} {z1_var} = {shared_name}[({elem} % {N}u) * 2u];"
         )
         self.kb.raw_line(
-            f"    {msl_type} {z2_var} = {shared_name}[(lid % {N}u) * 2u + 1u];"
+            f"    {msl_type} {z2_var} = {shared_name}[({elem} % {N}u) * 2u + 1u];"
         )
 
         # Register both results
@@ -3638,24 +3666,57 @@ class GenericLowerer:
         # Allocate threadgroup atomic histogram
         hist_name = f"hist_{self._shared_counter}"
         self._shared_counter += 1
-        # Declare as regular int array — use atomic operations on it
+
+        # Histogram requires all M elements to be processed before reading.
+        # If inside a wrapping loop, close it, do histogram standalone, reopen.
+        bs = self.effective_block_size
+        in_loop = self._needs_wrapping
+        if in_loop:
+            self.kb.raw_line(f"    }}")  # close wrapping loop
+
+        # Declare as atomic int array
         self.kb.raw_line(f"    threadgroup atomic_int {hist_name}[{N}];")
 
         # Initialize bins to 0
         self.kb.raw_line(f"    if (lid < {N}u) atomic_store_explicit(&{hist_name}[lid], 0, memory_order_relaxed);")
         self.kb.raw_line(f"    threadgroup_barrier(mem_flags::mem_threadgroup);")
 
-        # Each thread with valid input increments its bin (respecting mask if present)
-        mask_cond = f"lid < {M}u"
+        # Each thread increments bins — use stride loop to cover all M elements.
+        # Trace back to find the source pointer for re-loading values.
+        src_ptr_name = None
+        trace_id = ssa.operand_ids[0]
+        for op in self.graph.ops:
+            if op.id == trace_id and op.op == "tt.load" and op.operand_ids:
+                # Found the load — trace its ptr to the function arg
+                ptr_id = op.operand_ids[0]
+                ptr_info = self.env_is_ptr.get(ptr_id)
+                if ptr_info:
+                    src_ptr_name = ptr_info[0]
+                break
+
+        mask_extra = ""
         if len(ssa.operand_ids) >= 2:
             mask_var = self._lookup(ssa.operand_ids[1])
-            mask_cond = f"lid < {M}u && {mask_var}"
-        self.kb.raw_line(f"    if ({mask_cond}) atomic_fetch_add_explicit(&{hist_name}[(uint){input_var}], 1, memory_order_relaxed);")
+            mask_extra = f" && {mask_var}"
+
+        if src_ptr_name:
+            self.kb.raw_line(f"    for (uint _h = lid; _h < {M}u; _h += {bs}u) {{")
+            self.kb.raw_line(f"        int _hval = static_cast<int>({src_ptr_name}[_h]);")
+            self.kb.raw_line(f"        if (_h < {M}u{mask_extra}) atomic_fetch_add_explicit(&{hist_name}[(uint)_hval], 1, memory_order_relaxed);")
+            self.kb.raw_line(f"    }}")
+        else:
+            # Fallback: use the loaded input_var (only works when not wrapping)
+            self.kb.raw_line(f"    if (lid < {M}u{mask_extra}) atomic_fetch_add_explicit(&{hist_name}[(uint){input_var}], 1, memory_order_relaxed);")
         self.kb.raw_line(f"    threadgroup_barrier(mem_flags::mem_threadgroup);")
 
-        # Read result: each thread reads its assigned bin
+        # Read result
         result_var = self._next_var("hist")
         self.kb.raw_line(f"    int {result_var} = (lid < {N}u) ? atomic_load_explicit(&{hist_name}[lid], memory_order_relaxed) : 0;")
+
+        if in_loop:
+            # Reopen wrapping loop for remaining ops (stores)
+            total = getattr(self, "_total_elements", self.effective_block_size)
+            self.kb.raw_line(f"    for (uint _loop_e = lid; _loop_e < {total}u; _loop_e += {bs}u) {{")
 
         self.env[ssa.id] = result_var
         self.env_types[ssa.id] = "i32"

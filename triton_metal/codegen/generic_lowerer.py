@@ -2364,24 +2364,11 @@ class GenericLowerer:
         # In 2D kernels, 1D store tensors must be guarded to prevent
         # duplicate writes from extra threads (e.g. after 2D→1D reduce).
         store_1d_guard = None
-        # Check if the value went through ttg.convert_layout — trace back
-        # through passthroughs (casts, adds, etc.) to find a converted ID
-        val_converted = False
-        if hasattr(self, '_converted_layout_ids') and self._converted_layout_ids:
-            trace = val_id
-            visited_trace = set()
-            while trace not in visited_trace:
-                visited_trace.add(trace)
-                if trace in self._converted_layout_ids:
-                    val_converted = True
-                    break
-                # Follow through unary ops (casts, etc.)
-                for op in self.graph.ops:
-                    if op.id == trace and op.operand_ids:
-                        trace = op.operand_ids[0]
-                        break
-                else:
-                    break
+        # Check if the kernel has any ttg.convert_layout that did a real
+        # shared memory redistribution. If so, all 1D stores in this kernel
+        # should use simple lid < N guards because the convert_layout
+        # changed the thread-to-element mapping to simple (thread i = element i).
+        val_converted = hasattr(self, '_converted_layout_ids') and bool(getattr(self, '_converted_layout_ids', set()))
         if self._is_2d and not self._is_scalar_ptr(ptr_id):
             store_shape = self.env_shapes.get(ptr_id)
             if not store_shape:

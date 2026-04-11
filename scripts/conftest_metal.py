@@ -75,8 +75,6 @@ UNSUPPORTED_PRECISIONS = {"tf32"}
 UNIMPLEMENTED_FEATURES = {
     # Histogram — out-of-bounds safety not validated for Metal atomics path
     "test_histogram_silent_data_corruption",
-    # 2D broadcast bug — optimize_thread_locality still fails
-    "test_optimize_thread_locality",
     # Base join/split tests fail (parametrized variants pass)
     "test_join",
     "test_split",

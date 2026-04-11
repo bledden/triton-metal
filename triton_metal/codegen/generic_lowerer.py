@@ -2364,9 +2364,9 @@ class GenericLowerer:
         # In 2D kernels, 1D store tensors must be guarded to prevent
         # duplicate writes from extra threads (e.g. after 2D→1D reduce).
         store_1d_guard = None
+        val_converted = hasattr(self, '_converted_layout_ids') and val_id in getattr(self, '_converted_layout_ids', set())
         if self._is_2d and not self._is_scalar_ptr(ptr_id):
             store_shape = self.env_shapes.get(ptr_id)
-            # Fall back to extracting shape from the pointer SSA's type_str
             if not store_shape:
                 for op in self.graph.ops:
                     if op.id == ptr_id and op.type_str:
@@ -2377,21 +2377,21 @@ class GenericLowerer:
 
         if store_1d_guard is not None:
             lid = self._lid_expr
-            # After a 2D reduce (axis=1), the result is per-row and the
-            # broadcast uses lid / N (blocked). The store index from the
-            # output make_range uses lid % M (modular). When M != N these
-            # disagree, and when M == N the modular index cycles columns
-            # instead of rows. Fix: use lid / N as the store index and
-            # select one thread per row block.
-            shape = self._effective_2d_shape
-            if (shape and len(shape) >= 2 and store_1d_guard == shape[0]
-                    and shape[1] > 0):
-                N = shape[1]
-                # Override the store offset to use row-major blocked index
-                offsets = f"({lid} / {N}u)"
-                guard = f"{lid} % {N}u == 0u && {lid} / {N}u < {store_1d_guard}u"
-            else:
+            if val_converted:
+                # After convert_layout, thread i has element i. Simple guard.
                 guard = f"{lid} < {store_1d_guard}u"
+            else:
+                # After a 2D reduce (axis=1), the result is per-row and the
+                # broadcast uses lid / N (blocked). Fix: use lid / N as the
+                # store index and select one thread per row block.
+                shape = self._effective_2d_shape
+                if (shape and len(shape) >= 2 and store_1d_guard == shape[0]
+                        and shape[1] > 0):
+                    N = shape[1]
+                    offsets = f"({lid} / {N}u)"
+                    guard = f"{lid} % {N}u == 0u && {lid} / {N}u < {store_1d_guard}u"
+                else:
+                    guard = f"{lid} < {store_1d_guard}u"
             if mask_var:
                 self.kb.raw_line(f"    if ({guard} && {mask_var}) {{ {base_ptr}[{offsets}] = {cast_val}; }}")
             else:
@@ -5414,13 +5414,13 @@ class GenericLowerer:
     def _lower_ttg(self, ssa: SSAValue):
         """Lower ttg.* ops (TritonGPU dialect).
 
-        Most ttg ops are layout annotations or shared memory management
-        that map to no-ops or passthroughs in the 1D per-thread model.
+        Most ttg ops are layout annotations or shared memory management.
+        convert_layout requires shared memory redistribution when the
+        source and destination layouts map elements to different threads.
         """
         op = ssa.op
         if op == "ttg.convert_layout":
-            # Layout conversion is a no-op in our 1D model
-            self._emit_passthrough(ssa)
+            self._lower_convert_layout(ssa)
         elif op == "ttg.local_alloc":
             # Shared memory allocation — passthrough (data is same)
             self._emit_passthrough(ssa)
@@ -5433,6 +5433,135 @@ class GenericLowerer:
         else:
             # Other ttg ops: passthrough
             self._emit_passthrough(ssa)
+
+    def _lower_convert_layout(self, ssa: SSAValue):
+        """ttg.convert_layout → shared memory redistribution.
+
+        When the source layout's thread-to-element mapping differs from the
+        destination layout, elements must be redistributed via shared memory:
+          1. Each thread writes its value to shared[source_index]
+          2. threadgroup_barrier
+          3. Each thread reads shared[dest_index]
+
+        For 1D tensors in our model: after a 2D reduce, the broadcast puts
+        results on threads using lid/N or lid%M, but the destination layout
+        expects a simple lid-based mapping. The shared memory shuffle fixes
+        this mismatch.
+
+        For cases where both layouts use the same mapping (e.g. same blocked
+        layout), this is a passthrough.
+        """
+        if not ssa.operand_ids:
+            self._emit_passthrough(ssa)
+            return
+
+        src_var = self._lookup(ssa.operand_ids[0])
+        src_shape = _extract_shape(ssa.type_str)
+        if not src_shape:
+            # Can't determine shape — passthrough
+            self._emit_passthrough(ssa)
+            return
+
+        N = 1
+        for d in src_shape:
+            N *= d
+
+        # Only do shared memory redistribution when the source layout is
+        # a #ttg.slice (from a reduce). For #blocked → #blocked conversions,
+        # our 1D model doesn't distinguish between blocked layouts, so
+        # passthrough is correct.
+        src_type = ""
+        for op in self.graph.ops:
+            if op.id == ssa.operand_ids[0] and op.type_str:
+                src_type = op.type_str
+                break
+        if not src_type:
+            src_type = self._find_op_type_str(ssa.operand_ids[0]) or ""
+
+        # Only redistribute when converting FROM a slice layout TO a
+        # non-slice layout (e.g., #ttg.slice → #blocked2). This indicates
+        # the reduce result needs remapping to a new thread assignment.
+        # When both source and dest are slice layouts, it's a layout
+        # variant change that doesn't affect thread mapping in our model.
+        dest_type = ssa.type_str or ""
+        needs_redistribute = ("ttg.slice" in src_type
+                              and "ttg.slice" not in dest_type)
+
+        if not needs_redistribute or not self._is_2d or N <= 1:
+            self._emit_passthrough(ssa)
+            return
+
+        # Determine source element type
+        src_dtype = self.env_types.get(ssa.operand_ids[0], "fp32")
+        is_int = not (src_dtype.startswith("fp") or src_dtype.startswith("bf"))
+        msl_type = "int" if is_int else "float"
+        shared_dtype = "i32" if is_int else "fp32"
+
+        # Allocate shared memory for the redistribution
+        shared_name = f"shared_{self._shared_counter}"
+        self._shared_counter += 1
+        self.kb.declare_threadgroup_array(shared_name, dtype=shared_dtype, size=N)
+
+        # Determine the source write index.
+        # After a 2D reduce with broadcast, the thread-to-element mapping
+        # uses lid / N_reduced (blocked row indexing), where N_reduced is
+        # the inner dim of the reduce input (NOT the global 2D shape).
+        # Trace back to find the reduce that produced this value and get
+        # its input inner dim.
+        N_reduced = None
+        src_id = ssa.operand_ids[0]
+        # Trace through passthroughs (addf, etc.) to find the reduce
+        visited = set()
+        trace_id = src_id
+        while trace_id not in visited:
+            visited.add(trace_id)
+            for op in self.graph.ops:
+                if op.id == trace_id:
+                    if op.op == "tt.reduce":
+                        # Found the reduce — get its input shape's inner dim
+                        if op.operand_ids:
+                            inp_shape = self.env_shapes.get(op.operand_ids[0])
+                            if not inp_shape:
+                                inp_type = self._find_op_type_str(op.operand_ids[0])
+                                inp_shape = _extract_shape(inp_type) if inp_type else None
+                            if inp_shape and len(inp_shape) >= 2:
+                                axis = op.attrs.get("axis", 0)
+                                if axis == 1:
+                                    N_reduced = inp_shape[1]
+                                elif axis == 0:
+                                    N_reduced = inp_shape[0]
+                        break
+                    elif op.operand_ids:
+                        # Follow through passthroughs
+                        trace_id = op.operand_ids[0]
+                    break
+
+        if N_reduced and N_reduced > 1:
+            # Source is from a reduce result — broadcast used lid / N_reduced
+            src_idx = f"lid / {N_reduced}u"
+            self.kb.raw_line(f"    if (lid % {N_reduced}u == 0u && lid / {N_reduced}u < {N}u)")
+            self.kb.raw_line(f"        {shared_name}[{src_idx}] = {src_var};")
+        else:
+            # Standard modular mapping or no reduce found
+            self.kb.raw_line(f"    if (lid < {N}u)")
+            self.kb.raw_line(f"        {shared_name}[lid % {N}u] = {src_var};")
+
+        self.kb.raw_line(f"    threadgroup_barrier(mem_flags::mem_threadgroup);")
+
+        # Read back in destination layout: thread i gets element i
+        result_var = self._next_var("cvt")
+        self.kb.raw_line(f"    {msl_type} {result_var} = (lid < {N}u) ? {shared_name}[lid] : ({msl_type})0;")
+
+        self.env[ssa.id] = result_var
+        self.env_types[ssa.id] = src_dtype
+        if src_shape:
+            self.env_shapes[ssa.id] = src_shape
+        # Mark this value as having been through convert_layout — the
+        # thread-to-element mapping is now simple (thread i = element i).
+        # This prevents the store from using 2D-aware guards.
+        if not hasattr(self, '_converted_layout_ids'):
+            self._converted_layout_ids = set()
+        self._converted_layout_ids.add(ssa.id)
 
 
 # ---------------------------------------------------------------------------

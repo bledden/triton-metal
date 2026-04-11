@@ -3,8 +3,8 @@ Backend: metal
 ==================================================
 
 Total:   8952
-Passed:  4237 (47.3%)
-Failed:  43
+Passed:  4248 (47.5%)
+Failed:  32
 Skipped: 4672
 Errors:  0
 
@@ -12,10 +12,10 @@ Failure Categories:
   Numerical mismatch: 6
 
 Pytest summary (cross-check):
-  failed: 43
-  passed: 4237
+  failed: 32
+  passed: 4248
   skipped: 5054
-  warnings: 1578
+  warnings: 54
 
 Sample passing tests:
   unit/language/test_core.py::test_scalar_overflow
@@ -40,23 +40,23 @@ Sample passing tests:
   unit/language/test_core.py::test_bin_op[1-int16-bfloat16-+]
 
 Sample failing tests:
+  unit/language/test_core.py::test_tensor_atomic_rmw[shape2-0-1-float32-True]
   unit/language/test_core.py::test_tensor_atomic_rmw[shape8-1-1-float32-True]
   unit/language/test_core.py::test_tensor_atomic_rmw[shape20-1-1-float32-True]
   unit/language/test_core.py::test_tensor_atomic_rmw[shape32-1-1-float32-True]
+  unit/language/test_core.py::test_tensor_atomic_rmw[shape38-0-1-float32-True]
   unit/language/test_core.py::test_tensor_atomic_rmw[shape44-1-1-float32-True]
+  unit/language/test_core.py::test_tensor_atomic_rmw[shape50-0-1-float32-True]
   unit/language/test_core.py::test_tensor_atomic_rmw[shape56-1-1-float32-True]
   unit/language/test_core.py::test_join
   unit/language/test_core.py::test_split
-  unit/language/test_core.py::test_reduce[1-min-float32-shape61-1-False]
-  unit/language/test_core.py::test_reduce[1-min-float32-shape63-1-False]
-  unit/language/test_core.py::test_reduce[1-min-float32-shape65-1-False]
-  unit/language/test_core.py::test_reduce[1-max-float32-shape67-1-False]
-  unit/language/test_core.py::test_reduce[1-max-float32-shape69-1-False]
-  unit/language/test_core.py::test_reduce[1-max-float32-shape71-1-False]
-  unit/language/test_core.py::test_reduce[1-sum-float32-shape73-1-False]
-  unit/language/test_core.py::test_reduce[1-sum-float32-shape75-1-False]
-  unit/language/test_core.py::test_reduce[1-sum-float32-shape77-1-False]
-  unit/language/test_core.py::test_reduce[1-sum-float32-shape140--1-False]
-  unit/language/test_core.py::test_reduce[1-argmin-float32-shape148-1-True]
-  unit/language/test_core.py::test_reduce[1-argmax-float32-shape150-1-True]
-  unit/language/test_core.py::test_reduce[1-xor_sum-bool-shape175-1-False]
+  unit/language/test_core.py::test_histogram[1024-8]
+  unit/language/test_core.py::test_histogram[1024-128]
+  unit/language/test_core.py::test_histogram[256-512]
+  unit/language/test_core.py::test_histogram_mask[256-512]
+  unit/language/test_core.py::test_optimize_thread_locality[2-512-32-sum]
+  unit/language/test_core.py::test_optimize_thread_locality[2-512-32-max]
+  unit/language/test_core.py::test_optimize_thread_locality[2-512-32-min]
+  unit/language/test_core.py::test_optimize_thread_locality[2-1024-32-sum]
+  unit/language/test_core.py::test_optimize_thread_locality[2-1024-32-max]
+  unit/language/test_core.py::test_optimize_thread_locality[2-1024-32-min]

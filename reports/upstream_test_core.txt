@@ -3,19 +3,21 @@ Backend: metal
 ==================================================
 
 Total:   8952
-Passed:  4250 (47.5%)
-Failed:  30
+Passed:  4278 (47.8%)
+Failed:  2
 Skipped: 4672
 Errors:  0
 
 Failure Categories:
-  Numerical mismatch: 6
+  Numerical mismatch: 1
+  Other: 1
 
 Pytest summary (cross-check):
-  failed: 30
-  passed: 4250
+  error: 1
+  failed: 2
+  passed: 4278
   skipped: 5054
-  warnings: 72
+  warnings: 628
 
 Sample passing tests:
   unit/language/test_core.py::test_scalar_overflow
@@ -40,23 +42,5 @@ Sample passing tests:
   unit/language/test_core.py::test_bin_op[1-int16-bfloat16-+]
 
 Sample failing tests:
-  unit/language/test_core.py::test_tensor_atomic_rmw[shape2-0-1-float32-True]
-  unit/language/test_core.py::test_tensor_atomic_rmw[shape8-1-1-float32-True]
-  unit/language/test_core.py::test_tensor_atomic_rmw[shape14-0-1-float32-True]
-  unit/language/test_core.py::test_tensor_atomic_rmw[shape20-1-1-float32-True]
-  unit/language/test_core.py::test_tensor_atomic_rmw[shape26-0-1-float32-True]
-  unit/language/test_core.py::test_tensor_atomic_rmw[shape32-1-1-float32-True]
-  unit/language/test_core.py::test_tensor_atomic_rmw[shape38-0-1-float32-True]
-  unit/language/test_core.py::test_tensor_atomic_rmw[shape44-1-1-float32-True]
-  unit/language/test_core.py::test_tensor_atomic_rmw[shape50-0-1-float32-True]
-  unit/language/test_core.py::test_tensor_atomic_rmw[shape56-1-1-float32-True]
-  unit/language/test_core.py::test_join
-  unit/language/test_core.py::test_split
-  unit/language/test_core.py::test_reduce[1-min-float32-shape60-0-False]
-  unit/language/test_core.py::test_reduce[1-min-float32-shape62-0-False]
-  unit/language/test_core.py::test_reduce[1-min-float32-shape64-0-False]
-  unit/language/test_core.py::test_reduce[1-max-float32-shape66-0-False]
-  unit/language/test_core.py::test_reduce[1-max-float32-shape68-0-False]
-  unit/language/test_core.py::test_reduce[1-max-float32-shape70-0-False]
-  unit/language/test_core.py::test_reduce[1-sum-float32-shape72-0-False]
-  unit/language/test_core.py::test_reduce[1-sum-float32-shape74-0-False]
+  unit/language/test_core.py::test_histogram[256-512]
+  unit/language/test_core.py::test_histogram_mask[256-512]

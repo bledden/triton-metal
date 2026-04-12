@@ -800,67 +800,149 @@ class GenericLowerer:
         return {"M": M, "N": N, "K": K, "ptr_args": ptr_args, "dot_ssa": dot_ssa}
 
     def _lower_simple_dot_inline(self, info):
-        """Generate MSL for a simple dot kernel (no strides, no scf.for).
+        """Generate MSL for a simple dot kernel using simdgroup MMA.
 
-        Emits a complete kernel that:
-        1. Cooperatively loads A and B tiles into shared memory
-        2. Barriers
-        3. Each thread computes one element of C via a K-loop
-        4. Stores the result to global memory
+        Emits a complete kernel that uses simdgroup_matrix_multiply_accumulate
+        (hardware 8x8 MMA) instead of scalar per-thread matmul. Each SIMD group
+        processes 32x8 of the output tile via 4 rows of 8x8 MMA operations.
 
-        Uses M*N threads (one per output element).
+        128 threads per threadgroup (4 SIMD groups), K-loop in steps of 8,
+        data staged through threadgroup shared memory. For M or N > 32 the
+        kernel loops over 32x32 output tiles within a single threadgroup.
         """
         M = info["M"]
         N = info["N"]
         K = info["K"]
         ptr_args = info["ptr_args"]
+        dot_ssa = info["dot_ssa"]
 
-        total = M * N
-        # Cap block size at 1024 (Metal limit), use 1024 if total <= 1024
-        block_size = min(total, 1024)
-        self.effective_block_size = block_size
+        # 128 threads = 4 SIMD groups x 32 threads
+        self.effective_block_size = 128
 
         a_name = ptr_args[0].name
         b_name = ptr_args[1].name
         c_name = ptr_args[2].name
 
+        # Determine input element type from A pointer arg
+        a_elem = ptr_args[0].elem_type  # e.g. "f32", "f16"
+        if a_elem in ("f16",):
+            input_msl_type = "half"
+        else:
+            input_msl_type = "float"
+
+        # Determine output element type from C pointer arg
+        c_elem = ptr_args[2].elem_type
+        if c_elem in ("f16",):
+            output_msl_type = "half"
+        else:
+            output_msl_type = "float"
+
+        # Threadgroup staging and accumulation always in float
+        tg_type = "float"
+        frag_type = "simdgroup_float8x8"
+        cast_load = "float"
+
         safe_name = _sanitize_msl_name(self.graph.func_name)
+
+        # Number of 32x32 tiles needed
+        n_tile_rows = (M + 31) // 32
+        n_tile_cols = (N + 31) // 32
 
         lines = []
         lines.append("#include <metal_stdlib>")
+        lines.append("#include <metal_simdgroup_matrix>")
         lines.append("using namespace metal;")
         lines.append("")
         lines.append(f"kernel void {safe_name}(")
-        lines.append(f"    device const float* {a_name} [[buffer(0)]],")
-        lines.append(f"    device const float* {b_name} [[buffer(1)]],")
-        lines.append(f"    volatile device float* {c_name} [[buffer(2)]],")
-        lines.append(f"    uint pid [[threadgroup_position_in_grid]],")
-        lines.append(f"    uint lid [[thread_position_in_threadgroup]],")
-        lines.append(f"    uint tid [[thread_position_in_grid]]")
+        lines.append(f"    device const {input_msl_type}* {a_name} [[buffer(0)]],")
+        lines.append(f"    device const {input_msl_type}* {b_name} [[buffer(1)]],")
+        lines.append(f"    device {output_msl_type}* {c_name} [[buffer(2)]],")
+        lines.append(f"    uint sgitg [[simdgroup_index_in_threadgroup]],")
+        lines.append(f"    uint tiitg [[thread_index_in_threadgroup]]")
         lines.append(f") {{")
-        lines.append(f"    threadgroup float smem_a[{M * K}];")
-        lines.append(f"    threadgroup float smem_b[{K * N}];")
+        lines.append(f"    // Constants")
+        lines.append(f"    const uint M = {M}u;")
+        lines.append(f"    const uint N = {N}u;")
+        lines.append(f"    const uint K = {K}u;")
         lines.append(f"")
-        lines.append(f"    // Cooperatively load A ({M}x{K}) into shared memory")
-        lines.append(f"    for (uint i = lid; i < {M * K}u; i += {block_size}u) {{")
-        lines.append(f"        smem_a[i] = {a_name}[i];")
-        lines.append(f"    }}")
-        lines.append(f"    // Cooperatively load B ({K}x{N}) into shared memory")
-        lines.append(f"    for (uint i = lid; i < {K * N}u; i += {block_size}u) {{")
-        lines.append(f"        smem_b[i] = {b_name}[i];")
-        lines.append(f"    }}")
-        lines.append(f"    threadgroup_barrier(mem_flags::mem_threadgroup);")
+        lines.append(f"    threadgroup {tg_type} tg_A[32 * 8];")
+        lines.append(f"    threadgroup {tg_type} tg_B[8 * 32];")
         lines.append(f"")
-        lines.append(f"    // Each thread computes one or more elements of C ({M}x{N})")
-        lines.append(f"    for (uint e = lid; e < {total}u; e += {block_size}u) {{")
-        lines.append(f"        uint row = e / {N}u;")
-        lines.append(f"        uint col = e % {N}u;")
-        lines.append(f"        float sum = 0.0f;")
-        lines.append(f"        for (uint k = 0; k < {K}u; k++) {{")
-        lines.append(f"            sum += smem_a[row * {K}u + k] * smem_b[k * {N}u + col];")
+
+        # Loop over 32x32 output tiles (single threadgroup handles entire matrix)
+        lines.append(f"    for (uint tile_row = 0u; tile_row < {n_tile_rows}u; tile_row++) {{")
+        lines.append(f"    for (uint tile_col = 0u; tile_col < {n_tile_cols}u; tile_col++) {{")
+        lines.append(f"        uint row_base = tile_row * 32u;")
+        lines.append(f"        uint col_base = tile_col * 32u + sgitg * 8u;")
+        lines.append(f"")
+        lines.append(f"        {frag_type} acc0(0), acc1(0), acc2(0), acc3(0);")
+        lines.append(f"        {frag_type} a_frag, b_frag;")
+        lines.append(f"")
+        lines.append(f"        for (uint kk = 0u; kk < K; kk += 8u) {{")
+
+        # Load A tile (32x8) cooperatively
+        lines.append(f"            for (uint i = tiitg; i < 256u; i += 128u) {{")
+        lines.append(f"                uint r = i / 8u, c = i % 8u;")
+        lines.append(f"                uint gr = row_base + r, gc = kk + c;")
+        lines.append(f"                tg_A[i] = (gr < M && gc < K) ? {cast_load}({a_name}[gr * K + gc]) : 0.0f;")
+        lines.append(f"            }}")
+
+        # Load B tile (8x32) cooperatively
+        lines.append(f"            uint col_base_tg = tile_col * 32u;")
+        lines.append(f"            for (uint i = tiitg; i < 256u; i += 128u) {{")
+        lines.append(f"                uint r = i / 32u, c = i % 32u;")
+        lines.append(f"                uint gr = kk + r, gc = col_base_tg + c;")
+        lines.append(f"                tg_B[i] = (gr < K && gc < N) ? {cast_load}({b_name}[gr * N + gc]) : 0.0f;")
+        lines.append(f"            }}")
+        lines.append(f"")
+        lines.append(f"            threadgroup_barrier(mem_flags::mem_threadgroup);")
+        lines.append(f"")
+
+        # Simdgroup MMA: each SIMD group loads its B column slice, then 4 rows of A
+        lines.append(f"            simdgroup_load(b_frag, tg_B + sgitg * 8u, 32);")
+        lines.append(f"")
+        lines.append(f"            simdgroup_load(a_frag, tg_A, 8);")
+        lines.append(f"            simdgroup_multiply_accumulate(acc0, a_frag, b_frag, acc0);")
+        lines.append(f"")
+        lines.append(f"            simdgroup_load(a_frag, tg_A + 64u, 8);")
+        lines.append(f"            simdgroup_multiply_accumulate(acc1, a_frag, b_frag, acc1);")
+        lines.append(f"")
+        lines.append(f"            simdgroup_load(a_frag, tg_A + 128u, 8);")
+        lines.append(f"            simdgroup_multiply_accumulate(acc2, a_frag, b_frag, acc2);")
+        lines.append(f"")
+        lines.append(f"            simdgroup_load(a_frag, tg_A + 192u, 8);")
+        lines.append(f"            simdgroup_multiply_accumulate(acc3, a_frag, b_frag, acc3);")
+        lines.append(f"")
+        lines.append(f"            threadgroup_barrier(mem_flags::mem_threadgroup);")
         lines.append(f"        }}")
-        lines.append(f"        {c_name}[e] = sum;")
-        lines.append(f"    }}")
+        lines.append(f"")
+
+        # Store results to global memory
+        if output_msl_type == "float":
+            lines.append(f"        simdgroup_store(acc0, {c_name} + (row_base) * N + col_base, N);")
+            lines.append(f"        simdgroup_store(acc1, {c_name} + (row_base + 8u) * N + col_base, N);")
+            lines.append(f"        simdgroup_store(acc2, {c_name} + (row_base + 16u) * N + col_base, N);")
+            lines.append(f"        simdgroup_store(acc3, {c_name} + (row_base + 24u) * N + col_base, N);")
+        else:
+            # For half output, store through threadgroup memory and convert
+            lines.append(f"        // Store accumulators (float) to threadgroup, then convert to {output_msl_type}")
+            lines.append(f"        threadgroup float tg_out[32 * 8];")
+            lines.append(f"        simdgroup_store(acc0, tg_out, 8);")
+            lines.append(f"        simdgroup_store(acc1, tg_out + 64u, 8);")
+            lines.append(f"        simdgroup_store(acc2, tg_out + 128u, 8);")
+            lines.append(f"        simdgroup_store(acc3, tg_out + 192u, 8);")
+            lines.append(f"        threadgroup_barrier(mem_flags::mem_threadgroup);")
+            lines.append(f"        for (uint i = tiitg; i < 256u; i += 128u) {{")
+            lines.append(f"            uint r = i / 8u, c = i % 8u;")
+            lines.append(f"            uint gr = row_base + r, gc = col_base + c;")
+            lines.append(f"            if (gr < M && gc < N) {{")
+            lines.append(f"                {c_name}[gr * N + gc] = {output_msl_type}(tg_out[i]);")
+            lines.append(f"            }}")
+            lines.append(f"        }}")
+            lines.append(f"        threadgroup_barrier(mem_flags::mem_threadgroup);")
+
+        lines.append(f"    }} // tile_col")
+        lines.append(f"    }} // tile_row")
         lines.append(f"}}")
 
         return "\n".join(lines)

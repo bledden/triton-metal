@@ -11,6 +11,22 @@ from types import ModuleType
 from triton.backends.compiler import BaseBackend, GPUTarget
 
 
+def _get_cache_dir():
+    """Return the persistent cache directory for compiled kernels.
+
+    The directory is created if it does not exist.  Users can override the
+    location by setting the ``TRITON_METAL_CACHE_DIR`` environment variable.
+    """
+    cache_dir = os.environ.get("TRITON_METAL_CACHE_DIR")
+    if cache_dir:
+        os.makedirs(cache_dir, exist_ok=True)
+        return cache_dir
+    # Default: ~/.cache/triton_metal/
+    home = os.path.expanduser("~")
+    cache_dir = os.path.join(home, ".cache", "triton_metal")
+    os.makedirs(cache_dir, exist_ok=True)
+    return cache_dir
+
 
 @dataclass(frozen=True)
 class MetalOptions:
@@ -183,8 +199,9 @@ class MetalBackend(BaseBackend):
     def make_msl(mod, metadata, options):
         import sys
         import time
+        import warnings
         from triton_metal.codegen.msl_emitter import emit_msl
-        from triton_metal.debug import _debug_level, _dump_dir
+        from triton_metal.debug import _debug_level, _dump_dir, _fallback_mode
 
         level = _debug_level()
         kernel_name = metadata.get("name", "kernel")
@@ -197,11 +214,67 @@ class MetalBackend(BaseBackend):
             with open(ttgir_path, "w") as f:
                 f.write(str(mod))
 
+        # Check persistent MSL cache (TTGIR text + options → MSL string).
+        mod_text = str(mod)
+        cache_key = hashlib.sha256(
+            (mod_text + options.hash()).encode("utf-8")
+        ).hexdigest()[:16]
+        cache_dir = _get_cache_dir()
+        msl_cache_path = os.path.join(cache_dir, f"{kernel_name}_{cache_key}.msl")
+
+        if os.path.exists(msl_cache_path):
+            with open(msl_cache_path, "r") as f:
+                msl_src = f.read()
+
+            # Populate metadata that emit_msl would normally set.
+            # Extract kernel name from MSL: "kernel void NAME("
+            import re as _re
+            m = _re.search(r'kernel\s+void\s+(\w+)\s*\(', msl_src)
+            if m:
+                metadata["name"] = m.group(1)
+            else:
+                metadata["name"] = kernel_name
+            # block_size and output_arg_indices default if not cached
+            metadata.setdefault("block_size", options.num_warps * 32)
+            metadata.setdefault("needs_2d_grid", False)
+
+            # Try to load cached metadata alongside the MSL
+            meta_cache_path = msl_cache_path.replace(".msl", ".meta.json")
+            if os.path.exists(meta_cache_path):
+                import json
+                with open(meta_cache_path, "r") as f:
+                    cached_meta = json.load(f)
+                metadata.update(cached_meta)
+
+            if level >= 2:
+                print(
+                    f"[triton-metal] make_msl({kernel_name}): cache hit",
+                    file=sys.stderr,
+                )
+
+            return msl_src
+
         # Level 2: time the MSL emission
         if level >= 2:
             t0 = time.perf_counter()
 
-        msl_src = emit_msl(mod, metadata, options)
+        try:
+            msl_src = emit_msl(mod, metadata, options)
+        except Exception as e:
+            mode = _fallback_mode()
+            if mode == "warn":
+                warnings.warn(
+                    f"triton-metal: MSL codegen failed for kernel "
+                    f"'{kernel_name}': {e}. "
+                    f"Kernel will fall back to CPU.",
+                    stacklevel=2,
+                )
+            elif mode == "error":
+                # Re-raise without fallback hint — user wants hard errors.
+                raise
+            # "silent" and "warn" both re-raise so Triton/torch.compile
+            # can route to CPU fallback.
+            raise
 
         if level >= 2:
             elapsed_ms = (time.perf_counter() - t0) * 1000
@@ -209,6 +282,34 @@ class MetalBackend(BaseBackend):
                 f"[triton-metal] make_msl({kernel_name}): {elapsed_ms:.1f}ms",
                 file=sys.stderr,
             )
+
+        # Cache the generated MSL and metadata atomically.
+        tmp_fd, tmp_path = tempfile.mkstemp(
+            dir=cache_dir, suffix=".msl.tmp"
+        )
+        try:
+            with os.fdopen(tmp_fd, "w") as f:
+                f.write(msl_src)
+            os.replace(tmp_path, msl_cache_path)
+            # Cache metadata (name, block_size, etc.) alongside the MSL.
+            import json
+            meta_cache_path = msl_cache_path.replace(".msl", ".meta.json")
+            cacheable = {
+                k: v for k, v in metadata.items()
+                if isinstance(v, (str, int, float, bool, type(None), list, tuple))
+            }
+            tmp_meta_fd, tmp_meta_path = tempfile.mkstemp(
+                dir=cache_dir, suffix=".meta.tmp"
+            )
+            with os.fdopen(tmp_meta_fd, "w") as f:
+                json.dump(cacheable, f)
+            os.replace(tmp_meta_path, meta_cache_path)
+        except Exception:
+            # Best-effort cleanup on failure; compilation still succeeds.
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
 
         # Level 1+: dump generated MSL
         if level >= 1:
@@ -222,95 +323,124 @@ class MetalBackend(BaseBackend):
     def make_metallib(src, metadata, options):
         import sys
         import time
-        from triton_metal.debug import _debug_level
+        import warnings
+        from triton_metal.debug import _debug_level, _fallback_mode
 
         level = _debug_level()
+        kernel_name = metadata.get("name", "kernel")
+
         if level >= 2:
             t0 = time.perf_counter()
 
-        # Write metallib to a persistent cache directory so the driver
-        # can load it via newLibraryWithURL (avoids PyObjC NSData crash).
-        cache_dir = os.path.join(tempfile.gettempdir(), "triton_metal_cache")
-        os.makedirs(cache_dir, exist_ok=True)
+        try:
+            # Persistent cache directory (survives reboots).
+            cache_dir = _get_cache_dir()
 
-        # Use content hash for deterministic naming.
-        src_hash = hashlib.sha256(src.encode("utf-8")).hexdigest()[:16]
-        kernel_name = metadata.get("name", "kernel")
-        base = f"{kernel_name}_{src_hash}"
+            # Use content hash for deterministic naming.
+            src_hash = hashlib.sha256(src.encode("utf-8")).hexdigest()[:16]
+            base = f"{kernel_name}_{src_hash}"
 
-        metal_path = os.path.join(cache_dir, f"{base}.metal")
-        air_path = os.path.join(cache_dir, f"{base}.air")
-        metallib_path = os.path.join(cache_dir, f"{base}.metallib")
+            metal_path = os.path.join(cache_dir, f"{base}.metal")
+            air_path = os.path.join(cache_dir, f"{base}.air")
+            metallib_path = os.path.join(cache_dir, f"{base}.metallib")
 
-        # Skip compilation if cached metallib exists.
-        if os.path.exists(metallib_path):
+            # Skip compilation if cached metallib exists.
+            if os.path.exists(metallib_path):
+                if level >= 2:
+                    print(
+                        f"[triton-metal] make_metallib({kernel_name}): cache hit",
+                        file=sys.stderr,
+                    )
+                with open(metallib_path, "rb") as f:
+                    return f.read()
+
+            with open(metal_path, "w") as f:
+                f.write(src)
+
+            # Resolve Metal standard version for compilation.
+            if options.target_metal_version == "auto":
+                from triton_metal.backend.device_detect import get_device_info
+                metal_std_flag = get_device_info().metal_std_flag
+            else:
+                metal_std_flag = f"-std=metal{options.target_metal_version}"
+
+            # Compile MSL -> AIR
+            try:
+                subprocess.run(
+                    [
+                        "xcrun", "-sdk", "macosx", "metal",
+                        "-c", metal_path,
+                        "-o", air_path,
+                        metal_std_flag,
+                        "-mmacosx-version-min=15.0",
+                        "-O2",
+                    ],
+                    capture_output=True,
+                    check=True,
+                )
+            except subprocess.CalledProcessError as e:
+                from triton_metal.errors import MetalCompilationError
+                stderr = e.stderr.decode("utf-8", errors="replace") if e.stderr else ""
+                raise MetalCompilationError(
+                    f"Metal shader compilation failed (exit {e.returncode})",
+                    msl_source=metal_path,
+                    stderr=stderr,
+                ) from None
+
+            # Link AIR -> metallib (atomic write via rename).
+            tmp_metallib_path = metallib_path + ".tmp"
+            try:
+                subprocess.run(
+                    [
+                        "xcrun", "-sdk", "macosx", "metallib",
+                        air_path,
+                        "-o", tmp_metallib_path,
+                    ],
+                    capture_output=True,
+                    check=True,
+                )
+                os.replace(tmp_metallib_path, metallib_path)
+            except subprocess.CalledProcessError as e:
+                # Clean up partial temp file on failure.
+                try:
+                    os.unlink(tmp_metallib_path)
+                except OSError:
+                    pass
+                from triton_metal.errors import MetalCompilationError
+                stderr = e.stderr.decode("utf-8", errors="replace") if e.stderr else ""
+                raise MetalCompilationError(
+                    f"Metal library linking failed (exit {e.returncode})",
+                    msl_source=air_path,
+                    stderr=stderr,
+                ) from None
+
             with open(metallib_path, "rb") as f:
-                return f.read()
+                data = f.read()
 
-        with open(metal_path, "w") as f:
-            f.write(src)
+            if level >= 2:
+                elapsed_ms = (time.perf_counter() - t0) * 1000
+                print(
+                    f"[triton-metal] make_metallib({kernel_name}): {elapsed_ms:.1f}ms",
+                    file=sys.stderr,
+                )
 
-        # Resolve Metal standard version for compilation.
-        if options.target_metal_version == "auto":
-            from triton_metal.backend.device_detect import get_device_info
-            metal_std_flag = get_device_info().metal_std_flag
-        else:
-            metal_std_flag = f"-std=metal{options.target_metal_version}"
+            return data
 
-        # Compile MSL -> AIR
-        try:
-            subprocess.run(
-                [
-                    "xcrun", "-sdk", "macosx", "metal",
-                    "-c", metal_path,
-                    "-o", air_path,
-                    metal_std_flag,
-                    "-mmacosx-version-min=15.0",
-                    "-O2",
-                ],
-                capture_output=True,
-                check=True,
-            )
-        except subprocess.CalledProcessError as e:
-            from triton_metal.errors import MetalCompilationError
-            stderr = e.stderr.decode("utf-8", errors="replace") if e.stderr else ""
-            raise MetalCompilationError(
-                f"Metal shader compilation failed (exit {e.returncode})",
-                msl_source=metal_path,
-                stderr=stderr,
-            ) from None
-
-        # Link AIR -> metallib
-        try:
-            subprocess.run(
-                [
-                    "xcrun", "-sdk", "macosx", "metallib",
-                    air_path,
-                    "-o", metallib_path,
-                ],
-                capture_output=True,
-                check=True,
-            )
-        except subprocess.CalledProcessError as e:
-            from triton_metal.errors import MetalCompilationError
-            stderr = e.stderr.decode("utf-8", errors="replace") if e.stderr else ""
-            raise MetalCompilationError(
-                f"Metal library linking failed (exit {e.returncode})",
-                msl_source=air_path,
-                stderr=stderr,
-            ) from None
-
-        with open(metallib_path, "rb") as f:
-            data = f.read()
-
-        if level >= 2:
-            elapsed_ms = (time.perf_counter() - t0) * 1000
-            print(
-                f"[triton-metal] make_metallib({kernel_name}): {elapsed_ms:.1f}ms",
-                file=sys.stderr,
-            )
-
-        return data
+        except Exception as e:
+            mode = _fallback_mode()
+            if mode == "warn":
+                warnings.warn(
+                    f"triton-metal: Metal compilation failed for kernel "
+                    f"'{kernel_name}': {e}. "
+                    f"Kernel will fall back to CPU.",
+                    stacklevel=2,
+                )
+            elif mode == "error":
+                # Re-raise without fallback hint -- user wants hard errors.
+                raise
+            # "silent" and "warn" both re-raise so Triton/torch.compile
+            # can route to CPU fallback.
+            raise
 
     @functools.lru_cache()
     def hash(self):

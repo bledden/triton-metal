@@ -44,8 +44,31 @@ def _dump_dir() -> str:
     return _cached_dump_dir
 
 
+_cached_fallback_mode = _UNSET
+
+
+def _fallback_mode() -> str:
+    """Return the fallback mode from TRITON_METAL_FALLBACK env var.
+
+    Controls behavior when MSL codegen or Metal compilation fails:
+      "warn"   - emit a warning, then re-raise so Triton/torch.compile falls back (default)
+      "silent" - re-raise without a warning
+      "error"  - re-raise with the original exception (no fallback hint in message)
+
+    Caches the result to avoid repeated os.environ lookups.
+    """
+    global _cached_fallback_mode
+    if _cached_fallback_mode is _UNSET:
+        raw = os.environ.get("TRITON_METAL_FALLBACK", "warn").lower().strip()
+        if raw not in ("warn", "silent", "error"):
+            raw = "warn"
+        _cached_fallback_mode = raw
+    return _cached_fallback_mode
+
+
 def _reset_debug_cache():
     """Reset cached debug settings. Intended for use in tests."""
-    global _cached_debug_level, _cached_dump_dir
+    global _cached_debug_level, _cached_dump_dir, _cached_fallback_mode
     _cached_debug_level = _UNSET
     _cached_dump_dir = _UNSET
+    _cached_fallback_mode = _UNSET

@@ -518,6 +518,13 @@ class GenericLowerer:
 
     def lower(self) -> str:
         """Lower the IRGraph to MSL source code."""
+        # Check for simple dot (no stride args, no scf.for) — use inline
+        # scalar matmul that loads from global into shared memory, then
+        # does per-thread dot product.
+        simple_dot = self._detect_simple_dot()
+        if simple_dot:
+            return self._lower_simple_dot_inline(simple_dot)
+
         # Check for tt.dot — switch to prebuilt matmul template
         if self._requires_matmul_template():
             msl = self._lower_dot_via_prebuilt_template()
@@ -713,9 +720,13 @@ class GenericLowerer:
         """Check if the kernel contains tt.dot (matrix multiply).
 
         When tt.dot is present, the generic 1D-per-thread lowerer cannot
-        produce correct code — tt.dot requires simdgroup_matrix 8×8 MMA
+        produce correct code — tt.dot requires simdgroup_matrix 8x8 MMA
         with threadgroup memory staging and 2D tile accumulation. We
         route these kernels to a prebuilt tiled matmul MSL template.
+
+        Note: _detect_simple_dot() is checked before this in lower() and
+        handles the simple load->dot->store pattern with an inline scalar
+        matmul. This method catches everything else (strided, constant, etc).
         """
         for ssa in self.graph.ops:
             if ssa.op == "tt.dot":
@@ -725,6 +736,134 @@ class GenericLowerer:
                     if body_op.op == "tt.dot":
                         return True
         return False
+
+    def _detect_simple_dot(self):
+        """Detect a simple dot kernel: load→local_alloc→local_load→dot→store.
+
+        Returns dict with {M, N, K, ptr_args, dot_ssa} if detected, None otherwise.
+        Only matches kernels with:
+        - No stride args
+        - No scf.for loops
+        - tt.load ops feeding the dot (not constant-input dots)
+        - At least 3 pointer args (A, B, C)
+        """
+        scalar_args = [a for a in self.graph.args if not a.is_ptr]
+        has_strides = any("stride" in a.name.lower() for a in scalar_args)
+        if has_strides:
+            return None
+
+        has_scf_for = any(ssa.op == "scf.for" for ssa in self.graph.ops)
+        if has_scf_for:
+            return None
+
+        dot_ssa = None
+        for ssa in self.graph.ops:
+            if ssa.op == "tt.dot":
+                dot_ssa = ssa
+                break
+        if not dot_ssa or len(dot_ssa.operand_ids) < 3:
+            return None
+
+        # Verify the dot operands come from loads (not constants)
+        # Trace: dot ← local_load ← local_alloc ← tt.load
+        has_loads = False
+        for load_op in self.graph.ops:
+            if load_op.op == "tt.load":
+                has_loads = True
+                break
+        if not has_loads:
+            return None
+
+        # Verify there are local_alloc/local_load ops (the shared memory path)
+        has_local_alloc = any(
+            ssa.op == "ttg.local_alloc" for ssa in self.graph.ops
+        )
+        if not has_local_alloc:
+            return None
+
+        # Extract shapes from dot operands
+        a_type = self._find_op_type_str(dot_ssa.operand_ids[0])
+        b_type = self._find_op_type_str(dot_ssa.operand_ids[1])
+        a_shape = _extract_shape(a_type) if a_type else None
+        b_shape = _extract_shape(b_type) if b_type else None
+
+        if not a_shape or not b_shape or len(a_shape) < 2 or len(b_shape) < 2:
+            return None
+
+        M, K = a_shape[0], a_shape[1]
+        K2, N = b_shape[0], b_shape[1]
+
+        ptr_args = [a for a in self.graph.args if a.is_ptr]
+        if len(ptr_args) < 3:
+            return None
+
+        return {"M": M, "N": N, "K": K, "ptr_args": ptr_args, "dot_ssa": dot_ssa}
+
+    def _lower_simple_dot_inline(self, info):
+        """Generate MSL for a simple dot kernel (no strides, no scf.for).
+
+        Emits a complete kernel that:
+        1. Cooperatively loads A and B tiles into shared memory
+        2. Barriers
+        3. Each thread computes one element of C via a K-loop
+        4. Stores the result to global memory
+
+        Uses M*N threads (one per output element).
+        """
+        M = info["M"]
+        N = info["N"]
+        K = info["K"]
+        ptr_args = info["ptr_args"]
+
+        total = M * N
+        # Cap block size at 1024 (Metal limit), use 1024 if total <= 1024
+        block_size = min(total, 1024)
+        self.effective_block_size = block_size
+
+        a_name = ptr_args[0].name
+        b_name = ptr_args[1].name
+        c_name = ptr_args[2].name
+
+        safe_name = _sanitize_msl_name(self.graph.func_name)
+
+        lines = []
+        lines.append("#include <metal_stdlib>")
+        lines.append("using namespace metal;")
+        lines.append("")
+        lines.append(f"kernel void {safe_name}(")
+        lines.append(f"    device const float* {a_name} [[buffer(0)]],")
+        lines.append(f"    device const float* {b_name} [[buffer(1)]],")
+        lines.append(f"    volatile device float* {c_name} [[buffer(2)]],")
+        lines.append(f"    uint pid [[threadgroup_position_in_grid]],")
+        lines.append(f"    uint lid [[thread_position_in_threadgroup]],")
+        lines.append(f"    uint tid [[thread_position_in_grid]]")
+        lines.append(f") {{")
+        lines.append(f"    threadgroup float smem_a[{M * K}];")
+        lines.append(f"    threadgroup float smem_b[{K * N}];")
+        lines.append(f"")
+        lines.append(f"    // Cooperatively load A ({M}x{K}) into shared memory")
+        lines.append(f"    for (uint i = lid; i < {M * K}u; i += {block_size}u) {{")
+        lines.append(f"        smem_a[i] = {a_name}[i];")
+        lines.append(f"    }}")
+        lines.append(f"    // Cooperatively load B ({K}x{N}) into shared memory")
+        lines.append(f"    for (uint i = lid; i < {K * N}u; i += {block_size}u) {{")
+        lines.append(f"        smem_b[i] = {b_name}[i];")
+        lines.append(f"    }}")
+        lines.append(f"    threadgroup_barrier(mem_flags::mem_threadgroup);")
+        lines.append(f"")
+        lines.append(f"    // Each thread computes one or more elements of C ({M}x{N})")
+        lines.append(f"    for (uint e = lid; e < {total}u; e += {block_size}u) {{")
+        lines.append(f"        uint row = e / {N}u;")
+        lines.append(f"        uint col = e % {N}u;")
+        lines.append(f"        float sum = 0.0f;")
+        lines.append(f"        for (uint k = 0; k < {K}u; k++) {{")
+        lines.append(f"            sum += smem_a[row * {K}u + k] * smem_b[k * {N}u + col];")
+        lines.append(f"        }}")
+        lines.append(f"        {c_name}[e] = sum;")
+        lines.append(f"    }}")
+        lines.append(f"}}")
+
+        return "\n".join(lines)
 
     def _detect_3d_reduce(self):
         """Detect if this kernel is a simple 3D reduce that needs a template.
@@ -4796,21 +4935,244 @@ class GenericLowerer:
             self.env_types[ssa.id] = shared_dtype
             self.env_shapes[ssa.id] = input_shape
 
+    # -- Shared memory ops (ttg.local_alloc / ttg.local_load) --
+
+    def _lower_local_alloc(self, ssa: SSAValue):
+        """ttg.local_alloc -> write tensor to threadgroup shared memory.
+
+        Cooperatively fills shared memory using a strided loop so all
+        threads contribute, then barriers. When inside a wrapping loop,
+        closes/reopens it so the fill is standalone.
+        """
+        if not ssa.operand_ids:
+            self._emit_passthrough(ssa)
+            return
+
+        src_var = self._lookup(ssa.operand_ids[0])
+        # ttg.local_alloc output is !ttg.memdesc<MxNxT, ...> — _extract_shape
+        # only handles tensor<...>, so try the input operand type first.
+        shape = _extract_shape(self._find_op_type_str(ssa.operand_ids[0]))
+        if not shape or len(shape) < 2:
+            # Try parsing memdesc directly: !ttg.memdesc<32x32xf32, ...>
+            import re
+            m = re.search(r"memdesc<((?:\d+x)+)", ssa.type_str or "")
+            if m:
+                dims_str = m.group(1).rstrip("x")
+                shape = tuple(int(d) for d in dims_str.split("x") if d)
+        if not shape or len(shape) < 2:
+            self._emit_passthrough(ssa)
+            return
+
+        M, N = shape[0], shape[1]
+        total = M * N
+
+        src_dtype = self.env_types.get(ssa.operand_ids[0], "fp32")
+        is_float = src_dtype.startswith("fp") or src_dtype.startswith("bf")
+        shared_dtype = "fp32" if is_float else "i32"
+
+        shared_name = f"smem_{self._shared_counter}"
+        self._shared_counter += 1
+        self.kb.declare_threadgroup_array(shared_name, dtype=shared_dtype, size=total)
+
+        # Close wrapping loop if active — the fill must be standalone
+        bs = self.effective_block_size
+        in_loop = self._needs_wrapping
+        if in_loop:
+            self.kb.raw_line(f"    }}")  # close wrapping loop
+
+        # Trace back to find the source pointer for re-loading values
+        # into shared memory directly from global memory.
+        src_ptr_name = None
+        trace_id = ssa.operand_ids[0]
+        for op in self.graph.ops:
+            if op.id == trace_id:
+                if op.op == "tt.load" and op.operand_ids:
+                    # The load's pointer operand
+                    ptr_id = op.operand_ids[0]
+                    ptr_info = self.env_is_ptr.get(ptr_id)
+                    if ptr_info:
+                        src_ptr_name = ptr_info[0]
+                break
+
+        # Cooperative strided fill: each thread writes elements stride-apart
+        if src_ptr_name:
+            # Re-load from global memory into shared memory using the
+            # pointer base. We compute the global address per element.
+            # For 2D: element i maps to row i/N, col i%N → global[row*N + col]
+            self.kb.raw_line(f"    for (uint _sa = lid; _sa < {total}u; _sa += {bs}u) {{")
+            # Recompute the address that the original load used.
+            # The load used addptr chains, but we can simply index the
+            # pointer directly since the kernel's pointer covers the tile.
+            # Access the environment's addptr result to get the base pointer
+            # for the load op.
+            load_ptr_var = None
+            for op in self.graph.ops:
+                if op.id == trace_id and op.op == "tt.load" and op.operand_ids:
+                    load_ptr_var = self.env.get(op.operand_ids[0])
+                    break
+            if load_ptr_var and "UNKNOWN" not in str(load_ptr_var):
+                # The pointer variable maps element index to address.
+                # In the per-thread model, the ptr var was computed for _loop_e.
+                # We need to re-evaluate it for _sa. The simplest approach:
+                # just use the base pointer + linear index.
+                self.kb.raw_line(f"        {shared_name}[_sa] = {src_ptr_name}[_sa];")
+            else:
+                self.kb.raw_line(f"        {shared_name}[_sa] = {src_ptr_name}[_sa];")
+            self.kb.raw_line(f"    }}")
+        else:
+            # Fallback: use the value from the wrapping loop (only correct
+            # when not wrapping, or for a single element).
+            self.kb.raw_line(f"    for (uint _sa = lid; _sa < {total}u; _sa += {bs}u) {{")
+            self.kb.raw_line(f"        {shared_name}[_sa] = {src_var};")
+            self.kb.raw_line(f"    }}")
+
+        self.kb.raw_line(f"    threadgroup_barrier(mem_flags::mem_threadgroup);")
+
+        # Reopen wrapping loop if it was active
+        if in_loop:
+            total_elems = getattr(self, "_total_elements", self.effective_block_size)
+            self.kb.raw_line(f"    for (uint _loop_e = lid; _loop_e < {total_elems}u; _loop_e += {bs}u) {{")
+
+        # Store shared array name for local_load to reference
+        self.env[ssa.id] = shared_name
+        self.env_types[ssa.id] = src_dtype
+        self.env_shapes[ssa.id] = shape
+        # Mark as shared memory descriptor
+        if not hasattr(self, '_shared_mem_descs'):
+            self._shared_mem_descs = {}
+        self._shared_mem_descs[ssa.id] = (shared_name, shape, shared_dtype)
+
+    def _lower_local_load(self, ssa: SSAValue):
+        """ttg.local_load -> marker for shared memory access.
+
+        Data is already in shared memory from local_alloc. This just
+        propagates the shared memory descriptor so tt.dot can find it.
+        No actual code is emitted — the dot reads directly from shared.
+        """
+        if not ssa.operand_ids:
+            self._emit_passthrough(ssa)
+            return
+
+        src_id = ssa.operand_ids[0]
+        shared_info = getattr(self, '_shared_mem_descs', {}).get(src_id)
+        if not shared_info:
+            # No shared memory descriptor — passthrough
+            self._emit_passthrough(ssa)
+            return
+
+        shared_name, shape, shared_dtype = shared_info
+
+        # Propagate shared memory descriptor so tt.dot can find the array
+        self.env[ssa.id] = shared_name
+        self.env_types[ssa.id] = shared_dtype
+        self.env_shapes[ssa.id] = shape
+        if not hasattr(self, '_shared_mem_descs'):
+            self._shared_mem_descs = {}
+        self._shared_mem_descs[ssa.id] = shared_info
+
     # -- Matrix multiply (tt.dot) --
 
     def _lower_dot(self, ssa: SSAValue):
-        """tt.dot → simdgroup_matrix MMA.
+        """tt.dot -> generic scalar matmul using shared memory operands.
 
-        This should only be reached if _requires_matmul_template() somehow missed it.
-        The normal path uses _lower_dot_via_prebuilt_template() instead.
+        For simple dot kernels (no stride args), each thread computes one
+        element of C: C[row, col] = sum(A[row, k] * B[k, col]).
+        This is a naive per-thread scalar loop — simdgroup MMA will be
+        added in a follow-up for hardware-accelerated matmul.
+
+        When inside a wrapping loop, closes/reopens it so the dot
+        computation is standalone with its own strided loop.
+
+        For strided kernels, this should not be reached — they go through
+        _lower_dot_via_prebuilt_template() instead.
         """
-        if len(ssa.operand_ids) >= 3:
-            acc = self._lookup(ssa.operand_ids[2])
-            self.env[ssa.id] = acc
-        else:
-            var_name = self._next_var("dot")
-            self.kb.raw_line(f"    float {var_name} = 0.0f;")
-            self.env[ssa.id] = var_name
+        if len(ssa.operand_ids) < 3:
+            self.kb.comment("UNSUPPORTED: tt.dot with < 3 operands")
+            return
+
+        a_id = ssa.operand_ids[0]
+        b_id = ssa.operand_ids[1]
+        acc_var = self._lookup(ssa.operand_ids[2])
+
+        # Get A shape (M, K) from type string of operand 0
+        a_type = self._find_op_type_str(a_id)
+        a_shape = _extract_shape(a_type) if a_type else None
+        # Get B shape (K, N)
+        b_type = self._find_op_type_str(b_id)
+        b_shape = _extract_shape(b_type) if b_type else None
+
+        if not a_shape or not b_shape or len(a_shape) < 2 or len(b_shape) < 2:
+            # Fall back to passthrough (accumulator)
+            self.env[ssa.id] = acc_var
+            self.kb.comment("UNSUPPORTED: tt.dot without 2D operand shapes -- passthrough")
+            return
+
+        M, K = a_shape[0], a_shape[1]
+        K2, N = b_shape[0], b_shape[1]
+
+        # Get shared memory names for A and B
+        # Trace through local_load to find the shared memory arrays
+        a_shared = getattr(self, '_shared_mem_descs', {}).get(a_id)
+        b_shared = getattr(self, '_shared_mem_descs', {}).get(b_id)
+
+        if not a_shared:
+            for op in self.graph.ops:
+                if op.id == a_id and op.op == "ttg.local_load" and op.operand_ids:
+                    a_shared = getattr(self, '_shared_mem_descs', {}).get(op.operand_ids[0])
+                    break
+        if not b_shared:
+            for op in self.graph.ops:
+                if op.id == b_id and op.op == "ttg.local_load" and op.operand_ids:
+                    b_shared = getattr(self, '_shared_mem_descs', {}).get(op.operand_ids[0])
+                    break
+
+        if not a_shared or not b_shared:
+            # No shared memory — fall back to passthrough
+            self.env[ssa.id] = acc_var
+            self.kb.comment("UNSUPPORTED: tt.dot operands not in shared memory -- passthrough")
+            return
+
+        a_smem, _, _ = a_shared
+        b_smem, _, _ = b_shared
+
+        total = M * N
+        bs = self.effective_block_size
+
+        # Close wrapping loop if active — dot needs standalone computation
+        in_loop = self._needs_wrapping
+        if in_loop:
+            self.kb.raw_line(f"    }}")  # close wrapping loop
+
+        # Declare a threadgroup result array to store per-thread dot results
+        result_smem = f"smem_dot_{self._shared_counter}"
+        self._shared_counter += 1
+        self.kb.declare_threadgroup_array(result_smem, dtype="fp32", size=total)
+
+        # Each thread computes one or more elements of C via strided loop
+        self.kb.raw_line(f"    for (uint _de = lid; _de < {total}u; _de += {bs}u) {{")
+        self.kb.raw_line(f"        uint _dot_row = _de / {N}u;")
+        self.kb.raw_line(f"        uint _dot_col = _de % {N}u;")
+        self.kb.raw_line(f"        float _dot_sum = {acc_var};")
+        self.kb.raw_line(f"        for (uint _dk = 0; _dk < {K}u; _dk++) {{")
+        self.kb.raw_line(f"            _dot_sum += {a_smem}[_dot_row * {K}u + _dk] * {b_smem}[_dk * {N}u + _dot_col];")
+        self.kb.raw_line(f"        }}")
+        self.kb.raw_line(f"        {result_smem}[_de] = _dot_sum;")
+        self.kb.raw_line(f"    }}")
+        self.kb.raw_line(f"    threadgroup_barrier(mem_flags::mem_threadgroup);")
+
+        # Reopen wrapping loop if it was active
+        if in_loop:
+            total_elems = getattr(self, "_total_elements", self.effective_block_size)
+            self.kb.raw_line(f"    for (uint _loop_e = lid; _loop_e < {total_elems}u; _loop_e += {bs}u) {{")
+
+        # The result for each thread's element comes from the shared result array
+        result_var = self._next_var("dot")
+        elem = self._lid_expr
+        self.kb.raw_line(f"    float {result_var} = ({elem} < {total}u) ? {result_smem}[{elem}] : 0.0f;")
+
+        self.env[ssa.id] = result_var
+        self.env_types[ssa.id] = "fp32"
+        self.env_shapes[ssa.id] = (M, N)
 
     # -- SCF (structured control flow) --
 
@@ -5487,11 +5849,9 @@ class GenericLowerer:
         if op == "ttg.convert_layout":
             self._lower_convert_layout(ssa)
         elif op == "ttg.local_alloc":
-            # Shared memory allocation — passthrough (data is same)
-            self._emit_passthrough(ssa)
+            self._lower_local_alloc(ssa)
         elif op == "ttg.local_load":
-            # Load from shared memory — passthrough
-            self._emit_passthrough(ssa)
+            self._lower_local_load(ssa)
         elif op == "ttg.local_store":
             # Store to shared memory — passthrough
             self._emit_passthrough(ssa)

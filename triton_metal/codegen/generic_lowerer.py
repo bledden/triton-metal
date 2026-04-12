@@ -737,25 +737,85 @@ class GenericLowerer:
                         return True
         return False
 
+    def _resolve_constant_int(self, ssa_id):
+        """Resolve an SSA ID to its integer constant value, or None."""
+        for ssa in self.graph.ops:
+            if ssa.id == ssa_id and ssa.op == "arith.constant":
+                val = ssa.attrs.get("value")
+                if isinstance(val, int):
+                    return val
+        return None
+
     def _detect_simple_dot(self):
         """Detect a simple dot kernel: load→local_alloc→local_load→dot→store.
 
         Returns dict with {M, N, K, ptr_args, dot_ssa} if detected, None otherwise.
-        Only matches kernels with:
-        - No stride args
-        - No scf.for loops
-        - tt.load ops feeding the dot (not constant-input dots)
-        - At least 3 pointer args (A, B, C)
+
+        Handles two patterns:
+        1. Simple (no scf.for): tile fits in one block, no K-loop needed.
+        2. K-loop (scf.for wrapping tt.dot): K > BLOCK_K, accumulate across tiles.
+           Returns extra fields: has_k_loop=True, BLOCK_K, BLOCK_M, BLOCK_N,
+           and scalar_args for M/N/K runtime values.
+
+        Rejects kernels with stride args (those go through the strided template).
         """
         scalar_args = [a for a in self.graph.args if not a.is_ptr]
         has_strides = any("stride" in a.name.lower() for a in scalar_args)
         if has_strides:
             return None
 
-        has_scf_for = any(ssa.op == "scf.for" for ssa in self.graph.ops)
-        if has_scf_for:
-            return None
+        # Find scf.for and check if it contains tt.dot (K-loop pattern)
+        scf_for_ssa = None
+        for ssa in self.graph.ops:
+            if ssa.op == "scf.for":
+                scf_for_ssa = ssa
+                break
 
+        if scf_for_ssa:
+            # Check if the scf.for body contains tt.dot
+            dot_in_loop = None
+            has_loads_in_loop = False
+            has_local_alloc_in_loop = False
+            if scf_for_ssa.region_ops:
+                for body_op in scf_for_ssa.region_ops:
+                    if body_op.op == "tt.dot":
+                        dot_in_loop = body_op
+                    elif body_op.op == "tt.load":
+                        has_loads_in_loop = True
+                    elif body_op.op == "ttg.local_alloc":
+                        has_local_alloc_in_loop = True
+
+            if not dot_in_loop:
+                return None  # scf.for without dot — not our pattern
+
+            # Extract BLOCK_M x BLOCK_K and BLOCK_K x BLOCK_N from dot operands
+            a_type = self._find_op_type_str(dot_in_loop.operand_ids[0])
+            b_type = self._find_op_type_str(dot_in_loop.operand_ids[1])
+            a_shape = _extract_shape(a_type) if a_type else None
+            b_shape = _extract_shape(b_type) if b_type else None
+
+            if not a_shape or not b_shape or len(a_shape) < 2 or len(b_shape) < 2:
+                return None
+
+            BLOCK_M, BLOCK_K = a_shape[0], a_shape[1]
+            BLOCK_K2, BLOCK_N = b_shape[0], b_shape[1]
+
+            ptr_args = [a for a in self.graph.args if a.is_ptr]
+            if len(ptr_args) < 3:
+                return None
+
+            # Try to find M, N, K scalar args by name
+            scalar_arg_map = {a.name: a for a in scalar_args}
+
+            return {
+                "BLOCK_M": BLOCK_M, "BLOCK_N": BLOCK_N, "BLOCK_K": BLOCK_K,
+                "ptr_args": ptr_args, "dot_ssa": dot_in_loop,
+                "has_k_loop": True,
+                "scalar_args": scalar_arg_map,
+                "all_scalar_args": scalar_args,
+            }
+
+        # --- Non-K-loop: simple dot without scf.for ---
         dot_ssa = None
         for ssa in self.graph.ops:
             if ssa.op == "tt.dot":
@@ -809,7 +869,14 @@ class GenericLowerer:
         128 threads per threadgroup (4 SIMD groups), K-loop in steps of 8,
         data staged through threadgroup shared memory. For M or N > 32 the
         kernel loops over 32x32 output tiles within a single threadgroup.
+
+        When has_k_loop is True, generates a pid-tiled kernel where each
+        threadgroup handles one BLOCK_M x BLOCK_N output tile and iterates
+        over K in steps of BLOCK_K.
         """
+        if info.get("has_k_loop"):
+            return self._lower_k_loop_dot_inline(info)
+
         M = info["M"]
         N = info["N"]
         K = info["K"]
@@ -943,6 +1010,184 @@ class GenericLowerer:
 
         lines.append(f"    }} // tile_col")
         lines.append(f"    }} // tile_row")
+        lines.append(f"}}")
+
+        return "\n".join(lines)
+
+    def _lower_k_loop_dot_inline(self, info):
+        """Generate MSL for a K-loop dot kernel using simdgroup MMA.
+
+        Each threadgroup computes one BLOCK_M x BLOCK_N output tile, iterating
+        over K in steps of BLOCK_K. Uses pid_m (program_id(0)) and pid_n
+        (program_id(1)) to select which output tile to compute.
+
+        128 threads = 4 SIMD groups x 32 threads per threadgroup.
+        Each SIMD group handles an 8-column slice of the 32-wide output tile.
+        The inner MMA loop iterates BLOCK_K in steps of 8.
+        """
+        BLOCK_M = info["BLOCK_M"]
+        BLOCK_N = info["BLOCK_N"]
+        BLOCK_K = info["BLOCK_K"]
+        ptr_args = info["ptr_args"]
+        scalar_arg_map = info.get("scalar_args", {})
+        all_scalar_args = info.get("all_scalar_args", [])
+
+        # 128 threads = 4 SIMD groups x 32 threads
+        self.effective_block_size = 128
+
+        # Signal 2D grid dispatch (pid_m on axis 0, pid_n on axis 1)
+        self._used_pid_axes = {0, 1}
+
+        a_name = ptr_args[0].name
+        b_name = ptr_args[1].name
+        c_name = ptr_args[2].name
+
+        # Determine input element type from A pointer arg
+        a_elem = ptr_args[0].elem_type
+        if a_elem in ("f16",):
+            input_msl_type = "half"
+        else:
+            input_msl_type = "float"
+
+        # Determine output element type from C pointer arg
+        c_elem = ptr_args[2].elem_type
+        if c_elem in ("f16",):
+            output_msl_type = "half"
+        else:
+            output_msl_type = "float"
+
+        tg_type = "float"
+        frag_type = "simdgroup_float8x8"
+        cast_load = "float"
+
+        safe_name = _sanitize_msl_name(self.graph.func_name)
+
+        # Number of row tiles per MMA step (BLOCK_M / 8)
+        n_row_tiles = BLOCK_M // 8
+
+        # Threadgroup memory sizes
+        tg_a_size = BLOCK_M * BLOCK_K
+        tg_b_size = BLOCK_K * BLOCK_N
+
+        lines = []
+        lines.append("#include <metal_stdlib>")
+        lines.append("#include <metal_simdgroup_matrix>")
+        lines.append("using namespace metal;")
+        lines.append("")
+
+        # Build kernel signature with all args from the IR
+        lines.append(f"kernel void {safe_name}(")
+        arg_decls = []
+        for i, arg in enumerate(self.graph.args):
+            if arg.is_ptr:
+                arg_msl_type = triton_type_to_msl(arg.elem_type)
+                arg_decls.append(
+                    f"    device {arg_msl_type}* {arg.name} [[buffer({i})]]")
+            else:
+                arg_decls.append(
+                    f"    device int* {arg.name}_buf [[buffer({i})]]")
+        lines.append(",\n".join(arg_decls) + ",")
+        lines.append(f"    uint3 pid3 [[threadgroup_position_in_grid]],")
+        lines.append(f"    uint sgitg [[simdgroup_index_in_threadgroup]],")
+        lines.append(f"    uint tiitg [[thread_index_in_threadgroup]]")
+        lines.append(f") {{")
+
+        # Unpack scalar args from buffers
+        for arg in all_scalar_args:
+            lines.append(f"    int {arg.name} = {arg.name}_buf[0];")
+
+        lines.append(f"")
+        lines.append(f"    uint pid_m = pid3.x;")
+        lines.append(f"    uint pid_n = pid3.y;")
+        lines.append(f"")
+
+        # Determine M, N, K — use scalar args if available, else BLOCK dims
+        has_M = "M" in scalar_arg_map
+        has_N = "N" in scalar_arg_map
+        has_K = "K" in scalar_arg_map
+
+        if has_M:
+            lines.append(f"    uint _M = (uint)M;")
+        else:
+            lines.append(f"    uint _M = {BLOCK_M}u;  // no M arg, single tile")
+        if has_N:
+            lines.append(f"    uint _N = (uint)N;")
+        else:
+            lines.append(f"    uint _N = {BLOCK_N}u;  // no N arg, single tile")
+        if has_K:
+            lines.append(f"    uint _K = (uint)K;")
+        else:
+            lines.append(f"    uint _K = {BLOCK_K}u;  // no K arg, single tile")
+
+        lines.append(f"")
+        lines.append(f"    uint row_base = pid_m * {BLOCK_M}u;")
+        lines.append(f"    uint col_base = pid_n * {BLOCK_N}u;")
+        lines.append(f"")
+        lines.append(f"    threadgroup {tg_type} tg_A[{tg_a_size}];")
+        lines.append(f"    threadgroup {tg_type} tg_B[{tg_b_size}];")
+        lines.append(f"")
+
+        # Declare accumulators — one per 8-row tile
+        acc_names = [f"acc{i}" for i in range(n_row_tiles)]
+        lines.append(f"    {frag_type} {', '.join(n + '(0)' for n in acc_names)};")
+        lines.append(f"    {frag_type} a_frag, b_frag;")
+        lines.append(f"")
+
+        # K-loop: iterate over K in steps of BLOCK_K
+        lines.append(f"    for (uint _k = 0u; _k < _K; _k += {BLOCK_K}u) {{")
+        lines.append(f"")
+
+        # Cooperative load A tile (BLOCK_M x BLOCK_K) from global memory
+        lines.append(f"        // Load A tile ({BLOCK_M}x{BLOCK_K})")
+        lines.append(f"        for (uint i = tiitg; i < {tg_a_size}u; i += 128u) {{")
+        lines.append(f"            uint r = i / {BLOCK_K}u, c = i % {BLOCK_K}u;")
+        lines.append(f"            uint gr = row_base + r, gc = _k + c;")
+        lines.append(f"            tg_A[i] = (gr < _M && gc < _K) ? {cast_load}({a_name}[gr * _K + gc]) : 0.0f;")
+        lines.append(f"        }}")
+
+        # Cooperative load B tile (BLOCK_K x BLOCK_N) from global memory
+        lines.append(f"        // Load B tile ({BLOCK_K}x{BLOCK_N})")
+        lines.append(f"        for (uint i = tiitg; i < {tg_b_size}u; i += 128u) {{")
+        lines.append(f"            uint r = i / {BLOCK_N}u, c = i % {BLOCK_N}u;")
+        lines.append(f"            uint gr = _k + r, gc = col_base + c;")
+        lines.append(f"            tg_B[i] = (gr < _K && gc < _N) ? {cast_load}({b_name}[gr * _N + gc]) : 0.0f;")
+        lines.append(f"        }}")
+        lines.append(f"        threadgroup_barrier(mem_flags::mem_threadgroup);")
+        lines.append(f"")
+
+        # Inner MMA: iterate BLOCK_K in steps of 8
+        lines.append(f"        // MMA across BLOCK_K in steps of 8")
+        lines.append(f"        for (uint kk = 0u; kk < {BLOCK_K}u; kk += 8u) {{")
+        lines.append(f"            simdgroup_load(b_frag, tg_B + kk * {BLOCK_N}u + sgitg * 8u, {BLOCK_N});")
+        for t in range(n_row_tiles):
+            lines.append(f"            simdgroup_load(a_frag, tg_A + {t}u * 8u * {BLOCK_K}u + kk, {BLOCK_K});")
+            lines.append(f"            simdgroup_multiply_accumulate({acc_names[t]}, a_frag, b_frag, {acc_names[t]});")
+        lines.append(f"        }}")
+        lines.append(f"        threadgroup_barrier(mem_flags::mem_threadgroup);")
+        lines.append(f"    }} // K-loop")
+        lines.append(f"")
+
+        # Store results to global memory
+        lines.append(f"    // Store {BLOCK_M}x{BLOCK_N} result tile")
+        col_expr = "col_base + sgitg * 8u"
+        if output_msl_type == "float":
+            for t in range(n_row_tiles):
+                row_off = t * 8
+                lines.append(f"    simdgroup_store({acc_names[t]}, {c_name} + (row_base + {row_off}u) * _N + {col_expr}, _N);")
+        else:
+            # For half output, store through threadgroup memory and convert
+            lines.append(f"    threadgroup float tg_out[{BLOCK_M} * 8];")
+            for t in range(n_row_tiles):
+                lines.append(f"    simdgroup_store({acc_names[t]}, tg_out + {t * 64}u, 8);")
+            lines.append(f"    threadgroup_barrier(mem_flags::mem_threadgroup);")
+            lines.append(f"    for (uint i = tiitg; i < {BLOCK_M * 8}u; i += 128u) {{")
+            lines.append(f"        uint r = i / 8u, c = i % 8u;")
+            lines.append(f"        uint gr = row_base + r, gc = col_base + sgitg * 8u + c;")
+            lines.append(f"        if (gr < _M && gc < _N) {{")
+            lines.append(f"            {c_name}[gr * _N + gc] = {output_msl_type}(tg_out[i]);")
+            lines.append(f"        }}")
+            lines.append(f"    }}")
+
         lines.append(f"}}")
 
         return "\n".join(lines)

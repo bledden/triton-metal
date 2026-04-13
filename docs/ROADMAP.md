@@ -193,11 +193,21 @@ These items improve runtime performance without changing correctness. Can be wor
 | **Dependencies** | None (can use existing kernel paths) |
 | **Files** | `benchmarks/bench_all.py` (extend), new `benchmarks/bench_matmul_sweep.py`, new `benchmarks/bench_attention.py`, `benchmarks/bench_regression.py` (extend with JSON output) |
 
+### 2E. Shared Memory Lifetime Analysis and Aliasing
+
+| Aspect | Detail |
+|--------|--------|
+| **What** | Implement shared memory reuse: when multiple `ttg.local_alloc` arrays have non-overlapping lifetimes, alias them to the same physical shared memory. Currently each `local_alloc` gets a unique `threadgroup` array, which accumulates to >32KB for complex kernels like FlashAttention with HEAD_DIM=64 (41KB needed, 32KB limit). Analyze SSA def-use chains to determine which arrays are live simultaneously, then assign overlapping arrays to the same base allocation. |
+| **Why** | Metal caps threadgroup memory at 32KB. FlashAttention with HEAD_DIM=64 needs Q(8KB) + K(8KB) + V(8KB) + S(4KB) + dot_result(8KB) = 36KB+. K can be freed before V is loaded, so K and V can alias. This optimization would unlock HEAD_DIM=64 flash attention and larger matmul tiles. |
+| **Scope** | ~200 LOC. Lifetime analysis pass after the lowerer's op scan, shared memory allocation planner, alias assignment. |
+| **Dependencies** | Phase 1B (ttg.local_alloc as real ops — DONE) |
+| **Files** | `triton_metal/codegen/generic_lowerer.py` (lifetime analysis + alias assignment) |
+
 **Phase 2 summary:**
 
 | Metric | Value |
 |--------|-------|
-| Total estimated LOC | ~1,150 |
+| Total estimated LOC | ~1,350 |
 | Complexity | Medium |
 | Parallelizable with | Phase 1 (items 2A, 2B, 2D are fully independent) |
 

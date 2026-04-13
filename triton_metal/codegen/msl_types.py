@@ -23,6 +23,15 @@ _TYPE_MAP = {
     "u16": "ushort",
     "u32": "uint",
     "u64": "ulong",
+    # FP8 types — no hardware support on Metal, stored as uchar (uint8_t).
+    # Software emulation converts to/from float for computation.
+    "fp8e4nv": "uchar",    # e4m3 (4 exponent, 3 mantissa, bias 7)
+    "fp8e5": "uchar",      # e5m2 (5 exponent, 2 mantissa, bias 15)
+    "fp8e4b15": "uchar",   # e4m3 with bias 15
+    "fp8e4b8": "uchar",    # e4m3 with bias 8
+    "fp8e5b16": "uchar",   # e5m2 with bias 16
+    "fp8_e4m3": "uchar",   # alias
+    "fp8_e5m2": "uchar",   # alias
 }
 
 # Pointer types map to device pointers.

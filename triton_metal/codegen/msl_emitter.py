@@ -32,8 +32,12 @@ def _msl_compute_type(dtype):
 
     For fp16, computations are done in float and cast back to half on store.
     This matches Triton's behavior and avoids precision issues.
+    FP8 types always compute in float — stored as uchar, converted on load/store.
     """
     if dtype in ("fp16", "bf16"):
+        return "float"
+    from triton_metal.codegen.msl_builtins import is_fp8_type
+    if is_fp8_type(dtype):
         return "float"
     return triton_type_to_msl(dtype)
 
@@ -42,6 +46,9 @@ def _msl_zero(dtype):
     """Get the zero literal for a MSL type."""
     if dtype in ("fp16", "bf16", "fp32", "f32"):
         return "0.0f"
+    from triton_metal.codegen.msl_builtins import is_fp8_type
+    if is_fp8_type(dtype):
+        return "0.0f"  # FP8 computes in float
     return "0"
 
 
@@ -879,20 +886,31 @@ def make_matmul_kernel(block_m=32, block_n=32, block_k=32, dtype="fp32"):
         block_k: Tile depth (inner dimension chunk).
         dtype: Data type.
     """
+    from triton_metal.codegen.msl_builtins import is_fp8_type, fp8_to_float_func, fp8_device_functions
+
+    fp8_input = is_fp8_type(dtype)
+
     # Threadgroup size: one thread per output element in the tile
     threads_per_tg = block_m * block_n
 
     kb = KernelBuilder("matmul_kernel", block_size=threads_per_tg)
     kb.add_ptr_arg("A", dtype=dtype, const=True)
     kb.add_ptr_arg("B", dtype=dtype, const=True)
-    kb.add_ptr_arg("C", dtype=dtype, const=False)
+    # Output is always fp32 for FP8 inputs
+    out_dtype = "fp32" if fp8_input else dtype
+    kb.add_ptr_arg("C", dtype=out_dtype, const=False)
     kb.add_scalar_arg("M", dtype="u32")
     kb.add_scalar_arg("N", dtype="u32")
     kb.add_scalar_arg("K", dtype="u32")
 
-    # Shared memory tiles
-    kb.declare_threadgroup_array("tileA", dtype=dtype, size=block_m * block_k)
-    kb.declare_threadgroup_array("tileB", dtype=dtype, size=block_k * block_n)
+    # For FP8, inject conversion device functions
+    if fp8_input:
+        for fn_src in fp8_device_functions(dtype):
+            kb._device_functions.append(fn_src)
+
+    # Shared memory tiles (always float for computation)
+    kb.declare_threadgroup_array("tileA", dtype="fp32", size=block_m * block_k)
+    kb.declare_threadgroup_array("tileB", dtype="fp32", size=block_k * block_n)
 
     # Thread mapping: each thread computes one element of the output tile
     # pid.x = tile column, pid.y = tile row (we use 2D grid)
@@ -922,27 +940,50 @@ def make_matmul_kernel(block_m=32, block_n=32, block_k=32, dtype="fp32"):
     # Each thread loads one element. We need block_m * block_k elements loaded
     # by block_m * block_n threads, so some threads load multiple elements.
     kb._var("a_col", f"tk * {block_k}u + local_col", ty="uint")
-    kb.raw_line(f"if (global_row < M && a_col < K) {{")
-    kb.indent()
-    kb.raw_line(f"tileA[local_row * {block_k}u + local_col] = A[global_row * K + a_col];")
-    kb.dedent()
-    kb.raw_line("} else {")
-    kb.indent()
-    kb.raw_line(f"tileA[local_row * {block_k}u + local_col] = 0.0f;")
-    kb.dedent()
-    kb.raw_line("}")
+    if fp8_input:
+        to_float = fp8_to_float_func(dtype)
+        kb.raw_line(f"if (global_row < M && a_col < K) {{")
+        kb.indent()
+        kb.raw_line(f"tileA[local_row * {block_k}u + local_col] = {to_float}(A[global_row * K + a_col]);")
+        kb.dedent()
+        kb.raw_line("} else {")
+        kb.indent()
+        kb.raw_line(f"tileA[local_row * {block_k}u + local_col] = 0.0f;")
+        kb.dedent()
+        kb.raw_line("}")
+    else:
+        kb.raw_line(f"if (global_row < M && a_col < K) {{")
+        kb.indent()
+        kb.raw_line(f"tileA[local_row * {block_k}u + local_col] = A[global_row * K + a_col];")
+        kb.dedent()
+        kb.raw_line("} else {")
+        kb.indent()
+        kb.raw_line(f"tileA[local_row * {block_k}u + local_col] = 0.0f;")
+        kb.dedent()
+        kb.raw_line("}")
 
     # Load B tile: tileB[local_row_k][local_col] = B[tk*BLOCK_K + local_row_k][global_col]
     kb._var("b_row", f"tk * {block_k}u + local_row", ty="uint")
-    kb.raw_line(f"if (b_row < K && global_col < N) {{")
-    kb.indent()
-    kb.raw_line(f"tileB[local_row * {block_n}u + local_col] = B[b_row * N + global_col];")
-    kb.dedent()
-    kb.raw_line("} else {")
-    kb.indent()
-    kb.raw_line(f"tileB[local_row * {block_n}u + local_col] = 0.0f;")
-    kb.dedent()
-    kb.raw_line("}")
+    if fp8_input:
+        kb.raw_line(f"if (b_row < K && global_col < N) {{")
+        kb.indent()
+        kb.raw_line(f"tileB[local_row * {block_n}u + local_col] = {to_float}(B[b_row * N + global_col]);")
+        kb.dedent()
+        kb.raw_line("} else {")
+        kb.indent()
+        kb.raw_line(f"tileB[local_row * {block_n}u + local_col] = 0.0f;")
+        kb.dedent()
+        kb.raw_line("}")
+    else:
+        kb.raw_line(f"if (b_row < K && global_col < N) {{")
+        kb.indent()
+        kb.raw_line(f"tileB[local_row * {block_n}u + local_col] = B[b_row * N + global_col];")
+        kb.dedent()
+        kb.raw_line("} else {")
+        kb.indent()
+        kb.raw_line(f"tileB[local_row * {block_n}u + local_col] = 0.0f;")
+        kb.dedent()
+        kb.raw_line("}")
 
     kb.barrier("threadgroup")
 

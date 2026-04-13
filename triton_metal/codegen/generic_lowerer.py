@@ -79,11 +79,28 @@ def _mlir_to_triton_dtype(mlir_type: str) -> str:
     result = _map.get(mlir_type)
     if result:
         return result
+    # FP8 MLIR types: f8E4M3FN, f8E5M2, f8E4M3B11FNUZ, f8E4M3FNUZ, f8E5M2FNUZ
+    _fp8_map = {
+        "f8E4M3FN": "fp8e4nv",
+        "f8E4M3FNUZ": "fp8e4nv",
+        "f8E5M2": "fp8e5",
+        "f8E5M2FNUZ": "fp8e5",
+        "f8E4M3B11FNUZ": "fp8e4b15",
+        "f8E4M3": "fp8e4nv",
+    }
+    fp8_result = _fp8_map.get(mlir_type)
+    if fp8_result:
+        return fp8_result
     # Handle multi-dim type strings like "4xi32" → extract base type
     import re
     m = re.search(r"([a-z]\w*)$", mlir_type)
     if m:
-        return _map.get(m.group(1), "fp32")
+        base = m.group(1)
+        return _map.get(base, "fp32")
+    # Also check for FP8 in multi-dim strings like "256xf8E4M3FN"
+    m = re.search(r"(f8E\w+)$", mlir_type)
+    if m:
+        return _fp8_map.get(m.group(1), "fp32")
     return "fp32"
 
 
@@ -1587,7 +1604,12 @@ class GenericLowerer:
                 has_accumulator_load = True
 
         # MSL type mapping
-        if dtype in ("fp16", "f16"):
+        from triton_metal.codegen.msl_builtins import is_fp8_type
+        is_fp8_dot = is_fp8_type(dtype)
+        if is_fp8_dot:
+            msl_type = "uchar"  # FP8 stored as uchar
+            compute_type = "float"
+        elif dtype in ("fp16", "f16"):
             msl_type = "half"
             compute_type = "float"
         elif dtype in ("bf16",):
@@ -1622,7 +1644,8 @@ class GenericLowerer:
         arg_decls = []
         for i, arg in enumerate(self.graph.args):
             if arg.is_ptr:
-                arg_msl_type = triton_type_to_msl(arg.elem_type)
+                arg_triton_dtype = _mlir_to_triton_dtype(arg.elem_type)
+                arg_msl_type = triton_type_to_msl(arg_triton_dtype)
                 arg_decls.append(
                     f"    volatile device {arg_msl_type}* {arg.name} [[buffer({i})]]")
             else:
@@ -1772,7 +1795,7 @@ class GenericLowerer:
             b_s0, b_s1 = stride_map[b_ptr.name]
             c_s0, c_s1 = stride_map[c_ptr.name]
 
-        c_type = triton_type_to_msl(c_ptr.elem_type)
+        c_type = triton_type_to_msl(_mlir_to_triton_dtype(c_ptr.elem_type))
 
         # Detect epilogue from IR ops after tt.dot
         epilogue = self._detect_dot_epilogue()
@@ -1807,6 +1830,24 @@ class GenericLowerer:
             lines.append(f"    if (lid < {N}u) _bias[lid] = ({compute_type}){c_ptr.name}[lid * {c_s1}];")
             lines.append(f"    threadgroup_barrier(mem_flags::mem_threadgroup);")
 
+        # FP8 dot: inject conversion functions and use them for A/B loads
+        if is_fp8_dot:
+            from triton_metal.codegen.msl_builtins import fp8_to_float_func, fp8_device_functions
+            a_dtype = _mlir_to_triton_dtype(a_ptr.elem_type)
+            b_dtype = _mlir_to_triton_dtype(b_ptr.elem_type)
+            fp8_funcs_added = set()
+            for dt in (a_dtype, b_dtype):
+                if is_fp8_type(dt) and dt not in fp8_funcs_added:
+                    fp8_funcs_added.add(dt)
+                    for fn_src in fp8_device_functions(dt):
+                        lines.insert(2, fn_src)  # Insert after "using namespace metal;"
+                        lines.insert(3, "")
+            a_load = lambda idx: f"{fp8_to_float_func(a_dtype)}({a_ptr.name}[{idx}])" if is_fp8_type(a_dtype) else f"({compute_type}){a_ptr.name}[{idx}]"
+            b_load = lambda idx: f"{fp8_to_float_func(b_dtype)}({b_ptr.name}[{idx}])" if is_fp8_type(b_dtype) else f"({compute_type}){b_ptr.name}[{idx}]"
+        else:
+            a_load = lambda idx: f"({compute_type}){a_ptr.name}[{idx}]"
+            b_load = lambda idx: f"({compute_type}){b_ptr.name}[{idx}]"
+
         # Emit the matmul loop
         if is_3d_dot:
             total = B_batch * M * N
@@ -1819,8 +1860,10 @@ class GenericLowerer:
             lines.append(f"        uint _j = _e % {N}u;")
             lines.append(f"        {compute_type} _sum = 0.0f;")
             lines.append(f"        for (uint _k = 0; _k < {K}u; _k++) {{")
-            lines.append(f"            _sum += ({compute_type}){a_ptr.name}[_b * {a_sb} + (_pid_m_off + _i) * {a_s0} + _k * {a_s1}]")
-            lines.append(f"                  * ({compute_type}){b_ptr.name}[_b * {b_sb} + _k * {b_s0} + (_pid_n_off + _j) * {b_s1}];")
+            a_idx = f"_b * {a_sb} + (_pid_m_off + _i) * {a_s0} + _k * {a_s1}"
+            b_idx = f"_b * {b_sb} + _k * {b_s0} + (_pid_n_off + _j) * {b_s1}"
+            lines.append(f"            _sum += {a_load(a_idx)}")
+            lines.append(f"                  * {b_load(b_idx)};")
             lines.append(f"        }}")
             lines.append(f"        {c_ptr.name}[_b * {c_sb} + (_pid_m_off + _i) * {c_s0} + (_pid_n_off + _j) * {c_s1}] = ({c_type})_sum;")
             lines.append(f"    }}")
@@ -1841,8 +1884,10 @@ class GenericLowerer:
                 lines.append(f"        {compute_type} _sum = 0.0f;")
 
             lines.append(f"        for (uint _k = 0; _k < {K}u; _k++) {{")
-            lines.append(f"            _sum += ({compute_type}){a_ptr.name}[_i * {a_s0} + _k * {a_s1}]")
-            lines.append(f"                  * ({compute_type}){b_ptr.name}[_k * {b_s0} + _j * {b_s1}];")
+            a_idx_2d = f"_i * {a_s0} + _k * {a_s1}"
+            b_idx_2d = f"_k * {b_s0} + _j * {b_s1}"
+            lines.append(f"            _sum += {a_load(a_idx_2d)}")
+            lines.append(f"                  * {b_load(b_idx_2d)};")
             lines.append(f"        }}")
 
         # Epilogue handling (2D only — 3D dot loop already includes store)
@@ -2437,6 +2482,8 @@ class GenericLowerer:
             self._lower_precise_math(ssa, "divf")
         elif op == "tt.extern_elementwise":
             self._lower_extern_elementwise(ssa)
+        elif op == "tt.fp_to_fp":
+            self._lower_fp_to_fp(ssa)
         elif op == "tt.assert":
             pass  # Runtime bounds check — skip in MSL
         else:
@@ -2709,6 +2756,13 @@ class GenericLowerer:
         compute_type = _msl_compute_type(dtype)
         zero = "0.0f" if dtype in ("fp32", "fp16", "bf16") else "0"
 
+        # Check if this is an FP8 load — needs software conversion from uchar
+        from triton_metal.codegen.msl_builtins import is_fp8_type, fp8_to_float_func
+        fp8_load = is_fp8_type(dtype)
+        if fp8_load:
+            zero = "0.0f"  # FP8 computes in float
+            self._inject_fp8_device_functions(dtype)
+
         # Parse operands: tt.load(ptr, mask?, other?)
         # Operands after the pointer: mask (i1 tensor), then other (default value)
         mask_var = None
@@ -2724,7 +2778,28 @@ class GenericLowerer:
 
         var_name = self._next_var("val")
 
-        if mask_var:
+        if fp8_load:
+            # FP8: load as uchar, then convert to float
+            to_float = fp8_to_float_func(dtype)
+            raw_var = self._next_var("raw")
+            if mask_var:
+                self.kb.raw_line(
+                    f"    uchar {raw_var} = {mask_var} ? "
+                    f"{base_ptr}[{offsets}] : uchar(0);"
+                )
+                self.kb.raw_line(
+                    f"    float {var_name} = {mask_var} ? "
+                    f"{to_float}({raw_var}) : "
+                    f"static_cast<float>({other_val});"
+                )
+            else:
+                self.kb.raw_line(
+                    f"    uchar {raw_var} = {base_ptr}[{offsets}];"
+                )
+                self.kb.raw_line(
+                    f"    float {var_name} = {to_float}({raw_var});"
+                )
+        elif mask_var:
             self.kb.raw_line(
                 f"    {compute_type} {var_name} = {mask_var} ? "
                 f"static_cast<{compute_type}>({base_ptr}[{offsets}]) : "
@@ -2783,10 +2858,7 @@ class GenericLowerer:
                 offsets = self._lid_expr
             val_var = self._lookup(val_id)
             store_dtype = self._trace_ptr_dtype(ptr_id)
-            store_type = triton_type_to_msl(store_dtype)
-            compute_type = _msl_compute_type(store_dtype)
-            needs_cast = (store_type != compute_type)
-            cast_val = f"static_cast<{store_type}>({val_var})" if needs_cast else val_var
+            cast_val = self._fp8_cast_val(val_var, store_dtype)
             idx = self._lid_expr
             # In 2D kernels, lid maps to row index via lid/N where N is the
             # inner dimension.  The guard must cover all threads whose
@@ -2815,10 +2887,7 @@ class GenericLowerer:
         # Determine storage type
         # Trace back to the function arg to find the pointer dtype
         store_dtype = self._trace_ptr_dtype(ptr_id)
-        store_type = triton_type_to_msl(store_dtype)
-        compute_type = _msl_compute_type(store_dtype)
-        needs_cast = (store_type != compute_type)
-        cast_val = f"static_cast<{store_type}>({val_var})" if needs_cast else val_var
+        cast_val = self._fp8_cast_val(val_var, store_dtype)
 
         # Get mask if provided
         mask_var = None
@@ -2870,6 +2939,31 @@ class GenericLowerer:
             self.kb.raw_line(f"    if ({mask_var}) {{ {base_ptr}[{offsets}] = {cast_val}; }}")
         else:
             self.kb.raw_line(f"    {base_ptr}[{offsets}] = {cast_val};")
+
+    def _fp8_cast_val(self, val_var: str, store_dtype: str) -> str:
+        """Return the MSL expression to convert a float value to FP8 uchar.
+
+        If store_dtype is not FP8, returns a regular static_cast or passthrough.
+        """
+        from triton_metal.codegen.msl_builtins import is_fp8_type, fp8_from_float_func
+        if is_fp8_type(store_dtype):
+            self._inject_fp8_device_functions(store_dtype)
+            return f"{fp8_from_float_func(store_dtype)}({val_var})"
+        store_type = triton_type_to_msl(store_dtype)
+        compute_type = _msl_compute_type(store_dtype)
+        if store_type != compute_type:
+            return f"static_cast<{store_type}>({val_var})"
+        return val_var
+
+    def _inject_fp8_device_functions(self, dtype: str):
+        """Inject FP8 conversion device functions into the kernel builder."""
+        from triton_metal.codegen.msl_builtins import fp8_device_functions
+        if not hasattr(self, '_fp8_injected'):
+            self._fp8_injected = set()
+        if dtype not in self._fp8_injected:
+            self._fp8_injected.add(dtype)
+            for fn_src in fp8_device_functions(dtype):
+                self.kb._device_functions.append(fn_src)
 
     def _trace_ptr_dtype(self, ptr_id: int) -> str:
         """Trace a pointer SSA value back to its function arg dtype."""
@@ -3060,11 +3154,9 @@ class GenericLowerer:
         elif op == "arith.select":
             self._lower_select(ssa)
         elif op == "arith.extf":
-            self._emit_passthrough(ssa)
-            self.env_types[ssa.id] = "fp32"
+            self._lower_extf(ssa)
         elif op == "arith.truncf":
-            self._emit_passthrough(ssa)
-            self.env_types[ssa.id] = "fp16"
+            self._lower_truncf(ssa)
         elif op == "arith.sitofp":
             self._emit_cast(ssa, "float")
             self.env_types[ssa.id] = "fp32"
@@ -3136,13 +3228,17 @@ class GenericLowerer:
         # Check element type first (most reliable)
         if ssa.elem_type in ("f32", "f16", "bf16", "f64"):
             return True
+        # FP8 MLIR element types (f8E4M3FN, f8E5M2, etc.) also produce floats
+        if ssa.elem_type and ssa.elem_type.startswith("f8"):
+            return True
         # Check op suffix
         if ssa.op.endswith("f") or ssa.op.endswith("fp"):
             return True
         # Check operand types
+        from triton_metal.codegen.msl_builtins import is_fp8_type
         for op_id in ssa.operand_ids[:2]:
             dtype = self.env_types.get(op_id)
-            if dtype and dtype.startswith("fp") or dtype in ("bf16",):
+            if dtype and (dtype.startswith("fp") or dtype in ("bf16",) or is_fp8_type(dtype)):
                 return True
         return False
 
@@ -3304,6 +3400,108 @@ class GenericLowerer:
         self.env[ssa.id] = var_name
         self.env_types[ssa.id] = "i32"
         # Shape: element-wise binary
+        self._propagate_shape_elementwise(ssa)
+
+    def _lower_fp_to_fp(self, ssa: SSAValue):
+        """tt.fp_to_fp — Triton's FP8 cast operation.
+
+        FP8 → wider (extf direction): load already converted to float, passthrough.
+        wider → FP8 (truncf direction): convert float to FP8 encoding.
+        """
+        if not ssa.operand_ids:
+            return
+        src_id = ssa.operand_ids[0]
+        src_var = self._lookup(src_id)
+        src_dtype = self.env_types.get(src_id, "fp32")
+        dst_elem = ssa.elem_type or "f32"
+        dst_dtype = _mlir_to_triton_dtype(dst_elem)
+
+        from triton_metal.codegen.msl_builtins import is_fp8_type, fp8_to_float_func, fp8_from_float_func
+
+        if is_fp8_type(src_dtype) and not is_fp8_type(dst_dtype):
+            # FP8 → wider float: already in float from load, passthrough
+            self._emit_passthrough(ssa)
+            self.env_types[ssa.id] = dst_dtype
+        elif not is_fp8_type(src_dtype) and is_fp8_type(dst_dtype):
+            # wider float → FP8: round-trip through encode/decode to emulate truncation
+            self._inject_fp8_device_functions(dst_dtype)
+            var_name = self._next_var("fp8")
+            from_func = fp8_from_float_func(dst_dtype)
+            to_func = fp8_to_float_func(dst_dtype)
+            # Convert to fp8 encoding and back to float (the actual fp8 byte
+            # is materialized at the store boundary when writing to uchar buffer)
+            self.kb.raw_line(
+                f"    float {var_name} = {to_func}({from_func}(static_cast<float>({src_var})));"
+            )
+            self.env[ssa.id] = var_name
+            self.env_types[ssa.id] = dst_dtype
+        elif is_fp8_type(src_dtype) and is_fp8_type(dst_dtype):
+            # FP8 → FP8: re-encode through float
+            self._inject_fp8_device_functions(src_dtype)
+            self._inject_fp8_device_functions(dst_dtype)
+            var_name = self._next_var("fp8")
+            from_func = fp8_from_float_func(dst_dtype)
+            to_func = fp8_to_float_func(dst_dtype)
+            self.kb.raw_line(
+                f"    float {var_name} = {to_func}({from_func}(static_cast<float>({src_var})));"
+            )
+            self.env[ssa.id] = var_name
+            self.env_types[ssa.id] = dst_dtype
+        else:
+            # non-FP8 → non-FP8: passthrough (regular float precision change)
+            self._emit_passthrough(ssa)
+            self.env_types[ssa.id] = dst_dtype
+        self._propagate_shape_elementwise(ssa)
+
+    def _lower_extf(self, ssa: SSAValue):
+        """arith.extf — extend float precision.
+
+        FP8 → FP32/FP16: call software conversion function.
+        FP16 → FP32: passthrough (compute already in float).
+        """
+        if not ssa.operand_ids:
+            return
+        src_id = ssa.operand_ids[0]
+        src_dtype = self.env_types.get(src_id, "fp32")
+        from triton_metal.codegen.msl_builtins import is_fp8_type, fp8_to_float_func
+        if is_fp8_type(src_dtype):
+            # FP8 → float: the load already converted to float, so this is a passthrough.
+            # However, if the source is a raw uchar (from bitcast or constant), convert.
+            self._emit_passthrough(ssa)
+            self.env_types[ssa.id] = "fp32"
+        else:
+            self._emit_passthrough(ssa)
+            self.env_types[ssa.id] = "fp32"
+        self._propagate_shape_elementwise(ssa)
+
+    def _lower_truncf(self, ssa: SSAValue):
+        """arith.truncf — truncate float precision.
+
+        FP32 → FP8: call software conversion function.
+        FP32 → FP16: passthrough (cast happens at store).
+        """
+        if not ssa.operand_ids:
+            return
+        dst_elem = ssa.elem_type or "f16"
+        dst_dtype = _mlir_to_triton_dtype(dst_elem)
+        from triton_metal.codegen.msl_builtins import is_fp8_type, fp8_from_float_func
+        if is_fp8_type(dst_dtype):
+            # FP32 → FP8: emit conversion call
+            src_var = self._lookup(ssa.operand_ids[0])
+            self._inject_fp8_device_functions(dst_dtype)
+            var_name = self._next_var("fp8")
+            from_func = fp8_from_float_func(dst_dtype)
+            to_func = fp8_to_float_func(dst_dtype)
+            # Convert to fp8 and immediately back to float for further computation
+            # The actual fp8 encoding is stored at the store boundary
+            self.kb.raw_line(
+                f"    float {var_name} = {to_func}({from_func}(static_cast<float>({src_var})));"
+            )
+            self.env[ssa.id] = var_name
+            self.env_types[ssa.id] = dst_dtype
+        else:
+            self._emit_passthrough(ssa)
+            self.env_types[ssa.id] = _mlir_to_triton_dtype(dst_elem) if dst_elem else "fp16"
         self._propagate_shape_elementwise(ssa)
 
     def _emit_passthrough(self, ssa: SSAValue):
@@ -6403,6 +6601,11 @@ class _DeviceFuncLowerer:
             self._lower_scf_for(ssa)
         elif op == "tt.extern_elementwise":
             self._lower_extern_elementwise(ssa)
+        elif op == "tt.fp_to_fp":
+            # FP8 cast in device function — passthrough (compute in float)
+            self._emit_passthrough(ssa)
+            if ssa.elem_type:
+                self.env_types[ssa.id] = _mlir_to_triton_dtype(ssa.elem_type)
         elif op.startswith("ttg.") or op in ("tt.reshape", "tt.expand_dims",
                                                "tt.unsplat", "tt.make_range"):
             self._emit_passthrough(ssa)

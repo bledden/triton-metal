@@ -38,8 +38,8 @@ class MetalOptions:
     # Metal threadgroup memory is capped at 32 KB.
     max_threadgroup_memory: int = 32768
     enable_fp_fusion: bool = True
-    # Apple GPUs have no FP8 support.
-    supported_fp8_dtypes: tuple = ()
+    # FP8 via software emulation — store as uchar, convert to/from float.
+    supported_fp8_dtypes: tuple = ("fp8e4nv", "fp8e5", "fp8e4b15", "fp8e4b8", "fp8e5b16")
     default_dot_input_precision: str = "ieee"
     allowed_dot_input_precisions: tuple = ("ieee",)
     max_num_imprecise_acc_default: int = 0

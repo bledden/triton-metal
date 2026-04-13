@@ -603,19 +603,30 @@ class GenericLowerer:
             for s in self.graph.size_per_thread:
                 size_per_thread *= s
 
+        # Scan for reduces/barriers recursively (ops may be inside scf.for body)
+        def _scan_all_ops(ops):
+            for s in ops:
+                yield s
+                if s.region_ops:
+                    yield from _scan_all_ops(s.region_ops)
+                if s.else_ops:
+                    yield from _scan_all_ops(s.else_ops)
+
+        all_ops_iter = list(_scan_all_ops(self.graph.ops))
         has_reduce_ops = any(
-            ssa.op == "tt.reduce" for ssa in self.graph.ops
+            ssa.op == "tt.reduce" for ssa in all_ops_iter
         )
         has_barrier_ops = any(
-            ssa.op in ("tt.reduce", "tt.scan", "tt.debug_barrier", "tt.trans")
-            for ssa in self.graph.ops
+            ssa.op in ("tt.reduce", "tt.scan", "tt.debug_barrier", "tt.trans",
+                       "tt.dot", "ttg.local_alloc")
+            for ssa in all_ops_iter
         )
         # Multi-value reduces (argmin/argmax) need per-element indices which
         # are incompatible with the multi-pass accumulation loop (the loop
         # variable goes out of scope before the reduce handler runs).
         has_multivalue_reduce = any(
             ssa.op == "tt.reduce" and ssa.result_ids and len(ssa.result_ids) >= 2
-            for ssa in self.graph.ops
+            for ssa in all_ops_iter
         )
         num_threads = self.graph.num_warps * 32
 
@@ -625,7 +636,7 @@ class GenericLowerer:
         # accumulator mixes values from different rows/columns.
         has_2d_axis_reduce = False
         if self._is_2d and self._effective_2d_shape and has_reduce_ops:
-            for ssa in self.graph.ops:
+            for ssa in all_ops_iter:
                 if ssa.op == "tt.reduce" and ssa.operand_ids:
                     reduce_axis = ssa.attrs.get("axis", 0)
                     # Extract shape from the reduce input's type_str in the IR
@@ -654,6 +665,31 @@ class GenericLowerer:
             # Skip multipass; use full block_size with one element per thread.
             # _lower_reduce_2d handles the sequential reduction internally.
             pass
+        elif has_2d_axis_reduce and block_size > 1024:
+            # Total 2D elements exceed 1024. Cap block_size to 1024.
+            # The dot path uses strided loops for outputs > block_size.
+            # The reduce path stores to shared[lid] which needs lid < total,
+            # so check that reduce inputs fit within 1024.
+            max_reduce_size = 0
+            def _scan_reduce_sizes(ops):
+                nonlocal max_reduce_size
+                for op in ops:
+                    if op.op == "tt.reduce" and op.operand_ids:
+                        inp_type = self._find_op_type_str(op.operand_ids[0])
+                        inp_shape = _extract_shape(inp_type) if inp_type else None
+                        if inp_shape:
+                            rs = 1
+                            for d in inp_shape:
+                                rs *= d
+                            max_reduce_size = max(max_reduce_size, rs)
+                    if op.region_ops:
+                        _scan_reduce_sizes(op.region_ops)
+            _scan_reduce_sizes(self.graph.ops)
+            if max_reduce_size <= 1024:
+                block_size = max(max_reduce_size, 1024)
+                block_size = min(block_size, 1024)
+            else:
+                self._flash_too_large = True
         elif has_multivalue_reduce and block_size <= 1024:
             # Multi-value reduces (argmin/argmax) need per-element indices that
             # go out of scope in the multi-pass accumulation loop. Use full
@@ -679,6 +715,15 @@ class GenericLowerer:
                 block_size = 1024  # Cap dispatch to Metal max
 
         self.effective_block_size = block_size
+
+        # If the kernel is too large for the generic lowerer (cooperative ops
+        # with > 1024 total elements), emit a minimal kernel with UNSUPPORTED
+        # so the legacy parser can handle it via prebuilt templates.
+        if getattr(self, '_flash_too_large', False):
+            self.kb = KernelBuilder(self.graph.func_name, block_size=block_size)
+            self._register_args()
+            self.kb.comment("UNSUPPORTED: 2D kernel with cooperative ops exceeds 1024 elements")
+            return self.kb.build()
 
         self.kb = KernelBuilder(self.graph.func_name, block_size=block_size)
 
@@ -734,25 +779,44 @@ class GenericLowerer:
         return indices
 
     def _requires_matmul_template(self) -> bool:
-        """Check if the kernel contains tt.dot (matrix multiply).
+        """Check if the kernel is a pure matmul that needs the prebuilt template.
 
-        When tt.dot is present, the generic 1D-per-thread lowerer cannot
-        produce correct code — tt.dot requires simdgroup_matrix 8x8 MMA
-        with threadgroup memory staging and 2D tile accumulation. We
-        route these kernels to a prebuilt tiled matmul MSL template.
+        Returns True only for PURE matmul kernels (dot + loads + stores).
+        Returns False for complex kernels that have dot mixed with reductions,
+        masking, or other ops (like flash attention) — these go through the
+        generic op-by-op lowerer which handles tt.dot via _lower_dot.
 
         Note: _detect_simple_dot() is checked before this in lower() and
-        handles the simple load->dot->store pattern with an inline scalar
-        matmul. This method catches everything else (strided, constant, etc).
+        handles simple dot patterns with an inline simdgroup MMA template.
         """
-        for ssa in self.graph.ops:
-            if ssa.op == "tt.dot":
-                return True
-            if ssa.region_ops:
-                for body_op in ssa.region_ops:
-                    if body_op.op == "tt.dot":
-                        return True
-        return False
+        has_dot = False
+        has_reduce = False
+        has_where = False
+
+        def _scan_ops(ops):
+            nonlocal has_dot, has_reduce, has_where
+            for ssa in ops:
+                if ssa.op == "tt.dot":
+                    has_dot = True
+                elif ssa.op == "tt.reduce":
+                    has_reduce = True
+                elif ssa.op == "arith.select":
+                    has_where = True
+                if ssa.region_ops:
+                    _scan_ops(ssa.region_ops)
+
+        _scan_ops(self.graph.ops)
+
+        if not has_dot:
+            return False
+
+        # Pure matmul: dot without reductions or conditional masking.
+        # Complex kernels (flash attention, fused matmul+softmax) have
+        # reductions/masking alongside dot and must go through generic lowerer.
+        if has_reduce or has_where:
+            return False
+
+        return True
 
     def _resolve_constant_int(self, ssa_id):
         """Resolve an SSA ID to its integer constant value, or None."""
@@ -5083,10 +5147,21 @@ class GenericLowerer:
         M, N = input_shape[0], input_shape[1]
         total = M * N
 
-        # Allocate shared memory for the full 2D tensor
-        shared_name = f"shared_{self._shared_counter}"
-        self._shared_counter += 1
-        self.kb.declare_threadgroup_array(shared_name, dtype=shared_dtype, size=total)
+        # Check if the input data is already in a shared memory array (e.g.,
+        # from a dot result or local_alloc). If so, skip the copy and reuse it.
+        input_id = ssa.operand_ids[0] if ssa.operand_ids else None
+        existing_shared = None
+        if input_id is not None:
+            existing_shared = getattr(self, '_shared_mem_descs', {}).get(input_id)
+
+        if existing_shared:
+            shared_name = existing_shared[0]
+            # Data is already in shared_name[lid] — no copy needed
+        else:
+            # Allocate shared memory for the full 2D tensor
+            shared_name = f"shared_{self._shared_counter}"
+            self._shared_counter += 1
+            self.kb.declare_threadgroup_array(shared_name, dtype=shared_dtype, size=total)
 
         # Identity value for the combine op
         if combine_op == "sum":
@@ -5114,9 +5189,10 @@ class GenericLowerer:
 
         result_var = self._next_var("reduced")
 
-        # Store all values to shared memory
-        self.kb.raw_line(f"    if (lid < {total}u) {shared_name}[lid] = {input_var};")
-        self.kb.raw_line(f"    threadgroup_barrier(mem_flags::mem_threadgroup);")
+        # Store all values to shared memory (skip if already there)
+        if not existing_shared:
+            self.kb.raw_line(f"    if (lid < {total}u) {shared_name}[lid] = {input_var};")
+            self.kb.raw_line(f"    threadgroup_barrier(mem_flags::mem_threadgroup);")
 
         # Use a second shared array to broadcast results to all threads
         result_shared = f"shared_{self._shared_counter}"
@@ -5566,6 +5642,10 @@ class GenericLowerer:
         if not hasattr(self, '_shared_mem_descs'):
             self._shared_mem_descs = {}
         self._shared_mem_descs[ssa.id] = (shared_name, shape, shared_dtype)
+        # Also mark the source operand as having its data in shared memory.
+        # This allows downstream reduces on the source to skip redundant copies.
+        if ssa.operand_ids:
+            self._shared_mem_descs[ssa.operand_ids[0]] = (shared_name, shape, shared_dtype)
 
     def _lower_local_load(self, ssa: SSAValue):
         """ttg.local_load -> marker for shared memory access.
@@ -5594,6 +5674,41 @@ class GenericLowerer:
         if not hasattr(self, '_shared_mem_descs'):
             self._shared_mem_descs = {}
         self._shared_mem_descs[ssa.id] = shared_info
+
+    def _lower_memdesc_trans(self, ssa: SSAValue):
+        """ttg.memdesc_trans -> transpose shared memory descriptor.
+
+        This op changes the logical access order of a shared memory array
+        without moving data. We propagate the shared memory descriptor and
+        mark it as transposed so that tt.dot uses the correct indexing:
+        B_trans[k, col] accesses physical B[col * K + k] instead of B[k * N + col].
+        """
+        if not ssa.operand_ids:
+            self._emit_passthrough(ssa)
+            return
+
+        src_id = ssa.operand_ids[0]
+
+        # Propagate env, env_types, env_shapes from source
+        self._emit_passthrough(ssa)
+
+        # Propagate shared memory descriptor with transposed flag
+        if not hasattr(self, '_shared_mem_descs'):
+            self._shared_mem_descs = {}
+        shared_info = self._shared_mem_descs.get(src_id)
+        if shared_info:
+            shared_name, shape, shared_dtype = shared_info
+            # Swap dimensions to reflect transposed access
+            if len(shape) >= 2:
+                trans_shape = (shape[1], shape[0]) + shape[2:]
+            else:
+                trans_shape = shape
+            self._shared_mem_descs[ssa.id] = (shared_name, trans_shape, shared_dtype)
+            self.env_shapes[ssa.id] = trans_shape
+            # Mark this shared array as transposed for dot indexing
+            if not hasattr(self, '_shared_mem_transposed'):
+                self._shared_mem_transposed = set()
+            self._shared_mem_transposed.add(shared_name)
 
     # -- Matrix multiply (tt.dot) --
 
@@ -5660,6 +5775,26 @@ class GenericLowerer:
         a_smem, _, _ = a_shared
         b_smem, _, _ = b_shared
 
+        # Check if operands were transposed via memdesc_trans.
+        # Transposed arrays need swapped indexing: B_trans[k, col] reads
+        # physical B_orig[col, k] = smem[col * K_orig + k].
+        transposed = getattr(self, '_shared_mem_transposed', set())
+        a_trans = a_smem in transposed
+        b_trans = b_smem in transposed
+
+        # For transposed operands, the physical storage dimensions differ from
+        # the logical ones. K is the inner/contraction dimension.
+        # A normal: smem[row * K + k], A transposed: smem[k * M + row]
+        # B normal: smem[k * N + col], B transposed: smem[col * K + k]
+        if a_trans:
+            a_index = f"{a_smem}[_dk * {M}u + _dot_row]"
+        else:
+            a_index = f"{a_smem}[_dot_row * {K}u + _dk]"
+        if b_trans:
+            b_index = f"{b_smem}[_dot_col * {K}u + _dk]"
+        else:
+            b_index = f"{b_smem}[_dk * {N}u + _dot_col]"
+
         total = M * N
         bs = self.effective_block_size
 
@@ -5679,7 +5814,7 @@ class GenericLowerer:
         self.kb.raw_line(f"        uint _dot_col = _de % {N}u;")
         self.kb.raw_line(f"        float _dot_sum = {acc_var};")
         self.kb.raw_line(f"        for (uint _dk = 0; _dk < {K}u; _dk++) {{")
-        self.kb.raw_line(f"            _dot_sum += {a_smem}[_dot_row * {K}u + _dk] * {b_smem}[_dk * {N}u + _dot_col];")
+        self.kb.raw_line(f"            _dot_sum += {a_index} * {b_index};")
         self.kb.raw_line(f"        }}")
         self.kb.raw_line(f"        {result_smem}[_de] = _dot_sum;")
         self.kb.raw_line(f"    }}")
@@ -5698,6 +5833,11 @@ class GenericLowerer:
         self.env[ssa.id] = result_var
         self.env_types[ssa.id] = "fp32"
         self.env_shapes[ssa.id] = (M, N)
+        # Track that this variable's data is already in shared memory at lid.
+        # Downstream reduce can skip the copy and read from result_smem directly.
+        if not hasattr(self, '_shared_mem_descs'):
+            self._shared_mem_descs = {}
+        self._shared_mem_descs[ssa.id] = (result_smem, (M, N), "fp32")
 
     # -- SCF (structured control flow) --
 
@@ -6380,6 +6520,8 @@ class GenericLowerer:
         elif op == "ttg.local_store":
             # Store to shared memory — passthrough
             self._emit_passthrough(ssa)
+        elif op == "ttg.memdesc_trans":
+            self._lower_memdesc_trans(ssa)
         else:
             # Other ttg ops: passthrough
             self._emit_passthrough(ssa)

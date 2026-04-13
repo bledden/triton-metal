@@ -127,10 +127,41 @@ class MetalBackend(BaseBackend):
         pass
 
     def add_stages(self, stages, options, language=None):
-        stages["ttir"] = lambda src, metadata: self.make_ttir(src, metadata, options)
-        stages["ttgir"] = lambda src, metadata: self.make_ttgir(src, metadata, options)
+        from triton.compiler.compiler import Language
+
+        if language == Language.GLUON:
+            # Gluon: skip TTIR, use gluon-specific passes to reach TTGIR.
+            stages["ttgir"] = lambda src, metadata: self.gluon_to_ttgir(src, metadata, options)
+        else:
+            # Triton (default): TTIR → TTGIR
+            stages["ttir"] = lambda src, metadata: self.make_ttir(src, metadata, options)
+            stages["ttgir"] = lambda src, metadata: self.make_ttgir(src, metadata, options)
+
         stages["msl"] = lambda src, metadata: self.make_msl(src, metadata, options)
         stages["metallib"] = lambda src, metadata: self.make_metallib(src, metadata, options)
+
+    @staticmethod
+    def gluon_to_ttgir(mod, metadata, options):
+        """Convert Gluon IR to TTGIR for Metal.
+
+        Gluon is Triton's higher-level language. The conversion applies
+        Gluon-specific passes (inliner, encoding resolution) then standard
+        TTGIR conversion passes. Metal-specific: no TMA, no NVIDIA passes.
+        """
+        from triton._C.libtriton import ir, passes
+
+        pm = ir.pass_manager(mod.context)
+        passes.gluon.add_inliner(pm)
+        passes.gluon.add_infer_coalesced_encodings(pm)
+        passes.gluon.add_resolve_auto_encodings(pm)
+        passes.gluon.add_canonicalizer(pm)
+        passes.common.add_sccp(pm)
+        passes.ttir.add_loop_aware_cse(pm)
+        passes.gluon.add_canonicalizer(pm)
+        passes.ttgpuir.add_combine_tensor_select_and_if(pm)
+        pm.run(mod, "gluon_to_ttgir")
+        metadata["tensordesc_meta"] = mod.get_tensordesc_metadata()
+        return mod
 
     @staticmethod
     def make_ttir(mod, metadata, options):

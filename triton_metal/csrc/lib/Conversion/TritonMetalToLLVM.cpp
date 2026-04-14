@@ -1,13 +1,13 @@
 #include "triton_metal/Conversion/TritonMetalToLLVM.h"
 
 #include "mlir/Conversion/LLVMCommon/TypeConverter.h"
+#include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/Pass/Pass.h"
 #include "mlir/Transforms/DialectConversion.h"
 
 #include "triton/Dialect/Triton/IR/Dialect.h"
-#include "triton/Dialect/TritonGPU/IR/Dialect.h"
 
 // Forward declaration — defined in ElementwiseOpToLLVM.cpp
 namespace mlir {
@@ -45,6 +45,12 @@ public:
     // (i32 -> i32, f32 -> f32, index -> i64, etc.)
     mlir::LLVMTypeConverter typeConverter(ctx);
 
+    // Collect rewrite patterns — this also registers custom type conversions
+    // for Triton tensor and pointer types on the typeConverter.
+    mlir::RewritePatternSet patterns(ctx);
+    mlir::triton_metal::populateTritonMetalToLLVMPatterns(typeConverter,
+                                                          patterns);
+
     // Set up conversion target — LLVM dialect is legal, everything else
     // is potentially illegal (partial conversion only lowers ops with
     // registered patterns).
@@ -52,10 +58,13 @@ public:
     target.addLegalDialect<mlir::LLVM::LLVMDialect>();
     target.addLegalOp<mlir::ModuleOp>();
 
-    // Collect rewrite patterns
-    mlir::RewritePatternSet patterns(ctx);
-    mlir::triton_metal::populateTritonMetalToLLVMPatterns(typeConverter,
-                                                          patterns);
+    // Mark Triton ops as illegal so the conversion framework requires them
+    // to be lowered by our patterns.
+    target.addIllegalDialect<mlir::triton::TritonDialect>();
+
+    // Keep arith/math/scf legal — they will be lowered by standard MLIR
+    // passes in a later pipeline stage.
+    target.addLegalDialect<mlir::arith::ArithDialect>();
 
     // Apply partial conversion — only ops with matching patterns are lowered.
     // This is intentional: we add patterns incrementally across tasks.

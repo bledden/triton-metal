@@ -68,6 +68,15 @@ if(NOT LLVM_ENABLE_RTTI)
 endif()
 
 # ---------------------------------------------------------------------------
+# Triton dialect object files — Triton builds as OBJECT libraries so we
+# collect the pre-built .o files and link them into our shared library.
+# ---------------------------------------------------------------------------
+set(TRITON_IR_OBJS_DIR
+    "${TRITON_BUILDPATH}/lib/Dialect/Triton/IR/CMakeFiles/TritonIR.dir")
+
+file(GLOB TRITON_IR_OBJS "${TRITON_IR_OBJS_DIR}/*.o")
+
+# ---------------------------------------------------------------------------
 # Subdirectories
 # ---------------------------------------------------------------------------
 add_subdirectory(lib/Conversion)
@@ -77,6 +86,7 @@ add_subdirectory(lib/Conversion)
 # ---------------------------------------------------------------------------
 add_library(triton_metal_backend SHARED
     $<TARGET_OBJECTS:TritonMetalToLLVM>
+    ${TRITON_IR_OBJS}
 )
 
 target_link_libraries(triton_metal_backend
@@ -88,6 +98,13 @@ target_link_libraries(triton_metal_backend
     MLIRTransformUtils
     MLIRLLVMDialect
     MLIRLLVMCommonConversion
+    MLIRArithDialect
+    MLIRControlFlowDialect
+    MLIRSCFDialect
+    MLIRMathDialect
+    MLIRArithUtils
+    MLIRFuncDialect
+    MLIRTensorDialect
     LLVMSupport
     LLVMCore
 )

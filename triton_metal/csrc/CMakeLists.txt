@@ -58,6 +58,15 @@ if(NOT MSVC)
   set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -D__STDC_FORMAT_MACROS -fPIC")
 endif()
 
+# Match LLVM's RTTI setting — LLVM/MLIR are built without RTTI
+if(NOT LLVM_ENABLE_RTTI)
+  if(NOT MSVC)
+    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fno-rtti")
+  else()
+    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} /GR-")
+  endif()
+endif()
+
 # ---------------------------------------------------------------------------
 # Subdirectories
 # ---------------------------------------------------------------------------
@@ -76,6 +85,9 @@ target_link_libraries(triton_metal_backend
     MLIRPass
     MLIRSupport
     MLIRTransforms
+    MLIRTransformUtils
+    MLIRLLVMDialect
+    MLIRLLVMCommonConversion
     LLVMSupport
     LLVMCore
 )

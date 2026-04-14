@@ -1,4 +1,13 @@
-// ElementwiseOpToLLVM.cpp — placeholder for elementwise lowering patterns.
-//
-// Will contain RewritePatterns that lower Triton elementwise ops
-// (add, mul, etc.) to LLVM IR targeting Metal/AIR.
+#include "mlir/Conversion/LLVMCommon/TypeConverter.h"
+#include "mlir/IR/PatternMatch.h"
+
+namespace mlir {
+namespace triton_metal {
+
+void populateTritonMetalToLLVMPatterns(LLVMTypeConverter &typeConverter,
+                                       RewritePatternSet &patterns) {
+  // Patterns will be added in Task 3
+}
+
+} // namespace triton_metal
+} // namespace mlir

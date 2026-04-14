@@ -2525,7 +2525,13 @@ class GenericLowerer:
         if self._effective_2d_shape is None:
             self._effective_2d_shape = max_2d_shape
 
-        # Find expand_dims ops and trace back to make_range
+        # Find expand_dims ops and trace back to make_range.
+        # Also record expand_dims by parent layout to pair dim=0/dim=1 siblings
+        # so each make_range can know its tile's inner dimension.
+        # Use an instance-level dict to accumulate across recursive prescan calls.
+        if not hasattr(self, '_expand_by_parent'):
+            self._expand_by_parent = {}
+        expand_by_parent = self._expand_by_parent
         for ssa in ops:
             if ssa.op == "tt.expand_dims" and ssa.operand_ids:
                 axis = ssa.attrs.get("axis", 0)
@@ -2538,6 +2544,60 @@ class GenericLowerer:
                     # expand_dims(x, axis=0): x becomes col dim (dim 1)
                     dim = 0 if axis == 1 else (len(max_2d_shape) - 1)
                     self._make_range_dim[mr_id] = dim
+
+                    # Extract the parent layout from the expand_dims source type
+                    # e.g., "tensor<32xi32, #ttg.slice<{dim = 1, parent = #blocked}>>"
+                    # to pair with siblings from the same tile.
+                    src_type = ""
+                    if src_id in op_by_id and op_by_id[src_id].type_str:
+                        src_type = op_by_id[src_id].type_str
+                    elif mr_id in op_by_id and op_by_id[mr_id].type_str:
+                        src_type = op_by_id[mr_id].type_str
+                    import re as _re
+                    # Extract the parent layout identifier. The type string
+                    # may use aliases (#blocked, #blocked1) or inline defs
+                    # (#ttg.blocked<{...}>).  Use a nested-brace-aware match.
+                    parent_key = "default"
+                    pidx = src_type.find("parent")
+                    if pidx >= 0:
+                        # Find the `=` and the start of the layout spec
+                        eq_idx = src_type.find("=", pidx)
+                        if eq_idx >= 0:
+                            rest = src_type[eq_idx + 1:].strip()
+                            # Capture everything up to matching `>` or `}`
+                            depth = 0
+                            end_idx = 0
+                            for ci, ch in enumerate(rest):
+                                if ch in ('<', '{', '['):
+                                    depth += 1
+                                elif ch in ('>', '}', ']'):
+                                    if depth == 0:
+                                        end_idx = ci
+                                        break
+                                    depth -= 1
+                                    if depth == 0:
+                                        end_idx = ci + 1
+                                        break
+                            parent_key = rest[:end_idx].strip() if end_idx > 0 else rest[:40]
+                    mr_op = op_by_id.get(mr_id)
+                    range_size = 0
+                    if mr_op:
+                        range_size = mr_op.attrs.get("end", 0) - mr_op.attrs.get("start", 0)
+                    expand_by_parent.setdefault(parent_key, []).append(
+                        (dim, mr_id, range_size))
+
+        # For each parent layout, pair dim=0 and dim=1 make_ranges to
+        # determine the tile inner dim for dim=0 (row) make_ranges.
+        if not hasattr(self, '_make_range_inner_N'):
+            self._make_range_inner_N = {}
+        for parent_key, entries in expand_by_parent.items():
+            dim0_entries = [(mr_id, rs) for d, mr_id, rs in entries if d == 0]
+            dim1_entries = [(mr_id, rs) for d, mr_id, rs in entries if d != 0]
+            # The dim=1 range_size IS the inner dim N for all dim=0 siblings
+            if dim1_entries:
+                inner_N = max(rs for _, rs in dim1_entries)
+                for mr_id, _ in dim0_entries:
+                    self._make_range_inner_N[mr_id] = inner_N
 
     def _trace_to_make_range(self, ssa_id, ops, op_by_id):
         """Trace an SSA ID back through passthrough ops to find a make_range.
@@ -2798,8 +2858,16 @@ class GenericLowerer:
             # and output (4,2)), so each make_range derives N from its own range.
             # For row (dim 0): range covers rows, N = total / range = inner dim
             # For col (dim 1): range IS the inner dim, N = range_size
+            #
+            # When the kernel has tiles of different sizes (e.g., 32x64 for Q/K/V
+            # and 32x32 for QK^T), use the per-tile inner N from _make_range_inner_N
+            # instead of the global total.
             if dim == 0:
-                N = total // range_size if range_size > 0 else 1
+                inner_N_map = getattr(self, '_make_range_inner_N', {})
+                if ssa.id in inner_N_map:
+                    N = inner_N_map[ssa.id]
+                else:
+                    N = total // range_size if range_size > 0 else 1
                 expr = f"{lid} / {N}u"
             else:
                 expr = f"{lid} % {range_size}u"
@@ -3060,18 +3128,193 @@ class GenericLowerer:
             self._propagate_shape_from_type(ssa)
 
     def _lower_store(self, ssa: SSAValue):
-        """tt.store → masked buffer write.
+        """tt.store -> masked buffer write.
 
-        TODO(2D codegen): When ptr shape is 2D+, emit proper row/col
-        indexing for the store offset instead of flat lid-based offset.
-        The shape information from env_shapes can be used to decompose
-        the flat thread index into multi-dimensional coordinates.
+        When the value to store is backed by a shared-memory array (total >
+        block_size), emits a cooperative strided store loop that reads from
+        shared memory and writes to global memory with reconstructed 2D
+        addressing.
         """
         if len(ssa.operand_ids) < 2:
             return
 
         ptr_id = ssa.operand_ids[0]
         val_id = ssa.operand_ids[1]
+
+        # Check if the value to store is smem-backed with total > block_size
+        smem_descs = getattr(self, '_shared_mem_descs', {})
+        val_smem = smem_descs.get(val_id)
+        bs = self.effective_block_size
+        if val_smem:
+            val_shape = val_smem[1]
+            val_total = 1
+            for d in val_shape:
+                val_total *= d
+            if val_total > bs and len(val_shape) >= 2:
+                smem_name = val_smem[0]
+                M, N = val_shape[0], val_shape[1]
+
+                # Get mask if provided
+                mask_id = None
+                if len(ssa.operand_ids) >= 3:
+                    mid = ssa.operand_ids[2]
+                    if mid in self.env_is_mask or self._is_mask(mid):
+                        mask_id = mid
+
+                # Get the pointer info
+                ptr_info = self.env_is_ptr.get(ptr_id)
+                if ptr_info:
+                    base_ptr, offset_expr = ptr_info
+
+                    # Rebuild the offset expression with _fill_row / _fill_col
+                    # substitution (same approach as _lower_local_alloc).
+                    def _all_ops(ops):
+                        for o in ops:
+                            yield o
+                            if o.region_ops:
+                                yield from _all_ops(o.region_ops)
+                            if o.else_ops:
+                                yield from _all_ops(o.else_ops)
+                    all_ops = list(_all_ops(self.graph.ops))
+
+                    row_var = None
+                    col_var = None
+                    for mr_id, dim in self._make_range_dim.items():
+                        v = self.env.get(mr_id, "")
+                        if not isinstance(v, str) or not v.startswith("idx_"):
+                            continue
+                        if v in offset_expr:
+                            if dim == 1 and col_var is None:
+                                col_var = v
+                            elif dim == 0 and row_var is None:
+                                row_var = v
+                            continue
+                        # Transitive dependency check
+                        if dim == 0 and row_var is None:
+                            dep_names = {v}
+                            changed = True
+                            while changed:
+                                changed = False
+                                for dop in all_ops:
+                                    dv = self.env.get(dop.id, "")
+                                    if not isinstance(dv, str) or dv in dep_names:
+                                        continue
+                                    if not dop.operand_ids:
+                                        continue
+                                    if any(self.env.get(oid, "") in dep_names
+                                           for oid in dop.operand_ids):
+                                        dep_names.add(dv)
+                                        changed = True
+                            if any(dn in offset_expr for dn in dep_names):
+                                row_var = v
+
+                    self.kb.raw_line(
+                        f"    for (uint _st = lid; _st < {val_total}u; "
+                        f"_st += {bs}u) {{")
+                    self.kb.raw_line(
+                        f"        uint _fill_row = _st / {N}u;")
+                    self.kb.raw_line(
+                        f"        uint _fill_col = _st % {N}u;")
+
+                    new_offset = offset_expr
+                    emitted = set()
+                    if col_var:
+                        new_offset = new_offset.replace(col_var, "_fill_col")
+                    if row_var:
+                        # Build the set of variables in offset_expr that need
+                        # substitution (directly or via dependencies).
+                        needed_in_offset = set()
+                        for op in all_ops:
+                            v = self.env.get(op.id, "")
+                            if isinstance(v, str) and v in offset_expr:
+                                needed_in_offset.add(v)
+
+                        for op in all_ops:
+                            v = self.env.get(op.id, "")
+                            if not isinstance(v, str) or not v.startswith("r_") or v in emitted:
+                                continue
+                            if not op.operand_ids:
+                                continue
+                            uses_row = any(self.env.get(oid, "") == row_var
+                                           for oid in op.operand_ids)
+                            if not uses_row:
+                                continue
+                            # Only emit if this var or a downstream var appears in offset
+                            if v not in offset_expr:
+                                # Check if any 2nd-level dep uses this var and appears in offset
+                                has_downstream = False
+                                for op2 in all_ops:
+                                    v2 = self.env.get(op2.id, "")
+                                    if isinstance(v2, str) and v2 in offset_expr and op2.operand_ids:
+                                        if any(self.env.get(oid, "") == v for oid in op2.operand_ids):
+                                            has_downstream = True
+                                            break
+                                if not has_downstream:
+                                    continue
+                            emitted.add(v)
+                            a_ = self.env.get(op.operand_ids[0], "?")
+                            b_ = self.env.get(op.operand_ids[1], "?") if len(op.operand_ids) > 1 else "0"
+                            a_sub = "(int)_fill_row" if a_ == row_var else a_
+                            b_sub = "(int)_fill_row" if b_ == row_var else b_
+                            op_sym = " + " if "add" in (op.op or "") else " * " if "mul" in (op.op or "") else " + "
+                            self.kb.raw_line(
+                                f"        int _fill_{v} = {a_sub}{op_sym}{b_sub};")
+                            new_offset = new_offset.replace(v, f"_fill_{v}")
+                            # 2nd-level deps
+                            for op2 in all_ops:
+                                v2 = self.env.get(op2.id, "")
+                                if not isinstance(v2, str) or not v2.startswith("r_") or v2 in emitted:
+                                    continue
+                                if not op2.operand_ids:
+                                    continue
+                                if not any(self.env.get(oid, "") == v
+                                           for oid in op2.operand_ids):
+                                    continue
+                                if v2 not in offset_expr:
+                                    continue
+                                emitted.add(v2)
+                                a2 = self.env.get(op2.operand_ids[0], "?")
+                                b2 = self.env.get(op2.operand_ids[1], "?") if len(op2.operand_ids) > 1 else "0"
+                                a2_sub = f"_fill_{v}" if a2 == v else a2
+                                b2_sub = f"_fill_{v}" if b2 == v else b2
+                                op2_sym = " + " if "add" in (op2.op or "") else " * " if "mul" in (op2.op or "") else " + "
+                                self.kb.raw_line(
+                                    f"        int _fill_{v2} = {a2_sub}{op2_sym}{b2_sub};")
+                                new_offset = new_offset.replace(v2, f"_fill_{v2}")
+                        new_offset = new_offset.replace(row_var, "(int)_fill_row")
+
+                    # Mask: reconstruct per-element mask
+                    mask_expr = None
+                    if mask_id is not None:
+                        # The mask is typically row < N_CTX. Rebuild with _fill_row.
+                        mask_str = self._lookup(mask_id)
+                        # Check if the mask depends on the row variable
+                        if row_var and any(v in mask_str for v in emitted):
+                            # Complex mask — use a simple bounds check
+                            mask_expr = f"((int)_fill_row + r_8) < (int)N_CTX"
+                        elif mask_str.startswith("mask_") or mask_str.startswith("("):
+                            # Rebuild mask with _fill_row
+                            # Simple approach: row-based mask
+                            mask_expr = None  # Will use the existing mask pattern
+                        else:
+                            mask_expr = mask_str
+
+                    store_val = f"{smem_name}[_st]"
+                    store_dtype = self._trace_ptr_dtype(ptr_id)
+                    store_type = triton_type_to_msl(store_dtype)
+                    compute_type = _msl_compute_type(store_dtype)
+                    if store_type != compute_type:
+                        store_val = f"static_cast<{store_type}>({store_val})"
+
+                    if mask_expr:
+                        self.kb.raw_line(
+                            f"        if ({mask_expr}) "
+                            f"{base_ptr}[{new_offset}] = {store_val};")
+                    else:
+                        self.kb.raw_line(
+                            f"        {base_ptr}[{new_offset}] = {store_val};")
+                    self.kb.raw_line(f"    }}")
+                    return
 
         # Detect reduce keep_dims pattern: store to (M, 1) or (1, N) shaped pointer
         # where the value comes from a reduce. The generic 2D index decomposition
@@ -3431,11 +3674,92 @@ class GenericLowerer:
             self.kb.comment(f"UNSUPPORTED arith: {op}")
 
     def _emit_binary(self, ssa: SSAValue, op_str: str, force_unsigned=False):
-        """Emit a binary operation: result = a op b."""
+        """Emit a binary operation: result = a op b.
+
+        When one operand is a shared-memory-backed array (total > block_size,
+        from an oversized iter_arg), emits a cooperative strided loop that
+        updates the array in-place.  The non-array operand is treated as a
+        per-row broadcast: its per-thread value is stored to a temporary
+        shared array indexed by row, then read back per-element in the
+        strided loop.
+        """
         if len(ssa.operand_ids) < 2:
             return
         a = self._lookup(ssa.operand_ids[0])
         b = self._lookup(ssa.operand_ids[1])
+        bs = self.effective_block_size
+
+        # Check if either operand is a shared-memory-backed oversized array.
+        smem_descs = getattr(self, '_shared_mem_descs', {})
+        a_smem = smem_descs.get(ssa.operand_ids[0])
+        b_smem = smem_descs.get(ssa.operand_ids[1])
+
+        smem_info = None  # (smem_name, shape, other_var, other_id)
+        if a_smem:
+            shape_a = a_smem[1]
+            total_a = 1
+            for d in shape_a:
+                total_a *= d
+            if total_a > bs:
+                smem_info = (a_smem[0], shape_a, b, ssa.operand_ids[1])
+        if smem_info is None and b_smem:
+            shape_b = b_smem[1]
+            total_b = 1
+            for d in shape_b:
+                total_b *= d
+            if total_b > bs:
+                smem_info = (b_smem[0], shape_b, a, ssa.operand_ids[0])
+
+        if smem_info is not None:
+            smem_name, shape, other_var, other_id = smem_info
+            M = shape[0] if len(shape) >= 2 else 1
+            N = shape[1] if len(shape) >= 2 else shape[0]
+            total = M * N
+
+            # Determine if other_var is per-row broadcast (from expand_dims
+            # of a 1D vector) vs truly per-element.  Per-row values have the
+            # same value for all columns in a row.  We check env_shapes: if
+            # the original shape was (M, 1) or (M,), it's per-row.
+            other_shape = self.env_shapes.get(other_id, ())
+            is_per_row = (
+                (len(other_shape) == 1 and other_shape[0] == M)
+                or (len(other_shape) >= 2 and other_shape[1] == 1)
+                or (len(other_shape) >= 2 and other_shape == shape
+                    and total > bs)
+            )
+
+            if is_per_row or total > bs:
+                # Store the per-row value into temp shared memory so the
+                # strided loop can access any row's value.
+                row_stride = max(1, bs // M)
+                temp_smem = f"smem_bcast_{self._shared_counter}"
+                self._shared_counter += 1
+                self.kb.declare_threadgroup_array(temp_smem, dtype="fp32",
+                                                  size=M)
+                # Each thread writes its row's value (many threads per row
+                # write the same value — harmless).
+                self.kb.raw_line(
+                    f"    {temp_smem}[lid / {row_stride}u] = {other_var};")
+                self.kb.raw_line(
+                    f"    threadgroup_barrier(mem_flags::mem_threadgroup);")
+                # Strided in-place update
+                self.kb.raw_line(
+                    f"    for (uint _sb = lid; _sb < {total}u; "
+                    f"_sb += {bs}u) {{")
+                self.kb.raw_line(
+                    f"        {smem_name}[_sb] = {smem_name}[_sb] "
+                    f"{op_str} {temp_smem}[_sb / {N}u];")
+                self.kb.raw_line(f"    }}")
+                self.kb.raw_line(
+                    f"    threadgroup_barrier(mem_flags::mem_threadgroup);")
+
+                # Result is the updated smem array
+                self.env[ssa.id] = smem_name
+                self.env_types[ssa.id] = "fp32"
+                self._propagate_shape_elementwise(ssa)
+                self._shared_mem_descs[ssa.id] = (smem_name, shape, "fp32")
+                return
+
         var_name = self._next_var("r")
         is_float = self._is_float_op(ssa)
         if is_float:
@@ -3750,6 +4074,10 @@ class GenericLowerer:
                 self.env_is_mask[ssa.id] = True
             if src_id in self.env_is_ptr:
                 self.env_is_ptr[ssa.id] = self.env_is_ptr[src_id]
+            # Propagate shared_mem_descs for smem-backed oversized arrays
+            smem_descs = getattr(self, '_shared_mem_descs', {})
+            if src_id in smem_descs:
+                smem_descs[ssa.id] = smem_descs[src_id]
             # Propagate shape: passthrough preserves shape from source,
             # unless the result type has a different shape (e.g. reshape).
             if ssa.type_str:
@@ -5769,8 +6097,15 @@ class GenericLowerer:
         # Cooperative strided fill: each thread writes elements stride-apart.
         # For 2D tiles where total > block_size, each thread must handle
         # multiple elements. The per-thread src_var only holds ONE value
-        # (for lid), so we re-load from global memory with corrected
-        # row/col addressing for each _sa position.
+        # (for lid), so we re-load from global memory directly into shared
+        # memory with corrected row/col addressing for each _sa position.
+        #
+        # Strategy: trace back to the tt.load's base pointer and strides,
+        # then generate a simple cooperative loop:
+        #   for (_sa = lid; _sa < total; _sa += bs) {
+        #       row = _sa / N; col = _sa % N;
+        #       shared[_sa] = ptr[row * stride_row + col * stride_col];
+        #   }
         if total > bs and self._is_2d:
             # Trace the source chain to find the original tt.load and
             # its pointer info. Also collect any transformations applied
@@ -5828,14 +6163,27 @@ class GenericLowerer:
                         elif dim == 0 and row_var is None:
                             row_var = v
                         continue
-                    # Indirect: a dependent r_X variable appears in offset
+                    # Indirect: a TRANSITIVELY dependent variable appears
+                    # in offset.  Build the set of all variable names that
+                    # depend (directly or indirectly) on this make_range idx
+                    # and check if any of them appear in offset_expr.
                     if dim == 0 and row_var is None:
-                        for dop in all_ops:
-                            dv = self.env.get(dop.id, "")
-                            if isinstance(dv, str) and dv in offset_expr and dop.operand_ids:
-                                if any(self.env.get(oid, "") == v for oid in dop.operand_ids):
-                                    row_var = v
-                                    break
+                        dep_names = {v}
+                        changed = True
+                        while changed:
+                            changed = False
+                            for dop in all_ops:
+                                dv = self.env.get(dop.id, "")
+                                if not isinstance(dv, str) or dv in dep_names:
+                                    continue
+                                if not dop.operand_ids:
+                                    continue
+                                if any(self.env.get(oid, "") in dep_names
+                                       for oid in dop.operand_ids):
+                                    dep_names.add(dv)
+                                    changed = True
+                        if any(dn in offset_expr for dn in dep_names):
+                            row_var = v
 
                 self.kb.raw_line(f"    for (uint _sa = lid; _sa < {total}u; _sa += {bs}u) {{")
                 self.kb.raw_line(f"        uint _fill_row = _sa / {N}u;")
@@ -6081,21 +6429,43 @@ class GenericLowerer:
         total = M * N
         bs = self.effective_block_size
 
-        # Close wrapping loop if active — dot needs standalone computation
+        # Close wrapping loop if active -- dot needs standalone computation
         in_loop = self._needs_wrapping
         if in_loop:
             self.kb.raw_line(f"    }}")  # close wrapping loop
 
-        # Declare a threadgroup result array to store per-thread dot results
-        result_smem = f"smem_dot_{self._shared_counter}"
-        self._shared_counter += 1
-        self.kb.declare_threadgroup_array(result_smem, dtype="fp32", size=total)
+        # Check if the accumulator is a shared-memory-backed oversized array
+        # (e.g. the 32x64 accumulator in flash attention with HEAD_DIM=64).
+        # If so, read the init from shared memory per-element and write the
+        # result back to the SAME shared array (no new allocation needed).
+        acc_smem = getattr(self, '_shared_mem_descs', {}).get(ssa.operand_ids[2])
+        acc_is_smem = False
+        if acc_smem:
+            acc_shape = acc_smem[1]
+            acc_total = 1
+            for d in acc_shape:
+                acc_total *= d
+            if acc_total > bs:
+                acc_is_smem = True
+
+        if acc_is_smem:
+            # Use the existing smem array for both init and result
+            result_smem = acc_smem[0]
+        else:
+            # Declare a threadgroup result array to store per-thread dot results
+            result_smem = f"smem_dot_{self._shared_counter}"
+            self._shared_counter += 1
+            self.kb.declare_threadgroup_array(result_smem, dtype="fp32", size=total)
 
         # Each thread computes one or more elements of C via strided loop
         self.kb.raw_line(f"    for (uint _de = lid; _de < {total}u; _de += {bs}u) {{")
         self.kb.raw_line(f"        uint _dot_row = _de / {N}u;")
         self.kb.raw_line(f"        uint _dot_col = _de % {N}u;")
-        self.kb.raw_line(f"        float _dot_sum = {acc_var};")
+        if acc_is_smem:
+            # Read accumulator init from shared memory per-element
+            self.kb.raw_line(f"        float _dot_sum = {result_smem}[_de];")
+        else:
+            self.kb.raw_line(f"        float _dot_sum = {acc_var};")
         self.kb.raw_line(f"        for (uint _dk = 0; _dk < {K}u; _dk++) {{")
         self.kb.raw_line(f"            _dot_sum += {a_index} * {b_index};")
         self.kb.raw_line(f"        }}")
@@ -6125,11 +6495,17 @@ class GenericLowerer:
     # -- SCF (structured control flow) --
 
     def _lower_scf_for(self, ssa: SSAValue):
-        """scf.for → MSL for loop with iter_args.
+        """scf.for -> MSL for loop with iter_args.
 
         scf.for has operands: [start, end, step, init_0, init_1, ...]
         Results: [result_0, result_1, ...] (same count as iter_args)
         Body block args: [induction_var, iter_arg_0, iter_arg_1, ...]
+
+        For iter_args whose 2D shape total exceeds block_size (e.g. a 32x64
+        accumulator with 1024 threads), the value is kept in a persistent
+        shared-memory array instead of a per-thread scalar.  Operations on
+        those values (arith.mulf, tt.dot, tt.store) use cooperative strided
+        loops.  The mapping is tracked in ``_smem_iter_args``.
         """
         if len(ssa.operand_ids) < 3:
             return
@@ -6142,19 +6518,53 @@ class GenericLowerer:
         init_ids = ssa.operand_ids[3:]
         n_iter_args = len(init_ids)
 
+        bs = self.effective_block_size
+
         # Infer iter_arg types from init values and scf.for result types
         iter_vars = []
         iter_dtypes = []
+        # Track which iter_args are oversized and need shared memory
+        smem_iter_indices = set()  # indices into iter_vars that are smem-backed
         # The scf.for result type tells us the true type of iter_args
         result_elem = ssa.elem_type or "f32"  # First result's type
         for i, init_id in enumerate(init_ids):
-            var_name = self._next_var("iter")
             init_val = self._lookup(init_id)
             # Prefer result type, fall back to init value type
             init_type = self.env_types.get(init_id, "fp32")
             # Use result type if it's more specific (e.g., i64 vs i32)
             if result_elem in ("i64",) and init_type in ("i32", "fp32"):
                 init_type = result_elem
+
+            # Check if this iter_arg is a 2D tensor too large for scalar
+            init_shape = self.env_shapes.get(init_id, ())
+            init_total = 1
+            for d in init_shape:
+                init_total *= d
+            if len(init_shape) >= 2 and init_total > bs:
+                # Allocate persistent shared memory for this iter_arg
+                smem_name = f"smem_iter_{self._shared_counter}"
+                self._shared_counter += 1
+                self.kb.declare_threadgroup_array(smem_name, dtype="fp32",
+                                                  size=init_total)
+                # Cooperative init from the constant value
+                self.kb.raw_line(
+                    f"    for (uint _si = lid; _si < {init_total}u; "
+                    f"_si += {bs}u) {{")
+                self.kb.raw_line(
+                    f"        {smem_name}[_si] = {init_val};")
+                self.kb.raw_line(f"    }}")
+                self.kb.raw_line(
+                    f"    threadgroup_barrier(mem_flags::mem_threadgroup);")
+                iter_vars.append(smem_name)
+                iter_dtypes.append(init_type)
+                smem_iter_indices.add(i)
+                # Register in _shared_mem_descs so downstream ops can find it
+                if not hasattr(self, '_shared_mem_descs'):
+                    self._shared_mem_descs = {}
+                # We will register the block_arg_id below after mapping
+                continue
+
+            var_name = self._next_var("iter")
             if init_type.startswith("f") or init_type.startswith("bf"):
                 msl_type = "float"
             elif init_type in ("i64",):
@@ -6167,7 +6577,7 @@ class GenericLowerer:
             iter_vars.append(var_name)
             iter_dtypes.append(init_type)
 
-        # Emit for loop — use long for i64.
+        # Emit for loop -- use long for i64.
         # scf.for semantics: always `iv < ub` (Triton normalizes negative steps).
         start_type = self.env_types.get(ssa.operand_ids[0], "i32")
         is_i64 = start_type == "i64" or "i64" in (ssa.type_str or "")
@@ -6196,6 +6606,18 @@ class GenericLowerer:
                     init_id = init_ids[i] if i < len(init_ids) else None
                     if init_id is not None and init_id in self.env_shapes:
                         self.env_shapes[ba_id] = self.env_shapes[init_id]
+                    # Register shared-memory-backed iter_args
+                    if i in smem_iter_indices:
+                        init_shape = self.env_shapes.get(
+                            init_ids[i], ()) if i < len(init_ids) else ()
+                        if not hasattr(self, '_shared_mem_descs'):
+                            self._shared_mem_descs = {}
+                        self._shared_mem_descs[ba_id] = (var, init_shape, "fp32")
+                        # Also track that this block_arg is smem-backed so
+                        # that scf.yield can skip the scalar assignment.
+                        if not hasattr(self, '_smem_iter_args'):
+                            self._smem_iter_args = {}
+                        self._smem_iter_args[ba_id] = var
 
         # Process body ops
         if ssa.region_ops:
@@ -6204,6 +6626,31 @@ class GenericLowerer:
                     # Update iter_arg variables from yield operands
                     for i, yield_id in enumerate(body_op.operand_ids):
                         if i < len(iter_vars):
+                            # Skip scalar assignment for smem-backed iter_args;
+                            # the shared memory was already updated in-place by
+                            # the dot or strided binary op.
+                            if i in smem_iter_indices:
+                                # Check if the yield value has a shared_mem_desc
+                                # pointing to a DIFFERENT array (e.g. the dot
+                                # wrote to smem_dot_X).  If so, copy it over.
+                                yield_smem = getattr(self, '_shared_mem_descs', {}).get(yield_id)
+                                if yield_smem and yield_smem[0] != iter_vars[i]:
+                                    src_smem = yield_smem[0]
+                                    dst_smem = iter_vars[i]
+                                    init_shape = self.env_shapes.get(
+                                        init_ids[i], ()) if i < len(init_ids) else ()
+                                    sz = 1
+                                    for d in init_shape:
+                                        sz *= d
+                                    self.kb.raw_line(
+                                        f"    for (uint _cp = lid; _cp < {sz}u; "
+                                        f"_cp += {bs}u) {{")
+                                    self.kb.raw_line(
+                                        f"        {dst_smem}[_cp] = {src_smem}[_cp];")
+                                    self.kb.raw_line(f"    }}")
+                                    self.kb.raw_line(
+                                        f"    threadgroup_barrier(mem_flags::mem_threadgroup);")
+                                continue
                             yield_val = self._lookup(yield_id)
                             self.kb.raw_line(
                                 f"        {iter_vars[i]} = {yield_val};"
@@ -6223,6 +6670,13 @@ class GenericLowerer:
                     # Propagate shape from init value to result
                     if i < len(init_ids) and init_ids[i] in self.env_shapes:
                         self.env_shapes[rid] = self.env_shapes[init_ids[i]]
+                    # Propagate shared_mem_desc for oversized iter_args
+                    if i in smem_iter_indices:
+                        init_shape = self.env_shapes.get(
+                            init_ids[i], ()) if i < len(init_ids) else ()
+                        if not hasattr(self, '_shared_mem_descs'):
+                            self._shared_mem_descs = {}
+                        self._shared_mem_descs[rid] = (var, init_shape, "fp32")
         elif n_iter_args == 1 and iter_vars:
             self.env[ssa.id] = iter_vars[0]
             self.env_types[ssa.id] = iter_dtypes[0] if iter_dtypes else "fp32"

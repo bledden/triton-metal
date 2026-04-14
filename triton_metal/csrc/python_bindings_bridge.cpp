@@ -198,6 +198,41 @@ static void addAIRMetadata(llvm::Module &mod, llvm::Function &kernelFn,
             fields.push_back(llvm::MDString::get(ctx, ("arg" + std::to_string(i)).c_str()));
 
             bufferIndex++;
+        } else if (argTy->isFloatingPointTy()) {
+            // Scalar float argument — passed as constant buffer
+            unsigned byteWidth = argTy->isFloatTy() ? 4
+                               : argTy->isHalfTy()  ? 2
+                               : argTy->isDoubleTy() ? 8 : 4;
+            std::string typeName = argTy->isFloatTy() ? "float"
+                                 : argTy->isHalfTy()  ? "half"
+                                 : "float";
+
+            fields.push_back(llvm::MDString::get(ctx, "air.buffer"));
+            fields.push_back(llvm::MDString::get(ctx, "air.buffer_size"));
+            fields.push_back(llvm::ConstantAsMetadata::get(
+                llvm::ConstantInt::get(i32Ty, byteWidth)));
+            fields.push_back(llvm::MDString::get(ctx, "air.location_index"));
+            fields.push_back(llvm::ConstantAsMetadata::get(
+                llvm::ConstantInt::get(i32Ty, bufferIndex)));
+            fields.push_back(llvm::ConstantAsMetadata::get(
+                llvm::ConstantInt::get(i32Ty, 1)));
+            fields.push_back(llvm::MDString::get(ctx, "air.read"));
+            fields.push_back(llvm::MDString::get(ctx, "air.address_space"));
+            fields.push_back(llvm::ConstantAsMetadata::get(
+                llvm::ConstantInt::get(i32Ty, 2))); // constant address space
+
+            fields.push_back(llvm::MDString::get(ctx, "air.arg_type_size"));
+            fields.push_back(llvm::ConstantAsMetadata::get(
+                llvm::ConstantInt::get(i32Ty, byteWidth)));
+            fields.push_back(llvm::MDString::get(ctx, "air.arg_type_align_size"));
+            fields.push_back(llvm::ConstantAsMetadata::get(
+                llvm::ConstantInt::get(i32Ty, byteWidth)));
+            fields.push_back(llvm::MDString::get(ctx, "air.arg_type_name"));
+            fields.push_back(llvm::MDString::get(ctx, typeName));
+            fields.push_back(llvm::MDString::get(ctx, "air.arg_name"));
+            fields.push_back(llvm::MDString::get(ctx, ("arg" + std::to_string(i)).c_str()));
+
+            bufferIndex++;
         }
 
         argMDs.push_back(llvm::MDNode::get(ctx, fields));
@@ -447,7 +482,10 @@ extern "C" const char* triton_metal_run_to_llvm(const char* mlir_text,
                 if (arg.getType()->isPointerTy()) {
                     newArgTypes.push_back(devicePtrTy);
                     isScalarArg.push_back(false);
-                } else if (arg.getType()->isIntegerTy()) {
+                } else if (arg.getType()->isIntegerTy() ||
+                           arg.getType()->isFloatingPointTy()) {
+                    // Scalar args (int or float) are passed as constant
+                    // buffer pointers in Metal AIR.
                     newArgTypes.push_back(constPtrTy);
                     isScalarArg.push_back(true);
                 } else {

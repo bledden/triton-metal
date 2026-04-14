@@ -164,13 +164,28 @@ class MetalBackend(BaseBackend):
                 """
                 ttgir_text = metadata.pop("cpp_ttgir", None)
                 if ttgir_text and not MetalBackend._has_complex_ops(ttgir_text):
+                    # C++ per-thread model: one thread per element.
+                    # Can't handle kernels where total elements > 1024
+                    # (Metal's max threadgroup size). MSL uses wrapping
+                    # loops for those; the C++ path has no such mechanism.
+                    import re as _re
+                    mr_ends = [int(m.group(1)) for m in _re.finditer(
+                        r'tt\.make_range\s*\{[^}]*end\s*=\s*(\d+)', ttgir_text)]
+                    max_tensor_elems = max(mr_ends) if mr_ends else 0
+                    if max_tensor_elems > 1024:
+                        return MetalBackend.make_metallib(src, metadata, options)
                     try:
-                        # Use the CORRECT block_size from the MSL path
+                        # Don't inherit MSL's block_size (which reflects
+                        # wrapping loops / sizePerThread). Let make_llir
+                        # compute the correct value from make_range end.
                         cpp_meta = dict(metadata)
+                        cpp_meta.pop("block_size", None)
                         llir = MetalBackend.make_llir(ttgir_text, cpp_meta, options)
-                        # Override block_size with the MSL path's value
-                        cpp_meta["block_size"] = metadata["block_size"]
                         cpp_meta["name"] = metadata["name"]
+                        # Write the C++ path's block_size back to the shared
+                        # metadata so pack_metadata dispatches the correct
+                        # number of threads (one per element).
+                        metadata["block_size"] = cpp_meta["block_size"]
                         return MetalBackend.make_metallib_from_llir(llir, cpp_meta, options)
                     except Exception:
                         pass
@@ -199,12 +214,80 @@ class MetalBackend(BaseBackend):
         that require Python codegen for correctness. Simple elementwise
         kernels return False and can use the C++ LLVM IR path.
         """
-        # All kernels currently use MSL metallib for execution correctness.
-        # The C++ LLVM IR path is generated alongside for verification.
-        # Return True for all kernels until the C++ metallib is validated.
-        return True
-        for op in complex_ops:
-            if op in ttgir_text:
+        # ALLOWLIST: ops the C++ metallib path handles correctly.
+        # Only use C++ metallib for kernels using ONLY these ops.
+        import re
+        allowed_ops = {
+            # -- Triton ops (custom patterns in ElementwiseOpToLLVM.cpp) --
+            'tt.get_program_id', 'tt.get_num_programs',
+            'tt.make_range', 'tt.splat', 'tt.broadcast',
+            'tt.expand_dims', 'tt.reshape',
+            'tt.addptr', 'tt.load', 'tt.store',
+            'tt.func', 'tt.return',
+            'tt.reduce', 'tt.reduce.return',
+            'tt.extern_elementwise',
+            # -- Arith ops (standard arith-to-LLVM + custom constant) --
+            'arith.constant',
+            'arith.addf', 'arith.addi',
+            'arith.subf', 'arith.subi',
+            'arith.mulf', 'arith.muli',
+            'arith.divf', 'arith.divsi', 'arith.divui',
+            'arith.remf', 'arith.remsi', 'arith.remui',
+            'arith.negf',
+            'arith.andi', 'arith.ori', 'arith.xori',
+            'arith.shli', 'arith.shrsi', 'arith.shrui',
+            'arith.cmpi', 'arith.cmpf',
+            'arith.select',
+            'arith.sitofp', 'arith.fptosi',
+            'arith.uitofp', 'arith.fptoui',
+            'arith.extf', 'arith.truncf',
+            'arith.extsi', 'arith.extui', 'arith.trunci',
+            'arith.bitcast', 'arith.index_cast',
+            'arith.maxnumf', 'arith.minnumf',
+            'arith.maximumf', 'arith.minimumf',
+            'arith.maxsi', 'arith.minsi',
+            'arith.maxui', 'arith.minui',
+            # -- Math ops (standard math-to-LLVM) --
+            'math.exp', 'math.exp2',
+            'math.log', 'math.log2', 'math.log10',
+            'math.sqrt', 'math.rsqrt',
+            'math.absf', 'math.abs',
+            'math.sin', 'math.cos', 'math.tan',
+            'math.tanh', 'math.erf',
+            'math.ceil', 'math.floor', 'math.round',
+            'math.powf', 'math.fma',
+            'math.copysign',
+            # -- Control flow (standard cf-to-LLVM) --
+            'cf.br', 'cf.cond_br',
+            # -- SCF (structured control flow) --
+            'scf.for', 'scf.yield', 'scf.if',
+        }
+        # Extract actual MLIR operations from the TTGIR text.
+        # Operations appear as either:
+        #   %result = tt.load %ptr   (result-producing op)
+        #   tt.store %ptr, %val      (side-effecting op at line start)
+        #   tt.func public @name     (function definition at line start)
+        #   tt.return                (terminator at line start)
+        # We must NOT match attribute/type references like:
+        #   !tt.ptr<f32>             (type annotation, preceded by !)
+        #   #ttg.blocked<{...}>      (encoding attribute, preceded by #)
+        #   "ttg.num-warps"          (module attribute key, inside quotes)
+        #   "ttg.target"             (module attribute key, inside quotes)
+        ops_in_kernel = set()
+        for line in ttgir_text.splitlines():
+            stripped = line.strip()
+            if not stripped or stripped.startswith('//') or stripped.startswith('#'):
+                continue
+            # Match "= <op>" pattern (result-producing ops)
+            for m in re.finditer(r'=\s+((?:tt|arith|math|scf|ttg)\.\w+)', stripped):
+                ops_in_kernel.add(m.group(1))
+            # Match ops at line start (side-effecting ops like tt.store, tt.return, tt.func)
+            m = re.match(r'((?:tt|arith|math|scf|ttg)\.\w+)', stripped)
+            if m:
+                ops_in_kernel.add(m.group(1))
+        # If any op is NOT in the allowlist, use MSL
+        for op in ops_in_kernel:
+            if op not in allowed_ops:
                 return True
         return False
 
@@ -678,24 +761,33 @@ class MetalBackend(BaseBackend):
             if m:
                 cast_map[m.group(1)] = (m.group(3), m.group(2))
 
-        # Pass 0.5: Infer element types from GEP instructions.
-        # Pattern: getelementptr <elem_type>, ptr <ptr_name>, ...
+        # Pass 0.5: Infer element types from GEP and load instructions.
+        # GEP pattern: getelementptr <elem_type>, ptr <ptr_name>, ...
+        # Load pattern: load <elem_type>, ptr addrspace(N) <ptr_name>, ...
         # Follow addrspacecast chains to resolve back to the original param.
-        # Note: ptr_name uses [\w.]+  to match LLVM names like %.generic but
-        # NOT commas or other delimiters.
         param_types = {}  # param_name -> element_type (e.g. "%0" -> "half")
         for line in lines:
+            # GEP: getelementptr <type>, ptr %name
             m = re.match(
                 r'\s*%\S+\s*=\s*getelementptr\s+(\w+),\s*ptr\s+(%([\w.]+))',
                 line
             )
             if m:
                 elem_type = m.group(1)
-                ptr_name = m.group(2)  # e.g. "%.generic" or "%0"
-                # Follow addrspacecast to find the original parameter
+                ptr_name = m.group(2)
                 actual_ptr = cast_map.get(ptr_name, (ptr_name,))[0] if ptr_name in cast_map else ptr_name
                 if actual_ptr not in param_types:
                     param_types[actual_ptr] = elem_type
+            # Load from constant buffer: load <type>, ptr addrspace(2) %name
+            m = re.match(
+                r'\s*(%\S+)\s*=\s*load\s+(\w+),\s*ptr\s+addrspace\(2\)\s+(%([\w.]+))',
+                line
+            )
+            if m:
+                elem_type = m.group(2)
+                ptr_name = m.group(3)  # e.g. "%4"
+                if ptr_name not in param_types:
+                    param_types[ptr_name] = elem_type
 
         # Parse function signature to get ordered parameter names.
         # Pattern: define void @kernel(ptr addrspace(1) %0, ptr addrspace(1) %1, ...)
@@ -726,12 +818,20 @@ class MetalBackend(BaseBackend):
             """Return the element type for a device buffer parameter."""
             return param_types.get(param_name, 'float')
 
-        # Build a map: param_index -> element_type for device buffers (addrspace 1)
-        param_elem_types = {}  # index -> elem_type string
+        # Build maps: param_index -> element_type for device and constant buffers
+        param_elem_types = {}  # index -> elem_type string (device buffers)
+        const_elem_types = {}  # index -> elem_type string (constant buffers)
         for i, pname in enumerate(sig_param_names):
             if sig_param_addrspaces.get(pname) == '1':
                 param_elem_types[i] = _get_device_ptr_type(pname)
+            elif sig_param_addrspaces.get(pname) == '2':
+                const_elem_types[i] = param_types.get(pname, 'i32')
 
+        # Build per-param constant buffer type lookup by name (for non-sig lines)
+        const_param_type_by_name = {}
+        for i, pname in enumerate(sig_param_names):
+            if sig_param_addrspaces.get(pname) == '2':
+                const_param_type_by_name[pname] = const_elem_types.get(i, 'i32')
 
         # Pass 1: Process each line
         out_lines = []
@@ -763,12 +863,22 @@ class MetalBackend(BaseBackend):
                         ety = param_elem_types.get(i, 'float')
                         param = param.replace('ptr addrspace(1)', f'{ety} addrspace(1)*')
                     elif 'ptr addrspace(2)' in param:
-                        param = param.replace('ptr addrspace(2)', 'i32 addrspace(2)*')
+                        ety = const_elem_types.get(i, 'i32')
+                        param = param.replace('ptr addrspace(2)', f'{ety} addrspace(2)*')
                     new_params.append(param)
                 line = prefix + ', '.join(new_params) + suffix
             else:
-                # Non-signature lines: convert remaining ptr addrspace(N) patterns
-                line = line.replace('ptr addrspace(2)', 'i32 addrspace(2)*')
+                # Non-signature lines: convert ptr addrspace(2) with correct type.
+                # Match "ptr addrspace(2) %name" and use the inferred type.
+                def _replace_const_ptr(m):
+                    pname = m.group(1)
+                    ety = const_param_type_by_name.get(pname, 'i32')
+                    return f'{ety} addrspace(2)* {pname}'
+                line = re.sub(
+                    r'ptr\s+addrspace\(2\)\s+(%([\w.]+))',
+                    _replace_const_ptr,
+                    line
+                )
                 # Do NOT blindly replace ptr addrspace(1) here; GEP/load/store
                 # handlers below will use the correct element type.
 

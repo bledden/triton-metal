@@ -97,6 +97,27 @@ struct MakeRangeOpConversion
     auto call = LLVM::CallOp::create(rewriter, loc, fn, ValueRange{});
     Value lid = call.getResult();
 
+    // Check for 2D block decomposition attributes added by the Python
+    // text-level stripping phase. In 2D kernels (matmul), the linear
+    // thread ID (lid) needs to be decomposed into row/col indices:
+    //   metal.dim=1 → row index: lid / col_block_size
+    //   metal.dim=0 → col index: lid % col_block_size
+    auto dimAttr = op->getAttrOfType<IntegerAttr>("metal.dim");
+    auto colBlockAttr = op->getAttrOfType<IntegerAttr>("metal.col_block_size");
+    if (dimAttr && colBlockAttr) {
+      int64_t dim = dimAttr.getInt();
+      int64_t colBlockSize = colBlockAttr.getInt();
+      auto colBlockConst = LLVM::ConstantOp::create(rewriter, loc, i32Ty,
+          rewriter.getI32IntegerAttr(colBlockSize));
+      if (dim == 1) {
+        // Row index: lid / col_block_size
+        lid = LLVM::UDivOp::create(rewriter, loc, i32Ty, lid, colBlockConst);
+      } else if (dim == 0) {
+        // Col index: lid % col_block_size
+        lid = LLVM::URemOp::create(rewriter, loc, i32Ty, lid, colBlockConst);
+      }
+    }
+
     // Add the start offset if non-zero
     uint32_t start = op.getStart();
     if (start != 0) {

@@ -209,12 +209,15 @@ static void addAIRMetadata(llvm::Module &mod, llvm::Function &kernelFn,
     for (unsigned i = 0; i < implicitArgs.size(); ++i) {
         unsigned argIdx = explicitArgs + i;
         const auto &ia = implicitArgs[i];
+        llvm::Argument &arg = *kernelFn.getArg(argIdx);
+        bool isVec = arg.getType()->isVectorTy();
+
         llvm::SmallVector<llvm::Metadata *, 6> fields;
         fields.push_back(llvm::ConstantAsMetadata::get(
             llvm::ConstantInt::get(i32Ty, argIdx)));
         fields.push_back(llvm::MDString::get(ctx, ia.airMetadata));
         fields.push_back(llvm::MDString::get(ctx, "air.arg_type_name"));
-        fields.push_back(llvm::MDString::get(ctx, "uint"));
+        fields.push_back(llvm::MDString::get(ctx, isVec ? "uint3" : "uint"));
         fields.push_back(llvm::MDString::get(ctx, "air.arg_name"));
         fields.push_back(llvm::MDString::get(ctx, ia.argName));
         argMDs.push_back(llvm::MDNode::get(ctx, fields));
@@ -460,24 +463,36 @@ extern "C" const char* triton_metal_run_to_llvm(const char* mlir_text,
                 std::string intrinsicName;  // __metal_get_* function name
                 std::string argName;        // LLVM arg name
                 std::string airMetadata;    // AIR metadata key
+                bool isVector;              // true if this is a <3 x i32> arg
             };
             llvm::SmallVector<ImplicitArgEntry, 6> implicitArgs;
 
-            // Always add pid (threadgroup position) and lid (thread position)
+            // Determine dimensionality of program_id usage.
+            bool needsPidY = usedIntrinsics.count("__metal_get_program_id_1") > 0;
+            bool needsPidZ = usedIntrinsics.count("__metal_get_program_id_2") > 0;
+            bool needsMultiDimPid = needsPidY || needsPidZ;
+
+            // Thread position in grid: for 1D use scalar, for 2D/3D use <3 x i32>.
+            // The __metal_get_program_id_{0,1,2} calls map to extractelement
+            // from the vector arg.
             implicitArgs.push_back({
                 "__metal_get_program_id_0", "pid",
-                "air.threadgroup_position_in_grid"
+                "air.threadgroup_position_in_grid",
+                needsMultiDimPid // vector if multi-dim
             });
+
             implicitArgs.push_back({
                 "__metal_get_local_id", "lid",
-                "air.thread_position_in_threadgroup"
+                "air.thread_position_in_threadgroup",
+                false
             });
 
             // Add threadgroups_per_grid if get_num_programs is used
             if (usedIntrinsics.count("__metal_get_num_programs_0")) {
                 implicitArgs.push_back({
                     "__metal_get_num_programs_0", "grid_size",
-                    "air.threadgroups_per_grid"
+                    "air.threadgroups_per_grid",
+                    false
                 });
             }
 
@@ -485,19 +500,26 @@ extern "C" const char* triton_metal_run_to_llvm(const char* mlir_text,
             if (usedIntrinsics.count("__metal_get_sgitg")) {
                 implicitArgs.push_back({
                     "__metal_get_sgitg", "sgitg",
-                    "air.simdgroup_index_in_threadgroup"
+                    "air.simdgroup_index_in_threadgroup",
+                    false
                 });
             }
             if (usedIntrinsics.count("__metal_get_tiisg")) {
                 implicitArgs.push_back({
                     "__metal_get_tiisg", "tiisg",
-                    "air.thread_index_in_simdgroup"
+                    "air.thread_index_in_simdgroup",
+                    false
                 });
             }
 
-            // Append implicit arg types (all i32)
-            for (auto &ia : implicitArgs)
-                newArgTypes.push_back(i32Ty);
+            // Append implicit arg types
+            auto *vec3i32Ty = llvm::FixedVectorType::get(i32Ty, 3);
+            for (auto &ia : implicitArgs) {
+                llvm::Type *argTy = ia.isVector
+                    ? static_cast<llvm::Type *>(vec3i32Ty)
+                    : static_cast<llvm::Type *>(i32Ty);
+                newArgTypes.push_back(argTy);
+            }
 
             auto *newFnTy = llvm::FunctionType::get(
                 kernelFn->getReturnType(), newArgTypes, false);
@@ -521,12 +543,21 @@ extern "C" const char* triton_metal_run_to_llvm(const char* mlir_text,
                 ++argIdx;
             }
 
-            // Name and record the implicit args
+            // Name and record the implicit args.
+            // For multi-dim program_id, the vector arg is stored and
+            // extractelement is used for each axis.
             std::map<std::string, llvm::Argument *> implicitArgMap;
+            llvm::Argument *pidVectorArg = nullptr;
             for (auto &ia : implicitArgs) {
                 llvm::Argument *arg = &*newArgIt;
                 arg->setName(ia.argName);
-                implicitArgMap[ia.intrinsicName] = arg;
+                if (ia.isVector && ia.airMetadata == "air.threadgroup_position_in_grid") {
+                    pidVectorArg = arg;
+                    // Map axis 0 to extractelement (done later in IR)
+                    implicitArgMap[ia.intrinsicName] = arg; // placeholder
+                } else {
+                    implicitArgMap[ia.intrinsicName] = arg;
+                }
                 ++newArgIt;
             }
 
@@ -574,7 +605,9 @@ extern "C" const char* triton_metal_run_to_llvm(const char* mlir_text,
                 ++argIdx;
             }
 
-            // Replace __metal_* calls with corresponding implicit args
+            // Replace __metal_* calls with corresponding implicit args.
+            // For multi-dim program_id, extract the component from the
+            // <3 x i32> vector arg.
             for (auto &bb : *newFn) {
                 for (auto it = bb.begin(); it != bb.end(); ) {
                     auto *inst = &*it;
@@ -582,6 +615,20 @@ extern "C" const char* triton_metal_run_to_llvm(const char* mlir_text,
                     if (auto *callInst = llvm::dyn_cast<llvm::CallInst>(inst)) {
                         if (auto *callee = callInst->getCalledFunction()) {
                             auto name = callee->getName().str();
+
+                            // Handle multi-dim program_id via extractelement
+                            if (needsMultiDimPid && pidVectorArg &&
+                                llvm::StringRef(name).starts_with("__metal_get_program_id_")) {
+                                unsigned axis = name.back() - '0';
+                                llvm::IRBuilder<> b(callInst);
+                                auto *idx = llvm::ConstantInt::get(i32Ty, axis);
+                                auto *elem = b.CreateExtractElement(
+                                    pidVectorArg, idx, "pid_" + std::to_string(axis));
+                                callInst->replaceAllUsesWith(elem);
+                                callInst->eraseFromParent();
+                                continue;
+                            }
+
                             auto mapIt = implicitArgMap.find(name);
                             if (mapIt != implicitArgMap.end()) {
                                 callInst->replaceAllUsesWith(mapIt->second);

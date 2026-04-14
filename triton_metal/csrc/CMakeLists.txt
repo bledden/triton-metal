@@ -16,7 +16,7 @@ set(TRITON_BUILDPATH "$ENV{HOME}/Documents/triton/build/cmake.macosx-15.0-arm64-
     CACHE PATH "Path to Triton build tree (for generated headers)")
 
 # ---------------------------------------------------------------------------
-# Find LLVM & MLIR
+# Find LLVM & MLIR (for include paths and cmake modules only)
 # ---------------------------------------------------------------------------
 set(LLVM_DIR "${LLVM_SYSPATH}/lib/cmake/llvm" CACHE PATH "")
 set(MLIR_DIR "${LLVM_SYSPATH}/lib/cmake/mlir" CACHE PATH "")
@@ -36,7 +36,7 @@ include(AddMLIR)
 # ---------------------------------------------------------------------------
 # Include paths
 # ---------------------------------------------------------------------------
-# LLVM/MLIR headers
+# LLVM/MLIR headers (needed for compilation, NOT for linking)
 include_directories(SYSTEM ${LLVM_INCLUDE_DIRS})
 include_directories(SYSTEM ${MLIR_INCLUDE_DIRS})
 
@@ -58,7 +58,7 @@ if(NOT MSVC)
   set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -D__STDC_FORMAT_MACROS -fPIC")
 endif()
 
-# Match LLVM's RTTI setting — LLVM/MLIR are built without RTTI
+# Default to -fno-rtti (LLVM/MLIR convention); pybind11 source overrides below
 if(NOT LLVM_ENABLE_RTTI)
   if(NOT MSVC)
     set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fno-rtti")
@@ -69,7 +69,9 @@ endif()
 
 # ---------------------------------------------------------------------------
 # Triton dialect object files — Triton builds as OBJECT libraries so we
-# collect the pre-built .o files and link them into our shared library.
+# collect the pre-built .o files for the Triton IR dialect definitions.
+# These are needed because the Triton ops (GetProgramIdOp, LoadOp, etc.)
+# have non-inline methods defined in these compilation units.
 # ---------------------------------------------------------------------------
 set(TRITON_IR_OBJS_DIR
     "${TRITON_BUILDPATH}/lib/Dialect/Triton/IR/CMakeFiles/TritonIR.dir")
@@ -77,13 +79,24 @@ set(TRITON_IR_OBJS_DIR
 file(GLOB TRITON_IR_OBJS "${TRITON_IR_OBJS_DIR}/*.o")
 
 # ---------------------------------------------------------------------------
-# Subdirectories
+# libtriton.so path — Triton's shared library that contains all MLIR symbols.
+# By linking against this instead of standalone MLIR libraries, we avoid
+# duplicate MLIR dialect registrations when both are loaded in the same
+# Python process.
+# ---------------------------------------------------------------------------
+set(LIBTRITON_PATH "${TRITON_SRCPATH}/python/triton/_C/libtriton.so")
+if(NOT EXISTS "${LIBTRITON_PATH}")
+  message(FATAL_ERROR "libtriton.so not found at ${LIBTRITON_PATH}")
+endif()
+message(STATUS "Using libtriton.so at ${LIBTRITON_PATH}")
+
+# ---------------------------------------------------------------------------
+# Standalone shared library — aggregates all conversion objects.
+# This links against individual MLIR libraries and is used for standalone
+# testing only (NOT loaded alongside libtriton.so in the same process).
 # ---------------------------------------------------------------------------
 add_subdirectory(lib/Conversion)
 
-# ---------------------------------------------------------------------------
-# Shared library target — aggregates all conversion objects
-# ---------------------------------------------------------------------------
 add_library(triton_metal_backend SHARED
     $<TARGET_OBJECTS:TritonMetalToLLVM>
     ${TRITON_IR_OBJS}
@@ -110,20 +123,52 @@ target_link_libraries(triton_metal_backend
     LLVMCore
 )
 
-# Install target (optional — for packaging later)
 install(TARGETS triton_metal_backend LIBRARY DESTINATION lib)
 
 # ---------------------------------------------------------------------------
 # pybind11 Python extension — exposes C++ MLIR passes to Python
+#
+# KEY CHANGE: This module links against Triton's libtriton.so for MLIR
+# symbols instead of standalone MLIR libraries. This prevents the duplicate
+# MLIR dialect registration crash when both our .so and libtriton.so are
+# loaded in the same Python process.
+#
+# All conversion source files are compiled directly into this module (no
+# intermediate library), avoiding the two-library symbol resolution problem.
 # ---------------------------------------------------------------------------
 find_package(pybind11 REQUIRED PATHS
     "${CMAKE_CURRENT_SOURCE_DIR}/../../.venv/lib/python3.14/site-packages/pybind11/share/cmake/pybind11")
 
-pybind11_add_module(_triton_metal_cpp python_bindings.cpp)
-target_link_libraries(_triton_metal_cpp PRIVATE triton_metal_backend)
-# pybind11 requires RTTI (typeid).  The global CMAKE_CXX_FLAGS contain
-# -fno-rtti to match LLVM/MLIR, so we must override it for this target.
-# python_bindings.cpp does NOT include any MLIR headers — it calls
-# through a C-linkage bridge (python_bindings_bridge.cpp) that lives in
-# the dylib and is compiled with -fno-rtti.
-target_compile_options(_triton_metal_cpp PRIVATE -frtti)
+pybind11_add_module(_triton_metal_cpp
+    python_bindings.cpp
+    python_bindings_bridge.cpp
+    lib/Conversion/TritonMetalToLLVM.cpp
+    lib/Conversion/ElementwiseOpToLLVM.cpp
+)
+
+# Include our headers for the conversion sources compiled into this module
+target_include_directories(_triton_metal_cpp PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+)
+
+# Link against libtriton.so for ALL MLIR/LLVM symbols — this is the same
+# copy of MLIR that Triton uses, so no duplicate registrations.
+target_link_libraries(_triton_metal_cpp PRIVATE ${LIBTRITON_PATH})
+
+# Also link the Triton IR dialect object files — these contain non-inline
+# method definitions for Triton ops (GetProgramIdOp, LoadOp, etc.)
+target_sources(_triton_metal_cpp PRIVATE ${TRITON_IR_OBJS})
+
+# Per-file RTTI settings:
+# - python_bindings.cpp needs RTTI for pybind11 (typeid)
+# - Everything else needs -fno-rtti to match LLVM/MLIR conventions
+set_source_files_properties(
+    python_bindings.cpp
+    PROPERTIES COMPILE_FLAGS "-frtti"
+)
+set_source_files_properties(
+    python_bindings_bridge.cpp
+    lib/Conversion/TritonMetalToLLVM.cpp
+    lib/Conversion/ElementwiseOpToLLVM.cpp
+    PROPERTIES COMPILE_FLAGS "-fno-rtti"
+)

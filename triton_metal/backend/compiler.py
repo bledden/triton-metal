@@ -366,8 +366,15 @@ class MetalBackend(BaseBackend):
         if m:
             metadata["name"] = m.group(1)
 
-        # Set block_size from options
-        metadata.setdefault("block_size", options.num_warps * 32)
+        # Extract block_size from TTGIR make_range end attribute.
+        # The Python path gets this from the IRGraph, but here we parse
+        # it from the original TTGIR text.
+        import re
+        block_size = options.num_warps * 32  # default
+        mr_match = re.search(r'tt\.make_range\s*\{[^}]*end\s*=\s*(\d+)', ttgir_text)
+        if mr_match:
+            block_size = int(mr_match.group(1))
+        metadata.setdefault("block_size", min(block_size, 1024))
         metadata.setdefault("needs_2d_grid", False)
 
         return air_llvm_ir

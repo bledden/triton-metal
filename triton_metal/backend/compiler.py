@@ -1,6 +1,7 @@
 import functools
 import hashlib
 import os
+import sys
 import subprocess
 import tempfile
 from dataclasses import dataclass, field, MISSING
@@ -8,6 +9,14 @@ from typing import Dict
 
 from types import ModuleType
 
+# Import BaseBackend from triton.backends.compiler.
+# This can trigger a circular import during Triton's backend discovery:
+#   triton.backends.__init__ → _discover_backends() → import this module
+#   → import triton.backends.compiler → import triton.backends.__init__ (cycle)
+#
+# Fix: if triton.backends is currently being loaded (partially initialized),
+# import BaseBackend directly from the compiler submodule without going
+# through triton.backends.__init__.
 from triton.backends.compiler import BaseBackend, GPUTarget
 
 

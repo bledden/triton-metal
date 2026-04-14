@@ -247,6 +247,17 @@ class MetalBackend(BaseBackend):
 
         return '\n'.join(out_lines) + '\n'
 
+    # Map LLVM IR element types to their byte size and AIR metadata name.
+    _ELEM_TYPE_INFO = {
+        'half':  (2, 2, 'half'),
+        'float': (4, 4, 'float'),
+        'i8':    (1, 1, 'char'),
+        'i16':   (2, 2, 'short'),
+        'i32':   (4, 4, 'int'),
+        'i64':   (8, 8, 'long'),
+        'bfloat':(2, 2, 'bfloat'),
+    }
+
     @staticmethod
     def _opaque_to_typed_ptrs(llir_text):
         """Convert LLVM IR with opaque pointers to typed pointers for Metal AIR.
@@ -254,18 +265,18 @@ class MetalBackend(BaseBackend):
         Metal's GPU JIT compiler requires typed pointers and does not support
         generic address space stores. This conversion:
         1. Eliminates addrspacecasts (inlines source pointers)
-        2. Converts all pointer types to typed equivalents
-        3. Fixes metadata to use typed function pointer references
-
-        Limitations: assumes float element type for device buffers (nano backend).
+        2. Infers element types from GEP instructions for each device buffer
+        3. Converts all pointer types to typed equivalents
+        4. Fixes metadata to use typed function pointer references and correct
+           type names/sizes for non-float buffers
         """
         import re
 
         lines = llir_text.split('\n')
 
-        # Pass 1: Collect addrspacecast mappings and their source address spaces.
+        # Pass 0: Collect addrspacecast mappings and their source address spaces.
         # E.g. %.generic = addrspacecast ptr addrspace(1) %0 to ptr
-        #   → cast_map["%.generic"] = ("%0", "1")
+        #   -> cast_map["%.generic"] = ("%0", "1")
         cast_map = {}
         for line in lines:
             m = re.match(
@@ -275,7 +286,62 @@ class MetalBackend(BaseBackend):
             if m:
                 cast_map[m.group(1)] = (m.group(3), m.group(2))
 
-        # Pass 2: Process each line
+        # Pass 0.5: Infer element types from GEP instructions.
+        # Pattern: getelementptr <elem_type>, ptr <ptr_name>, ...
+        # Follow addrspacecast chains to resolve back to the original param.
+        # Note: ptr_name uses [\w.]+  to match LLVM names like %.generic but
+        # NOT commas or other delimiters.
+        param_types = {}  # param_name -> element_type (e.g. "%0" -> "half")
+        for line in lines:
+            m = re.match(
+                r'\s*%\S+\s*=\s*getelementptr\s+(\w+),\s*ptr\s+(%([\w.]+))',
+                line
+            )
+            if m:
+                elem_type = m.group(1)
+                ptr_name = m.group(2)  # e.g. "%.generic" or "%0"
+                # Follow addrspacecast to find the original parameter
+                actual_ptr = cast_map.get(ptr_name, (ptr_name,))[0] if ptr_name in cast_map else ptr_name
+                if actual_ptr not in param_types:
+                    param_types[actual_ptr] = elem_type
+
+        # Parse function signature to get ordered parameter names.
+        # Pattern: define void @kernel(ptr addrspace(1) %0, ptr addrspace(1) %1, ...)
+        sig_param_names = []  # ordered list of param names from define line
+        sig_param_addrspaces = {}  # param_name -> addrspace string or None
+        for line in lines:
+            m = re.match(
+                r'\s*define\s+void\s+@\w+\((.*)\)',
+                line
+            )
+            if m:
+                for param in m.group(1).split(','):
+                    param = param.strip()
+                    # Extract param name (last %word in the param)
+                    name_m = re.search(r'(%\S+)\s*$', param)
+                    if name_m:
+                        pname = name_m.group(1)
+                        sig_param_names.append(pname)
+                        # Check if it has an addrspace
+                        as_m = re.search(r'addrspace\((\d+)\)', param)
+                        if as_m:
+                            sig_param_addrspaces[pname] = as_m.group(1)
+                break
+
+        # For device buffer params (addrspace 1), determine the typed pointer.
+        # If we found a GEP that uses the param, use that type; else default to float.
+        def _get_device_ptr_type(param_name):
+            """Return the element type for a device buffer parameter."""
+            return param_types.get(param_name, 'float')
+
+        # Build a map: param_index -> element_type for device buffers (addrspace 1)
+        param_elem_types = {}  # index -> elem_type string
+        for i, pname in enumerate(sig_param_names):
+            if sig_param_addrspaces.get(pname) == '1':
+                param_elem_types[i] = _get_device_ptr_type(pname)
+
+
+        # Pass 1: Process each line
         out_lines = []
         fn_name = None
         fn_param_types = []
@@ -291,36 +357,51 @@ class MetalBackend(BaseBackend):
                 # Word-boundary replacement
                 line = re.sub(re.escape(name) + r'(?=[\s,)\]]|$)', src, line)
 
-            # Convert ptr addrspace(1) → float addrspace(1)*
-            line = line.replace('ptr addrspace(1)', 'float addrspace(1)*')
-            # Convert ptr addrspace(2) → i32 addrspace(2)*
-            line = line.replace('ptr addrspace(2)', 'i32 addrspace(2)*')
+            # Convert function signature with per-param types
+            def_m = re.match(
+                r'(\s*define\s+void\s+@\w+\()(.*?)(\)\s*\{.*)$',
+                line
+            )
+            if def_m:
+                prefix, params_str, suffix = def_m.group(1), def_m.group(2), def_m.group(3)
+                new_params = []
+                for i, param in enumerate(params_str.split(',')):
+                    param = param.strip()
+                    if 'ptr addrspace(1)' in param:
+                        ety = param_elem_types.get(i, 'float')
+                        param = param.replace('ptr addrspace(1)', f'{ety} addrspace(1)*')
+                    elif 'ptr addrspace(2)' in param:
+                        param = param.replace('ptr addrspace(2)', 'i32 addrspace(2)*')
+                    new_params.append(param)
+                line = prefix + ', '.join(new_params) + suffix
+            else:
+                # Non-signature lines: convert remaining ptr addrspace(N) patterns
+                line = line.replace('ptr addrspace(2)', 'i32 addrspace(2)*')
+                # Do NOT blindly replace ptr addrspace(1) here; GEP/load/store
+                # handlers below will use the correct element type.
 
-            # GEP: getelementptr float, ptr %0 → getelementptr float, float addrspace(1)* %0
-            # We know device buffer params are addrspace(1), so float* → float addrspace(1)*
+            # GEP: getelementptr <type>, ptr %X → getelementptr <type>, <type> addrspace(1)* %X
             line = re.sub(
                 r'getelementptr\s+(\w+),\s*ptr\s+(%\S+)',
                 r'getelementptr \1, \1 addrspace(1)* \2',
                 line
             )
 
-            # Load from GEP result (also addrspace 1): load float, ptr %8
+            # Load from GEP result (device buffer, addrspace 1):
+            # load <type>, ptr %X -> load <type>, <type> addrspace(1)* %X
+            # By this point, constant buffer loads (addrspace 2) already have
+            # their ptr replaced with i32 addrspace(2)*, so any remaining
+            # "load <type>, ptr %X" refers to a device buffer GEP result.
             line = re.sub(
-                r'load\s+(float),\s*ptr\s+(%\S+)',
+                r'load\s+(\w+),\s*ptr\s+(%\S+)',
                 r'load \1, \1 addrspace(1)* \2',
                 line
             )
-            # Load i32 from addrspace(2): already converted above
-            line = re.sub(
-                r'load\s+(i32),\s*ptr\s+(%\S+)',
-                r'load \1, \1* \2',
-                line
-            )
 
-            # Store: store float %v, ptr %12 → store float %v, float addrspace(1)* %12
-            # (Skip threadgroup memory — handled separately below)
+            # Store: store <type> %v, ptr %X → store <type> %v, <type> addrspace(1)* %X
+            # Handle any scalar type.
             line = re.sub(
-                r'store\s+(float)\s+(%\S+),\s*ptr\s+(%\S+)',
+                r'store\s+(\w+)\s+(%\S+),\s*ptr\s+(%\S+)',
                 r'store \1 \2, \1 addrspace(1)* \3',
                 line
             )
@@ -329,7 +410,7 @@ class MetalBackend(BaseBackend):
             # These are generated by the reduce op lowering.
 
             # GEP with array type base: getelementptr [N x float], ptr addrspace(3) @name, ...
-            # → getelementptr [N x float], [N x float] addrspace(3)* @name, ...
+            # -> getelementptr [N x float], [N x float] addrspace(3)* @name, ...
             line = re.sub(
                 r'getelementptr\s+(\[\d+ x float\]),\s*ptr addrspace\(3\)\s+([%@]\S+)',
                 r'getelementptr \1, \1 addrspace(3)* \2',
@@ -384,11 +465,43 @@ class MetalBackend(BaseBackend):
                     else:
                         fn_param_types.append(param)
 
-            # Metadata: ptr @fn → typed function pointer
+            # Metadata: ptr @fn -> typed function pointer
             if fn_name and line.strip().startswith('!') and f'ptr @{fn_name}' in line:
                 typed_sig = ', '.join(fn_param_types)
                 fn_ptr_type = f'void ({typed_sig})*'
                 line = line.replace(f'ptr @{fn_name}', f'{fn_ptr_type} @{fn_name}')
+
+            # Fix metadata arg_type_name and arg_type_size for non-float device buffers.
+            # The C++ pass hardcodes "float" / size 4 for all device buffers.
+            # Replace with the correct type based on GEP-inferred element types.
+            if line.strip().startswith('!') and '!"air.buffer"' in line and '!"air.address_space", i32 1' in line:
+                # This is a device buffer metadata entry. Extract the arg index.
+                arg_idx_m = re.match(r'(\s*!\d+\s*=\s*!\{i32\s+)(\d+)', line)
+                if arg_idx_m:
+                    arg_idx = int(arg_idx_m.group(2))
+                    if arg_idx in param_elem_types:
+                        ety = param_elem_types[arg_idx]
+                        type_info = MetalBackend._ELEM_TYPE_INFO.get(ety)
+                        if type_info:
+                            byte_size, align_size, air_name = type_info
+                            # Replace arg_type_size
+                            line = re.sub(
+                                r'(!"air\.arg_type_size",\s*i32\s+)\d+',
+                                rf'\g<1>{byte_size}',
+                                line
+                            )
+                            # Replace arg_type_align_size
+                            line = re.sub(
+                                r'(!"air\.arg_type_align_size",\s*i32\s+)\d+',
+                                rf'\g<1>{align_size}',
+                                line
+                            )
+                            # Replace arg_type_name
+                            line = re.sub(
+                                r'(!"air\.arg_type_name",\s*!")(\w+)(")',
+                                rf'\g<1>{air_name}\3',
+                                line
+                            )
 
             out_lines.append(line)
 
@@ -475,6 +588,10 @@ class MetalBackend(BaseBackend):
 
         # Run C++ pass pipeline: TTGIR → LLVM IR with AIR metadata
         air_llvm_ir_opaque = cpp.run_to_llvm(stripped)
+
+        if level >= 2:
+            with open(os.path.join(debug_dir, f"{kernel_name}.opaque.ll"), "w") as f:
+                f.write(air_llvm_ir_opaque)
 
         # Metal's GPU JIT compiler requires typed pointers (old LLVM IR format).
         # Convert opaque pointers to typed pointers.

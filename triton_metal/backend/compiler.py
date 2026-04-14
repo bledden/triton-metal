@@ -147,34 +147,23 @@ class MetalBackend(BaseBackend):
             stages["ttgir"] = lambda src, metadata: self.make_ttgir(src, metadata, options)
 
         # Optional C++ LLVM IR lowering: TTGIR → AIR LLVM IR → metallib
-        # Enabled by TRITON_METAL_USE_CPP=1. Bypasses MSL entirely by
-        # emitting AIR-compatible LLVM IR and feeding it to Metal's compiler.
-        # Kernels with tt.reduce or tt.dot fall back to the Python/MSL path
-        # since the C++ pass doesn't handle cross-thread reductions yet.
+        # Enabled by TRITON_METAL_USE_CPP=1. Bypasses MSL for the metallib
+        # compilation. Kernels with unsupported ops fall back to MSL path.
         use_cpp = os.environ.get("TRITON_METAL_USE_CPP", "") == "1"
         if use_cpp and self._has_cpp_passes():
             def _llir_or_msl(src, metadata):
                 """Try C++ lowering; fall back to MSL for unsupported ops."""
                 ttgir_text = str(src)
                 if MetalBackend._has_unsupported_ops(ttgir_text):
-                    from triton_metal.debug import _debug_level
-                    if _debug_level() >= 1:
-                        kernel_name = metadata.get("name", "kernel")
-                        print(
-                            f"[triton-metal] C++ path: kernel '{kernel_name}' "
-                            f"has unsupported ops, falling back to MSL",
-                            file=sys.stderr,
-                        )
-                    # Run through MSL path instead: TTGIR → MSL → metallib
+                    # Fall back to MSL path
                     msl_src = MetalBackend.make_msl(src, metadata, options)
                     metallib = MetalBackend.make_metallib(msl_src, metadata, options)
-                    # Store the metallib in metadata so the next stage can find it
                     metadata["_cpp_fallback_metallib"] = metallib
-                    return None  # signal: skip llir→metallib stage
+                    metadata["_cpp_fallback_msl"] = msl_src
+                    return None
                 return MetalBackend.make_llir(src, metadata, options)
 
             def _metallib_from_llir_or_fallback(src, metadata):
-                """Use fallback metallib if set, otherwise compile LLIR."""
                 fb = metadata.pop("_cpp_fallback_metallib", None)
                 if fb is not None:
                     return fb

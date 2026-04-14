@@ -15,6 +15,7 @@
 
 #include "mlir/Conversion/LLVMCommon/Pattern.h"
 #include "mlir/Conversion/LLVMCommon/TypeConverter.h"
+#include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
 #include "mlir/IR/PatternMatch.h"
 
@@ -331,6 +332,36 @@ struct ReturnOpConversion
   }
 };
 
+// Pattern for arith.constant with tensor types → scalar LLVM constant.
+// Standard arith-to-LLVM doesn't know our tensor→scalar mapping.
+class ArithConstantOpConversion
+    : public ConvertOpToLLVMPattern<mlir::arith::ConstantOp> {
+public:
+  using ConvertOpToLLVMPattern<mlir::arith::ConstantOp>::ConvertOpToLLVMPattern;
+  LogicalResult matchAndRewrite(
+      mlir::arith::ConstantOp op, OpAdaptor adaptor,
+      ConversionPatternRewriter &rewriter) const override {
+    auto resultType = getTypeConverter()->convertType(op.getType());
+    if (!resultType) return failure();
+    auto value = op.getValue();
+    // For dense tensor constants, extract the scalar splat value
+    if (auto denseAttr = mlir::dyn_cast<DenseElementsAttr>(value)) {
+      if (denseAttr.isSplat()) {
+        auto splatVal = denseAttr.getSplatValue<Attribute>();
+        rewriter.replaceOpWithNewOp<LLVM::ConstantOp>(op, resultType, splatVal);
+        return success();
+      }
+      // Non-splat: use first element (per-thread model)
+      auto firstVal = *denseAttr.value_begin<Attribute>();
+      rewriter.replaceOpWithNewOp<LLVM::ConstantOp>(op, resultType, firstVal);
+      return success();
+    }
+    // Scalar constants pass through
+    rewriter.replaceOpWithNewOp<LLVM::ConstantOp>(op, resultType, value);
+    return success();
+  }
+};
+
 // ---------------------------------------------------------------------------
 // Public entry point
 // ---------------------------------------------------------------------------
@@ -351,6 +382,9 @@ void populateTritonMetalToLLVMPatterns(LLVMTypeConverter &typeConverter,
   });
 
   // Add all conversion patterns
+  // Higher benefit (10) so our pattern beats arith-to-LLVM's constant pattern
+  // for tensor-typed constants (dense<0.0> : tensor<256xf32> → scalar 0.0f)
+  patterns.add<ArithConstantOpConversion>(typeConverter, /*benefit=*/10);
   patterns.add<GetProgramIdOpConversion>(typeConverter);
   patterns.add<MakeRangeOpConversion>(typeConverter);
   patterns.add<SplatOpConversion>(typeConverter);

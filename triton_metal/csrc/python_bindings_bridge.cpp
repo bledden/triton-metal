@@ -20,6 +20,9 @@
 #include "mlir/Target/LLVMIR/Export.h"
 
 #include "triton/Dialect/Triton/IR/Dialect.h"
+// TritonGPU dialect symbols are not exported from libtriton.so on macOS.
+// Use allowUnregisteredDialects() to parse TTGIR without registering it.
+// #include "triton/Dialect/TritonGPU/IR/Dialect.h"
 
 #include "llvm/IR/Module.h"
 #include "llvm/IR/LLVMContext.h"
@@ -293,6 +296,9 @@ extern "C" const char* triton_metal_run_to_llvm(const char* mlir_text,
     // Create a fresh context with all needed dialects.
     mlir::MLIRContext mlirCtx;
     mlirCtx.loadDialect<mlir::triton::TritonDialect>();
+    // Allow unregistered dialects so TTGIR with #ttg.blocked<...>
+    // attributes can be parsed without linking TritonGPU dialect symbols.
+    mlirCtx.allowUnregisteredDialects();
     mlirCtx.loadDialect<mlir::LLVM::LLVMDialect>();
     mlirCtx.loadDialect<mlir::arith::ArithDialect>();
     mlirCtx.loadDialect<mlir::scf::SCFDialect>();

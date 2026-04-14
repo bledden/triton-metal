@@ -114,3 +114,44 @@ def test_vector_add_execution():
 
     max_err = (out - (x + y)).abs().max().item()
     assert max_err < 1e-5, f"max error {max_err} exceeds tolerance"
+
+
+@requires_cpp
+@requires_metal
+def test_scf_for_accumulation():
+    """Accumulation loop compiles and executes through C++ metallib.
+
+    The kernel sums K chunks of an input vector using an explicit loop,
+    which Triton lowers to scf.for + scf.yield. The C++ path handles
+    this via SCFToControlFlowPass -> cf.br/cf.cond_br -> LLVM branches.
+    """
+    import os
+    import torch
+    import triton
+    import triton.language as tl
+
+    os.environ["TRITON_METAL_USE_CPP"] = "1"
+    try:
+        @triton.jit
+        def accum_kernel(x_ptr, out_ptr, K: tl.constexpr, BLOCK: tl.constexpr):
+            pid = tl.program_id(0)
+            offs = pid * BLOCK + tl.arange(0, BLOCK)
+            acc = tl.zeros([BLOCK], dtype=tl.float32)
+            for k in range(K):
+                val = tl.load(x_ptr + offs * K + k)
+                acc += val
+            tl.store(out_ptr + offs, acc)
+
+        BLOCK = 256
+        K = 4
+        n = BLOCK
+        x = torch.randn(n * K)
+        out = torch.zeros(n)
+
+        accum_kernel[(1,)](x, out, K=K, BLOCK=BLOCK)
+
+        expected = x.view(n, K).sum(dim=1)
+        max_err = (out - expected).abs().max().item()
+        assert max_err < 1e-4, f"scf.for accumulation: max error {max_err}"
+    finally:
+        os.environ.pop("TRITON_METAL_USE_CPP", None)

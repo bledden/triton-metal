@@ -146,8 +146,16 @@ class MetalBackend(BaseBackend):
             stages["ttir"] = lambda src, metadata: self.make_ttir(src, metadata, options)
             stages["ttgir"] = lambda src, metadata: self.make_ttgir(src, metadata, options)
 
-        stages["msl"] = lambda src, metadata: self.make_msl(src, metadata, options)
-        stages["metallib"] = lambda src, metadata: self.make_metallib(src, metadata, options)
+        # Optional C++ LLVM IR lowering: TTGIR → AIR LLVM IR → metallib
+        # Enabled by TRITON_METAL_USE_CPP=1. Bypasses MSL entirely by
+        # emitting AIR-compatible LLVM IR and feeding it to Metal's compiler.
+        use_cpp = os.environ.get("TRITON_METAL_USE_CPP", "") == "1"
+        if use_cpp and self._has_cpp_passes():
+            stages["llir"] = lambda src, metadata: self.make_llir(src, metadata, options)
+            stages["metallib"] = lambda src, metadata: self.make_metallib_from_llir(src, metadata, options)
+        else:
+            stages["msl"] = lambda src, metadata: self.make_msl(src, metadata, options)
+            stages["metallib"] = lambda src, metadata: self.make_metallib(src, metadata, options)
 
     @staticmethod
     def _has_cpp_passes():
@@ -157,6 +165,324 @@ class MetalBackend(BaseBackend):
             return True
         except ImportError:
             return False
+
+    @staticmethod
+    def _strip_ttg_annotations(ttgir_text):
+        """Strip TritonGPU encoding attributes and loc annotations from MLIR text.
+
+        Our C++ pass doesn't need the encoding annotations (it converts
+        tensor types to scalars regardless), and parsing them would require
+        the TritonGPU dialect which pulls in NVIDIA-specific dependencies.
+        """
+        import re
+
+        # Process line by line for reliable stripping
+        lines = ttgir_text.split('\n')
+        out_lines = []
+        for line in lines:
+            stripped = line.rstrip()
+
+            # Skip #name = #ttg.blocked<...> alias definitions
+            if re.match(r'^#\w+ = #ttg\.', stripped):
+                continue
+
+            # Skip #locN = loc(...) alias definitions
+            if re.match(r'^#loc\d*\s*=\s*loc\(', stripped):
+                continue
+
+            # Remove , #blocked from tensor types
+            stripped = re.sub(r',\s*#\w+>', '>', stripped)
+
+            # Remove ttg.* module attributes
+            stripped = re.sub(r'"ttg\.[^"]*"\s*=\s*[^,}]+[,]?\s*', '', stripped)
+            stripped = re.sub(r'ttg\.\w+\s*=\s*"[^"]*"[,]?\s*', '', stripped)
+
+            # Remove loc(...) annotations — handle nested parens.
+            # Pattern: loc("..."(#loc)) or loc(#loc) or loc(unknown)
+            # Use iterative removal for nested cases.
+            while 'loc(' in stripped:
+                prev = stripped
+                # Match loc(...) where ... contains balanced parens
+                stripped = re.sub(
+                    r'\s*loc\((?:[^()]*|\([^()]*\))*\)', '', stripped
+                )
+                if stripped == prev:
+                    break  # avoid infinite loop on unmatched patterns
+
+            # Clean up empty module attributes
+            stripped = re.sub(r'module attributes \{\s*\}', 'module', stripped)
+
+            # Skip now-empty lines
+            if stripped.strip():
+                out_lines.append(stripped)
+
+        return '\n'.join(out_lines) + '\n'
+
+    @staticmethod
+    def _opaque_to_typed_ptrs(llir_text):
+        """Convert LLVM IR with opaque pointers to typed pointers for Metal AIR.
+
+        Metal's GPU JIT compiler requires typed pointers and does not support
+        generic address space stores. This conversion:
+        1. Eliminates addrspacecasts (inlines source pointers)
+        2. Converts all pointer types to typed equivalents
+        3. Fixes metadata to use typed function pointer references
+
+        Limitations: assumes float element type for device buffers (nano backend).
+        """
+        import re
+
+        lines = llir_text.split('\n')
+
+        # Pass 1: Collect addrspacecast mappings and their source address spaces.
+        # E.g. %.generic = addrspacecast ptr addrspace(1) %0 to ptr
+        #   → cast_map["%.generic"] = ("%0", "1")
+        cast_map = {}
+        for line in lines:
+            m = re.match(
+                r'\s*(%\S+)\s*=\s*addrspacecast\s+ptr\s+addrspace\((\d+)\)\s+(%\S+)\s+to\s+ptr',
+                line
+            )
+            if m:
+                cast_map[m.group(1)] = (m.group(3), m.group(2))
+
+        # Pass 2: Process each line
+        out_lines = []
+        fn_name = None
+        fn_param_types = []
+
+        for line in lines:
+            # Skip addrspacecast lines
+            if re.match(r'\s*%\S+\s*=\s*addrspacecast\s+.*to\s+ptr', line):
+                continue
+
+            # Replace cast names with source names (longest first for safety)
+            for name in sorted(cast_map.keys(), key=len, reverse=True):
+                src, addrspace = cast_map[name]
+                # Word-boundary replacement
+                line = re.sub(re.escape(name) + r'(?=[\s,)\]]|$)', src, line)
+
+            # Convert ptr addrspace(1) → float addrspace(1)*
+            line = line.replace('ptr addrspace(1)', 'float addrspace(1)*')
+            # Convert ptr addrspace(2) → i32 addrspace(2)*
+            line = line.replace('ptr addrspace(2)', 'i32 addrspace(2)*')
+
+            # GEP: getelementptr float, ptr %0 → getelementptr float, float addrspace(1)* %0
+            # We know device buffer params are addrspace(1), so float* → float addrspace(1)*
+            line = re.sub(
+                r'getelementptr\s+(\w+),\s*ptr\s+(%\S+)',
+                r'getelementptr \1, \1 addrspace(1)* \2',
+                line
+            )
+
+            # Load from GEP result (also addrspace 1): load float, ptr %8
+            line = re.sub(
+                r'load\s+(float),\s*ptr\s+(%\S+)',
+                r'load \1, \1 addrspace(1)* \2',
+                line
+            )
+            # Load i32 from addrspace(2): already converted above
+            line = re.sub(
+                r'load\s+(i32),\s*ptr\s+(%\S+)',
+                r'load \1, \1* \2',
+                line
+            )
+
+            # Store: store float %v, ptr %12 → store float %v, float addrspace(1)* %12
+            line = re.sub(
+                r'store\s+(float)\s+(%\S+),\s*ptr\s+(%\S+)',
+                r'store \1 \2, \1 addrspace(1)* \3',
+                line
+            )
+
+            # Capture function name and param types for metadata
+            m = re.match(
+                r'\s*define\s+void\s+@(\w+)\(((?:[^()]*|\([^()]*\))*)\)',
+                line
+            )
+            if m:
+                fn_name = m.group(1)
+                for param in m.group(2).split(','):
+                    param = param.strip()
+                    idx = param.rfind('%')
+                    if idx > 0:
+                        fn_param_types.append(param[:idx].rstrip())
+                    else:
+                        fn_param_types.append(param)
+
+            # Metadata: ptr @fn → typed function pointer
+            if fn_name and line.strip().startswith('!') and f'ptr @{fn_name}' in line:
+                typed_sig = ', '.join(fn_param_types)
+                fn_ptr_type = f'void ({typed_sig})*'
+                line = line.replace(f'ptr @{fn_name}', f'{fn_ptr_type} @{fn_name}')
+
+            out_lines.append(line)
+
+        return '\n'.join(out_lines)
+
+    @staticmethod
+    def make_llir(mod, metadata, options):
+        """Lower TTGIR to AIR-compatible LLVM IR using C++ MLIR passes.
+
+        Pipeline: TTGIR text → strip TritonGPU annotations → C++ pass
+        pipeline (Triton ops → LLVM dialect → LLVM IR) → AIR LLVM IR
+        with Metal kernel metadata.
+
+        The output is LLVM IR text that can be fed directly to Metal's
+        compiler (xcrun metal -Xclang -opaque-pointers -c -x ir).
+        """
+        import triton_metal._triton_metal_cpp as cpp
+        from triton_metal.debug import _debug_level, _dump_dir
+
+        level = _debug_level()
+        kernel_name = metadata.get("name", "kernel")
+
+        # Get TTGIR text and strip TritonGPU encoding attributes
+        ttgir_text = str(mod)
+        stripped = MetalBackend._strip_ttg_annotations(ttgir_text)
+
+        if level >= 1:
+            debug_dir = _dump_dir()
+            os.makedirs(debug_dir, exist_ok=True)
+            with open(os.path.join(debug_dir, f"{kernel_name}.ttgir"), "w") as f:
+                f.write(ttgir_text)
+            with open(os.path.join(debug_dir, f"{kernel_name}.stripped.mlir"), "w") as f:
+                f.write(stripped)
+
+        # Run C++ pass pipeline: TTGIR → LLVM IR with AIR metadata
+        air_llvm_ir_opaque = cpp.run_to_llvm(stripped)
+
+        # Metal's GPU JIT compiler requires typed pointers (old LLVM IR format).
+        # Convert opaque pointers to typed pointers.
+        air_llvm_ir = MetalBackend._opaque_to_typed_ptrs(air_llvm_ir_opaque)
+
+        if level >= 1:
+            with open(os.path.join(debug_dir, f"{kernel_name}.ll"), "w") as f:
+                f.write(air_llvm_ir)
+
+        # Extract kernel name from the LLVM IR
+        import re
+        m = re.search(r'define\s+void\s+@(\w+)\s*\(', air_llvm_ir)
+        if m:
+            metadata["name"] = m.group(1)
+
+        # Set block_size from options
+        metadata.setdefault("block_size", options.num_warps * 32)
+        metadata.setdefault("needs_2d_grid", False)
+
+        return air_llvm_ir
+
+    @staticmethod
+    def make_metallib_from_llir(src, metadata, options):
+        """Compile AIR LLVM IR to metallib using Metal's compiler.
+
+        Pipeline: LLVM IR text → metal -c -x ir → .air → metallib
+        This bypasses MSL entirely.
+        """
+        import time
+        import warnings
+        from triton_metal.debug import _debug_level, _fallback_mode
+
+        level = _debug_level()
+        kernel_name = metadata.get("name", "kernel")
+
+        if level >= 2:
+            t0 = time.perf_counter()
+
+        try:
+            cache_dir = _get_cache_dir()
+            src_hash = hashlib.sha256(src.encode("utf-8")).hexdigest()[:16]
+            base = f"{kernel_name}_{src_hash}"
+
+            ll_path = os.path.join(cache_dir, f"{base}.ll")
+            air_path = os.path.join(cache_dir, f"{base}.air")
+            metallib_path = os.path.join(cache_dir, f"{base}.metallib")
+
+            # Skip compilation if cached metallib exists.
+            if os.path.exists(metallib_path):
+                if level >= 2:
+                    print(
+                        f"[triton-metal] make_metallib_from_llir({kernel_name}): cache hit",
+                        file=sys.stderr,
+                    )
+                with open(metallib_path, "rb") as f:
+                    return f.read()
+
+            with open(ll_path, "w") as f:
+                f.write(src)
+
+            # Compile LLVM IR → AIR using Metal's compiler
+            # Our IR uses typed pointers (Metal's GPU JIT requires them).
+            try:
+                subprocess.run(
+                    [
+                        "xcrun", "-sdk", "macosx", "metal",
+                        "-c", "-x", "ir",
+                        ll_path,
+                        "-o", air_path,
+                    ],
+                    capture_output=True,
+                    check=True,
+                )
+            except subprocess.CalledProcessError as e:
+                from triton_metal.errors import MetalCompilationError
+                stderr = e.stderr.decode("utf-8", errors="replace") if e.stderr else ""
+                raise MetalCompilationError(
+                    f"Metal IR compilation failed (exit {e.returncode})",
+                    msl_source=ll_path,
+                    stderr=stderr,
+                ) from None
+
+            # Link AIR → metallib
+            tmp_metallib_path = metallib_path + ".tmp"
+            try:
+                subprocess.run(
+                    [
+                        "xcrun", "-sdk", "macosx", "metallib",
+                        air_path,
+                        "-o", tmp_metallib_path,
+                    ],
+                    capture_output=True,
+                    check=True,
+                )
+                os.replace(tmp_metallib_path, metallib_path)
+            except subprocess.CalledProcessError as e:
+                try:
+                    os.unlink(tmp_metallib_path)
+                except OSError:
+                    pass
+                from triton_metal.errors import MetalCompilationError
+                stderr = e.stderr.decode("utf-8", errors="replace") if e.stderr else ""
+                raise MetalCompilationError(
+                    f"Metal library linking failed (exit {e.returncode})",
+                    msl_source=air_path,
+                    stderr=stderr,
+                ) from None
+
+            with open(metallib_path, "rb") as f:
+                data = f.read()
+
+            if level >= 2:
+                elapsed_ms = (time.perf_counter() - t0) * 1000
+                print(
+                    f"[triton-metal] make_metallib_from_llir({kernel_name}): {elapsed_ms:.1f}ms",
+                    file=sys.stderr,
+                )
+
+            return data
+
+        except Exception as e:
+            mode = _fallback_mode()
+            if mode == "warn":
+                warnings.warn(
+                    f"triton-metal: Metal IR compilation failed for kernel "
+                    f"'{kernel_name}': {e}. "
+                    f"Kernel will fall back to CPU.",
+                    stacklevel=2,
+                )
+            elif mode == "error":
+                raise
+            raise
 
     @staticmethod
     def gluon_to_ttgir(mod, metadata, options):

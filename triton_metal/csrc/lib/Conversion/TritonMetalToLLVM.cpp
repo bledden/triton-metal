@@ -4,8 +4,12 @@
 #include "mlir/Conversion/ArithToLLVM/ArithToLLVM.h"
 #include "mlir/Conversion/ControlFlowToLLVM/ControlFlowToLLVM.h"
 #include "mlir/Conversion/IndexToLLVM/IndexToLLVM.h"
+#include "mlir/Conversion/MathToLLVM/MathToLLVM.h"
+#include "mlir/Conversion/FuncToLLVM/ConvertFuncToLLVM.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/ControlFlow/IR/ControlFlow.h"
+#include "mlir/Dialect/Math/IR/Math.h"
+#include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/Pass/Pass.h"
@@ -55,13 +59,15 @@ public:
     mlir::triton_metal::populateTritonMetalToLLVMPatterns(typeConverter,
                                                           patterns);
 
-    // Also populate standard arith->LLVM and cf->LLVM patterns so they
-    // share our type converter (tensor<NxT> -> T). This is critical:
-    // arith ops on tensor types need to see our scalar conversion.
+    // Also populate standard dialect->LLVM patterns so they share our type
+    // converter (tensor<NxT> -> T). This is critical: arith/math ops on
+    // tensor types need to see our scalar conversion.
     mlir::arith::populateArithToLLVMConversionPatterns(typeConverter, patterns);
     mlir::cf::populateControlFlowToLLVMConversionPatterns(typeConverter,
                                                           patterns);
     mlir::index::populateIndexToLLVMConversionPatterns(typeConverter, patterns);
+    mlir::populateMathToLLVMConversionPatterns(typeConverter, patterns);
+    mlir::populateFuncToLLVMConversionPatterns(typeConverter, patterns);
 
     // Set up conversion target — LLVM dialect is legal, everything else
     // is illegal.
@@ -73,10 +79,12 @@ public:
     // to be lowered by our patterns.
     target.addIllegalDialect<mlir::triton::TritonDialect>();
 
-    // Also mark arith and cf as illegal — they will be lowered in this
-    // same conversion pass using the shared type converter.
+    // Also mark arith, cf, math, and func as illegal — they will be lowered
+    // in this same conversion pass using the shared type converter.
     target.addIllegalDialect<mlir::arith::ArithDialect>();
     target.addIllegalDialect<mlir::cf::ControlFlowDialect>();
+    target.addIllegalDialect<mlir::math::MathDialect>();
+    target.addIllegalDialect<mlir::func::FuncDialect>();
 
     // Apply partial conversion — only ops with matching patterns are lowered.
     // This is intentional: we add patterns incrementally across tasks.

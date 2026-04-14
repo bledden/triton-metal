@@ -149,10 +149,39 @@ class MetalBackend(BaseBackend):
         # Optional C++ LLVM IR lowering: TTGIR → AIR LLVM IR → metallib
         # Enabled by TRITON_METAL_USE_CPP=1. Bypasses MSL entirely by
         # emitting AIR-compatible LLVM IR and feeding it to Metal's compiler.
+        # Kernels with tt.reduce or tt.dot fall back to the Python/MSL path
+        # since the C++ pass doesn't handle cross-thread reductions yet.
         use_cpp = os.environ.get("TRITON_METAL_USE_CPP", "") == "1"
         if use_cpp and self._has_cpp_passes():
-            stages["llir"] = lambda src, metadata: self.make_llir(src, metadata, options)
-            stages["metallib"] = lambda src, metadata: self.make_metallib_from_llir(src, metadata, options)
+            def _llir_or_msl(src, metadata):
+                """Try C++ lowering; fall back to MSL for unsupported ops."""
+                ttgir_text = str(src)
+                if MetalBackend._has_unsupported_ops(ttgir_text):
+                    from triton_metal.debug import _debug_level
+                    if _debug_level() >= 1:
+                        kernel_name = metadata.get("name", "kernel")
+                        print(
+                            f"[triton-metal] C++ path: kernel '{kernel_name}' "
+                            f"has unsupported ops, falling back to MSL",
+                            file=sys.stderr,
+                        )
+                    # Run through MSL path instead: TTGIR → MSL → metallib
+                    msl_src = MetalBackend.make_msl(src, metadata, options)
+                    metallib = MetalBackend.make_metallib(msl_src, metadata, options)
+                    # Store the metallib in metadata so the next stage can find it
+                    metadata["_cpp_fallback_metallib"] = metallib
+                    return None  # signal: skip llir→metallib stage
+                return MetalBackend.make_llir(src, metadata, options)
+
+            def _metallib_from_llir_or_fallback(src, metadata):
+                """Use fallback metallib if set, otherwise compile LLIR."""
+                fb = metadata.pop("_cpp_fallback_metallib", None)
+                if fb is not None:
+                    return fb
+                return MetalBackend.make_metallib_from_llir(src, metadata, options)
+
+            stages["llir"] = _llir_or_msl
+            stages["metallib"] = _metallib_from_llir_or_fallback
         else:
             stages["msl"] = lambda src, metadata: self.make_msl(src, metadata, options)
             stages["metallib"] = lambda src, metadata: self.make_metallib(src, metadata, options)
@@ -321,6 +350,52 @@ class MetalBackend(BaseBackend):
         return '\n'.join(out_lines)
 
     @staticmethod
+    def _strip_unsupported_llvm_attrs(llir_text):
+        """Strip LLVM function attributes that Metal's compiler doesn't support.
+
+        Metal's compiler is based on an older LLVM and doesn't understand
+        newer attributes like nocreateundeforpoison, memory(none), etc.
+        We remove attribute group definitions and their references from
+        function declarations.
+        """
+        import re
+
+        lines = llir_text.split('\n')
+        out_lines = []
+        for line in lines:
+            # Remove "attributes #N = { ... }" lines entirely
+            if re.match(r'\s*attributes\s+#\d+\s*=\s*\{', line):
+                continue
+            # Remove #N references from declare/define lines
+            line = re.sub(r'\s+#\d+\b', '', line)
+            out_lines.append(line)
+
+        return '\n'.join(out_lines)
+
+    # Mapping from LLVM intrinsics to AIR intrinsics for math functions
+    # that Metal's runtime doesn't resolve as standard LLVM intrinsics.
+    # Most llvm.* intrinsics work (exp, sin, cos, ...) but this provides
+    # a safety net for any that don't.
+    _LLVM_TO_AIR_INTRINSICS = {
+        # These are only needed if Metal's runtime fails to resolve them.
+        # Currently llvm.exp.f32, llvm.sin.f32, etc. all work.
+        # Add entries here if specific intrinsics cause "Undefined symbols" errors.
+    }
+
+    # Ops that the C++ pass cannot handle — these require cross-thread
+    # communication (reductions, matrix multiply) which needs SIMD
+    # intrinsics or shared memory not yet implemented in the C++ path.
+    _CPP_UNSUPPORTED_OPS = {"tt.reduce", "tt.dot", "tt.trans"}
+
+    @staticmethod
+    def _has_unsupported_ops(ttgir_text):
+        """Check if TTGIR contains ops the C++ path cannot handle."""
+        for op in MetalBackend._CPP_UNSUPPORTED_OPS:
+            if op in ttgir_text:
+                return True
+        return False
+
+    @staticmethod
     def make_llir(mod, metadata, options):
         """Lower TTGIR to AIR-compatible LLVM IR using C++ MLIR passes.
 
@@ -330,6 +405,10 @@ class MetalBackend(BaseBackend):
 
         The output is LLVM IR text that can be fed directly to Metal's
         compiler (xcrun metal -Xclang -opaque-pointers -c -x ir).
+
+        If the TTGIR contains ops the C++ path cannot handle (tt.reduce,
+        tt.dot, tt.trans), raises RuntimeError to trigger fallback to the
+        Python/MSL path.
         """
         import triton_metal._triton_metal_cpp as cpp
         from triton_metal.debug import _debug_level, _dump_dir
@@ -355,6 +434,10 @@ class MetalBackend(BaseBackend):
         # Metal's GPU JIT compiler requires typed pointers (old LLVM IR format).
         # Convert opaque pointers to typed pointers.
         air_llvm_ir = MetalBackend._opaque_to_typed_ptrs(air_llvm_ir_opaque)
+
+        # Strip LLVM function attributes that Metal's compiler doesn't
+        # understand (nocreateundeforpoison, memory(none), etc.).
+        air_llvm_ir = MetalBackend._strip_unsupported_llvm_attrs(air_llvm_ir)
 
         if level >= 1:
             with open(os.path.join(debug_dir, f"{kernel_name}.ll"), "w") as f:

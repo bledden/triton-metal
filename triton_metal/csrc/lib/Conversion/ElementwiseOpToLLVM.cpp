@@ -317,6 +317,153 @@ struct FuncOpConversion
 };
 
 // ---------------------------------------------------------------------------
+// tt.broadcast → passthrough (per-thread model: tensor shapes are irrelevant)
+// ---------------------------------------------------------------------------
+struct BroadcastOpConversion
+    : public ConvertOpToLLVMPattern<triton::BroadcastOp> {
+  using ConvertOpToLLVMPattern<triton::BroadcastOp>::ConvertOpToLLVMPattern;
+
+  LogicalResult
+  matchAndRewrite(triton::BroadcastOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    // In the per-thread model, broadcast is a no-op: the scalar is already
+    // the per-thread value. The type converter handles tensor<NxT> → T.
+    rewriter.replaceOp(op, adaptor.getSrc());
+    return success();
+  }
+};
+
+// ---------------------------------------------------------------------------
+// tt.expand_dims → passthrough (per-thread model: dimension changes are no-ops)
+// ---------------------------------------------------------------------------
+struct ExpandDimsOpConversion
+    : public ConvertOpToLLVMPattern<triton::ExpandDimsOp> {
+  using ConvertOpToLLVMPattern<triton::ExpandDimsOp>::ConvertOpToLLVMPattern;
+
+  LogicalResult
+  matchAndRewrite(triton::ExpandDimsOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    rewriter.replaceOp(op, adaptor.getSrc());
+    return success();
+  }
+};
+
+// ---------------------------------------------------------------------------
+// tt.reshape → passthrough (per-thread model: reshape is a no-op on scalars)
+// ---------------------------------------------------------------------------
+struct ReshapeOpConversion
+    : public ConvertOpToLLVMPattern<triton::ReshapeOp> {
+  using ConvertOpToLLVMPattern<triton::ReshapeOp>::ConvertOpToLLVMPattern;
+
+  LogicalResult
+  matchAndRewrite(triton::ReshapeOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    rewriter.replaceOp(op, adaptor.getSrc());
+    return success();
+  }
+};
+
+// ---------------------------------------------------------------------------
+// tt.extern_elementwise → LLVM intrinsic for known math functions
+//
+// Triton's frontend emits tt.extern_elementwise for libdevice calls like
+// __nv_tanhf, __nv_sinf, etc. We map these to standard LLVM intrinsics
+// which Metal's compiler understands.
+// ---------------------------------------------------------------------------
+struct ExternElementwiseOpConversion
+    : public ConvertOpToLLVMPattern<triton::ExternElementwiseOp> {
+  using ConvertOpToLLVMPattern<triton::ExternElementwiseOp>::ConvertOpToLLVMPattern;
+
+  LogicalResult
+  matchAndRewrite(triton::ExternElementwiseOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    auto loc = op->getLoc();
+    auto symbol = op.getSymbol();
+
+    // Map NVIDIA libdevice symbols to Metal AIR intrinsic names.
+    // Metal's GPU runtime recognizes air.fast_* as built-in math functions.
+    // Using these instead of llvm.* intrinsics ensures compatibility at
+    // both compilation and metallib linking stages.
+    static const llvm::StringMap<llvm::StringRef> nvToAIR = {
+        {"__nv_tanhf", "air.fast_tanh.f32"},
+        {"__nv_tanf", "air.fast_tan.f32"},
+        {"__nv_sinf", "air.fast_sin.f32"},
+        {"__nv_cosf", "air.fast_cos.f32"},
+        {"__nv_expf", "air.fast_exp.f32"},
+        {"__nv_exp2f", "air.fast_exp2.f32"},
+        {"__nv_logf", "air.fast_log.f32"},
+        {"__nv_log2f", "air.fast_log2.f32"},
+        {"__nv_sqrtf", "air.fast_sqrt.f32"},
+        {"__nv_fabsf", "air.fast_fabs.f32"},
+        {"__nv_floorf", "air.fast_floor.f32"},
+        {"__nv_ceilf", "air.fast_ceil.f32"},
+        {"__nv_roundf", "air.fast_round.f32"},
+        {"__nv_fmaf", "air.fast_fma.f32"},
+        {"__nv_powf", "air.fast_pow.f32"},
+        {"__nv_fmaxf", "air.fast_fmax.f32"},
+        {"__nv_fminf", "air.fast_fmin.f32"},
+        {"__nv_copysignf", "air.fast_copysign.f32"},
+    };
+
+    auto it = nvToAIR.find(symbol);
+    if (it == nvToAIR.end()) {
+      return rewriter.notifyMatchFailure(
+          op, "unknown extern_elementwise symbol: " + symbol.str());
+    }
+
+    // Get the converted result type
+    auto resultTy = getTypeConverter()->convertType(op.getType());
+    if (!resultTy)
+      return failure();
+
+    // Build the LLVM intrinsic function type
+    SmallVector<Type> argTypes;
+    for (auto operand : adaptor.getSrcs())
+      argTypes.push_back(operand.getType());
+
+    auto fnTy = LLVM::LLVMFunctionType::get(resultTy, argTypes);
+
+    // Get or insert the intrinsic declaration
+    auto module = op->getParentOfType<ModuleOp>();
+    auto fn = getOrInsertFunction(module, rewriter, it->second, fnTy);
+
+    // Call the intrinsic
+    SmallVector<Value> args(adaptor.getSrcs().begin(),
+                            adaptor.getSrcs().end());
+    auto call = LLVM::CallOp::create(rewriter, loc, fn, args);
+    rewriter.replaceOp(op, call.getResult());
+    return success();
+  }
+};
+
+// ---------------------------------------------------------------------------
+// tt.get_num_programs → call @__metal_get_num_programs_{0,1,2}
+// ---------------------------------------------------------------------------
+struct GetNumProgramsOpConversion
+    : public ConvertOpToLLVMPattern<triton::GetNumProgramsOp> {
+  using ConvertOpToLLVMPattern<triton::GetNumProgramsOp>::ConvertOpToLLVMPattern;
+
+  LogicalResult
+  matchAndRewrite(triton::GetNumProgramsOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    auto loc = op->getLoc();
+    auto *ctx = rewriter.getContext();
+    auto i32Ty = IntegerType::get(ctx, 32);
+    auto fnTy = LLVM::LLVMFunctionType::get(i32Ty, {});
+
+    unsigned axis = static_cast<unsigned>(op.getAxis());
+    std::string fnName = "__metal_get_num_programs_" + std::to_string(axis);
+
+    auto module = op->getParentOfType<ModuleOp>();
+    auto fn = getOrInsertFunction(module, rewriter, fnName, fnTy);
+
+    auto call = LLVM::CallOp::create(rewriter, loc, fn, ValueRange{});
+    rewriter.replaceOp(op, call.getResult());
+    return success();
+  }
+};
+
+// ---------------------------------------------------------------------------
 // tt.return → llvm.return
 // ---------------------------------------------------------------------------
 struct ReturnOpConversion
@@ -386,8 +533,13 @@ void populateTritonMetalToLLVMPatterns(LLVMTypeConverter &typeConverter,
   // for tensor-typed constants (dense<0.0> : tensor<256xf32> → scalar 0.0f)
   patterns.add<ArithConstantOpConversion>(typeConverter, /*benefit=*/10);
   patterns.add<GetProgramIdOpConversion>(typeConverter);
+  patterns.add<GetNumProgramsOpConversion>(typeConverter);
   patterns.add<MakeRangeOpConversion>(typeConverter);
   patterns.add<SplatOpConversion>(typeConverter);
+  patterns.add<BroadcastOpConversion>(typeConverter);
+  patterns.add<ExpandDimsOpConversion>(typeConverter);
+  patterns.add<ReshapeOpConversion>(typeConverter);
+  patterns.add<ExternElementwiseOpConversion>(typeConverter);
   patterns.add<AddPtrOpConversion>(typeConverter);
   patterns.add<LoadOpConversion>(typeConverter);
   patterns.add<StoreOpConversion>(typeConverter);

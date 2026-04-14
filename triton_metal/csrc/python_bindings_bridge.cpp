@@ -34,12 +34,21 @@
 #include "llvm/Transforms/Utils/Cloning.h"
 #include "llvm/Support/raw_ostream.h"
 
+#include <map>
+#include <set>
 #include <string>
 #include <sstream>
 
 extern "C" void triton_metal_register_passes() {
     mlir::triton_metal::registerTritonMetalToLLVMPasses();
 }
+
+// Descriptor for an implicit Metal kernel argument (thread position, grid
+// size, etc.) that gets its value from a Metal AIR intrinsic.
+struct AIRImplicitArg {
+    std::string airMetadata;  // e.g. "air.threadgroup_position_in_grid"
+    std::string argName;      // e.g. "pid"
+};
 
 // ---------------------------------------------------------------------------
 // Add AIR metadata to the LLVM IR module so Metal's compiler can consume it.
@@ -50,10 +59,12 @@ extern "C" void triton_metal_register_passes() {
 // - The AIR version and language version
 // - Thread position intrinsics (threadgroup_position_in_grid, etc.)
 // ---------------------------------------------------------------------------
-// numExplicitArgs: number of args from the Triton kernel (before pid/lid).
+// numExplicitArgs: number of args from the Triton kernel (before implicit args).
 // If 0, all args are treated as explicit (no thread position args).
+// implicitArgs: ordered list of implicit arg descriptors (pid, lid, etc.)
 static void addAIRMetadata(llvm::Module &mod, llvm::Function &kernelFn,
-                           unsigned numExplicitArgs = 0) {
+                           unsigned numExplicitArgs,
+                           const llvm::SmallVectorImpl<AIRImplicitArg> &implicitArgs) {
     auto &ctx = mod.getContext();
     auto *i32Ty = llvm::Type::getInt32Ty(ctx);
 
@@ -192,33 +203,21 @@ static void addAIRMetadata(llvm::Module &mod, llvm::Function &kernelFn,
         argMDs.push_back(llvm::MDNode::get(ctx, fields));
     }
 
-    // Add threadgroup_position_in_grid (pid) and
-    // thread_position_in_threadgroup (lid) as implicit arguments.
-    // When numExplicitArgs > 0, these are already in the function signature
-    // at positions explicitArgs and explicitArgs+1.
-    {
-        unsigned pidIdx = explicitArgs;
-        llvm::SmallVector<llvm::Metadata *, 4> pidFields;
-        pidFields.push_back(llvm::ConstantAsMetadata::get(
-            llvm::ConstantInt::get(i32Ty, pidIdx)));
-        pidFields.push_back(llvm::MDString::get(ctx, "air.threadgroup_position_in_grid"));
-        pidFields.push_back(llvm::MDString::get(ctx, "air.arg_type_name"));
-        pidFields.push_back(llvm::MDString::get(ctx, "uint"));
-        pidFields.push_back(llvm::MDString::get(ctx, "air.arg_name"));
-        pidFields.push_back(llvm::MDString::get(ctx, "pid"));
-        argMDs.push_back(llvm::MDNode::get(ctx, pidFields));
-    }
-    {
-        unsigned lidIdx = explicitArgs + 1;
-        llvm::SmallVector<llvm::Metadata *, 4> lidFields;
-        lidFields.push_back(llvm::ConstantAsMetadata::get(
-            llvm::ConstantInt::get(i32Ty, lidIdx)));
-        lidFields.push_back(llvm::MDString::get(ctx, "air.thread_position_in_threadgroup"));
-        lidFields.push_back(llvm::MDString::get(ctx, "air.arg_type_name"));
-        lidFields.push_back(llvm::MDString::get(ctx, "uint"));
-        lidFields.push_back(llvm::MDString::get(ctx, "air.arg_name"));
-        lidFields.push_back(llvm::MDString::get(ctx, "lid"));
-        argMDs.push_back(llvm::MDNode::get(ctx, lidFields));
+    // Add implicit thread position / grid size arguments.
+    // These are already in the function signature starting at index
+    // explicitArgs, in the order given by the implicitArgs vector.
+    for (unsigned i = 0; i < implicitArgs.size(); ++i) {
+        unsigned argIdx = explicitArgs + i;
+        const auto &ia = implicitArgs[i];
+        llvm::SmallVector<llvm::Metadata *, 6> fields;
+        fields.push_back(llvm::ConstantAsMetadata::get(
+            llvm::ConstantInt::get(i32Ty, argIdx)));
+        fields.push_back(llvm::MDString::get(ctx, ia.airMetadata));
+        fields.push_back(llvm::MDString::get(ctx, "air.arg_type_name"));
+        fields.push_back(llvm::MDString::get(ctx, "uint"));
+        fields.push_back(llvm::MDString::get(ctx, "air.arg_name"));
+        fields.push_back(llvm::MDString::get(ctx, ia.argName));
+        argMDs.push_back(llvm::MDNode::get(ctx, fields));
     }
 
     // The kernel metadata references the function directly.
@@ -395,27 +394,36 @@ extern "C" const char* triton_metal_run_to_llvm(const char* mlir_text,
     }
 
     // ---------------------------------------------------------------
-    // Replace __metal_get_program_id_0 / __metal_get_local_id calls
-    // with extra kernel function parameters. In Metal AIR, thread
-    // position intrinsics are implicit function arguments, not calls.
+    // Replace __metal_* intrinsic calls with extra kernel function
+    // parameters. In Metal AIR, thread position / grid size intrinsics
+    // are implicit function arguments, not calls.
+    //
+    // Supported intrinsics:
+    //   __metal_get_program_id_{0,1,2} → threadgroup_position_in_grid.{x,y,z}
+    //   __metal_get_local_id           → thread_position_in_threadgroup.x
+    //   __metal_get_num_programs_{0,1,2} → threadgroups_per_grid.{x,y,z}
     // ---------------------------------------------------------------
+    llvm::SmallVector<AIRImplicitArg, 6> airImplicitArgs;
     {
         auto *i32Ty = llvm::Type::getInt32Ty(llvmCtx);
 
-        // Collect calls to replace
+        // Collect all __metal_* calls and determine which intrinsics are used.
         struct CallInfo {
             llvm::CallInst *call;
             std::string fnName;
         };
-        llvm::SmallVector<CallInfo, 4> calls;
+        llvm::SmallVector<CallInfo, 8> calls;
+        // Track which intrinsics are present (by function name).
+        std::set<std::string> usedIntrinsics;
+
         for (auto &bb : *kernelFn) {
             for (auto &inst : bb) {
                 if (auto *callInst = llvm::dyn_cast<llvm::CallInst>(&inst)) {
                     if (auto *callee = callInst->getCalledFunction()) {
                         auto name = callee->getName();
-                        if (name == "__metal_get_program_id_0" ||
-                            name == "__metal_get_local_id") {
+                        if (name.starts_with("__metal_get_")) {
                             calls.push_back({callInst, name.str()});
+                            usedIntrinsics.insert(name.str());
                         }
                     }
                 }
@@ -426,7 +434,7 @@ extern "C" const char* triton_metal_run_to_llvm(const char* mlir_text,
             // Create new function type with AIR address spaces:
             // - ptr args → ptr addrspace(1) (device buffer)
             // - i32 args → ptr addrspace(2) (constant buffer, load to get value)
-            // Then append pid (i32) and lid (i32) as implicit args.
+            // Then append implicit thread position args (i32 each).
             auto *devicePtrTy = llvm::PointerType::get(llvmCtx, 1); // addrspace(1)
             auto *constPtrTy = llvm::PointerType::get(llvmCtx, 2);  // addrspace(2)
 
@@ -444,8 +452,38 @@ extern "C" const char* triton_metal_run_to_llvm(const char* mlir_text,
                     isScalarArg.push_back(false);
                 }
             }
-            newArgTypes.push_back(i32Ty); // pid
-            newArgTypes.push_back(i32Ty); // lid
+
+            // Build ordered list of implicit args. We always add pid and lid
+            // as the canonical Metal kernel interface, plus any additional
+            // intrinsics (num_programs) as needed.
+            struct ImplicitArgEntry {
+                std::string intrinsicName;  // __metal_get_* function name
+                std::string argName;        // LLVM arg name
+                std::string airMetadata;    // AIR metadata key
+            };
+            llvm::SmallVector<ImplicitArgEntry, 6> implicitArgs;
+
+            // Always add pid (threadgroup position) and lid (thread position)
+            implicitArgs.push_back({
+                "__metal_get_program_id_0", "pid",
+                "air.threadgroup_position_in_grid"
+            });
+            implicitArgs.push_back({
+                "__metal_get_local_id", "lid",
+                "air.thread_position_in_threadgroup"
+            });
+
+            // Add threadgroups_per_grid if get_num_programs is used
+            if (usedIntrinsics.count("__metal_get_num_programs_0")) {
+                implicitArgs.push_back({
+                    "__metal_get_num_programs_0", "grid_size",
+                    "air.threadgroups_per_grid"
+                });
+            }
+
+            // Append implicit arg types (all i32)
+            for (auto &ia : implicitArgs)
+                newArgTypes.push_back(i32Ty);
 
             auto *newFnTy = llvm::FunctionType::get(
                 kernelFn->getReturnType(), newArgTypes, false);
@@ -458,25 +496,25 @@ extern "C" const char* triton_metal_run_to_llvm(const char* mlir_text,
             // Copy attributes
             newFn->setCallingConv(kernelFn->getCallingConv());
 
-            // We'll clone the function, then fix up the entry block to add
-            // addrspacecast/load instructions for address-space-changed args.
-            // First, set up the value map for cloning.
+            // Set up the value map for cloning.
             llvm::ValueToValueMapTy vmap;
             auto newArgIt = newFn->arg_begin();
             unsigned argIdx = 0;
             for (auto &oldArg : kernelFn->args()) {
                 newArgIt->setName(oldArg.getName());
-                // Temporarily map old→new; we'll fix up after cloning
                 vmap[&oldArg] = &*newArgIt;
                 ++newArgIt;
                 ++argIdx;
             }
 
-            // Name the new pid/lid args
-            llvm::Argument *pidArg = &*newArgIt; ++newArgIt;
-            llvm::Argument *lidArg = &*newArgIt;
-            pidArg->setName("pid");
-            lidArg->setName("lid");
+            // Name and record the implicit args
+            std::map<std::string, llvm::Argument *> implicitArgMap;
+            for (auto &ia : implicitArgs) {
+                llvm::Argument *arg = &*newArgIt;
+                arg->setName(ia.argName);
+                implicitArgMap[ia.intrinsicName] = arg;
+                ++newArgIt;
+            }
 
             // Clone the function body
             llvm::SmallVector<llvm::ReturnInst *, 4> returns;
@@ -484,10 +522,10 @@ extern "C" const char* triton_metal_run_to_llvm(const char* mlir_text,
                                     llvm::CloneFunctionChangeType::LocalChangesOnly,
                                     returns);
 
-            // Now fix up the cloned function:
+            // Fix up the cloned function:
             // 1. For ptr args: addrspacecast from addrspace(1) to addrspace(0)
             // 2. For scalar args: load value from addrspace(2) pointer
-            // 3. Replace __metal_* calls with pid/lid args
+            // 3. Replace __metal_* calls with implicit args
             auto &entryBB = newFn->getEntryBlock();
             llvm::IRBuilder<> builder(&*entryBB.getFirstInsertionPt());
 
@@ -497,10 +535,8 @@ extern "C" const char* triton_metal_run_to_llvm(const char* mlir_text,
                 llvm::Argument *newArg = &*newArgIt;
 
                 if (isScalarArg[argIdx]) {
-                    // Scalar arg: was i32, now ptr addrspace(2) — insert a load
                     auto *loadedVal = builder.CreateLoad(
                         oldArg.getType(), newArg, newArg->getName() + ".val");
-                    // Replace all uses of the new arg (except our load)
                     for (auto it = newArg->use_begin(); it != newArg->use_end(); ) {
                         auto &use = *it;
                         ++it;
@@ -509,15 +545,9 @@ extern "C" const char* triton_metal_run_to_llvm(const char* mlir_text,
                     }
                 } else if (newArg->getType() != oldArg.getType() &&
                            newArg->getType()->isPointerTy()) {
-                    // Pointer arg: addrspace changed (ptr -> ptr addrspace(1)).
-                    // We need addrspacecast so that GEPs/loads/stores in the
-                    // body (cloned from the original function) see a generic
-                    // pointer. Metal AIR optimizations will propagate the
-                    // address space through.
                     auto *genericPtr = llvm::PointerType::get(llvmCtx, 0);
                     auto *castVal = builder.CreateAddrSpaceCast(
                         newArg, genericPtr, newArg->getName() + ".generic");
-                    // Replace all uses of newArg (except our cast)
                     for (auto it = newArg->use_begin(); it != newArg->use_end(); ) {
                         auto &use = *it;
                         ++it;
@@ -530,18 +560,17 @@ extern "C" const char* triton_metal_run_to_llvm(const char* mlir_text,
                 ++argIdx;
             }
 
-            // Replace __metal_* calls with pid/lid args
+            // Replace __metal_* calls with corresponding implicit args
             for (auto &bb : *newFn) {
                 for (auto it = bb.begin(); it != bb.end(); ) {
                     auto *inst = &*it;
                     ++it;
                     if (auto *callInst = llvm::dyn_cast<llvm::CallInst>(inst)) {
                         if (auto *callee = callInst->getCalledFunction()) {
-                            if (callee->getName() == "__metal_get_program_id_0") {
-                                callInst->replaceAllUsesWith(pidArg);
-                                callInst->eraseFromParent();
-                            } else if (callee->getName() == "__metal_get_local_id") {
-                                callInst->replaceAllUsesWith(lidArg);
+                            auto name = callee->getName().str();
+                            auto mapIt = implicitArgMap.find(name);
+                            if (mapIt != implicitArgMap.end()) {
+                                callInst->replaceAllUsesWith(mapIt->second);
                                 callInst->eraseFromParent();
                             }
                         }
@@ -559,20 +588,31 @@ extern "C" const char* triton_metal_run_to_llvm(const char* mlir_text,
                 auto &fn = *it;
                 ++it;
                 if (fn.isDeclaration() &&
-                    (fn.getName() == "__metal_get_program_id_0" ||
-                     fn.getName() == "__metal_get_local_id")) {
+                    fn.getName().starts_with("__metal_get_")) {
                     fn.eraseFromParent();
                 }
+            }
+
+            // Export implicit arg descriptors for AIR metadata generation
+            for (auto &ia : implicitArgs) {
+                airImplicitArgs.push_back({ia.airMetadata, ia.argName});
             }
         }
     }
 
+    // Default implicit args if no __metal_* calls were found (shouldn't
+    // happen for real kernels, but be safe).
+    if (airImplicitArgs.empty()) {
+        airImplicitArgs.push_back({"air.threadgroup_position_in_grid", "pid"});
+        airImplicitArgs.push_back({"air.thread_position_in_threadgroup", "lid"});
+    }
+
     // Add AIR metadata for Metal compilation.
-    // numExplicitArgs = totalArgs - 2 (pid, lid are implicit thread position args)
-    unsigned numExplicit = kernelFn->arg_size() >= 2
-                           ? kernelFn->arg_size() - 2
+    unsigned numImplicit = airImplicitArgs.size();
+    unsigned numExplicit = kernelFn->arg_size() >= numImplicit
+                           ? kernelFn->arg_size() - numImplicit
                            : kernelFn->arg_size();
-    addAIRMetadata(*llvmMod, *kernelFn, numExplicit);
+    addAIRMetadata(*llvmMod, *kernelFn, numExplicit, airImplicitArgs);
 
     // Serialize to text
     static std::string result;

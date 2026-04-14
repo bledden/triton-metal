@@ -87,6 +87,7 @@ add_subdirectory(lib/Conversion)
 add_library(triton_metal_backend SHARED
     $<TARGET_OBJECTS:TritonMetalToLLVM>
     ${TRITON_IR_OBJS}
+    python_bindings_bridge.cpp
 )
 
 target_link_libraries(triton_metal_backend
@@ -111,3 +112,18 @@ target_link_libraries(triton_metal_backend
 
 # Install target (optional — for packaging later)
 install(TARGETS triton_metal_backend LIBRARY DESTINATION lib)
+
+# ---------------------------------------------------------------------------
+# pybind11 Python extension — exposes C++ MLIR passes to Python
+# ---------------------------------------------------------------------------
+find_package(pybind11 REQUIRED PATHS
+    "${CMAKE_CURRENT_SOURCE_DIR}/../../.venv/lib/python3.14/site-packages/pybind11/share/cmake/pybind11")
+
+pybind11_add_module(_triton_metal_cpp python_bindings.cpp)
+target_link_libraries(_triton_metal_cpp PRIVATE triton_metal_backend)
+# pybind11 requires RTTI (typeid).  The global CMAKE_CXX_FLAGS contain
+# -fno-rtti to match LLVM/MLIR, so we must override it for this target.
+# python_bindings.cpp does NOT include any MLIR headers — it calls
+# through a C-linkage bridge (python_bindings_bridge.cpp) that lives in
+# the dylib and is compiled with -fno-rtti.
+target_compile_options(_triton_metal_cpp PRIVATE -frtti)

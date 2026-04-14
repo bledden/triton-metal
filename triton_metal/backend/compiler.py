@@ -150,6 +150,15 @@ class MetalBackend(BaseBackend):
         stages["metallib"] = lambda src, metadata: self.make_metallib(src, metadata, options)
 
     @staticmethod
+    def _has_cpp_passes():
+        """Check if the C++ MLIR pass library is available."""
+        try:
+            import triton_metal._triton_metal_cpp
+            return True
+        except ImportError:
+            return False
+
+    @staticmethod
     def gluon_to_ttgir(mod, metadata, options):
         """Convert Gluon IR to TTGIR for Metal.
 

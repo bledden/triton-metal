@@ -481,6 +481,20 @@ extern "C" const char* triton_metal_run_to_llvm(const char* mlir_text,
                 });
             }
 
+            // Add SIMD group intrinsics for reductions
+            if (usedIntrinsics.count("__metal_get_sgitg")) {
+                implicitArgs.push_back({
+                    "__metal_get_sgitg", "sgitg",
+                    "air.simdgroup_index_in_threadgroup"
+                });
+            }
+            if (usedIntrinsics.count("__metal_get_tiisg")) {
+                implicitArgs.push_back({
+                    "__metal_get_tiisg", "tiisg",
+                    "air.thread_index_in_simdgroup"
+                });
+            }
+
             // Append implicit arg types (all i32)
             for (auto &ia : implicitArgs)
                 newArgTypes.push_back(i32Ty);

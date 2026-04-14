@@ -152,6 +152,175 @@ def _shape_numel(shape: tuple) -> int:
 
 
 # ---------------------------------------------------------------------------
+# Shared memory aliasing post-pass
+# ---------------------------------------------------------------------------
+
+def _alias_shared_memory(msl: str) -> str:
+    """Rewrite threadgroup array declarations to reuse memory.
+
+    After the lowerer generates MSL with one threadgroup array per allocation,
+    this pass finds arrays with non-overlapping lifetimes and aliases them to
+    the same physical array, reducing total threadgroup memory usage.
+
+    The algorithm:
+    1. Parse all `threadgroup float NAME[SIZE];` declarations.
+    2. For each, scan the MSL body for first and last LINE where NAME appears
+       (excluding the declaration itself).
+    3. Build a conflict graph: two arrays conflict if their [first, last] line
+       ranges overlap.
+    4. Greedily assign arrays to "physical" slots. For each array (sorted by
+       size descending), try to reuse a physical slot whose current occupants
+       don't conflict. If none, create a new slot.
+    5. Rename arrays in each group to the physical name (the first/largest
+       member), remove duplicate declarations, and adjust the declaration
+       size to the group maximum.
+    """
+    import re
+
+    lines = msl.split('\n')
+
+    # 1. Parse declarations: name -> (size, decl_line_idx)
+    decl_re = re.compile(r'^\s*threadgroup\s+float\s+(\w+)\[(\d+)\];')
+    decls = {}  # name -> (size, line_idx)
+    for i, line in enumerate(lines):
+        m = decl_re.match(line)
+        if m:
+            name, size = m.group(1), int(m.group(2))
+            decls[name] = (size, i)
+
+    if len(decls) < 2:
+        return msl  # nothing to alias
+
+    # 2a. Detect loop boundaries: for (...) { ... }
+    # Any array used inside a loop has its live range expanded to cover
+    # the entire loop, because all iterations share the same memory.
+    loop_ranges = []  # list of (loop_start_line, loop_end_line)
+    brace_stack = []
+    for_line_re = re.compile(r'^\s*for\s*\(')
+    for i, line in enumerate(lines):
+        if for_line_re.match(line):
+            brace_stack.append(i)
+        # Track braces — simplistic but works for generated MSL
+        opens = line.count('{')
+        closes = line.count('}')
+        for _ in range(opens):
+            if not brace_stack or brace_stack[-1] != i:
+                brace_stack.append(i)
+        for _ in range(closes):
+            if brace_stack:
+                start = brace_stack.pop()
+                # Only record loops (for statements), not bare blocks
+                if for_line_re.match(lines[start]):
+                    loop_ranges.append((start, i))
+
+    # 2b. Compute live ranges: name -> (first_use_line, last_use_line)
+    live = {}
+    for name in decls:
+        decl_line = decls[name][1]
+        first_use = None
+        last_use = None
+        pattern = re.compile(r'\b' + re.escape(name) + r'\b')
+        for i, line in enumerate(lines):
+            if i == decl_line:
+                continue
+            if pattern.search(line):
+                if first_use is None:
+                    first_use = i
+                last_use = i
+        if first_use is not None:
+            # Expand range to cover enclosing loop ONLY if the array is
+            # used both outside and inside the loop (persistent across
+            # iterations, like Q). Arrays first allocated inside the loop
+            # are loop-local and don't need expansion — they're rewritten
+            # each iteration so their within-iteration range is sufficient.
+            for loop_start, loop_end in loop_ranges:
+                used_inside = first_use >= loop_start and last_use <= loop_end
+                used_before = first_use < loop_start and last_use >= loop_start
+                used_after = last_use > loop_end and first_use <= loop_end
+                if used_before or used_after:
+                    # Array spans into/out of the loop → expand to full loop
+                    first_use = min(first_use, loop_start)
+                    last_use = max(last_use, loop_end)
+                # If used_inside only: keep the within-loop range as-is
+            live[name] = (first_use, last_use)
+        else:
+            live[name] = (decl_line, decl_line)
+
+    # 3. Check overlap: two arrays conflict if their ranges overlap.
+    def overlaps(a, b):
+        a0, a1 = live[a]
+        b0, b1 = live[b]
+        return a0 <= b1 and b0 <= a1
+
+    # 4. Greedy coloring: assign arrays to physical slots.
+    # Sort by size descending so large arrays get first pick.
+    names_sorted = sorted(decls.keys(), key=lambda n: decls[n][0], reverse=True)
+
+    # Each slot: (physical_name, max_size, [member_names])
+    slots = []
+    assignment = {}  # name -> physical_name
+
+    for name in names_sorted:
+        size = decls[name][0]
+        assigned = False
+        for slot in slots:
+            phys_name, slot_size, members = slot
+            # Check if this array conflicts with any member
+            conflicts = any(overlaps(name, m) for m in members)
+            if not conflicts:
+                # Assign to this slot
+                members.append(name)
+                if size > slot_size:
+                    slot[1] = size  # update max size
+                assignment[name] = phys_name
+                assigned = True
+                break
+        if not assigned:
+            # New slot
+            slots.append([name, size, [name]])
+            assignment[name] = name  # self-assigned
+
+    # 5. Rename in MSL
+    # Build replacement map: old_name -> new_name
+    renames = {}
+    for name in decls:
+        if assignment[name] != name:
+            renames[name] = assignment[name]
+
+    if not renames:
+        return msl  # no aliasing needed
+
+    # Update declaration sizes to group maximum
+    slot_max_size = {}
+    for slot in slots:
+        phys_name, max_size, members = slot
+        slot_max_size[phys_name] = max_size
+
+    # Process lines: rename, update sizes, remove duplicate declarations
+    seen_decls = set()
+    new_lines = []
+    for i, line in enumerate(lines):
+        m = decl_re.match(line)
+        if m:
+            name = m.group(1)
+            phys_name = assignment.get(name, name)
+            if phys_name in seen_decls:
+                continue  # remove duplicate declaration
+            seen_decls.add(phys_name)
+            # Update size to group maximum
+            max_size = slot_max_size.get(phys_name, int(m.group(2)))
+            new_lines.append(f"    threadgroup float {phys_name}[{max_size}];")
+        else:
+            new_line = line
+            for old, new in renames.items():
+                if old in new_line:
+                    new_line = re.sub(r'\b' + re.escape(old) + r'\b', new, new_line)
+            new_lines.append(new_line)
+
+    return '\n'.join(new_lines)
+
+
+# ---------------------------------------------------------------------------
 # Generic Lowerer
 # ---------------------------------------------------------------------------
 
@@ -761,7 +930,9 @@ class GenericLowerer:
         if self._used_pid_axes:
             self.kb._used_pid_axes = self._used_pid_axes
 
-        return self.kb.build()
+        msl = self.kb.build()
+        msl = _alias_shared_memory(msl)
+        return msl
 
     def get_output_arg_indices(self):
         """Return list of arg positions that are output (stored-to) pointers.
@@ -5595,34 +5766,146 @@ class GenericLowerer:
                         src_ptr_name = ptr_info[0]
                 break
 
-        # Cooperative strided fill: each thread writes elements stride-apart
-        if src_ptr_name:
-            # Re-load from global memory into shared memory using the
-            # pointer base. We compute the global address per element.
-            # For 2D: element i maps to row i/N, col i%N → global[row*N + col]
-            self.kb.raw_line(f"    for (uint _sa = lid; _sa < {total}u; _sa += {bs}u) {{")
-            # Recompute the address that the original load used.
-            # The load used addptr chains, but we can simply index the
-            # pointer directly since the kernel's pointer covers the tile.
-            # Access the environment's addptr result to get the base pointer
-            # for the load op.
-            load_ptr_var = None
-            for op in self.graph.ops:
-                if op.id == trace_id and op.op == "tt.load" and op.operand_ids:
-                    load_ptr_var = self.env.get(op.operand_ids[0])
+        # Cooperative strided fill: each thread writes elements stride-apart.
+        # For 2D tiles where total > block_size, each thread must handle
+        # multiple elements. The per-thread src_var only holds ONE value
+        # (for lid), so we re-load from global memory with corrected
+        # row/col addressing for each _sa position.
+        if total > bs and self._is_2d:
+            # Trace the source chain to find the original tt.load and
+            # its pointer info. Also collect any transformations applied
+            # between the load and local_alloc (e.g., multiply by scale).
+            load_ptr_info = None
+            load_mask_op_id = None
+            post_load_ops = []  # (op_type, extra_operand_var) chain
+
+            # Build flat list of all ops including those inside scf.for bodies
+            def _all_ops(ops):
+                for o in ops:
+                    yield o
+                    if o.region_ops:
+                        yield from _all_ops(o.region_ops)
+                    if o.else_ops:
+                        yield from _all_ops(o.else_ops)
+            all_ops = list(_all_ops(self.graph.ops))
+
+            cur_id = ssa.operand_ids[0]
+            for _depth in range(10):
+                for op in all_ops:
+                    if op.id == cur_id:
+                        if op.op == "tt.load" and op.operand_ids:
+                            ptr_id = op.operand_ids[0]
+                            load_ptr_info = self.env_is_ptr.get(ptr_id)
+                            # Find mask
+                            for oid in op.operand_ids[1:]:
+                                if oid in self.env_is_mask or self._is_mask(oid):
+                                    load_mask_op_id = oid
+                        elif op.operand_ids:
+                            # Record transformation op (e.g., arith.mulf)
+                            if len(op.operand_ids) >= 2:
+                                other_id = op.operand_ids[1]
+                                other_var = self._lookup(other_id)
+                                post_load_ops.insert(0, (op.op, other_var))
+                            cur_id = op.operand_ids[0]
+                        break
+                if load_ptr_info is not None:
                     break
-            if load_ptr_var and "UNKNOWN" not in str(load_ptr_var):
-                # The pointer variable maps element index to address.
-                # In the per-thread model, the ptr var was computed for _loop_e.
-                # We need to re-evaluate it for _sa. The simplest approach:
-                # just use the base pointer + linear index.
-                self.kb.raw_line(f"        {shared_name}[_sa] = {src_ptr_name}[_sa];")
+
+            if load_ptr_info:
+                base_ptr, offset_expr = load_ptr_info
+                # Find which idx variables are used in THIS offset expression.
+                # Different loads may use different idx vars for the same dim.
+                row_var = None
+                col_var = None
+                for mr_id, dim in self._make_range_dim.items():
+                    v = self.env.get(mr_id, "")
+                    if not isinstance(v, str) or not v.startswith("idx_"):
+                        continue
+                    # Direct: idx appears in offset expression
+                    if v in offset_expr:
+                        if dim == 1 and col_var is None:
+                            col_var = v
+                        elif dim == 0 and row_var is None:
+                            row_var = v
+                        continue
+                    # Indirect: a dependent r_X variable appears in offset
+                    if dim == 0 and row_var is None:
+                        for dop in all_ops:
+                            dv = self.env.get(dop.id, "")
+                            if isinstance(dv, str) and dv in offset_expr and dop.operand_ids:
+                                if any(self.env.get(oid, "") == v for oid in dop.operand_ids):
+                                    row_var = v
+                                    break
+
+                self.kb.raw_line(f"    for (uint _sa = lid; _sa < {total}u; _sa += {bs}u) {{")
+                self.kb.raw_line(f"        uint _fill_row = _sa / {N}u;")
+                self.kb.raw_line(f"        uint _fill_col = _sa % {N}u;")
+
+                # Rebuild the offset expression by substituting row/col vars.
+                new_offset = offset_expr
+                emitted = set()
+                if col_var:
+                    new_offset = new_offset.replace(col_var, "_fill_col")
+                if row_var:
+                    # Find dependent variables and rebuild them
+                    for op in all_ops:
+                        v = self.env.get(op.id, "")
+                        if not isinstance(v, str) or not v.startswith("r_") or v in emitted:
+                            continue
+                        if not op.operand_ids:
+                            continue
+                        uses_row = any(self.env.get(oid, "") == row_var for oid in op.operand_ids)
+                        if not uses_row:
+                            continue
+                        emitted.add(v)
+                        a = self.env.get(op.operand_ids[0], "?") if len(op.operand_ids) > 0 else "?"
+                        b = self.env.get(op.operand_ids[1], "?") if len(op.operand_ids) > 1 else "0"
+                        a_sub = "(int)_fill_row" if a == row_var else a
+                        b_sub = "(int)_fill_row" if b == row_var else b
+                        op_sym = " + " if "add" in (op.op or "") else " * " if "mul" in (op.op or "") else " + "
+                        self.kb.raw_line(f"        int _fill_{v} = {a_sub}{op_sym}{b_sub};")
+                        new_offset = new_offset.replace(v, f"_fill_{v}")
+                        # 2nd-level deps
+                        for op2 in all_ops:
+                            v2 = self.env.get(op2.id, "")
+                            if not isinstance(v2, str) or not v2.startswith("r_") or v2 in emitted:
+                                continue
+                            if not op2.operand_ids:
+                                continue
+                            if not any(self.env.get(oid, "") == v for oid in op2.operand_ids):
+                                continue
+                            emitted.add(v2)
+                            a2 = self.env.get(op2.operand_ids[0], "?")
+                            b2 = self.env.get(op2.operand_ids[1], "?") if len(op2.operand_ids) > 1 else "0"
+                            a2_sub = f"_fill_{v}" if a2 == v else a2
+                            b2_sub = f"_fill_{v}" if b2 == v else b2
+                            op2_sym = " + " if "add" in (op2.op or "") else " * " if "mul" in (op2.op or "") else " + "
+                            self.kb.raw_line(f"        int _fill_{v2} = {a2_sub}{op2_sym}{b2_sub};")
+                            new_offset = new_offset.replace(v2, f"_fill_{v2}")
+                    new_offset = new_offset.replace(row_var, "(int)_fill_row")
+
+                # Load value from global memory
+                val_expr = f"{base_ptr}[{new_offset}]"
+                # Apply post-load transformations (e.g., * scale)
+                for op_type, other_var in post_load_ops:
+                    if "mul" in op_type:
+                        val_expr = f"({val_expr} * {other_var})"
+                    elif "add" in op_type:
+                        val_expr = f"({val_expr} + {other_var})"
+                self.kb.raw_line(f"        {shared_name}[_sa] = {val_expr};")
+                self.kb.raw_line(f"    }}")
             else:
-                self.kb.raw_line(f"        {shared_name}[_sa] = {src_ptr_name}[_sa];")
+                # Couldn't find load pointer — fall back to per-thread value
+                self.kb.raw_line(f"    for (uint _sa = lid; _sa < {total}u; _sa += {bs}u) {{")
+                self.kb.raw_line(f"        {shared_name}[_sa] = {src_var};")
+                self.kb.raw_line(f"    }}")
+        elif src_ptr_name:
+            self.kb.raw_line(f"    for (uint _sa = lid; _sa < {total}u; _sa += {bs}u) {{")
+            self.kb.raw_line(f"        {shared_name}[_sa] = {src_ptr_name}[_sa];")
             self.kb.raw_line(f"    }}")
         else:
             # Fallback: use the value from the wrapping loop (only correct
-            # when not wrapping, or for a single element).
+            # when total == block_size or for a single element).
             self.kb.raw_line(f"    for (uint _sa = lid; _sa < {total}u; _sa += {bs}u) {{")
             self.kb.raw_line(f"        {shared_name}[_sa] = {src_var};")
             self.kb.raw_line(f"    }}")

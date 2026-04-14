@@ -126,7 +126,7 @@ class TestFlashAttention:
         (1, 1, 32, 32),
         (1, 1, 64, 32),
         pytest.param(1, 1, 64, 64, marks=pytest.mark.xfail(
-            reason="HEAD_DIM=64: 41KB threadgroup memory exceeds Metal 32KB limit")),
+            reason="HEAD_DIM=64: local_alloc 2D fill bug for tiles > 1024 elements")),
         (1, 2, 64, 32),
         (2, 2, 64, 32),
         (1, 1, 128, 32),
@@ -161,7 +161,7 @@ class TestFlashAttention:
         (1, 1, 32, 32),
         (1, 1, 64, 32),
         pytest.param(1, 1, 64, 64, marks=pytest.mark.xfail(
-            reason="HEAD_DIM=64: 41KB threadgroup memory exceeds Metal 32KB limit")),
+            reason="HEAD_DIM=64: local_alloc 2D fill bug for tiles > 1024 elements")),
         (1, 2, 64, 32),
         (1, 1, 128, 32),
     ])

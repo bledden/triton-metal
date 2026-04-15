@@ -85,8 +85,8 @@ UNIMPLEMENTED_FEATURES = {
     # Tensor atomic ops — most configs now work with 2D support
     # "test_tensor_atomic_rmw_block",  # Enabled: 2D matrix access (8x8)
     # "test_tensor_atomic_add_non_exclusive_offset",  # Enabled: most configs pass
-    "test_tensor_atomic_add_non_exclusive_offset[64-1-float32]",
-    "test_tensor_atomic_add_non_exclusive_offset[128-1-float32]",
+    # "test_tensor_atomic_add_non_exclusive_offset[64-1-float32]",  # Enabled: now passes
+    # "test_tensor_atomic_add_non_exclusive_offset[128-1-float32]",  # Enabled: now passes
     # "test_tensor_atomic_add_access_patterns",  # Enabled: 80 configs pass
     # scaled_dot — requires microscaling format support
     "test_scaled_dot",
@@ -141,7 +141,7 @@ UNIMPLEMENTED_FEATURES = {
     # "test_sum_dtype",  # Enabled: tensor type scan for block_size with tl.full
     # "test_umulhi",  # Enabled: tt.mulhiui → MSL mulhi()
     # "test_math_divide_op",  # Enabled: fdiv works (div_rn variant skipped via parametrize)
-    "test_math_divide_op[1-tl.math.div_rn(x, y)]",  # Metal: no round-to-nearest divide intrinsic
+    # "test_math_divide_op[1-tl.math.div_rn(x, y)]",  # Enabled: div_rn now passes
     # "test_unsplat",  # Testing: scalar extraction
     "test_no_rematerialization_op",
     # "test_load_store_same_ptr",  # Testing: simple load-mul-store
@@ -159,8 +159,7 @@ UNIMPLEMENTED_FEATURES = {
     "test_tl_range_num_stages",
     # i64 compute — Metal GPU pipeline compiler doesn't support int64
     "test_for_iv",
-    # test_if_call "jit_if" variant uses early return → cf.cond_br
-    "test_if_call[jit_if]",
+    # "test_if_call[jit_if]",  # Enabled: early return / cf.cond_br now works
     # "test_num_warps_pow2",  # Enabled: validation added to parse_options
     # Early return → cf.cond_br (unstructured control flow not implemented)
     "test_nested_if_else_return",

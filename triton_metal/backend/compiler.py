@@ -165,15 +165,8 @@ class MetalBackend(BaseBackend):
                 ttgir_text = metadata.pop("cpp_ttgir", None)
                 if ttgir_text and not MetalBackend._has_complex_ops(ttgir_text):
                     # C++ per-thread model: one thread per element.
-                    # Can't handle kernels where total elements > 1024
-                    # (Metal's max threadgroup size). MSL uses wrapping
-                    # loops for those; the C++ path has no such mechanism.
-                    import re as _re
-                    mr_ends = [int(m.group(1)) for m in _re.finditer(
-                        r'tt\.make_range\s*\{[^}]*end\s*=\s*(\d+)', ttgir_text)]
-                    max_tensor_elems = max(mr_ends) if mr_ends else 0
-                    if max_tensor_elems > 1024:
-                        return MetalBackend.make_metallib(src, metadata, options)
+                    # For kernels with >1024 elements, make_llir injects a
+                    # wrapping loop so 1024 threads cover all elements.
                     try:
                         # Don't inherit MSL's block_size (which reflects
                         # wrapping loops / sizePerThread). Let make_llir
@@ -1112,35 +1105,7 @@ class MetalBackend(BaseBackend):
             with open(os.path.join(debug_dir, f"{kernel_name}.stripped.mlir"), "w") as f:
                 f.write(stripped)
 
-        # Run C++ pass pipeline: TTGIR → LLVM IR with AIR metadata
-        air_llvm_ir_opaque = cpp.run_to_llvm(stripped)
-
-        if level >= 2:
-            with open(os.path.join(debug_dir, f"{kernel_name}.opaque.ll"), "w") as f:
-                f.write(air_llvm_ir_opaque)
-
-        # Metal's GPU JIT compiler requires typed pointers (old LLVM IR format).
-        # Convert opaque pointers to typed pointers.
-        air_llvm_ir = MetalBackend._opaque_to_typed_ptrs(air_llvm_ir_opaque)
-
-        # Strip LLVM function attributes that Metal's compiler doesn't
-        # understand (nocreateundeforpoison, memory(none), etc.).
-        air_llvm_ir = MetalBackend._strip_unsupported_llvm_attrs(air_llvm_ir)
-
-        if level >= 1:
-            with open(os.path.join(debug_dir, f"{kernel_name}.ll"), "w") as f:
-                f.write(air_llvm_ir)
-
-        # Extract kernel name from the LLVM IR
-        import re
-        m = re.search(r'define\s+void\s+@(\w+)\s*\(', air_llvm_ir)
-        if m:
-            metadata["name"] = m.group(1)
-
-        # Extract block_size from TTGIR make_range end attributes.
-        # For 1D kernels, block_size = the single make_range end value.
-        # For 2D kernels (matmul), block_size = product of unique make_range
-        # end values across different slice dimensions, capped at 1024.
+        # -- Compute block_size early (needed for wrapping loop decision) ----
         import re
         block_size = options.num_warps * 32  # default
         mr_ends = set()
@@ -1173,6 +1138,49 @@ class MetalBackend(BaseBackend):
             gen_mr = re.search(r'tt\.make_range\s*\{[^}]*end\s*=\s*(\d+)', stripped)
             if gen_mr:
                 block_size = int(gen_mr.group(1))
+
+        # Run C++ pass pipeline: TTGIR → LLVM IR with AIR metadata
+        air_llvm_ir_opaque = cpp.run_to_llvm(stripped)
+
+        if level >= 2:
+            debug_dir = _dump_dir()
+            os.makedirs(debug_dir, exist_ok=True)
+            with open(os.path.join(debug_dir, f"{kernel_name}.opaque.ll"), "w") as f:
+                f.write(air_llvm_ir_opaque)
+
+        # If total elements > 1024, inject a wrapping loop so that 1024
+        # threads can cover all elements via a stride loop.
+        if block_size > 1024:
+            cap = 1024
+            if level >= 1:
+                debug_dir = _dump_dir()
+                os.makedirs(debug_dir, exist_ok=True)
+                with open(os.path.join(debug_dir, f"{kernel_name}.pre_wrap.ll"), "w") as f:
+                    f.write(air_llvm_ir_opaque)
+            air_llvm_ir_opaque = MetalBackend._inject_wrapping_loop(
+                air_llvm_ir_opaque, block_size, cap,
+            )
+            if level >= 1:
+                with open(os.path.join(debug_dir, f"{kernel_name}.wrapped.ll"), "w") as f:
+                    f.write(air_llvm_ir_opaque)
+
+        # Metal's GPU JIT compiler requires typed pointers (old LLVM IR format).
+        # Convert opaque pointers to typed pointers.
+        air_llvm_ir = MetalBackend._opaque_to_typed_ptrs(air_llvm_ir_opaque)
+
+        # Strip LLVM function attributes that Metal's compiler doesn't
+        # understand (nocreateundeforpoison, memory(none), etc.).
+        air_llvm_ir = MetalBackend._strip_unsupported_llvm_attrs(air_llvm_ir)
+
+        if level >= 1:
+            with open(os.path.join(debug_dir, f"{kernel_name}.ll"), "w") as f:
+                f.write(air_llvm_ir)
+
+        # Extract kernel name from the LLVM IR
+        m = re.search(r'define\s+void\s+@(\w+)\s*\(', air_llvm_ir)
+        if m:
+            metadata["name"] = m.group(1)
+
         metadata.setdefault("block_size", min(block_size, 1024))
 
         # Detect 2D grid usage from program_id axes in the TTGIR.
@@ -1180,6 +1188,188 @@ class MetalBackend(BaseBackend):
         metadata.setdefault("needs_2d_grid", needs_2d)
 
         return air_llvm_ir
+
+    @staticmethod
+    def _inject_wrapping_loop(ir_text, total_elems, cap):
+        """Inject a stride loop into LLVM IR so *cap* threads cover *total_elems*.
+
+        Operates on opaque-pointer LLVM IR (before typed-pointer conversion).
+        Each thread iterates: for (_wlid = lid; _wlid < total_elems; _wlid += cap).
+
+        The generated IR replaces the single-pass per-thread model with a loop
+        where each of the *cap* threads processes multiple elements.
+        """
+        import re
+
+        # ---- locate function body ------------------------------------------
+        # The argument list contains nested parens (e.g. addrspace(1)),
+        # so we match the define line ending with ') {' then the body.
+        fn_match = re.search(
+            r'(define void @\w+\(.*?\) \{)\n(.*?)\n(\})',
+            ir_text, re.DOTALL,
+        )
+        if not fn_match:
+            raise RuntimeError("_inject_wrapping_loop: cannot find function body")
+
+        fn_header = fn_match.group(1)   # define void @name(...) {
+        body = fn_match.group(2)
+        fn_close = fn_match.group(3)    # }
+
+        # ---- determine entry block implicit label ---------------------------
+        # The entry block label = next unused SSA number after unnamed args.
+        # Named args (%pid, %lid) don't consume SSA numbers.
+        # Extract args from fn_header by stripping 'define void @name(' ... ') {'
+        args_match = re.search(r'@\w+\((.*)\)\s*\{', fn_header, re.DOTALL)
+        unnamed_count = 0
+        if args_match:
+            for arg in args_match.group(1).split(','):
+                arg = arg.strip()
+                if arg and re.search(r'%\d+\s*$', arg):
+                    unnamed_count += 1
+        entry_label = str(unnamed_count)
+
+        # ---- split body into lines and identify blocks ----------------------
+        lines = body.split('\n')
+
+        # Separate setup lines (addrspacecasts + addrspace(2) loads) from
+        # compute lines in the entry block.
+        setup_lines = []
+        compute_lines = []
+        past_setup = False
+        in_entry = True
+        other_blocks = []
+
+        for line in lines:
+            stripped = line.strip()
+            # Detect start of a new basic block (numeric or named label)
+            if re.match(r'^\d+:', stripped) or re.match(r'^[a-zA-Z_]\w*:', stripped):
+                in_entry = False
+
+            if in_entry:
+                if not past_setup and (
+                    'addrspacecast' in stripped
+                    or ('load' in stripped and 'addrspace(2)' in stripped)
+                    or stripped == ''
+                ):
+                    setup_lines.append(line)
+                else:
+                    past_setup = True
+                    compute_lines.append(line)
+            else:
+                other_blocks.append(line)
+
+        # ---- replace %lid with %_wlid in compute + other blocks ------------
+        def replace_lid(text):
+            # Replace %lid as a whole word (not inside other identifiers)
+            return re.sub(r'%lid\b', '%_wlid', text)
+
+        compute_text = replace_lid('\n'.join(compute_lines))
+        other_text = replace_lid('\n'.join(other_blocks))
+
+        # ---- find the merge block (the one with 'ret void') ----------------
+        # In the other_blocks text, replace 'ret void' with a branch to the
+        # loop latch. Also need to redirect any 'br label %<merge>' in the
+        # conditional store block to branch to latch instead.
+
+        # Find the merge block label (block containing ret void)
+        merge_label = None
+        for m in re.finditer(r'^(\d+):\s*;.*$', other_text, re.MULTILINE):
+            # Check if this block contains ret void
+            block_start = m.end()
+            next_block = re.search(r'^\d+:', other_text[block_start:], re.MULTILINE)
+            block_end = block_start + next_block.start() if next_block else len(other_text)
+            block_body = other_text[block_start:block_end]
+            if 'ret void' in block_body:
+                merge_label = m.group(1)
+                break
+
+        # Also check if ret void is directly in compute_text (no conditional store)
+        ret_in_compute = 'ret void' in compute_text and merge_label is None
+
+        if ret_in_compute:
+            # Simple case: no conditional branch, ret void directly in compute.
+            # The compute block has a direct store + ret void.
+            # Replace ret void with branch to latch.
+            compute_text = compute_text.replace('ret void', 'br label %_wl_latch')
+
+            new_body_parts = [
+                '\n'.join(setup_lines),
+                f'  br label %_wl_header',
+                '',
+                f'_wl_header:',
+                f'  %_wlid = phi i32 [ %lid, %{entry_label} ], [ %_wlid_next, %_wl_latch ]',
+                compute_text,
+                other_text,
+                '',
+                f'_wl_latch:',
+                f'  %_wlid_next = add i32 %_wlid, {cap}',
+                f'  %_wl_cmp = icmp slt i32 %_wlid_next, {total_elems}',
+                f'  br i1 %_wl_cmp, label %_wl_header, label %_wl_exit',
+                '',
+                f'_wl_exit:',
+                f'  ret void',
+            ]
+        else:
+            # Common case: conditional store with merge block.
+            # The merge block has ret void. Replace it with branch to latch.
+            # Also redirect branches to the merge block from the entry compute.
+            if merge_label is None:
+                # ret void might be at the end of other_text without a labeled block
+                # (shouldn't happen with our IR, but handle gracefully)
+                raise RuntimeError(
+                    "_inject_wrapping_loop: cannot find merge block with ret void"
+                )
+
+            # Replace 'ret void' in the merge block with branch to latch
+            other_text = other_text.replace('ret void', 'br label %_wl_latch')
+
+            # In compute_text, redirect branches to merge label to go to latch.
+            # e.g., "br i1 %6, label %11, label %12" where %12 is the merge.
+            # The false branch (mask=false, skip store) should go to latch.
+            compute_text = re.sub(
+                r'br label %' + merge_label + r'\b',
+                'br label %_wl_latch',
+                compute_text,
+            )
+            compute_text = re.sub(
+                r'(br i1 [^,]+, label %\d+), label %' + merge_label + r'\b',
+                r'\1, label %_wl_latch',
+                compute_text,
+            )
+
+            # In other_text, redirect branches to merge to go to latch
+            other_text = re.sub(
+                r'br label %' + merge_label + r'\b',
+                'br label %_wl_latch',
+                other_text,
+            )
+
+            # Update the preds comment in the merge block to reference latch
+            # (cosmetic, not functionally required)
+
+            new_body_parts = [
+                '\n'.join(setup_lines),
+                f'  br label %_wl_header',
+                '',
+                f'_wl_header:',
+                f'  %_wlid = phi i32 [ %lid, %{entry_label} ], [ %_wlid_next, %_wl_latch ]',
+                compute_text,
+                other_text,
+                '',
+                f'_wl_latch:',
+                f'  %_wlid_next = add i32 %_wlid, {cap}',
+                f'  %_wl_cmp = icmp slt i32 %_wlid_next, {total_elems}',
+                f'  br i1 %_wl_cmp, label %_wl_header, label %_wl_exit',
+                '',
+                f'_wl_exit:',
+                f'  ret void',
+            ]
+
+        new_body = '\n'.join(new_body_parts)
+        new_fn = f'{fn_header}\n{new_body}\n{fn_close}'
+
+        # Replace the old function in the full IR text
+        return ir_text[:fn_match.start()] + new_fn + ir_text[fn_match.end():]
 
     @staticmethod
     def make_metallib_from_llir(src, metadata, options):

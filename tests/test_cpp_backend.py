@@ -193,3 +193,32 @@ def test_scf_if_conditional():
         assert max_err < 1e-5, f"clamp: max error {max_err}"
     finally:
         os.environ.pop("TRITON_METAL_USE_CPP", None)
+
+
+@requires_cpp
+@requires_metal
+def test_wrapping_loop_large_block():
+    """Kernel with BLOCK_SIZE=2048 compiles through C++ metallib."""
+    import os, torch, triton
+    import triton.language as tl
+
+    os.environ["TRITON_METAL_USE_CPP"] = "1"
+    try:
+        @triton.jit
+        def scale_kernel(x_ptr, out_ptr, n, BLOCK: tl.constexpr):
+            pid = tl.program_id(0)
+            offs = pid * BLOCK + tl.arange(0, BLOCK)
+            mask = offs < n
+            x = tl.load(x_ptr + offs, mask=mask)
+            tl.store(out_ptr + offs, x * 2.0, mask=mask)
+
+        n = 4096
+        x = torch.randn(n)
+        out = torch.zeros(n)
+        grid = (triton.cdiv(n, 2048),)
+        scale_kernel[grid](x, out, n, BLOCK=2048)
+
+        max_err = (out - x * 2.0).abs().max().item()
+        assert max_err < 1e-5, f"wrapping loop: max error {max_err}"
+    finally:
+        os.environ.pop("TRITON_METAL_USE_CPP", None)

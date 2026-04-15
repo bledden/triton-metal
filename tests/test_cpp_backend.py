@@ -155,3 +155,41 @@ def test_scf_for_accumulation():
         assert max_err < 1e-4, f"scf.for accumulation: max error {max_err}"
     finally:
         os.environ.pop("TRITON_METAL_USE_CPP", None)
+
+
+@requires_cpp
+@requires_metal
+def test_scf_if_conditional():
+    """Conditional clamp with float scalar args through C++ metallib.
+
+    Uses tl.where (arith.cmpf + arith.select) and float scalar parameters
+    (lo, hi) which are passed as constant buffer pointers in AIR.
+    """
+    import os
+    import torch
+    import triton
+    import triton.language as tl
+
+    os.environ["TRITON_METAL_USE_CPP"] = "1"
+    try:
+        @triton.jit
+        def clamp_kernel(x_ptr, out_ptr, lo, hi, n, BLOCK: tl.constexpr):
+            pid = tl.program_id(0)
+            offs = pid * BLOCK + tl.arange(0, BLOCK)
+            mask = offs < n
+            x = tl.load(x_ptr + offs, mask=mask)
+            x = tl.where(x < lo, lo, x)
+            x = tl.where(x > hi, hi, x)
+            tl.store(out_ptr + offs, x, mask=mask)
+
+        n = 512
+        x = torch.randn(n) * 5
+        out = torch.zeros(n)
+
+        clamp_kernel[(triton.cdiv(n, 256),)](x, out, -1.0, 1.0, n, BLOCK=256)
+
+        expected = x.clamp(-1.0, 1.0)
+        max_err = (out - expected).abs().max().item()
+        assert max_err < 1e-5, f"clamp: max error {max_err}"
+    finally:
+        os.environ.pop("TRITON_METAL_USE_CPP", None)

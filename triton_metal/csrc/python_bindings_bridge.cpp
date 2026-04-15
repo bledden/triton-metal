@@ -43,6 +43,13 @@ extern "C" void triton_metal_register_passes() {
     mlir::triton_metal::registerTritonMetalToLLVMPasses();
 }
 
+// triton-ext compatible plugin entry point.
+// This allows loading our passes via TRITON_PASS_PLUGIN_PATH without
+// the pybind11 module overhead.
+extern "C" void tritonMetalRegisterPasses(void) {
+    mlir::triton_metal::registerTritonMetalToLLVMPasses();
+}
+
 // Descriptor for an implicit Metal kernel argument (thread position, grid
 // size, etc.) that gets its value from a Metal AIR intrinsic.
 struct AIRImplicitArg {

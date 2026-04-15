@@ -172,3 +172,25 @@ set_source_files_properties(
     lib/Conversion/ElementwiseOpToLLVM.cpp
     PROPERTIES COMPILE_FLAGS "-fno-rtti"
 )
+
+# ---------------------------------------------------------------------------
+# triton-ext compatible plugin shared library
+# Loads via TRITON_PASS_PLUGIN_PATH without pybind11 dependency.
+# ---------------------------------------------------------------------------
+add_library(triton_metal_plugin SHARED
+    python_bindings_bridge.cpp
+    lib/Conversion/TritonMetalToLLVM.cpp
+    lib/Conversion/ElementwiseOpToLLVM.cpp
+    ${TRITON_IR_OBJS}
+)
+
+target_link_libraries(triton_metal_plugin PRIVATE ${LIBTRITON_PATH})
+target_include_directories(triton_metal_plugin PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+)
+set_source_files_properties(
+    python_bindings_bridge.cpp
+    lib/Conversion/TritonMetalToLLVM.cpp
+    lib/Conversion/ElementwiseOpToLLVM.cpp
+    PROPERTIES COMPILE_FLAGS "-fno-rtti"
+)

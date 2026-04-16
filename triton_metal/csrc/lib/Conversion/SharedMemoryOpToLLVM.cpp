@@ -183,6 +183,114 @@ public:
   }
 };
 
+class LocalDeallocOpConversion
+    : public ConvertOpToLLVMPattern<triton::gpu::LocalDeallocOp> {
+public:
+  using ConvertOpToLLVMPattern<
+      triton::gpu::LocalDeallocOp>::ConvertOpToLLVMPattern;
+
+  LogicalResult matchAndRewrite(
+      triton::gpu::LocalDeallocOp op, OpAdaptor adaptor,
+      ConversionPatternRewriter &rewriter) const override {
+    // Metal threadgroup memory is function-scoped; no dealloc needed.
+    rewriter.eraseOp(op);
+    return success();
+  }
+};
+
+class AsyncWaitOpConversion
+    : public ConvertOpToLLVMPattern<triton::gpu::AsyncWaitOp> {
+public:
+  using ConvertOpToLLVMPattern<
+      triton::gpu::AsyncWaitOp>::ConvertOpToLLVMPattern;
+
+  LogicalResult matchAndRewrite(
+      triton::gpu::AsyncWaitOp op, OpAdaptor adaptor,
+      ConversionPatternRewriter &rewriter) const override {
+    auto loc = op.getLoc();
+    auto *ctx = rewriter.getContext();
+    auto i32Ty = IntegerType::get(ctx, 32);
+    auto voidTy = LLVM::LLVMVoidType::get(ctx);
+    auto module = op->getParentOfType<ModuleOp>();
+
+    auto barrierFnTy = LLVM::LLVMFunctionType::get(voidTy, {i32Ty, i32Ty});
+    auto barrierFn = module.lookupSymbol<LLVM::LLVMFuncOp>("air.wg.barrier");
+    if (!barrierFn) {
+      OpBuilder::InsertionGuard guard(rewriter);
+      rewriter.setInsertionPointToStart(module.getBody());
+      barrierFn = LLVM::LLVMFuncOp::create(rewriter, loc,
+                                            "air.wg.barrier", barrierFnTy);
+    }
+
+    Value two = LLVM::ConstantOp::create(rewriter, loc, i32Ty,
+                                          rewriter.getI32IntegerAttr(2));
+    Value one = LLVM::ConstantOp::create(rewriter, loc, i32Ty,
+                                          rewriter.getI32IntegerAttr(1));
+    LLVM::CallOp::create(rewriter, loc, barrierFn, ValueRange{two, one});
+    rewriter.eraseOp(op);
+    return success();
+  }
+};
+
+class MemDescSubsliceOpConversion
+    : public ConvertOpToLLVMPattern<triton::gpu::MemDescSubsliceOp> {
+public:
+  using ConvertOpToLLVMPattern<
+      triton::gpu::MemDescSubsliceOp>::ConvertOpToLLVMPattern;
+
+  LogicalResult matchAndRewrite(
+      triton::gpu::MemDescSubsliceOp op, OpAdaptor adaptor,
+      ConversionPatternRewriter &rewriter) const override {
+    auto loc = op.getLoc();
+    auto *ctx = rewriter.getContext();
+    auto i32Ty = IntegerType::get(ctx, 32);
+    auto srcTy = op.getSrc().getType();
+    auto srcShape = srcTy.getShape();
+    auto elemTy = getTypeConverter()->convertType(srcTy.getElementType());
+    if (!elemTy) return failure();
+
+    // Offsets are a static DenseI32Array attribute. Compute the linear
+    // offset at compile time (row-major):
+    //   offset = sum(idx[i] * prod(shape[i+1..]))
+    auto offsets = op.getOffsets();
+    int64_t linearOffset = 0;
+    for (unsigned i = 0; i < offsets.size(); ++i) {
+      int64_t stride = 1;
+      for (unsigned j = i + 1; j < srcShape.size(); ++j)
+        stride *= srcShape[j];
+      linearOffset += static_cast<int64_t>(offsets[i]) * stride;
+    }
+
+    Value offsetVal = LLVM::ConstantOp::create(
+        rewriter, loc, i32Ty,
+        rewriter.getI32IntegerAttr(static_cast<int32_t>(linearOffset)));
+
+    auto tgPtrTy = LLVM::LLVMPointerType::get(ctx, 3);
+    Value subPtr = LLVM::GEPOp::create(
+        rewriter, loc, tgPtrTy, elemTy, adaptor.getSrc(),
+        ValueRange{offsetVal});
+
+    rewriter.replaceOp(op, subPtr);
+    return success();
+  }
+};
+
+class MemDescTransOpConversion
+    : public ConvertOpToLLVMPattern<triton::gpu::MemDescTransOp> {
+public:
+  using ConvertOpToLLVMPattern<
+      triton::gpu::MemDescTransOp>::ConvertOpToLLVMPattern;
+
+  LogicalResult matchAndRewrite(
+      triton::gpu::MemDescTransOp op, OpAdaptor adaptor,
+      ConversionPatternRewriter &rewriter) const override {
+    // No data movement. The result type's order attribute signals
+    // transposed access to downstream consumers (tt.dot handles it).
+    rewriter.replaceOp(op, adaptor.getSrc());
+    return success();
+  }
+};
+
 void populateSharedMemoryOpToLLVMPatterns(LLVMTypeConverter &typeConverter,
                                            RewritePatternSet &patterns) {
   // Convert !ttg.memdesc<...> to llvm.ptr in addrspace(3) (Metal threadgroup).
@@ -192,7 +300,11 @@ void populateSharedMemoryOpToLLVMPatterns(LLVMTypeConverter &typeConverter,
       });
   patterns.add<LocalAllocOpConversion,
                LocalLoadOpConversion,
-               LocalStoreOpConversion>(typeConverter);
+               LocalStoreOpConversion,
+               LocalDeallocOpConversion,
+               AsyncWaitOpConversion,
+               MemDescSubsliceOpConversion,
+               MemDescTransOpConversion>(typeConverter);
 }
 
 } // namespace triton_metal

@@ -46,6 +46,8 @@ public:
   }
 
   void runOnOperation() override {
+    mlir::triton_metal::resetSharedMemoryCounter();
+
     mlir::ModuleOp module = getOperation();
     mlir::MLIRContext *ctx = &getContext();
 
@@ -58,6 +60,8 @@ public:
     mlir::RewritePatternSet patterns(ctx);
     mlir::triton_metal::populateTritonMetalToLLVMPatterns(typeConverter,
                                                           patterns);
+    mlir::triton_metal::populateSharedMemoryOpToLLVMPatterns(typeConverter,
+                                                             patterns);
 
     // Also populate standard dialect->LLVM patterns so they share our type
     // converter (tensor<NxT> -> T). This is critical: arith/math ops on

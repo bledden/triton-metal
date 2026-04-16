@@ -3,6 +3,7 @@
 add_library(TritonMetalToLLVM OBJECT
     TritonMetalToLLVM.cpp
     ElementwiseOpToLLVM.cpp
+    SharedMemoryOpToLLVM.cpp
 )
 
 target_include_directories(TritonMetalToLLVM

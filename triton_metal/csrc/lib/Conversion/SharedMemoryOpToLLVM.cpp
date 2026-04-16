@@ -102,6 +102,87 @@ public:
   }
 };
 
+class LocalLoadOpConversion
+    : public ConvertOpToLLVMPattern<triton::gpu::LocalLoadOp> {
+public:
+  using ConvertOpToLLVMPattern<
+      triton::gpu::LocalLoadOp>::ConvertOpToLLVMPattern;
+
+  LogicalResult matchAndRewrite(
+      triton::gpu::LocalLoadOp op, OpAdaptor adaptor,
+      ConversionPatternRewriter &rewriter) const override {
+    auto loc = op.getLoc();
+    auto resultTy = getTypeConverter()->convertType(op.getType());
+    if (!resultTy) return failure();
+
+    Value srcPtr = adaptor.getSrc();
+
+    // Per-thread model: each thread loads element at its lid
+    // (unless a subview has already narrowed the pointer — subview
+    // pattern adjusts the base accordingly)
+    auto *ctx = rewriter.getContext();
+    auto i32Ty = IntegerType::get(ctx, 32);
+    auto module = op->getParentOfType<ModuleOp>();
+    auto lidFnTy = LLVM::LLVMFunctionType::get(i32Ty, {});
+    auto lidFn = module.lookupSymbol<LLVM::LLVMFuncOp>(
+        "__metal_get_local_id");
+    if (!lidFn) {
+      OpBuilder::InsertionGuard guard(rewriter);
+      rewriter.setInsertionPointToStart(module.getBody());
+      lidFn = LLVM::LLVMFuncOp::create(rewriter, loc,
+                                        "__metal_get_local_id", lidFnTy);
+    }
+    auto lid = LLVM::CallOp::create(rewriter, loc, lidFn, ValueRange{});
+
+    auto tgPtrTy = LLVM::LLVMPointerType::get(ctx, 3);
+    Value slotPtr = LLVM::GEPOp::create(
+        rewriter, loc, tgPtrTy, resultTy, srcPtr,
+        ValueRange{lid.getResult()});
+
+    Value loaded = LLVM::LoadOp::create(rewriter, loc, resultTy, slotPtr);
+    rewriter.replaceOp(op, loaded);
+    return success();
+  }
+};
+
+class LocalStoreOpConversion
+    : public ConvertOpToLLVMPattern<triton::gpu::LocalStoreOp> {
+public:
+  using ConvertOpToLLVMPattern<
+      triton::gpu::LocalStoreOp>::ConvertOpToLLVMPattern;
+
+  LogicalResult matchAndRewrite(
+      triton::gpu::LocalStoreOp op, OpAdaptor adaptor,
+      ConversionPatternRewriter &rewriter) const override {
+    auto loc = op.getLoc();
+    Value srcVal = adaptor.getSrc();
+    Value dstPtr = adaptor.getDst();
+
+    auto *ctx = rewriter.getContext();
+    auto i32Ty = IntegerType::get(ctx, 32);
+    auto module = op->getParentOfType<ModuleOp>();
+    auto lidFnTy = LLVM::LLVMFunctionType::get(i32Ty, {});
+    auto lidFn = module.lookupSymbol<LLVM::LLVMFuncOp>(
+        "__metal_get_local_id");
+    if (!lidFn) {
+      OpBuilder::InsertionGuard guard(rewriter);
+      rewriter.setInsertionPointToStart(module.getBody());
+      lidFn = LLVM::LLVMFuncOp::create(rewriter, loc,
+                                        "__metal_get_local_id", lidFnTy);
+    }
+    auto lid = LLVM::CallOp::create(rewriter, loc, lidFn, ValueRange{});
+
+    auto tgPtrTy = LLVM::LLVMPointerType::get(ctx, 3);
+    Value slotPtr = LLVM::GEPOp::create(
+        rewriter, loc, tgPtrTy, srcVal.getType(), dstPtr,
+        ValueRange{lid.getResult()});
+
+    LLVM::StoreOp::create(rewriter, loc, srcVal, slotPtr);
+    rewriter.eraseOp(op);
+    return success();
+  }
+};
+
 void populateSharedMemoryOpToLLVMPatterns(LLVMTypeConverter &typeConverter,
                                            RewritePatternSet &patterns) {
   // Convert !ttg.memdesc<...> to llvm.ptr in addrspace(3) (Metal threadgroup).
@@ -109,7 +190,9 @@ void populateSharedMemoryOpToLLVMPatterns(LLVMTypeConverter &typeConverter,
       [](triton::gpu::MemDescType mdt) -> Type {
         return LLVM::LLVMPointerType::get(mdt.getContext(), /*addrspace=*/3);
       });
-  patterns.add<LocalAllocOpConversion>(typeConverter);
+  patterns.add<LocalAllocOpConversion,
+               LocalLoadOpConversion,
+               LocalStoreOpConversion>(typeConverter);
 }
 
 } // namespace triton_metal

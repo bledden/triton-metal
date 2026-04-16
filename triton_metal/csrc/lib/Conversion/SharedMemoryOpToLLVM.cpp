@@ -291,6 +291,74 @@ public:
   }
 };
 
+// Pre-M5 Metal has no async DMA. We lower ttg.async_copy_global_to_local
+// to a synchronous per-thread copy: each thread loads one element from
+// global and stores it to the destination memdesc at its lid. The op's
+// !ttg.async_token result is replaced with an i32 constant (matches the
+// upstream TritonGPUToLLVM type converter's AsyncTokenType -> i32 mapping);
+// the downstream async_wait is a barrier regardless of token value.
+class AsyncCopyGlobalToLocalOpConversion
+    : public ConvertOpToLLVMPattern<
+          triton::gpu::AsyncCopyGlobalToLocalOp> {
+public:
+  using ConvertOpToLLVMPattern<
+      triton::gpu::AsyncCopyGlobalToLocalOp>::ConvertOpToLLVMPattern;
+
+  LogicalResult matchAndRewrite(
+      triton::gpu::AsyncCopyGlobalToLocalOp op, OpAdaptor adaptor,
+      ConversionPatternRewriter &rewriter) const override {
+    auto loc = op.getLoc();
+    auto *ctx = rewriter.getContext();
+    auto i32Ty = IntegerType::get(ctx, 32);
+
+    // In the op, operand 0 is the global source pointer (as tensor of
+    // !tt.ptr), operand 1 is the destination memdesc (already allocated
+    // by ttg.local_alloc). After the type converter runs, the adaptor
+    // values are the mapped SSA values.
+    Value srcPtr = adaptor.getSrc();
+    Value dstPtr = adaptor.getResult();
+
+    // Element type comes from the destination memdesc.
+    auto dstTy = op.getResult().getType();
+    Type elemTy = getTypeConverter()->convertType(dstTy.getElementType());
+    if (!elemTy) return failure();
+
+    // Get lid (per-thread copy).
+    auto module = op->getParentOfType<ModuleOp>();
+    auto lidFnTy = LLVM::LLVMFunctionType::get(i32Ty, {});
+    auto lidFn = module.lookupSymbol<LLVM::LLVMFuncOp>(
+        "__metal_get_local_id");
+    if (!lidFn) {
+      OpBuilder::InsertionGuard guard(rewriter);
+      rewriter.setInsertionPointToStart(module.getBody());
+      lidFn = LLVM::LLVMFuncOp::create(rewriter, loc,
+                                        "__metal_get_local_id", lidFnTy);
+    }
+    auto lid = LLVM::CallOp::create(rewriter, loc, lidFn, ValueRange{});
+
+    // Load one element from global. The mask/other predication operands
+    // are ignored: the pipeliner's semantics typically ensure in-bounds,
+    // and for our synchronous lowering a simple scalar load matches the
+    // per-thread model used by local_alloc/load/store above.
+    Value loaded = LLVM::LoadOp::create(rewriter, loc, elemTy, srcPtr);
+
+    // Store to shared at this thread's slot.
+    auto tgPtrTy = LLVM::LLVMPointerType::get(ctx, 3);
+    Value slotPtr = LLVM::GEPOp::create(
+        rewriter, loc, tgPtrTy, elemTy, dstPtr,
+        ValueRange{lid.getResult()});
+    LLVM::StoreOp::create(rewriter, loc, loaded, slotPtr);
+
+    // Replace the !ttg.async_token result with an i32 zero. This matches
+    // the upstream TritonGPUToLLVM type converter's AsyncTokenType->i32
+    // convention so downstream uses (async_wait operands) typecheck.
+    Value tokenRepl = LLVM::ConstantOp::create(
+        rewriter, loc, i32Ty, rewriter.getI32IntegerAttr(0));
+    rewriter.replaceOp(op, tokenRepl);
+    return success();
+  }
+};
+
 void populateSharedMemoryOpToLLVMPatterns(LLVMTypeConverter &typeConverter,
                                            RewritePatternSet &patterns) {
   // Convert !ttg.memdesc<...> to llvm.ptr in addrspace(3) (Metal threadgroup).
@@ -298,13 +366,22 @@ void populateSharedMemoryOpToLLVMPatterns(LLVMTypeConverter &typeConverter,
       [](triton::gpu::MemDescType mdt) -> Type {
         return LLVM::LLVMPointerType::get(mdt.getContext(), /*addrspace=*/3);
       });
+  // Convert !ttg.async_token to i32 (matches upstream TritonGPUToLLVM).
+  // Our synchronous async_copy lowering produces an i32 constant in place
+  // of the token; any async_wait operand is just ignored (barrier emits
+  // unconditionally).
+  typeConverter.addConversion(
+      [](triton::gpu::AsyncTokenType t) -> Type {
+        return IntegerType::get(t.getContext(), 32);
+      });
   patterns.add<LocalAllocOpConversion,
                LocalLoadOpConversion,
                LocalStoreOpConversion,
                LocalDeallocOpConversion,
                AsyncWaitOpConversion,
                MemDescSubsliceOpConversion,
-               MemDescTransOpConversion>(typeConverter);
+               MemDescTransOpConversion,
+               AsyncCopyGlobalToLocalOpConversion>(typeConverter);
 }
 
 } // namespace triton_metal

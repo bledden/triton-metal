@@ -258,3 +258,41 @@ def test_local_alloc_basic():
         assert max_err < 1e-3, f"shmem roundtrip: max error {max_err}"
     finally:
         os.environ.pop("TRITON_METAL_USE_CPP", None)
+
+
+@requires_cpp
+@requires_metal
+def test_async_copy_sync_loop():
+    """ttg.async_copy_global_to_local via pipelined load+accumulate.
+
+    Triton's pipeliner generates ttg.async_copy_global_to_local when
+    num_stages > 1 with loads inside a loop. The C++ path lowers it to
+    a synchronous per-thread copy.
+    """
+    import os
+    import torch
+    import triton
+    import triton.language as tl
+
+    os.environ["TRITON_METAL_USE_CPP"] = "1"
+    try:
+        @triton.jit
+        def pipelined_kernel(x_ptr, out_ptr, K: tl.constexpr,
+                             BLOCK: tl.constexpr):
+            offs = tl.arange(0, BLOCK)
+            acc = tl.zeros([BLOCK], dtype=tl.float32)
+            for k in tl.range(K, num_stages=2):
+                acc += tl.load(x_ptr + offs + k * BLOCK)
+            tl.store(out_ptr + offs, acc)
+
+        BLOCK = 256
+        K = 4
+        x = torch.randn(BLOCK * K)
+        out = torch.zeros(BLOCK)
+        pipelined_kernel[(1,)](x, out, K=K, BLOCK=BLOCK)
+
+        expected = x.view(K, BLOCK).sum(dim=0)
+        max_err = (out - expected).abs().max().item()
+        assert max_err < 1e-3, f"async_copy: max error {max_err}"
+    finally:
+        os.environ.pop("TRITON_METAL_USE_CPP", None)

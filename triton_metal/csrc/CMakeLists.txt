@@ -78,6 +78,54 @@ set(TRITON_IR_OBJS_DIR
 
 file(GLOB TRITON_IR_OBJS "${TRITON_IR_OBJS_DIR}/*.o")
 
+# TritonGPU dialect object files — needed for type-safe matching on
+# TTG ops (LocalAllocOp, LocalLoadOp, etc.). TTG symbols are not
+# exported from libtriton.so on macOS, so we link the .o files directly.
+set(TRITON_GPU_OBJS_DIR
+    "${TRITON_BUILDPATH}/lib/Dialect/TritonGPU/IR/CMakeFiles/TritonGPUIR.dir")
+
+file(GLOB TRITON_GPU_OBJS "${TRITON_GPU_OBJS_DIR}/*.o")
+
+if(NOT TRITON_GPU_OBJS)
+  message(FATAL_ERROR "TritonGPU dialect objects not found at ${TRITON_GPU_OBJS_DIR}")
+endif()
+list(LENGTH TRITON_GPU_OBJS _ttg_obj_count)
+message(STATUS "Found ${_ttg_obj_count} TritonGPU objects")
+
+# TritonNvidiaGPU dialect objects — TTG Ops.cpp references TMEM ops
+# (TMEMStoreOp, TensorMemoryEncodingAttr, etc.) in canonicalize patterns,
+# so the TypeID symbols for those types must be present in the final
+# module. We don't register the dialect — just provide the symbols.
+set(TRITON_NVIDIA_GPU_OBJS_DIR
+    "${TRITON_BUILDPATH}/lib/Dialect/TritonNvidiaGPU/IR/CMakeFiles/TritonNvidiaGPUIR.dir")
+
+file(GLOB TRITON_NVIDIA_GPU_OBJS "${TRITON_NVIDIA_GPU_OBJS_DIR}/*.o")
+
+if(NOT TRITON_NVIDIA_GPU_OBJS)
+  message(FATAL_ERROR "TritonNvidiaGPU dialect objects not found at ${TRITON_NVIDIA_GPU_OBJS_DIR}")
+endif()
+list(LENGTH TRITON_NVIDIA_GPU_OBJS _tng_obj_count)
+message(STATUS "Found ${_tng_obj_count} TritonNvidiaGPU objects")
+
+# Triton support object files — LinearLayout, LayoutUtils, supportMMA,
+# inferDstEncoding, etc. These helpers are referenced by TTG Dialect.cpp
+# / Ops.cpp in verify/canonicalize paths. On macOS they live in libtriton.so
+# as local symbols (not exported), so we must pull in the specific .o files.
+set(TRITON_SUPPORT_OBJS
+    "${TRITON_BUILDPATH}/lib/Tools/CMakeFiles/TritonTools.dir/LinearLayout.cpp.o"
+    "${TRITON_BUILDPATH}/lib/Tools/CMakeFiles/TritonTools.dir/LayoutUtils.cpp.o"
+    "${TRITON_BUILDPATH}/lib/Analysis/CMakeFiles/TritonAnalysis.dir/Utility.cpp.o"
+    "${TRITON_BUILDPATH}/lib/Dialect/TritonGPU/Transforms/CMakeFiles/TritonGPUTransforms.dir/Utility.cpp.o"
+    "${TRITON_BUILDPATH}/third_party/f2reduce/CMakeFiles/f2reduce.dir/f2reduce.cpp.o"
+)
+foreach(_obj ${TRITON_SUPPORT_OBJS})
+  if(NOT EXISTS "${_obj}")
+    message(FATAL_ERROR "Triton support object not found: ${_obj}")
+  endif()
+endforeach()
+list(LENGTH TRITON_SUPPORT_OBJS _ts_obj_count)
+message(STATUS "Using ${_ts_obj_count} Triton support objects")
+
 # ---------------------------------------------------------------------------
 # libtriton.so path — Triton's shared library that contains all MLIR symbols.
 # By linking against this instead of standalone MLIR libraries, we avoid
@@ -159,6 +207,15 @@ target_link_libraries(_triton_metal_cpp PRIVATE ${LIBTRITON_PATH})
 # method definitions for Triton ops (GetProgramIdOp, LoadOp, etc.)
 target_sources(_triton_metal_cpp PRIVATE ${TRITON_IR_OBJS})
 
+# TritonGPU dialect object files — enables type-safe matching on TTG ops.
+target_sources(_triton_metal_cpp PRIVATE ${TRITON_GPU_OBJS})
+
+# TritonNvidiaGPU objects — provide TypeID symbols referenced by TTG ops.
+target_sources(_triton_metal_cpp PRIVATE ${TRITON_NVIDIA_GPU_OBJS})
+
+# Triton helper .o files — LinearLayout methods, supportMMA, etc.
+target_sources(_triton_metal_cpp PRIVATE ${TRITON_SUPPORT_OBJS})
+
 # Per-file RTTI settings:
 # - python_bindings.cpp needs RTTI for pybind11 (typeid)
 # - Everything else needs -fno-rtti to match LLVM/MLIR conventions
@@ -182,12 +239,23 @@ add_library(triton_metal_plugin SHARED
     lib/Conversion/TritonMetalToLLVM.cpp
     lib/Conversion/ElementwiseOpToLLVM.cpp
     ${TRITON_IR_OBJS}
+    ${TRITON_GPU_OBJS}
+    ${TRITON_NVIDIA_GPU_OBJS}
+    ${TRITON_SUPPORT_OBJS}
 )
 
 target_link_libraries(triton_metal_plugin PRIVATE ${LIBTRITON_PATH})
 target_include_directories(triton_metal_plugin PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/include
 )
+# TritonGPU/LinearLayout methods live in libtriton.so as "local" symbols
+# (internal linkage on macOS). Allow dynamic lookup so they resolve at
+# runtime when loaded alongside libtriton.so, matching the pybind11
+# module's bundle semantics.
+if(APPLE)
+  target_link_options(triton_metal_plugin PRIVATE
+      "LINKER:-undefined,dynamic_lookup")
+endif()
 set_source_files_properties(
     python_bindings_bridge.cpp
     lib/Conversion/TritonMetalToLLVM.cpp

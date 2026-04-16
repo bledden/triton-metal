@@ -254,6 +254,13 @@ class MetalBackend(BaseBackend):
             'cf.br', 'cf.cond_br',
             # -- SCF (structured control flow) --
             'scf.for', 'scf.yield', 'scf.if',
+            # -- TritonGPU shared memory ops (handled by C++ path) --
+            'ttg.local_alloc', 'ttg.local_load', 'ttg.local_store',
+            'ttg.local_dealloc',
+            'ttg.memdesc_subview', 'ttg.memdesc_trans',
+            'ttg.async_copy_global_to_local', 'ttg.async_wait',
+            # -- Cooperative matmul (handled by C++ path) --
+            'tt.dot',
         }
         # Extract actual MLIR operations from the TTGIR text.
         # Operations appear as either:

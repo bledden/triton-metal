@@ -16,6 +16,7 @@
 #include "mlir/Transforms/DialectConversion.h"
 
 #include "triton/Dialect/Triton/IR/Dialect.h"
+#include "triton/Dialect/TritonGPU/IR/Dialect.h"
 
 // Forward declaration — defined in ElementwiseOpToLLVM.cpp
 namespace mlir {
@@ -89,6 +90,7 @@ public:
     target.addIllegalDialect<mlir::cf::ControlFlowDialect>();
     target.addIllegalDialect<mlir::math::MathDialect>();
     target.addIllegalDialect<mlir::func::FuncDialect>();
+    target.addIllegalDialect<mlir::triton::gpu::TritonGPUDialect>();
 
     // Apply partial conversion — only ops with matching patterns are lowered.
     // This is intentional: we add patterns incrementally across tasks.

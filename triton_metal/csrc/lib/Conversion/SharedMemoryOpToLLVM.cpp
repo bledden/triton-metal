@@ -32,8 +32,12 @@ namespace triton_metal {
 
 void populateSharedMemoryOpToLLVMPatterns(LLVMTypeConverter &typeConverter,
                                            RewritePatternSet &patterns) {
+  // Convert !ttg.memdesc<...> to llvm.ptr in addrspace(3) (Metal threadgroup).
+  typeConverter.addConversion(
+      [](triton::gpu::MemDescType mdt) -> Type {
+        return LLVM::LLVMPointerType::get(mdt.getContext(), /*addrspace=*/3);
+      });
   // Patterns added in later tasks.
-  (void)typeConverter;
   (void)patterns;
 }
 

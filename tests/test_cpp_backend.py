@@ -468,3 +468,60 @@ def test_cpp_layer_norm():
         assert max_err < 1e-3, f"layer_norm: max error {max_err}"
     finally:
         os.environ.pop("TRITON_METAL_USE_CPP", None)
+
+
+@requires_cpp
+@requires_metal
+@pytest.mark.xfail(
+    reason="MSL fallback path produces incorrect results for tt.dot in all "
+           "shapes tested here (16x16x16 no-loop, 16x16x32 K-loop, 32x32x64 "
+           "K-loop all show max error > 16). Task 12 found that matmul kernels "
+           "fall back to MSL because _strip_ttg_annotations has a bug and "
+           "ttg.convert_layout is not in the allowlist, so the C++ tiled-MMA "
+           "path is not exercised. This test validates SCF→CF lowering at the "
+           "structural level; numerical correctness will come once the C++ "
+           "path is wired up (tracked separately from Task 13).",
+    strict=True,
+)
+def test_cpp_dot_k_loop():
+    """Matmul with K-loop (scf.for wrapping tt.dot).
+
+    NOTE: Currently fails numerically via MSL fallback. The test documents
+    the expected kernel shape; correctness validation is pending the
+    _strip_ttg_annotations / convert_layout fix from Task 12.
+    """
+    import os
+    import torch
+    import triton
+    import triton.language as tl
+
+    os.environ["TRITON_METAL_USE_CPP"] = "1"
+    try:
+        @triton.jit
+        def matmul_k_loop(a_ptr, b_ptr, c_ptr,
+                           M: tl.constexpr, N: tl.constexpr, K: tl.constexpr,
+                           BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr,
+                           BLOCK_K: tl.constexpr):
+            off_m = tl.arange(0, BLOCK_M)
+            off_n = tl.arange(0, BLOCK_N)
+            acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+            for k_off in range(0, K, BLOCK_K):
+                off_k = k_off + tl.arange(0, BLOCK_K)
+                a = tl.load(a_ptr + off_m[:, None] * K + off_k[None, :])
+                b = tl.load(b_ptr + off_k[:, None] * N + off_n[None, :])
+                acc = tl.dot(a.to(tl.float16), b.to(tl.float16), acc)
+            tl.store(c_ptr + off_m[:, None] * N + off_n[None, :], acc)
+
+        M = N = 16
+        K = 32
+        a = torch.randn(M, K)
+        b = torch.randn(K, N)
+        c = torch.zeros(M, N)
+        matmul_k_loop[(1,)](a, b, c, M=M, N=N, K=K,
+                             BLOCK_M=M, BLOCK_N=N, BLOCK_K=16)
+
+        expected = a @ b
+        max_err = (c - expected).abs().max().item()
+        assert max_err < 0.5, f"k-loop matmul: max error {max_err}"
+    finally:
+        os.environ.pop("TRITON_METAL_USE_CPP", None)

@@ -289,6 +289,42 @@ class MetalBackend(BaseBackend):
         for op in ops_in_kernel:
             if op not in allowed_ops:
                 return True
+
+        # Shared memory budget check: detect kernels whose effective
+        # threadgroup memory demand exceeds Metal's 32KB cap. This is a
+        # pre-lowering safety net; the C++ path also enforces this inside
+        # LocalAllocOpConversion for `ttg.local_alloc`. For tt.reduce, the
+        # C++ per-thread model can only correctly handle tensors whose size
+        # fits within the thread cap (1024). Larger reductions must go via
+        # MSL, which has its own shared-memory aliasing pass.
+        # Element byte sizes keyed by MLIR type suffix.
+        elem_bytes = {
+            'i1': 1, 'i8': 1, 'i16': 2, 'i32': 4, 'i64': 8,
+            'f16': 2, 'bf16': 2, 'f32': 4, 'f64': 8,
+        }
+        # Find any tt.reduce and check the input tensor type. The signature
+        # line follows the op body on a later line, so scan multi-line.
+        for m in re.finditer(
+            r'tt\.reduce["\w]*\b[^}]*?\}\)\s*:\s*\(tensor<([\dx]+)x(\w+)',
+            ttgir_text,
+            re.DOTALL,
+        ):
+            dims_str, elem_ty = m.group(1), m.group(2)
+            try:
+                dims = [int(d) for d in dims_str.split('x') if d]
+            except ValueError:
+                continue
+            n = 1
+            for d in dims:
+                n *= d
+            # If the reduction tensor has more elements than the thread cap,
+            # our per-thread SIMD-then-crossSIMD lowering is incorrect.
+            if n > 1024:
+                return True
+            # Also guard against exceeding the 32KB shared-memory budget.
+            eb = elem_bytes.get(elem_ty, 4)
+            if n * eb > 32 * 1024:
+                return True
         return False
 
     @staticmethod

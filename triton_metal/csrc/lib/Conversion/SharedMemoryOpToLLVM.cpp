@@ -17,8 +17,13 @@ namespace triton_metal {
 
 // Per-module counter for unique shared memory globals.
 static unsigned sharedMemoryCounter = 0;
+static uint64_t sharedMemoryBytes = 0;
+static constexpr uint64_t SHARED_MEMORY_LIMIT = 32 * 1024;  // 32 KB
 
-void resetSharedMemoryCounter() { sharedMemoryCounter = 0; }
+void resetSharedMemoryCounter() {
+  sharedMemoryCounter = 0;
+  sharedMemoryBytes = 0;
+}
 
 // Pattern populator (called from TritonMetalToLLVM.cpp).
 void populateSharedMemoryOpToLLVMPatterns(LLVMTypeConverter &typeConverter,
@@ -29,6 +34,31 @@ void populateSharedMemoryOpToLLVMPatterns(LLVMTypeConverter &typeConverter,
 
 namespace mlir {
 namespace triton_metal {
+
+// Helper: byte size of an element type (best effort; handles common types).
+static uint64_t elementByteSize(Type elemTy) {
+  if (auto intTy = llvm::dyn_cast<IntegerType>(elemTy)) {
+    unsigned bits = intTy.getWidth();
+    return (bits + 7) / 8;
+  }
+  if (llvm::isa<Float16Type, BFloat16Type>(elemTy)) return 2;
+  if (llvm::isa<Float32Type>(elemTy)) return 4;
+  if (llvm::isa<Float64Type>(elemTy)) return 8;
+  if (auto ptrTy = llvm::dyn_cast<LLVM::LLVMPointerType>(elemTy))
+    return 8;
+  // Fallback: assume 4 bytes (matches fp32/i32, the common case).
+  return 4;
+}
+
+// Helper: total bytes for a memdesc of `shape` and element type `elemTy`.
+static uint64_t computeBytes(ArrayRef<int64_t> shape, Type elemTy) {
+  uint64_t n = 1;
+  for (int64_t d : shape) n *= static_cast<uint64_t>(d);
+  return n * elementByteSize(elemTy);
+}
+
+// Helper: round up to 16-byte alignment (matches global alignment = 16).
+static uint64_t alignUp16(uint64_t v) { return (v + 15ULL) & ~15ULL; }
 
 // Helper: create a unique threadgroup global for the given memdesc shape/type.
 static LLVM::GlobalOp createTgGlobal(ModuleOp module,
@@ -65,6 +95,18 @@ public:
     auto elemTy = getTypeConverter()->convertType(
         memdescTy.getElementType());
     if (!elemTy) return failure();
+
+    // Enforce 32KB threadgroup memory budget.
+    // If exceeded, fail conversion so MSL fallback can handle this kernel.
+    uint64_t opBytes = computeBytes(shape, memdescTy.getElementType());
+    uint64_t opBytesAligned = alignUp16(opBytes);
+    if (sharedMemoryBytes + opBytesAligned > SHARED_MEMORY_LIMIT) {
+      return op->emitOpError()
+             << "threadgroup memory budget exceeded: "
+             << (sharedMemoryBytes + opBytesAligned)
+             << " > " << SHARED_MEMORY_LIMIT;
+    }
+    sharedMemoryBytes += opBytesAligned;
 
     auto module = op->getParentOfType<ModuleOp>();
     auto globalOp = createTgGlobal(module, rewriter, loc, shape, elemTy);

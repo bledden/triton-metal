@@ -981,9 +981,13 @@ class MetalBackend(BaseBackend):
             )
 
             # Store to threadgroup: store float %v, ptr addrspace(3) %slot or @global
-            # For direct global refs, insert GEP to get float* from [N x float]*.
+            # For direct global refs (declared as `[N x float]`), insert GEP to
+            # get float* from [N x float]*. `__tg_merged_*` globals are emitted
+            # by SharedMemoryAliasingPass when it coalesces reduce globals with
+            # non-overlapping live ranges; they keep the `[32 x float]` type.
             m_tg_store = re.match(
-                r'(\s*store\s+float\s+\S+),\s*ptr addrspace\(3\)\s+(@__reduce_shared_\d+)(.*)',
+                r'(\s*store\s+float\s+\S+),\s*ptr addrspace\(3\)\s+'
+                r'(@(?:__reduce_shared_|__tg_merged_)\d+)(.*)',
                 line
             )
             if m_tg_store:
@@ -999,7 +1003,8 @@ class MetalBackend(BaseBackend):
 
             # Load from threadgroup: load float, ptr addrspace(3) %slot or @global
             m_tg_load = re.match(
-                r'(\s*%\S+\s*=\s*load\s+float),\s*ptr addrspace\(3\)\s+(@__reduce_shared_\d+)(.*)',
+                r'(\s*%\S+\s*=\s*load\s+float),\s*ptr addrspace\(3\)\s+'
+                r'(@(?:__reduce_shared_|__tg_merged_)\d+)(.*)',
                 line
             )
             if m_tg_load:

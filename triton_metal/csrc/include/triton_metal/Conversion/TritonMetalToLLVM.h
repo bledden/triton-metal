@@ -4,6 +4,8 @@
 #include "mlir/Pass/Pass.h"
 #include <memory>
 
+namespace llvm { class Module; }
+
 namespace mlir {
 class LLVMTypeConverter;
 class ModuleOp;
@@ -26,6 +28,11 @@ void populateDotOpToLLVMPatterns(
     RewritePatternSet &patterns);
 
 void resetSharedMemoryCounter();
+
+/// Coalesce addrspace(3) globals with non-overlapping live ranges via
+/// greedy graph coloring. Runs on the LLVM Module after MLIR -> LLVM IR
+/// translation.
+void aliasSharedMemoryGlobals(llvm::Module &mod);
 
 } // namespace triton_metal
 } // namespace mlir

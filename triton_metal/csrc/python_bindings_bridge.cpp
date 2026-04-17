@@ -481,6 +481,11 @@ extern "C" const char* triton_metal_run_to_llvm(const char* mlir_text,
         return errMsg.c_str();
     }
 
+    // Coalesce addrspace(3) globals with non-overlapping live ranges.
+    // This reduces total shared-memory footprint for kernels with multiple
+    // phases that each need scratch space but don't coexist.
+    mlir::triton_metal::aliasSharedMemoryGlobals(*llvmMod);
+
     // ---------------------------------------------------------------
     // Replace __metal_* intrinsic calls with extra kernel function
     // parameters. In Metal AIR, thread position / grid size intrinsics

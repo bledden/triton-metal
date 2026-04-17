@@ -4,6 +4,7 @@ add_library(TritonMetalToLLVM OBJECT
     TritonMetalToLLVM.cpp
     ElementwiseOpToLLVM.cpp
     SharedMemoryOpToLLVM.cpp
+    SharedMemoryAliasingPass.cpp
     DotOpToLLVM.cpp
 )
 

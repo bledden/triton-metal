@@ -525,3 +525,44 @@ def test_cpp_dot_k_loop():
         assert max_err < 0.5, f"k-loop matmul: max error {max_err}"
     finally:
         os.environ.pop("TRITON_METAL_USE_CPP", None)
+
+
+@requires_cpp
+@requires_metal
+def test_aliasing_non_overlapping_allocs():
+    """Two non-overlapping shared allocations share backing memory.
+
+    Two-phase kernel: phase 1 reduces to mean, phase 2 uses mean to
+    compute max(x - mean). Each phase needs shared memory for cross-warp
+    reduction; after phase 1's barrier, phase 1's shared memory is dead
+    and can be reused for phase 2.
+    """
+    import os
+    import torch
+    import triton
+    import triton.language as tl
+
+    os.environ["TRITON_METAL_USE_CPP"] = "1"
+    try:
+        @triton.jit
+        def two_phase_kernel(x_ptr, out_ptr, BLOCK: tl.constexpr):
+            offs = tl.arange(0, BLOCK)
+            x = tl.load(x_ptr + offs)
+            s1 = tl.sum(x, axis=0)
+            diff = x - s1 / BLOCK
+            s2 = tl.max(diff, axis=0)
+            tl.store(out_ptr + offs, diff - s2)
+
+        BLOCK = 1024
+        x = torch.randn(BLOCK)
+        out = torch.zeros(BLOCK)
+        two_phase_kernel[(1,)](x, out, BLOCK=BLOCK)
+
+        mean = x.mean()
+        diff = x - mean
+        mx = diff.max()
+        expected = diff - mx
+        max_err = (out - expected).abs().max().item()
+        assert max_err < 1e-3, f"aliasing: max error {max_err}"
+    finally:
+        os.environ.pop("TRITON_METAL_USE_CPP", None)

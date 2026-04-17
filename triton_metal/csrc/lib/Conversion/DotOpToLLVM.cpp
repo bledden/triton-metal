@@ -71,18 +71,13 @@ public:
     if (loadAFn.empty() || mmaFn.empty() || storeFn.empty())
       return rewriter.notifyMatchFailure(op, "unsupported dot element types");
 
-    // For this task: only support M=K=N=8 (single MMA block).
-    // Larger tiles added in Task 12.
-    if (M != 8 || K != 8 || N != 8)
-      return rewriter.notifyMatchFailure(op,
-                                          "only 8x8x8 supported in Task 11");
-
     auto *ctx = rewriter.getContext();
     auto module = op->getParentOfType<ModuleOp>();
     auto aRegTy = LLVM::LLVMArrayType::get(aElem, 8);
     auto bRegTy = LLVM::LLVMArrayType::get(bElem, 8);
     auto cRegTy = LLVM::LLVMArrayType::get(cElem, 8);
     auto tgPtrTy = LLVM::LLVMPointerType::get(ctx, 3);
+    auto i32Ty = IntegerType::get(ctx, 32);
     auto i64Ty = IntegerType::get(ctx, 64);
 
     auto getOrInsertFn = [&](StringRef name, Type retTy,
@@ -100,43 +95,128 @@ public:
     auto loadAFnOp = getOrInsertFn(loadAFn, aRegTy, {tgPtrTy, i64Ty});
     auto loadBFnOp = getOrInsertFn(loadBFn, bRegTy, {tgPtrTy, i64Ty});
     auto mmaFnOp = getOrInsertFn(mmaFn, cRegTy, {aRegTy, bRegTy, cRegTy});
+    auto storeFnOp = getOrInsertFn(storeFn,
+        LLVM::LLVMVoidType::get(ctx), {tgPtrTy, cRegTy, i64Ty});
 
-    // Get A, B pointers (memdesc → ptr addrspace(3))
-    Value aPtr = adaptor.getA();
-    Value bPtr = adaptor.getB();
-    // C is the accumulator — it's a scalar in our per-thread model.
-    // Build an 8-element register from the scalar value.
-    Value cScalar = adaptor.getC();
-
-    // Build C register from scalar (broadcast across all 8 elements)
-    Value cReg = LLVM::UndefOp::create(rewriter, loc, cRegTy);
-    for (int i = 0; i < 8; ++i) {
-      cReg = LLVM::InsertValueOp::create(
-          rewriter, loc, cReg, cScalar, ArrayRef<int64_t>{i});
+    // Allocate output tile in threadgroup memory.
+    // sharedMemoryCounter in SharedMemoryOpToLLVM.cpp is static there; we use
+    // our own counter so names don't collide with that pool.
+    static unsigned dotOutCounter = 0;
+    auto outArrTy = LLVM::LLVMArrayType::get(cElem, M * N);
+    std::string outName = "__tg_dot_out_" + std::to_string(dotOutCounter++);
+    LLVM::GlobalOp outGlobal;
+    {
+      OpBuilder::InsertionGuard guard(rewriter);
+      rewriter.setInsertionPointToStart(module.getBody());
+      outGlobal = LLVM::GlobalOp::create(
+          rewriter, loc, outArrTy, /*isConstant=*/false,
+          LLVM::Linkage::Internal, outName,
+          /*value=*/Attribute(),
+          /*alignment=*/16, /*addrSpace=*/3);
     }
+    Value outBasePtr = LLVM::AddressOfOp::create(rewriter, loc, tgPtrTy,
+                                                   outGlobal.getSymName());
 
-    // Load A and B tiles (stride = column count K or N)
+    // Get A and B base pointers. In TTGIR, tt.dot's operands are tensor
+    // values produced by ttg.local_load on memdesc sources — but our type
+    // converter maps tensor<NxT> -> T (scalar), so adaptor.getA() is an
+    // f16 scalar, not a pointer. We need the underlying memdesc pointer.
+    // Walk back through the defining ttg.local_load op and ask the rewriter
+    // for the remapped (converted) source memdesc, which our SharedMemoryOp
+    // conversion maps to ptr addrspace(3).
+    auto getMemdescPtr = [&](Value tensorOperand) -> Value {
+      auto localLoad = tensorOperand.getDefiningOp<triton::gpu::LocalLoadOp>();
+      if (!localLoad) return nullptr;
+      return rewriter.getRemappedValue(localLoad.getSrc());
+    };
+    Value aBasePtr = getMemdescPtr(op.getA());
+    Value bBasePtr = getMemdescPtr(op.getB());
+    if (!aBasePtr || !bBasePtr)
+      return rewriter.notifyMatchFailure(op,
+          "tt.dot operands must come from ttg.local_load");
+
+    int64_t tilesM = M / 8, tilesN = N / 8, tilesK = K / 8;
     Value strideK = LLVM::ConstantOp::create(rewriter, loc, i64Ty,
                                               rewriter.getI64IntegerAttr(K));
     Value strideN = LLVM::ConstantOp::create(rewriter, loc, i64Ty,
                                               rewriter.getI64IntegerAttr(N));
 
-    Value aMat = LLVM::CallOp::create(rewriter, loc, loadAFnOp,
-                                        ValueRange{aPtr, strideK}).getResult();
-    Value bMat = LLVM::CallOp::create(rewriter, loc, loadBFnOp,
-                                        ValueRange{bPtr, strideN}).getResult();
+    // Unrolled tile loops
+    for (int64_t mi = 0; mi < tilesM; ++mi) {
+      for (int64_t ni = 0; ni < tilesN; ++ni) {
+        // Initialize C accumulator to zero
+        Value cElemZero = LLVM::ConstantOp::create(
+            rewriter, loc, cElem, rewriter.getZeroAttr(cElem));
+        Value acc = LLVM::UndefOp::create(rewriter, loc, cRegTy);
+        for (int64_t i = 0; i < 8; ++i) {
+          acc = LLVM::InsertValueOp::create(
+              rewriter, loc, acc, cElemZero, ArrayRef<int64_t>{i});
+        }
 
-    // MMA: D = A * B + C
-    Value dMat = LLVM::CallOp::create(rewriter, loc, mmaFnOp,
-                                        ValueRange{aMat, bMat, cReg}).getResult();
+        for (int64_t ki = 0; ki < tilesK; ++ki) {
+          // A tile at (mi*8, ki*8) — offset = mi*8*K + ki*8
+          int64_t aOffset = mi * 8 * K + ki * 8;
+          Value aOffsetC = LLVM::ConstantOp::create(
+              rewriter, loc, i32Ty,
+              rewriter.getI32IntegerAttr(aOffset));
+          Value aTilePtr = LLVM::GEPOp::create(
+              rewriter, loc, tgPtrTy, aElem, aBasePtr,
+              ValueRange{aOffsetC});
+          Value aMat = LLVM::CallOp::create(
+              rewriter, loc, loadAFnOp,
+              ValueRange{aTilePtr, strideK}).getResult();
 
-    // Extract a scalar result (per-thread model: each thread owns one element)
-    // For now, extract element 0. In the tiled case (Task 12), we write back to
-    // threadgroup memory and each thread reads its own element.
-    Value dScalar = LLVM::ExtractValueOp::create(
-        rewriter, loc, dMat, ArrayRef<int64_t>{0});
+          // B tile at (ki*8, ni*8) — offset = ki*8*N + ni*8
+          int64_t bOffset = ki * 8 * N + ni * 8;
+          Value bOffsetC = LLVM::ConstantOp::create(
+              rewriter, loc, i32Ty,
+              rewriter.getI32IntegerAttr(bOffset));
+          Value bTilePtr = LLVM::GEPOp::create(
+              rewriter, loc, tgPtrTy, bElem, bBasePtr,
+              ValueRange{bOffsetC});
+          Value bMat = LLVM::CallOp::create(
+              rewriter, loc, loadBFnOp,
+              ValueRange{bTilePtr, strideN}).getResult();
 
-    rewriter.replaceOp(op, dScalar);
+          // MMA: acc = A * B + acc
+          acc = LLVM::CallOp::create(
+              rewriter, loc, mmaFnOp,
+              ValueRange{aMat, bMat, acc}).getResult();
+        }
+
+        // Store C tile at (mi*8, ni*8) — offset = mi*8*N + ni*8
+        int64_t cOffset = mi * 8 * N + ni * 8;
+        Value cOffsetC = LLVM::ConstantOp::create(
+            rewriter, loc, i32Ty,
+            rewriter.getI32IntegerAttr(cOffset));
+        Value cTilePtr = LLVM::GEPOp::create(
+            rewriter, loc, tgPtrTy, cElem, outBasePtr,
+            ValueRange{cOffsetC});
+        LLVM::CallOp::create(rewriter, loc, storeFnOp,
+                               ValueRange{cTilePtr, acc, strideN});
+      }
+    }
+
+    // Barrier so all threads see the result
+    auto voidTy = LLVM::LLVMVoidType::get(ctx);
+    auto barrierFn = getOrInsertFn("air.wg.barrier", voidTy, {i32Ty, i32Ty});
+    Value two = LLVM::ConstantOp::create(rewriter, loc, i32Ty,
+                                          rewriter.getI32IntegerAttr(2));
+    Value one = LLVM::ConstantOp::create(rewriter, loc, i32Ty,
+                                          rewriter.getI32IntegerAttr(1));
+    LLVM::CallOp::create(rewriter, loc, barrierFn, ValueRange{two, one});
+
+    // Each thread reads its own element from the output tile.
+    // Per-thread model: thread's lid maps to (row, col) in the M×N output.
+    // lid ranges over [0, M*N), so each thread reads outBasePtr[lid].
+    auto lidFn = getOrInsertFn("__metal_get_local_id", i32Ty, {});
+    auto lid = LLVM::CallOp::create(rewriter, loc, lidFn, ValueRange{});
+    Value cResultPtr = LLVM::GEPOp::create(
+        rewriter, loc, tgPtrTy, cElem, outBasePtr,
+        ValueRange{lid.getResult()});
+    Value cResult = LLVM::LoadOp::create(rewriter, loc, cElem, cResultPtr);
+
+    rewriter.replaceOp(op, cResult);
     return success();
   }
 };

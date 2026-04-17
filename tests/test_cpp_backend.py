@@ -396,6 +396,46 @@ def test_cpp_cumsum():
 
 @requires_cpp
 @requires_metal
+def test_cpp_dot_32x32():
+    """32x32x32 f16 matmul through C++ path with tiled MMA."""
+    import os
+    import torch
+    import triton
+    import triton.language as tl
+
+    os.environ["TRITON_METAL_USE_CPP"] = "1"
+    try:
+        @triton.jit
+        def matmul_kernel(a_ptr, b_ptr, c_ptr,
+                           M: tl.constexpr, N: tl.constexpr, K: tl.constexpr,
+                           BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr,
+                           BLOCK_K: tl.constexpr):
+            off_m = tl.arange(0, BLOCK_M)
+            off_n = tl.arange(0, BLOCK_N)
+            off_k = tl.arange(0, BLOCK_K)
+            a = tl.load(a_ptr + off_m[:, None] * K + off_k[None, :])
+            b = tl.load(b_ptr + off_k[:, None] * N + off_n[None, :])
+            c = tl.dot(a.to(tl.float16), b.to(tl.float16),
+                        acc=tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32))
+            tl.store(c_ptr + off_m[:, None] * N + off_n[None, :], c)
+
+        M = N = K = 32
+        a = torch.randn(M, K)
+        b = torch.randn(K, N)
+        c = torch.zeros(M, N)
+        matmul_kernel[(1,)](a, b, c, M=M, N=N, K=K,
+                             BLOCK_M=M, BLOCK_N=N, BLOCK_K=K)
+
+        expected = a @ b
+        max_err = (c - expected).abs().max().item()
+        # f16 tolerance (relaxed)
+        assert max_err < 0.5, f"32x32 matmul: max error {max_err}"
+    finally:
+        os.environ.pop("TRITON_METAL_USE_CPP", None)
+
+
+@requires_cpp
+@requires_metal
 def test_cpp_layer_norm():
     """Layer norm (2-pass mean/var via shared memory) through C++ path."""
     import os

@@ -692,3 +692,35 @@ def test_cpp_flash_attention_head64():
     """
     max_err = _run_fa_cpp(N_CTX=64, HEAD_DIM=64)
     assert max_err < 5e-2, f"FA HEAD_DIM=64: max error {max_err}"
+
+
+@requires_cpp
+@requires_metal
+def test_vectorized_shared_load_store():
+    """Shared memory access — vectorization is opportunistic. Test verifies
+    correctness; the vector pass runs and shouldn't break correct scalar code.
+    """
+    import os
+    import torch
+    import triton
+    import triton.language as tl
+
+    os.environ["TRITON_METAL_USE_CPP"] = "1"
+    try:
+        @triton.jit
+        def vec_shared_kernel(x_ptr, out_ptr, BLOCK: tl.constexpr):
+            offs = tl.arange(0, BLOCK)
+            x = tl.load(x_ptr + offs)
+            s = tl.sum(x, axis=0)
+            tl.store(out_ptr + offs, x - s / BLOCK)
+
+        BLOCK = 512
+        x = torch.randn(BLOCK)
+        out = torch.zeros(BLOCK)
+        vec_shared_kernel[(1,)](x, out, BLOCK=BLOCK)
+
+        expected = x - x.mean()
+        max_err = (out - expected).abs().max().item()
+        assert max_err < 1e-3, f"vec shared: max error {max_err}"
+    finally:
+        os.environ.pop("TRITON_METAL_USE_CPP", None)

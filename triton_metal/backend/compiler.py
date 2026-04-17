@@ -785,6 +785,19 @@ class MetalBackend(BaseBackend):
 
         lines = llir_text.split('\n')
 
+        # Pass -1: Collect addrspace(3) global declarations so we can rewrite
+        # opaque-pointer references to them (including in !air.threadgroup_buffers
+        # metadata) into typed-pointer form.
+        # E.g. @__reduce_shared_0 = internal addrspace(3) global [32 x float] undef
+        tg_global_types = {}  # "@__reduce_shared_0" -> "[32 x float]"
+        for line in lines:
+            m = re.match(
+                r'\s*(@[\w.]+)\s*=\s*[^=]*addrspace\(3\)\s+global\s+(\[[^\]]+\]|\S+)',
+                line
+            )
+            if m:
+                tg_global_types[m.group(1)] = m.group(2)
+
         # Pass 0: Collect addrspacecast mappings and their source address spaces.
         # E.g. %.generic = addrspacecast ptr addrspace(1) %0 to ptr
         #   -> cast_map["%.generic"] = ("%0", "1")
@@ -1020,6 +1033,22 @@ class MetalBackend(BaseBackend):
                 typed_sig = ', '.join(fn_param_types)
                 fn_ptr_type = f'void ({typed_sig})*'
                 line = line.replace(f'ptr @{fn_name}', f'{fn_ptr_type} @{fn_name}')
+
+            # Metadata: ptr addrspace(3) @global -> typed pointer to the global.
+            # Emitted by the C++ bridge for !air.threadgroup_buffers entries.
+            # Metal rejects opaque `ptr` in metadata operands.
+            if line.strip().startswith('!') and 'ptr addrspace(3)' in line:
+                def _rewrite_tg_global(m):
+                    gname = m.group(1)
+                    gty = tg_global_types.get(gname)
+                    if gty is None:
+                        return m.group(0)
+                    return f'{gty} addrspace(3)* {gname}'
+                line = re.sub(
+                    r'ptr\s+addrspace\(3\)\s+(@[\w.]+)',
+                    _rewrite_tg_global,
+                    line
+                )
 
             # Fix metadata arg_type_name and arg_type_size for non-float device buffers.
             # The C++ pass hardcodes "float" / size 4 for all device buffers.

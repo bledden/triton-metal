@@ -263,6 +263,53 @@ static void addAIRMetadata(llvm::Module &mod, llvm::Function &kernelFn,
         argMDs.push_back(llvm::MDNode::get(ctx, fields));
     }
 
+    // Scan for addrspace(3) globals (threadgroup buffers) and add metadata.
+    // Metal's compiler uses this to validate shared memory allocations.
+    //
+    // NOTE: Empirically, MSL-compiled metallibs do NOT emit !air.threadgroup_buffers
+    // named metadata — the Metal compiler handles addrspace(3) globals implicitly
+    // when they are referenced by the kernel function. We only emit this metadata
+    // if addrspace(3) globals are present; if Metal rejects the format, the empty
+    // case (no globals) won't trigger any emission at all.
+    llvm::SmallVector<llvm::Metadata *, 4> tgBufferMDs;
+    unsigned tgLocIdx = 0;
+    for (auto &global : mod.globals()) {
+      if (global.getAddressSpace() != 3) continue;
+
+      // Skip internal globals not related to TTG shared memory
+      if (!global.getName().starts_with("__tg_shared_") &&
+          !global.getName().starts_with("__reduce_shared_")) continue;
+
+      // Compute size in bytes
+      auto *valTy = global.getValueType();
+      const auto &dl = mod.getDataLayout();
+      uint64_t bytes = dl.getTypeAllocSize(valTy);
+
+      llvm::SmallVector<llvm::Metadata *, 8> fields;
+      fields.push_back(llvm::ConstantAsMetadata::get(&global));
+      fields.push_back(llvm::MDString::get(ctx, "air.threadgroup_buffer"));
+      fields.push_back(llvm::MDString::get(ctx, "air.location_index"));
+      fields.push_back(llvm::ConstantAsMetadata::get(
+          llvm::ConstantInt::get(i32Ty, tgLocIdx)));
+      fields.push_back(llvm::ConstantAsMetadata::get(
+          llvm::ConstantInt::get(i32Ty, 0)));
+      fields.push_back(llvm::MDString::get(ctx, "air.arg_type_size"));
+      fields.push_back(llvm::ConstantAsMetadata::get(
+          llvm::ConstantInt::get(i32Ty, bytes)));
+      fields.push_back(llvm::MDString::get(ctx, "air.arg_type_align_size"));
+      fields.push_back(llvm::ConstantAsMetadata::get(
+          llvm::ConstantInt::get(i32Ty, 16)));
+
+      tgBufferMDs.push_back(llvm::MDNode::get(ctx, fields));
+      tgLocIdx++;
+    }
+
+    if (!tgBufferMDs.empty()) {
+      auto *tgBuffersMD = mod.getOrInsertNamedMetadata("air.threadgroup_buffers");
+      for (auto *md : tgBufferMDs)
+        tgBuffersMD->addOperand(llvm::cast<llvm::MDNode>(md));
+    }
+
     // The kernel metadata references the function directly.
     auto *fnPtrConst = llvm::ConstantExpr::getBitCast(
         &kernelFn, llvm::PointerType::getUnqual(ctx));

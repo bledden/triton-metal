@@ -19,6 +19,13 @@ try:
 except ImportError:
     _HAS_METAL = False
 
+try:
+    import triton
+    import triton.language as tl
+    _HAS_TRITON = True
+except ImportError:
+    _HAS_TRITON = False
+
 requires_cpp = pytest.mark.skipif(not _HAS_CPP, reason="C++ backend not built")
 requires_metal = pytest.mark.skipif(not _HAS_METAL, reason="Metal not available")
 
@@ -566,3 +573,122 @@ def test_aliasing_non_overlapping_allocs():
         assert max_err < 1e-3, f"aliasing: max error {max_err}"
     finally:
         os.environ.pop("TRITON_METAL_USE_CPP", None)
+
+
+if _HAS_TRITON:
+    @triton.jit
+    def _fa_fwd_strided_kernel(
+        Q, K, V, Out,
+        stride_qm, stride_qk,
+        stride_kn, stride_kk,
+        stride_vn, stride_vk,
+        stride_om, stride_ok,
+        sm_scale,
+        N_CTX, HEAD_DIM: tl.constexpr,
+        BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr,
+    ):
+        """FlashAttention v2 forward with explicit strides.
+
+        Uses stride arguments so the MSL backend pattern-matches this as a
+        flash-attention kernel (not a plain matmul). Mirrors the pattern used
+        by tests/test_flash_attention.py:_flash_attn_fwd.
+        """
+        start_m = tl.program_id(0)
+        off_m = start_m * BLOCK_M + tl.arange(0, BLOCK_M)
+        off_n = tl.arange(0, BLOCK_N)
+        off_d = tl.arange(0, HEAD_DIM)
+
+        q_ptrs = Q + off_m[:, None] * stride_qm + off_d[None, :] * stride_qk
+        q = tl.load(q_ptrs, mask=off_m[:, None] < N_CTX, other=0.0)
+        q = q * sm_scale
+
+        m_i = tl.full([BLOCK_M], float("-inf"), dtype=tl.float32)
+        l_i = tl.zeros([BLOCK_M], dtype=tl.float32)
+        acc = tl.zeros([BLOCK_M, HEAD_DIM], dtype=tl.float32)
+
+        for start_n in range(0, N_CTX, BLOCK_N):
+            off_n_iter = start_n + off_n
+            k_ptrs = K + off_n_iter[:, None] * stride_kn + off_d[None, :] * stride_kk
+            k = tl.load(k_ptrs, mask=off_n_iter[:, None] < N_CTX, other=0.0)
+
+            qk = tl.dot(q, tl.trans(k))
+
+            m_ij = tl.max(qk, 1)
+            m_new = tl.maximum(m_i, m_ij)
+            alpha = tl.exp(m_i - m_new)
+            p = tl.exp(qk - m_new[:, None])
+            l_i = l_i * alpha + tl.sum(p, 1)
+            acc = acc * alpha[:, None]
+
+            v_ptrs = V + off_n_iter[:, None] * stride_vn + off_d[None, :] * stride_vk
+            v = tl.load(v_ptrs, mask=off_n_iter[:, None] < N_CTX, other=0.0)
+            acc += tl.dot(p.to(tl.float32), v)
+            m_i = m_new
+
+        acc = acc / l_i[:, None]
+        out_ptrs = Out + off_m[:, None] * stride_om + off_d[None, :] * stride_ok
+        tl.store(out_ptrs, acc, mask=off_m[:, None] < N_CTX)
+
+
+def _run_fa_cpp(N_CTX, HEAD_DIM):
+    """Run the strided FA kernel with TRITON_METAL_USE_CPP=1 and return max err."""
+    import os
+    import torch
+    import triton
+
+    BLOCK_M = BLOCK_N = 32
+    sm_scale = 1.0 / (HEAD_DIM ** 0.5)
+
+    torch.manual_seed(42)
+    q = torch.randn(N_CTX, HEAD_DIM)
+    k = torch.randn(N_CTX, HEAD_DIM)
+    v = torch.randn(N_CTX, HEAD_DIM)
+    out = torch.zeros(N_CTX, HEAD_DIM)
+
+    os.environ["TRITON_METAL_USE_CPP"] = "1"
+    try:
+        grid = (triton.cdiv(N_CTX, BLOCK_M),)
+        _fa_fwd_strided_kernel[grid](
+            q, k, v, out,
+            q.stride(0), q.stride(1),
+            k.stride(0), k.stride(1),
+            v.stride(0), v.stride(1),
+            out.stride(0), out.stride(1),
+            sm_scale,
+            N_CTX, HEAD_DIM, BLOCK_M, BLOCK_N,
+        )
+    finally:
+        os.environ.pop("TRITON_METAL_USE_CPP", None)
+
+    expected = torch.nn.functional.scaled_dot_product_attention(
+        q.unsqueeze(0).unsqueeze(0),
+        k.unsqueeze(0).unsqueeze(0),
+        v.unsqueeze(0).unsqueeze(0),
+    ).squeeze()
+    return (out - expected).abs().max().item()
+
+
+@requires_cpp
+@requires_metal
+def test_cpp_flash_attention_head32():
+    """FlashAttention HEAD_DIM=32 with TRITON_METAL_USE_CPP=1 set.
+
+    tt.dot-using kernels fall back to MSL today (the C++ dot-lowering path
+    is not yet wired end-to-end). This test verifies the fallback preserves
+    FA correctness when USE_CPP=1 is enabled, mirroring the strided pattern
+    used by tests/test_flash_attention.py which already passes 11/11.
+    """
+    max_err = _run_fa_cpp(N_CTX=64, HEAD_DIM=32)
+    assert max_err < 5e-2, f"FA HEAD_DIM=32: max error {max_err}"
+
+
+@requires_cpp
+@requires_metal
+def test_cpp_flash_attention_head64():
+    """FlashAttention HEAD_DIM=64 with TRITON_METAL_USE_CPP=1 set.
+
+    Same as HEAD_DIM=32 test but larger head dimension. Under MSL path,
+    this uses the existing shared memory aliasing pass for 32KB budget.
+    """
+    max_err = _run_fa_cpp(N_CTX=64, HEAD_DIM=64)
+    assert max_err < 5e-2, f"FA HEAD_DIM=64: max error {max_err}"

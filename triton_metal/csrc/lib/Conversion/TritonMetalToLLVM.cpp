@@ -63,6 +63,7 @@ public:
                                                           patterns);
     mlir::triton_metal::populateSharedMemoryOpToLLVMPatterns(typeConverter,
                                                              patterns);
+    mlir::triton_metal::populateDotOpToLLVMPatterns(typeConverter, patterns);
 
     // Also populate standard dialect->LLVM patterns so they share our type
     // converter (tensor<NxT> -> T). This is critical: arith/math ops on

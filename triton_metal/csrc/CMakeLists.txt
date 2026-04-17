@@ -193,6 +193,7 @@ pybind11_add_module(_triton_metal_cpp
     lib/Conversion/TritonMetalToLLVM.cpp
     lib/Conversion/ElementwiseOpToLLVM.cpp
     lib/Conversion/SharedMemoryOpToLLVM.cpp
+    lib/Conversion/DotOpToLLVM.cpp
 )
 
 # Include our headers for the conversion sources compiled into this module
@@ -229,6 +230,7 @@ set_source_files_properties(
     lib/Conversion/TritonMetalToLLVM.cpp
     lib/Conversion/ElementwiseOpToLLVM.cpp
     lib/Conversion/SharedMemoryOpToLLVM.cpp
+    lib/Conversion/DotOpToLLVM.cpp
     PROPERTIES COMPILE_FLAGS "-fno-rtti"
 )
 
@@ -241,6 +243,7 @@ add_library(triton_metal_plugin SHARED
     lib/Conversion/TritonMetalToLLVM.cpp
     lib/Conversion/ElementwiseOpToLLVM.cpp
     lib/Conversion/SharedMemoryOpToLLVM.cpp
+    lib/Conversion/DotOpToLLVM.cpp
     ${TRITON_IR_OBJS}
     ${TRITON_GPU_OBJS}
     ${TRITON_NVIDIA_GPU_OBJS}
@@ -264,5 +267,6 @@ set_source_files_properties(
     lib/Conversion/TritonMetalToLLVM.cpp
     lib/Conversion/ElementwiseOpToLLVM.cpp
     lib/Conversion/SharedMemoryOpToLLVM.cpp
+    lib/Conversion/DotOpToLLVM.cpp
     PROPERTIES COMPILE_FLAGS "-fno-rtti"
 )

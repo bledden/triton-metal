@@ -21,6 +21,10 @@ void populateSharedMemoryOpToLLVMPatterns(
     LLVMTypeConverter &typeConverter,
     RewritePatternSet &patterns);
 
+void populateDotOpToLLVMPatterns(
+    LLVMTypeConverter &typeConverter,
+    RewritePatternSet &patterns);
+
 void resetSharedMemoryCounter();
 
 } // namespace triton_metal

@@ -332,3 +332,99 @@ def test_32kb_threadgroup_budget():
         assert max_err < 1e-1, f"32kb fallback: max error {max_err}"
     finally:
         os.environ.pop("TRITON_METAL_USE_CPP", None)
+
+
+@requires_cpp
+@requires_metal
+def test_cpp_tiled_reduction():
+    """Large reduction via shared memory through C++ path."""
+    import os
+    import torch
+    import triton
+    import triton.language as tl
+
+    os.environ["TRITON_METAL_USE_CPP"] = "1"
+    try:
+        @triton.jit
+        def sum_kernel(x_ptr, out_ptr, N: tl.constexpr, BLOCK: tl.constexpr):
+            offs = tl.arange(0, BLOCK)
+            mask = offs < N
+            x = tl.load(x_ptr + offs, mask=mask, other=0.0)
+            s = tl.sum(x, axis=0)
+            tl.store(out_ptr, s)
+
+        N = 1024
+        x = torch.randn(N)
+        out = torch.zeros(1)
+        sum_kernel[(1,)](x, out, N=N, BLOCK=1024)
+
+        max_err = abs(out.item() - x.sum().item())
+        assert max_err < 1e-2, f"tiled reduction: error {max_err}"
+    finally:
+        os.environ.pop("TRITON_METAL_USE_CPP", None)
+
+
+@requires_cpp
+@requires_metal
+def test_cpp_cumsum():
+    """Cumsum using shared memory through C++ path."""
+    import os
+    import torch
+    import triton
+    import triton.language as tl
+
+    os.environ["TRITON_METAL_USE_CPP"] = "1"
+    try:
+        @triton.jit
+        def cumsum_kernel(x_ptr, out_ptr, BLOCK: tl.constexpr):
+            offs = tl.arange(0, BLOCK)
+            x = tl.load(x_ptr + offs)
+            c = tl.cumsum(x, axis=0)
+            tl.store(out_ptr + offs, c)
+
+        BLOCK = 256
+        x = torch.randn(BLOCK)
+        out = torch.zeros(BLOCK)
+        cumsum_kernel[(1,)](x, out, BLOCK=BLOCK)
+
+        expected = x.cumsum(dim=0)
+        max_err = (out - expected).abs().max().item()
+        assert max_err < 1e-3, f"cumsum: max error {max_err}"
+    finally:
+        os.environ.pop("TRITON_METAL_USE_CPP", None)
+
+
+@requires_cpp
+@requires_metal
+def test_cpp_layer_norm():
+    """Layer norm (2-pass mean/var via shared memory) through C++ path."""
+    import os
+    import torch
+    import triton
+    import triton.language as tl
+
+    os.environ["TRITON_METAL_USE_CPP"] = "1"
+    try:
+        @triton.jit
+        def layer_norm_kernel(x_ptr, out_ptr, N: tl.constexpr,
+                               eps: tl.constexpr, BLOCK: tl.constexpr):
+            offs = tl.arange(0, BLOCK)
+            mask = offs < N
+            x = tl.load(x_ptr + offs, mask=mask, other=0.0)
+            mean = tl.sum(x, axis=0) / N
+            diff = x - mean
+            var = tl.sum(diff * diff, axis=0) / N
+            rstd = 1.0 / tl.sqrt(var + eps)
+            y = diff * rstd
+            tl.store(out_ptr + offs, y, mask=mask)
+
+        N = 256
+        x = torch.randn(N)
+        out = torch.zeros(N)
+        layer_norm_kernel[(1,)](x, out, N=N, eps=1e-5, BLOCK=256)
+
+        expected = torch.nn.functional.layer_norm(x, (N,), eps=1e-5)
+        max_err = (out - expected).abs().max().item()
+        assert max_err < 1e-3, f"layer_norm: max error {max_err}"
+    finally:
+        os.environ.pop("TRITON_METAL_USE_CPP", None)

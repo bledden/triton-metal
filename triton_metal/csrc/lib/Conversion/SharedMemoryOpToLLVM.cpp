@@ -333,6 +333,22 @@ public:
   }
 };
 
+class ConvertLayoutOpConversion
+    : public ConvertOpToLLVMPattern<triton::gpu::ConvertLayoutOp> {
+public:
+  using ConvertOpToLLVMPattern<
+      triton::gpu::ConvertLayoutOp>::ConvertOpToLLVMPattern;
+
+  LogicalResult matchAndRewrite(
+      triton::gpu::ConvertLayoutOp op, OpAdaptor adaptor,
+      ConversionPatternRewriter &rewriter) const override {
+    // In the per-thread scalar model, layout conversions are no-ops.
+    // Each thread owns one element regardless of layout encoding.
+    rewriter.replaceOp(op, adaptor.getSrc());
+    return success();
+  }
+};
+
 // Pre-M5 Metal has no async DMA. We lower ttg.async_copy_global_to_local
 // to a synchronous per-thread copy: each thread loads one element from
 // global and stores it to the destination memdesc at its lid. The op's
@@ -423,6 +439,7 @@ void populateSharedMemoryOpToLLVMPatterns(LLVMTypeConverter &typeConverter,
                AsyncWaitOpConversion,
                MemDescSubsliceOpConversion,
                MemDescTransOpConversion,
+               ConvertLayoutOpConversion,
                AsyncCopyGlobalToLocalOpConversion>(typeConverter);
 }
 

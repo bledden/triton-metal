@@ -219,6 +219,7 @@ class MetalBackend(BaseBackend):
             'tt.func', 'tt.return',
             'tt.reduce', 'tt.reduce.return',
             'tt.extern_elementwise',
+            'tt.dot',
             # -- Arith ops (standard arith-to-LLVM + custom constant) --
             'arith.constant',
             'arith.addf', 'arith.addi',
@@ -259,6 +260,7 @@ class MetalBackend(BaseBackend):
             'ttg.local_dealloc',
             'ttg.memdesc_subview', 'ttg.memdesc_trans',
             'ttg.async_copy_global_to_local', 'ttg.async_wait',
+            'ttg.convert_layout',
         }
         # Extract actual MLIR operations from the TTGIR text.
         # Operations appear as either:

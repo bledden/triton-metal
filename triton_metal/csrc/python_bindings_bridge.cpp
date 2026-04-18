@@ -486,11 +486,6 @@ extern "C" const char* triton_metal_run_to_llvm(const char* mlir_text,
     // phases that each need scratch space but don't coexist.
     mlir::triton_metal::aliasSharedMemoryGlobals(*llvmMod);
 
-    // Opportunistically vectorize consecutive scalar loads/stores on
-    // addrspace(3) pointers when their GEP indices are contiguous. If the
-    // IR doesn't match the pattern, scalar ops are left untouched.
-    mlir::triton_metal::vectorizeSharedMemoryAccess(*llvmMod);
-
     // ---------------------------------------------------------------
     // Replace __metal_* intrinsic calls with extra kernel function
     // parameters. In Metal AIR, thread position / grid size intrinsics

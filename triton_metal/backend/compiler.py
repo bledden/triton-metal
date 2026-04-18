@@ -259,8 +259,6 @@ class MetalBackend(BaseBackend):
             'ttg.local_dealloc',
             'ttg.memdesc_subview', 'ttg.memdesc_trans',
             'ttg.async_copy_global_to_local', 'ttg.async_wait',
-            # -- Cooperative matmul (handled by C++ path) --
-            'tt.dot',
         }
         # Extract actual MLIR operations from the TTGIR text.
         # Operations appear as either:
@@ -350,8 +348,10 @@ class MetalBackend(BaseBackend):
         - ttg.local_load %x  -> replaced with the original alloc operand
         - ttg.convert_layout %x -> replaced with %x (passthrough)
         - ttg.memdesc_trans %x -> replaced with %x (passthrough)
-        - tt.dot %a, %b, %c -> arith.mulf + arith.addf (scalar FMA)
         - tt.trans %x -> replaced with %x (passthrough in per-thread model)
+
+        tt.dot is preserved — handled by C++ DotOpToLLVM pattern or MSL
+        _detect_simple_dot path.
         """
         import re
 
@@ -453,10 +453,12 @@ class MetalBackend(BaseBackend):
             if stripped.strip():
                 phase1_lines.append(stripped)
 
-        # Phase 2: Strip TTG ops and replace tt.dot with scalar FMA.
+        # Phase 2: Strip TTG ops.
         #
         # Build maps from TTG op results to their original operands, then
         # remove TTG op lines and substitute references.
+        # (tt.dot is preserved — handled by C++ DotOpToLLVM pattern or MSL
+        # _detect_simple_dot path.)
         alloc_map = {}    # ttg.local_alloc result -> input operand
         replace_map = {}  # value to replace -> replacement value
 
@@ -494,8 +496,9 @@ class MetalBackend(BaseBackend):
                 replace_map[m.group(1)] = m.group(2)
                 continue
 
-        # Second pass: emit lines with TTG ops removed, references replaced,
-        # and tt.dot converted to scalar FMA.
+        # Second pass: emit lines with TTG ops removed and references replaced.
+        # tt.dot is preserved — handled by C++ DotOpToLLVM pattern or MSL
+        # _detect_simple_dot path.
         out_lines = []
         # Sort replacements longest-first to avoid partial matches
         sorted_replacements = sorted(replace_map.items(),
@@ -515,30 +518,8 @@ class MetalBackend(BaseBackend):
                 # Use word-boundary-aware replacement to avoid partial matches
                 line = re.sub(re.escape(old) + r'(?=[\s,):}\]]|$)', new, line)
 
-            # Replace tt.dot with scalar FMA (arith.mulf + arith.addf).
-            # The operand and result types are tensor types at the MLIR text
-            # level (the type converter will later reduce them to scalars).
-            dot_m = re.match(
-                r'(\s*)(%\S+)\s*=\s*tt\.dot\s+(%\S+),\s*(%\S+),\s*(%\S+)\s*:',
-                line
-            )
-            if dot_m:
-                indent, result, a, b, c = dot_m.groups()
-                # Extract the full result tensor type (e.g. tensor<32x32xf32>)
-                result_type_m = re.search(r'->\s*(tensor<[\dx]+x\w+>)', line)
-                result_type = result_type_m.group(1) if result_type_m else 'f32'
-                # Extract the operand tensor type (A's type, used for mul).
-                # The A operand type appears after the first colon.
-                a_type_m = re.search(r':\s*(tensor<[\dx]+x\w+>)\s*\*', line)
-                a_type = a_type_m.group(1) if a_type_m else result_type
-                mul_name = result + '_dot_mul'
-                out_lines.append(
-                    f'{indent}{mul_name} = arith.mulf {a}, {b} : {result_type}'
-                )
-                out_lines.append(
-                    f'{indent}{result} = arith.addf {c}, {mul_name} : {result_type}'
-                )
-                continue
+            # tt.dot is preserved — handled by C++ DotOpToLLVM pattern or MSL
+            # _detect_simple_dot path.
 
             # Remove residual TTG type annotations that slipped through
             # e.g. !ttg.memdesc<...> in type positions
@@ -548,215 +529,6 @@ class MetalBackend(BaseBackend):
                 out_lines.append(line)
 
         return '\n'.join(out_lines) + '\n'
-
-    @staticmethod
-    def _generate_scalar_matmul(fn_name, args, block_m, block_n, elem_type='f32'):
-        """Generate a scalar per-element matmul kernel in MLIR.
-
-        Each thread computes one output element:
-            C[m, n] = sum_k A[m, k] * B[k, n]
-
-        Thread decomposition: m = lid / BLOCK_N, n = lid % BLOCK_N
-        Block size = BLOCK_M * BLOCK_N.
-
-        Args:
-            fn_name: Kernel function name
-            args: List of (name, type) tuples for function arguments
-            block_m: Block size in M dimension
-            block_n: Block size in N dimension
-            elem_type: Element type (f32, f16, etc.)
-        Returns:
-            MLIR text for the scalar matmul module
-        """
-        # Build the function signature from argument list.
-        # Remove tt.divisibility attributes from arg types.
-        import re as _re
-        arg_strs = []
-        arg_names = set()
-        ptr_arg_names = []  # ordered list of pointer arg names
-        for name, ty in args:
-            # Strip {tt.divisibility = ...} from type
-            ty = _re.sub(r'\s*\{[^}]*\}', '', ty).strip()
-            arg_strs.append(f'%{name}: {ty}')
-            arg_names.add(name)
-            if '!tt.ptr' in ty:
-                ptr_arg_names.append(name)
-        sig = ', '.join(arg_strs)
-        block_size = block_m * block_n
-
-        # Identify the 3 matrix pointer args (A, B, C) by order
-        a_name = ptr_arg_names[0] if len(ptr_arg_names) > 0 else 'A'
-        b_name = ptr_arg_names[1] if len(ptr_arg_names) > 1 else 'B'
-        c_name = ptr_arg_names[2] if len(ptr_arg_names) > 2 else 'C'
-
-        # Determine arith mul/add ops based on element type
-        if elem_type in ('f32', 'f16', 'bf16', 'half', 'bfloat'):
-            mul_op = 'arith.mulf'
-            add_op = 'arith.addf'
-            zero_val = '0.000000e+00'
-            scalar_type = elem_type
-            if scalar_type == 'half':
-                scalar_type = 'f16'
-            elif scalar_type == 'bfloat':
-                scalar_type = 'bf16'
-        else:
-            mul_op = 'arith.muli'
-            add_op = 'arith.addi'
-            zero_val = '0'
-            scalar_type = elem_type
-
-        # For missing strides, use constant 1 (contiguous dimension)
-        stride_defs = []
-        def stride_ref(name):
-            if name in arg_names:
-                return f'%{name}'
-            # Generate a constant for missing stride
-            const_name = f'%_const_{name}'
-            stride_defs.append(f'    {const_name} = arith.constant 1 : i32')
-            return const_name
-
-        s_am = stride_ref('stride_am')
-        s_ak = stride_ref('stride_ak')
-        s_bk = stride_ref('stride_bk')
-        s_bn = stride_ref('stride_bn')
-        s_cm = stride_ref('stride_cm')
-        s_cn = stride_ref('stride_cn')
-        stride_defs_text = '\n'.join(stride_defs)
-        if stride_defs_text:
-            stride_defs_text += '\n'
-
-        return f'''module {{
-  tt.func public @{fn_name}({sig}) attributes {{noinline = false}} {{
-    %c0 = arith.constant 0 : i32
-    %c1 = arith.constant 1 : i32
-    %cBN = arith.constant {block_n} : i32
-    %cBM = arith.constant {block_m} : i32
-    %zero_acc = arith.constant {zero_val} : {scalar_type}
-{stride_defs_text}    %pid_m = tt.get_program_id x : i32
-    %pid_n = tt.get_program_id y : i32
-    %lid = tt.make_range {{end = {block_size} : i32, start = 0 : i32}} : tensor<{block_size}xi32>
-    %sBN = tt.splat %cBN : i32 -> tensor<{block_size}xi32>
-    %row = arith.divui %lid, %sBN : tensor<{block_size}xi32>
-    %col = arith.remui %lid, %sBN : tensor<{block_size}xi32>
-    %sBM = tt.splat %cBM : i32 -> tensor<{block_size}xi32>
-    %block_row_s = tt.splat %pid_m : i32 -> tensor<{block_size}xi32>
-    %block_row = arith.muli %block_row_s, %sBM : tensor<{block_size}xi32>
-    %block_col_s = tt.splat %pid_n : i32 -> tensor<{block_size}xi32>
-    %block_col = arith.muli %block_col_s, %sBN : tensor<{block_size}xi32>
-    %m = arith.addi %block_row, %row : tensor<{block_size}xi32>
-    %n = arith.addi %block_col, %col : tensor<{block_size}xi32>
-    %sAM = tt.splat {s_am} : i32 -> tensor<{block_size}xi32>
-    %a_row_off = arith.muli %m, %sAM : tensor<{block_size}xi32>
-    %sA = tt.splat %{a_name} : !tt.ptr<{scalar_type}> -> tensor<{block_size}x!tt.ptr<{scalar_type}>>
-    %a_base = tt.addptr %sA, %a_row_off : tensor<{block_size}x!tt.ptr<{scalar_type}>>, tensor<{block_size}xi32>
-    %sBN2 = tt.splat {s_bn} : i32 -> tensor<{block_size}xi32>
-    %b_col_off = arith.muli %n, %sBN2 : tensor<{block_size}xi32>
-    %sB = tt.splat %{b_name} : !tt.ptr<{scalar_type}> -> tensor<{block_size}x!tt.ptr<{scalar_type}>>
-    %b_base = tt.addptr %sB, %b_col_off : tensor<{block_size}x!tt.ptr<{scalar_type}>>, tensor<{block_size}xi32>
-    %szero = tt.splat %zero_acc : {scalar_type} -> tensor<{block_size}x{scalar_type}>
-    %acc = scf.for %k = %c0 to %K step %c1 iter_args(%acc_v = %szero) -> (tensor<{block_size}x{scalar_type}>) : i32 {{
-      %lp_sAK = tt.splat {s_ak} : i32 -> tensor<{block_size}xi32>
-      %lp_sk = tt.splat %k : i32 -> tensor<{block_size}xi32>
-      %lp_a_k_off = arith.muli %lp_sk, %lp_sAK : tensor<{block_size}xi32>
-      %lp_a_ptr = tt.addptr %a_base, %lp_a_k_off : tensor<{block_size}x!tt.ptr<{scalar_type}>>, tensor<{block_size}xi32>
-      %lp_a_val = tt.load %lp_a_ptr : tensor<{block_size}x!tt.ptr<{scalar_type}>>
-      %lp_sBK = tt.splat {s_bk} : i32 -> tensor<{block_size}xi32>
-      %lp_b_k_off = arith.muli %lp_sk, %lp_sBK : tensor<{block_size}xi32>
-      %lp_b_ptr = tt.addptr %b_base, %lp_b_k_off : tensor<{block_size}x!tt.ptr<{scalar_type}>>, tensor<{block_size}xi32>
-      %lp_b_val = tt.load %lp_b_ptr : tensor<{block_size}x!tt.ptr<{scalar_type}>>
-      %lp_prod = {mul_op} %lp_a_val, %lp_b_val : tensor<{block_size}x{scalar_type}>
-      %lp_new_acc = {add_op} %acc_v, %lp_prod : tensor<{block_size}x{scalar_type}>
-      scf.yield %lp_new_acc : tensor<{block_size}x{scalar_type}>
-    }}
-    %st_sCM = tt.splat {s_cm} : i32 -> tensor<{block_size}xi32>
-    %st_row_off = arith.muli %m, %st_sCM : tensor<{block_size}xi32>
-    %st_sCN = tt.splat {s_cn} : i32 -> tensor<{block_size}xi32>
-    %st_col_off = arith.muli %n, %st_sCN : tensor<{block_size}xi32>
-    %st_off = arith.addi %st_row_off, %st_col_off : tensor<{block_size}xi32>
-    %st_sC = tt.splat %{c_name} : !tt.ptr<{scalar_type}> -> tensor<{block_size}x!tt.ptr<{scalar_type}>>
-    %st_ptr = tt.addptr %st_sC, %st_off : tensor<{block_size}x!tt.ptr<{scalar_type}>>, tensor<{block_size}xi32>
-    tt.store %st_ptr, %acc : tensor<{block_size}x!tt.ptr<{scalar_type}>>
-    tt.return
-  }}
-}}
-'''
-
-    @staticmethod
-    def _try_generate_matmul_mlir(ttgir_text, stripped_text):
-        """Detect matmul pattern in TTGIR and generate scalar per-element kernel.
-
-        Returns the generated MLIR text if matmul detected, None otherwise.
-        """
-        import re
-
-        # Detect: tt.dot in the TTGIR and scf.for (K-loop)
-        if 'tt.dot' not in ttgir_text:
-            return None
-
-        # Extract function name
-        fn_m = re.search(r'tt\.func\s+public\s+@(\w+)\(', ttgir_text)
-        if not fn_m:
-            return None
-        fn_name = fn_m.group(1)
-
-        # Extract function arguments (name: type pairs).
-        # Need to handle nested parens from loc() annotations in the TTGIR.
-        # First strip loc(...) annotations to simplify parsing.
-        clean_ttgir = re.sub(
-            r'\s*loc\((?:[^()]*|\([^()]*\))*\)', '', ttgir_text
-        )
-        args_m = re.search(r'tt\.func\s+public\s+@\w+\(([^)]+)\)', clean_ttgir)
-        if not args_m:
-            return None
-        args_text = args_m.group(1)
-
-        # Parse argument list: %name: type loc(...)
-        args = []
-        for arg_str in re.split(r',\s*(?=%)', args_text):
-            arg_str = arg_str.strip()
-            # Remove loc annotations
-            arg_str = re.sub(r'\s*loc\(.*', '', arg_str)
-            am = re.match(r'(%\w+):\s*(.+)', arg_str)
-            if am:
-                name = am.group(1).lstrip('%')
-                ty = am.group(2).strip()
-                args.append((name, ty))
-
-        # Check required arguments exist
-        arg_names = {a[0] for a in args}
-        # Need: at least 3 pointer args and a K dimension arg.
-        # Stride args may be optimized away (e.g. stride=1 becomes constexpr).
-        has_ptrs = sum(1 for _, t in args if '!tt.ptr' in t) >= 3
-        has_k = 'K' in arg_names
-        # Need at least stride_am and stride_cm (row strides for A and C)
-        has_min_strides = 'stride_am' in arg_names and 'stride_cm' in arg_names
-
-        if not (has_ptrs and has_k and has_min_strides):
-            return None
-
-        # Extract block sizes from make_range end values
-        block_sizes = set()
-        for mr_m in re.finditer(
-            r'tt\.make_range\s*\{[^}]*end\s*=\s*(\d+)',
-            ttgir_text
-        ):
-            block_sizes.add(int(mr_m.group(1)))
-
-        if not block_sizes:
-            return None
-
-        # For matmul, BLOCK_M and BLOCK_N are typically the same
-        block_m = block_n = max(block_sizes)
-
-        # Detect element type from pointer types
-        elem_type = 'f32'
-        ptr_m = re.search(r'!tt\.ptr<(\w+)>', ttgir_text)
-        if ptr_m:
-            elem_type = ptr_m.group(1)
-
-        return MetalBackend._generate_scalar_matmul(
-            fn_name, args, block_m, block_n, elem_type
-        )
 
     # Map LLVM IR element types to their byte size and AIR metadata name.
     _ELEM_TYPE_INFO = {
@@ -1141,11 +913,12 @@ class MetalBackend(BaseBackend):
         # Add entries here if specific intrinsics cause "Undefined symbols" errors.
     }
 
-    # All Triton/TTG ops are now handled by the C++ path:
-    # - tt.dot is lowered to scalar FMA at the text level in _strip_ttg_annotations
+    # All Triton/TTG ops handled by the C++ path are listed in _has_complex_ops.
     # - tt.trans is a passthrough in the per-thread model
     # - ttg.local_alloc/local_load/convert_layout/memdesc_trans are stripped
     # - scf.for/if/yield are lowered by the scf-to-cf pass
+    # tt.dot is NOT in the allowlist — it cleanly falls back to the MSL path
+    # (_detect_simple_dot + template matmul), which is what FlashAttention uses.
     _CPP_UNSUPPORTED_OPS = set()  # empty — no fallback needed
 
     @staticmethod
@@ -1180,16 +953,10 @@ class MetalBackend(BaseBackend):
         # Get TTGIR text (accept either MLIR module or pre-saved text)
         ttgir_text = mod if isinstance(mod, str) else str(mod)
 
-        # For matmul kernels (containing tt.dot), generate a custom scalar
-        # per-element kernel instead of trying to strip and convert the
-        # TTGIR. The per-thread scalar model can't handle cooperative
-        # matrix operations (tt.dot requires K-dimension reduction).
-        matmul_mlir = MetalBackend._try_generate_matmul_mlir(ttgir_text, None)
-        if matmul_mlir is not None:
-            stripped = matmul_mlir
-        else:
-            # Standard path: strip TritonGPU annotations
-            stripped = MetalBackend._strip_ttg_annotations(ttgir_text)
+        # Strip TritonGPU annotations; tt.dot is preserved and either
+        # handled by the C++ DotOpToLLVM pattern or triggers fallback to
+        # the MSL path (via _has_complex_ops).
+        stripped = MetalBackend._strip_ttg_annotations(ttgir_text)
 
         if level >= 1:
             debug_dir = _dump_dir()

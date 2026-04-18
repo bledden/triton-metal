@@ -34,12 +34,6 @@ void resetSharedMemoryCounter();
 /// translation.
 void aliasSharedMemoryGlobals(llvm::Module &mod);
 
-/// Opportunistically coalesce 4 consecutive scalar loads/stores on
-/// addrspace(3) pointers with contiguous GEP indices into a single vector
-/// op. Matches the `#shared<{vec=4}>` encoding hint from TTGIR. If the
-/// preconditions aren't met, scalar ops remain untouched.
-void vectorizeSharedMemoryAccess(llvm::Module &mod);
-
 } // namespace triton_metal
 } // namespace mlir
 

@@ -1114,6 +1114,23 @@ class MetalBackend(BaseBackend):
 
         return '\n'.join(out_lines)
 
+    @staticmethod
+    def _rename_llvm_kernel(llir_text, new_name):
+        """Rename the LLVM kernel function from @kernel to @<new_name>.
+
+        Triton's TTGIR uses a generic symbol @kernel; Metal's runtime
+        launcher resolves kernels by their user-specified name. We rewrite
+        the LLVM IR to use the correct symbol (including references in
+        AIR metadata nodes like !air.kernel).
+        """
+        import re
+        if not new_name or new_name == "kernel":
+            return llir_text
+        # Rewrite define line and all @kernel references (as a whole word)
+        # so substrings like @kernel_fn aren't accidentally matched.
+        pattern = re.compile(r'@kernel\b')
+        return pattern.sub(f'@{new_name}', llir_text)
+
     # Mapping from LLVM intrinsics to AIR intrinsics for math functions
     # that Metal's runtime doesn't resolve as standard LLVM intrinsics.
     # Most llvm.* intrinsics work (exp, sin, cos, ...) but this provides
@@ -1249,11 +1266,21 @@ class MetalBackend(BaseBackend):
         # understand (nocreateundeforpoison, memory(none), etc.).
         air_llvm_ir = MetalBackend._strip_unsupported_llvm_attrs(air_llvm_ir)
 
+        # Rename the LLVM function from the generic @kernel to the user's
+        # kernel name. The Metal launcher resolves kernels by metadata["name"]
+        # which was set earlier in the pipeline (make_ttir/make_ttgir).
+        # Without this, the metallib exports @kernel but the launcher asks
+        # for @<user_fn_name>, producing "Kernel ... not found" errors.
+        user_name = metadata.get("name")
+        if user_name and user_name != "kernel":
+            air_llvm_ir = MetalBackend._rename_llvm_kernel(air_llvm_ir, user_name)
+
         if level >= 1:
             with open(os.path.join(debug_dir, f"{kernel_name}.ll"), "w") as f:
                 f.write(air_llvm_ir)
 
-        # Extract kernel name from the LLVM IR
+        # Extract kernel name from the LLVM IR (sanity check — should match
+        # the name we just renamed to above).
         m = re.search(r'define\s+void\s+@(\w+)\s*\(', air_llvm_ir)
         if m:
             metadata["name"] = m.group(1)

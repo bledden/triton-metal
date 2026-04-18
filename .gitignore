@@ -34,3 +34,4 @@ test_constexpr_ir.py
 
 # Raw test output (contains local paths)
 reports/upstream_test_core_raw.txt
+.cache/

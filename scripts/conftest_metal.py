@@ -124,7 +124,7 @@ UNIMPLEMENTED_FEATURES = {
     "test_disable_licm",
     "test_assume",
     "test_poison_return",
-    "test_ptx_cast",
+    # "test_ptx_cast",  # Enabled 2026-04-16: passes on C++ MMA path (2/2)
     # Newly exposed failures (were hidden by overly-broad parametrize skip):
     # "test_broadcast",  # Enabled: 2D broadcast via wrapping loop (>1024 threads)
     # "test_abs",  # Enabled: math.absi → MSL abs() for integer types

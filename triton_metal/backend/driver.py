@@ -552,11 +552,39 @@ class MetalLauncher:
                 sz = 8 if (arg > 0x7FFFFFFFFFFFFFFF or arg < -(1 << 31) or arg > 0xFFFFFFFF) else 4
                 pool_releases.append(("scalar", buf, sz))
             elif isinstance(arg, float):
-                buf = pool.acquire_scalar(4)
-                view = buf.contents().as_buffer(4)
-                struct.pack_into("f", view, 0, arg)
-                buffers.append((buf, 0))
-                pool_releases.append(("scalar", buf, 4))
+                # Determine the declared scalar float width from the kernel
+                # signature so that bf16/fp16 scalar args are marshalled as
+                # 2 bytes (matching MSL `half&` / `bfloat&` parameters)
+                # instead of being silently packed as 4-byte fp32.
+                sig_ty = None
+                if arg_idx < len(self.arg_names):
+                    sig_ty = self.signature.get(self.arg_names[arg_idx])
+                if sig_ty == "fp16":
+                    buf = pool.acquire_scalar(2)
+                    view = buf.contents().as_buffer(2)
+                    # struct 'e' = IEEE 754 binary16 (fp16)
+                    struct.pack_into("e", view, 0, arg)
+                    buffers.append((buf, 0))
+                    pool_releases.append(("scalar", buf, 2))
+                elif sig_ty == "bf16":
+                    buf = pool.acquire_scalar(2)
+                    view = buf.contents().as_buffer(2)
+                    # bf16 = upper 16 bits of fp32 (with round-to-nearest-even).
+                    # Using torch's conversion keeps nan/inf/denorm handling
+                    # consistent with the rest of the backend.
+                    import torch as _torch_bf16
+                    bf16_bits = _torch_bf16.tensor(
+                        [arg], dtype=_torch_bf16.float32
+                    ).to(_torch_bf16.bfloat16).view(_torch_bf16.int16).item()
+                    struct.pack_into("h", view, 0, bf16_bits)
+                    buffers.append((buf, 0))
+                    pool_releases.append(("scalar", buf, 2))
+                else:
+                    buf = pool.acquire_scalar(4)
+                    view = buf.contents().as_buffer(4)
+                    struct.pack_into("f", view, 0, arg)
+                    buffers.append((buf, 0))
+                    pool_releases.append(("scalar", buf, 4))
             elif arg is None:
                 # Optional pointer argument (mask, other, scale) — pack as null.
                 buf = pool.acquire_scalar(8)

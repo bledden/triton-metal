@@ -2200,13 +2200,20 @@ class TTGIRParser:
                 return input_vars[arg_name]
             return "0.0f"
 
-        # Binary float ops
-        if op in ("add", "sub", "mul", "div"):
+        # Binary float ops (arith.addf, subf, mulf, divf) and integer
+        # counterparts (arith.addi, subi, muli). MSL uses the same operators
+        # for both; the implicit conversion to float is harmless in this
+        # emission context.
+        _BIN_OP_ALIAS = {
+            "add": "add", "sub": "sub", "mul": "mul", "div": "div",
+            "addi": "add", "subi": "sub", "muli": "mul",
+        }
+        if op in _BIN_OP_ALIAS:
             lhs_var = self._emit_ssa_value(kb, val_info[1], input_vars, dtype, emitted)
             rhs_var = self._emit_ssa_value(kb, val_info[2], input_vars, dtype, emitted)
             # Generate a unique variable name
             var_name = f"r_{len(self.computed_values)}"
-            kb.binary_op(op, lhs_var, rhs_var, var_name)
+            kb.binary_op(_BIN_OP_ALIAS[op], lhs_var, rhs_var, var_name)
             self.computed_values[ssa] = var_name
             return var_name
 
@@ -2300,6 +2307,12 @@ class TTGIRParser:
         # Loop induction variable
         if op == "loop_iv":
             return ssa.lstrip("%")
+
+        # Program ID (tt.get_program_id). In MSL, this is the kernel arg
+        # `pid` (threadgroup_position_in_grid) which KernelBuilder already
+        # declares. Return it by name.
+        if op == "program_id":
+            return "pid"
 
         warnings.warn(
             f"Unknown SSA op '{op}' for value {ssa} in kernel '{self.kernel_name}'. "

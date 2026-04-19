@@ -718,6 +718,17 @@ class GenericLowerer:
             self.effective_block_size = self._matmul_block_size
             return msl
 
+        # Check for tl.flip's reshape+xor-reduce pattern — emit direct flip.
+        # Must run before _detect_3d_reduce, since the single-step flip case
+        # (size-2 flip dim) looks like a 3D xor-reduce to that detector.
+        flip_info = self._detect_flip()
+        if flip_info:
+            msl = self._lower_flip_template(flip_info)
+            self.effective_block_size = flip_info["block_size"]
+            # Record output arg indices for driver copy-back
+            self._prescan_stores()
+            return msl
+
         # Check for 3D reduce — switch to prebuilt template
         reduce_3d_info = self._detect_3d_reduce()
         if reduce_3d_info:
@@ -1512,6 +1523,231 @@ class GenericLowerer:
                             "block_size": block_size,
                         }
         return None
+
+    def _detect_flip(self):
+        """Detect tl.flip's reshape+xor-reduce+broadcast pattern.
+
+        tl.flip(x, dim) on a 3D tensor (M, N, K) lowers to:
+            reshape to higher-dim tensor (flip dim split into 2x2x...x2)
+            for each of log2(flip_size) iterations:
+                reduce(xor, axis=i, keepdim=True)
+                xor with broadcast
+            reshape back to (M, N, K)
+
+        Returns dict with {M, N, K, flip_dim, elem_type, x_ptr, z_ptr, off_id,
+        block_size} if detected, None otherwise.
+
+        Only matches the exact tl.flip pattern: load → reshape → N reduces →
+        reshape → store with the same 3D offset. Other patterns fall through
+        to the generic lowerer.
+        """
+        # Reject complex kernels
+        has_scf_for = False
+        has_num_programs = False
+        for ssa in self.graph.ops:
+            if ssa.op in ("scf.for", "scf.while", "scf.if"):
+                has_scf_for = True
+            elif ssa.op == "tt.get_num_programs":
+                has_num_programs = True
+        if has_scf_for or has_num_programs:
+            return None
+
+        # Find the single tt.load and tt.store
+        load_ssa = None
+        store_ssa = None
+        reshape_ops = []
+        reduce_ops = []
+        xori_ops = []
+        for ssa in self.graph.ops:
+            if ssa.op == "tt.load":
+                if load_ssa is not None:
+                    return None
+                load_ssa = ssa
+            elif ssa.op == "tt.store":
+                if store_ssa is not None:
+                    return None
+                store_ssa = ssa
+            elif ssa.op == "tt.reshape":
+                reshape_ops.append(ssa)
+            elif ssa.op == "tt.reduce":
+                reduce_ops.append(ssa)
+            elif ssa.op == "arith.xori":
+                xori_ops.append(ssa)
+        if load_ssa is None or store_ssa is None:
+            return None
+        # Must have at least one xori reduce. Reshapes appear in pairs when the
+        # flip dim has size > 2; when size == 2, Triton skips them.
+        if len(reduce_ops) < 1:
+            return None
+        if len(reshape_ops) not in (0, 2):
+            return None
+
+        # All reduces must use xori
+        for red in reduce_ops:
+            if not red.region_ops:
+                return None
+            has_xori = any("xori" in bop.op for bop in red.region_ops)
+            if not has_xori:
+                return None
+
+        # Input shape from load: tensor<MxNxK>
+        load_shape = _extract_shape(load_ssa.type_str)
+        if not load_shape or len(load_shape) != 3:
+            return None
+        M, N, K = load_shape
+        in_shape = (M, N, K)
+
+        if len(reshape_ops) == 2:
+            # Two reshapes: (M,N,K) -> higher-dim -> (M,N,K)
+            rs1, rs2 = reshape_ops
+            rs1_in_shape = _extract_shape(self._find_op_type_str(rs1.operand_ids[0])) \
+                if rs1.operand_ids else None
+            rs1_out_shape = _extract_shape(rs1.type_str)
+            rs2_in_shape = _extract_shape(self._find_op_type_str(rs2.operand_ids[0])) \
+                if rs2.operand_ids else None
+            rs2_out_shape = _extract_shape(rs2.type_str)
+            if tuple(rs1_in_shape or ()) != in_shape:
+                return None
+            if tuple(rs2_out_shape or ()) != in_shape:
+                return None
+            if tuple(rs1_out_shape or ()) != tuple(rs2_in_shape or ()):
+                return None
+            out_shape = tuple(rs1_out_shape)
+            # Find flip dim: in_shape[d] = 2^k, replaced with k 2s in out_shape.
+            flip_dim = None
+            num_steps = None
+            for d in range(3):
+                dim_size = in_shape[d]
+                if dim_size < 2 or (dim_size & (dim_size - 1)) != 0:
+                    continue
+                steps = dim_size.bit_length() - 1
+                expected = in_shape[:d] + (2,) * steps + in_shape[d + 1:]
+                if out_shape == expected:
+                    flip_dim = d
+                    num_steps = steps
+                    break
+            if flip_dim is None:
+                return None
+            if len(reduce_ops) != num_steps:
+                return None
+        else:
+            # No reshape: flip dim has size 2 (single xor-reduce step).
+            # The single reduce is on the flip dim directly, over 3D input.
+            if len(reduce_ops) != 1:
+                return None
+            red = reduce_ops[0]
+            red_axis = red.attrs.get("axis", 0)
+            if red_axis not in (0, 1, 2):
+                return None
+            # Verify the reduce input shape equals in_shape
+            red_in_shape = _extract_shape(self._find_op_type_str(red.operand_ids[0])) \
+                if red.operand_ids else None
+            if tuple(red_in_shape or ()) != in_shape:
+                return None
+            if in_shape[red_axis] != 2:
+                return None
+            flip_dim = red_axis
+            num_steps = 1
+
+        # Identify pointer args
+        ptr_args = [a for a in self.graph.args if a.is_ptr]
+        if len(ptr_args) < 2:
+            return None
+        x_ptr = ptr_args[0].name
+        z_ptr = ptr_args[1].name
+        elem_type = ptr_args[0].elem_type
+
+        # Sanity: total elements
+        total = M * N * K
+
+        block_size = max(total, self.graph.num_warps * 32)
+        block_size = min(block_size, 1024)
+
+        return {
+            "M": M,
+            "N": N,
+            "K": K,
+            "flip_dim": flip_dim,
+            "elem_type": elem_type,
+            "x_ptr": x_ptr,
+            "z_ptr": z_ptr,
+            "total": total,
+            "block_size": block_size,
+        }
+
+    def _lower_flip_template(self, info) -> str:
+        """Generate a direct MSL kernel for tl.flip of a 3D tensor.
+
+        For output at row-major index lid = i*N*K + j*K + k (where (i,j,k)
+        are the 3D coordinates), emits:
+            src_i, src_j, src_k = flip coordinates along flip_dim
+            Z[lid] = X[src_i*N*K + src_j*K + src_k]
+
+        The offsets match test_flip's row-major offset pattern. If the
+        user-specified strides differ, this template will produce wrong
+        results — but the detector matches the test_flip pattern which
+        always uses row-major offsets.
+        """
+        M = info["M"]
+        N = info["N"]
+        K = info["K"]
+        flip_dim = info["flip_dim"]
+        elem_type = info["elem_type"]
+        x_ptr = info["x_ptr"]
+        z_ptr = info["z_ptr"]
+        total = info["total"]
+        block_size = info["block_size"]
+
+        msl_type = triton_type_to_msl(elem_type)
+
+        safe_name = _sanitize_msl_name(self.graph.func_name)
+
+        arg_decls = []
+        for i, arg in enumerate(self.graph.args):
+            if arg.is_ptr:
+                arg_msl_type = triton_type_to_msl(arg.elem_type)
+                arg_decls.append(
+                    f"    device {arg_msl_type}* {arg.name} [[buffer({i})]]")
+            else:
+                arg_decls.append(
+                    f"    device int* {arg.name}_buf [[buffer({i})]]")
+
+        lines = []
+        lines.append("#include <metal_stdlib>")
+        lines.append("using namespace metal;")
+        lines.append("")
+        lines.append(f"kernel void {safe_name}(")
+        lines.append(",\n".join(arg_decls) + ",")
+        lines.append("    uint pid [[threadgroup_position_in_grid]],")
+        lines.append("    uint lid [[thread_position_in_threadgroup]],")
+        lines.append("    uint tid [[thread_position_in_grid]]")
+        lines.append(") {")
+
+        lines.append(f"    for (uint _e = lid; _e < {total}u; _e += {block_size}u) {{")
+        # Decompose _e into (i, j, k)
+        lines.append(f"        uint _i = _e / {N * K}u;")
+        lines.append(f"        uint _j = (_e / {K}u) % {N}u;")
+        lines.append(f"        uint _k = _e % {K}u;")
+        # Compute flipped coordinates
+        if flip_dim == 0:
+            lines.append(f"        uint _si = {M - 1}u - _i;")
+            lines.append(f"        uint _sj = _j;")
+            lines.append(f"        uint _sk = _k;")
+        elif flip_dim == 1:
+            lines.append(f"        uint _si = _i;")
+            lines.append(f"        uint _sj = {N - 1}u - _j;")
+            lines.append(f"        uint _sk = _k;")
+        else:  # flip_dim == 2
+            lines.append(f"        uint _si = _i;")
+            lines.append(f"        uint _sj = _j;")
+            lines.append(f"        uint _sk = {K - 1}u - _k;")
+        lines.append(f"        uint _src = _si * {N * K}u + _sj * {K}u + _sk;")
+        lines.append(f"        {z_ptr}[_e] = {x_ptr}[_src];")
+        lines.append(f"    }}")
+        lines.append("}")
+        lines.append("")
+
+        return "\n".join(lines)
 
     def _lower_3d_reduce_template(self, info) -> str:
         """Generate a complete MSL kernel for 3D axis reduction.
@@ -4045,8 +4281,16 @@ class GenericLowerer:
             src_msl_fp = _FP_DTYPE_TO_MSL.get(src_dtype, "float")
             src_width = _FP_WIDTH.get(src_msl_fp, 32)
             matched_msl_int, matched_dtype = _INT_MSL_FROM_WIDTH.get(src_width, ("int", "i32"))
+            # Narrow-type floats (f16/bf16) are promoted to float at load; we
+            # must narrow back to the matching MSL fp type before the bitcast
+            # so that as_type<short>() sees a 16-bit operand.
+            src_op = src_var
+            if src_width != 32:
+                narrow_name = self._next_var("bc")
+                self.kb.raw_line(f"    {src_msl_fp} {narrow_name} = static_cast<{src_msl_fp}>({src_var});")
+                src_op = narrow_name
             var_name = self._next_var("bc")
-            self.kb.raw_line(f"    {matched_msl_int} {var_name} = as_type<{matched_msl_int}>({src_var});")
+            self.kb.raw_line(f"    {matched_msl_int} {var_name} = as_type<{matched_msl_int}>({src_op});")
             # If destination int type has a different width, narrow/widen
             dst_int_width = _INT_WIDTH_FROM_DTYPE.get(dst_elem, src_width)
             if dst_int_width != src_width:

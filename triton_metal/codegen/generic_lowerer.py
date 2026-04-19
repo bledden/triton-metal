@@ -3913,7 +3913,9 @@ class GenericLowerer:
         """arith.bitcast → reinterpret bits without changing value.
 
         When source and destination types differ (float <-> int),
-        emit as_type<T>() in MSL. When they're the same category
+        emit as_type<T>() in MSL. MSL's as_type<>() requires matching
+        bit widths, so we pick the MSL destination type to match the
+        source value's width. When source and dest are the same category
         (e.g., ptr bitcast), pass through.
         """
         if not ssa.operand_ids:
@@ -3927,20 +3929,66 @@ class GenericLowerer:
         dst_is_float = dst_elem in ("f32", "f16", "bf16", "f64")
         dst_is_int = dst_elem.startswith("i")
 
+        # Mapping from Triton float dtype -> MSL type name
+        _FP_DTYPE_TO_MSL = {
+            "fp16": "half", "fp32": "float", "bf16": "bfloat", "fp64": "double",
+            "f16": "half", "f32": "float", "f64": "double",
+        }
+        _FP_ELEM_TO_MSL = {"f16": "half", "bf16": "bfloat", "f32": "float", "f64": "double"}
+        _FP_ELEM_TO_DTYPE = {"f16": "fp16", "bf16": "bf16", "f32": "fp32", "f64": "fp64"}
+
+        # Width mapping for MSL types
+        _FP_WIDTH = {"half": 16, "bfloat": 16, "float": 32, "double": 64}
+        _INT_WIDTH_FROM_DTYPE = {"i8": 8, "i16": 16, "i32": 32, "i64": 64,
+                                 "u8": 8, "u16": 16, "u32": 32, "u64": 64}
+        _INT_MSL_FROM_WIDTH = {8: ("char", "i8"), 16: ("short", "i16"),
+                               32: ("int", "i32"), 64: ("long", "i64")}
+
         if src_is_float and dst_is_int:
-            # float -> int bitcast: as_type<int>(val)
-            msl_ty, dtype = _msl_int_type(dst_elem, unsigned=False)
+            # float -> int bitcast. MSL as_type requires matching widths, so
+            # pick the int MSL type to match source float width; then cast
+            # to the requested destination int width if different.
+            src_msl_fp = _FP_DTYPE_TO_MSL.get(src_dtype, "float")
+            src_width = _FP_WIDTH.get(src_msl_fp, 32)
+            matched_msl_int, matched_dtype = _INT_MSL_FROM_WIDTH.get(src_width, ("int", "i32"))
             var_name = self._next_var("bc")
-            self.kb.raw_line(f"    {msl_ty} {var_name} = as_type<{msl_ty}>({src_var});")
-            self.env[ssa.id] = var_name
-            self.env_types[ssa.id] = dtype
+            self.kb.raw_line(f"    {matched_msl_int} {var_name} = as_type<{matched_msl_int}>({src_var});")
+            # If destination int type has a different width, narrow/widen
+            dst_int_width = _INT_WIDTH_FROM_DTYPE.get(dst_elem, src_width)
+            if dst_int_width != src_width:
+                dst_msl_int, dst_int_dtype = _INT_MSL_FROM_WIDTH.get(dst_int_width, ("int", "i32"))
+                cast_name = self._next_var("bc")
+                self.kb.raw_line(f"    {dst_msl_int} {cast_name} = static_cast<{dst_msl_int}>({var_name});")
+                self.env[ssa.id] = cast_name
+                self.env_types[ssa.id] = dst_int_dtype
+            else:
+                self.env[ssa.id] = var_name
+                self.env_types[ssa.id] = matched_dtype
             self._propagate_shape_elementwise(ssa)
         elif not src_is_float and dst_is_float:
-            # int -> float bitcast: as_type<float>(val)
+            # int -> float bitcast. MSL as_type requires matching widths, so
+            # pick the float MSL type to match the source int width; then
+            # cast to the requested destination float type if different.
+            src_int_width = _INT_WIDTH_FROM_DTYPE.get(src_dtype, 32)
+            # Find matching float type by width
+            _WIDTH_TO_FP = {16: ("half", "fp16"), 32: ("float", "fp32"),
+                            64: ("double", "fp64")}
+            matched_fp, matched_fp_dtype = _WIDTH_TO_FP.get(src_int_width, ("float", "fp32"))
             var_name = self._next_var("bc")
-            self.kb.raw_line(f"    float {var_name} = as_type<float>({src_var});")
-            self.env[ssa.id] = var_name
-            self.env_types[ssa.id] = "fp32"
+            self.kb.raw_line(f"    {matched_fp} {var_name} = as_type<{matched_fp}>({src_var});")
+            # Determine destination float type
+            dst_msl_fp = _FP_ELEM_TO_MSL.get(dst_elem, "float")
+            dst_width = _FP_WIDTH.get(dst_msl_fp, 32)
+            dst_dtype_name = _FP_ELEM_TO_DTYPE.get(dst_elem, "fp32")
+            if dst_width != src_int_width:
+                # Widths disagree — emit explicit float-to-float cast.
+                cast_name = self._next_var("bc")
+                self.kb.raw_line(f"    {dst_msl_fp} {cast_name} = static_cast<{dst_msl_fp}>({var_name});")
+                self.env[ssa.id] = cast_name
+                self.env_types[ssa.id] = dst_dtype_name
+            else:
+                self.env[ssa.id] = var_name
+                self.env_types[ssa.id] = dst_dtype_name
             self._propagate_shape_elementwise(ssa)
         else:
             # Same category — passthrough (shape propagation handled inside)

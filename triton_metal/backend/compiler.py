@@ -175,13 +175,23 @@ class MetalBackend(BaseBackend):
                         cpp_meta.pop("block_size", None)
                         llir = MetalBackend.make_llir(ttgir_text, cpp_meta, options)
                         cpp_meta["name"] = metadata["name"]
-                        # Write the C++ path's block_size back to the shared
-                        # metadata so pack_metadata dispatches the correct
-                        # number of threads (one per element).
+                        # Compile metallib FIRST — only then commit the
+                        # C++ path's block_size to shared metadata. This
+                        # keeps MSL fallback's metadata pristine if
+                        # compilation fails.
+                        result = MetalBackend.make_metallib_from_llir(
+                            llir, cpp_meta, options)
                         metadata["block_size"] = cpp_meta["block_size"]
-                        return MetalBackend.make_metallib_from_llir(llir, cpp_meta, options)
-                    except Exception:
-                        pass
+                        return result
+                    except Exception as _e:
+                        # Debug: expose the silently-swallowed error when
+                        # TRITON_METAL_CPP_TRACE=1 is set.
+                        if os.environ.get("TRITON_METAL_CPP_TRACE"):
+                            import traceback
+                            print(f"[triton-metal] C++ path failed for "
+                                  f"{metadata.get('name', 'kernel')}: {_e}",
+                                  file=sys.stderr)
+                            traceback.print_exc(file=sys.stderr)
                 # Complex kernels or C++ failure: use MSL metallib
                 return MetalBackend.make_metallib(src, metadata, options)
 
@@ -344,18 +354,34 @@ class MetalBackend(BaseBackend):
         tensor types to scalars regardless), and parsing them would require
         the TritonGPU dialect which pulls in NVIDIA-specific dependencies.
 
-        Additionally, this method replaces TritonGPU ops with their operand
-        passthroughs at the text level:
+        When `tt.dot` is NOT present (common case: elementwise/reduce
+        kernels), this method also replaces TritonGPU shared memory ops
+        with their operand passthroughs at the text level:
         - ttg.local_alloc %x -> deleted (local_load will use %x directly)
         - ttg.local_load %x  -> replaced with the original alloc operand
         - ttg.convert_layout %x -> replaced with %x (passthrough)
         - ttg.memdesc_trans %x -> replaced with %x (passthrough)
         - tt.trans %x -> replaced with %x (passthrough in per-thread model)
 
-        tt.dot is preserved — handled by C++ DotOpToLLVM pattern or MSL
-        _detect_simple_dot path.
+        When `tt.dot` IS present, these ops are preserved so the C++
+        patterns (LocalAllocOpConversion, LocalLoadOpConversion,
+        ConvertLayoutOpConversion, etc.) can lower them with proper
+        memdesc semantics. DotOpConversion needs to see the real
+        ttg.local_load defining ops to locate the memdesc pointers.
+
+        tt.dot is always preserved.
         """
         import re
+
+        # Detect whether tt.dot is present. When it is, the matmul chain
+        # (local_alloc -> local_load -> tt.dot) must survive this pass so
+        # the C++ DotOpConversion pattern can locate memdesc operands.
+        # Use a line-aware check to avoid matching attribute references.
+        has_dot = False
+        for _line in ttgir_text.splitlines():
+            if re.search(r'(?:^|=\s|\s)tt\.dot\b', _line):
+                has_dot = True
+                break
 
         # Phase 0.5: Detect 2D blocks and annotate make_range with dimension info.
         #
@@ -410,34 +436,54 @@ class MetalBackend(BaseBackend):
                     line = line[:mr_m.start(1)] + mr_m.group(1) + new_attrs + mr_m.group(3) + line[mr_m.end():]
             annotated_lines.append(line)
 
-        # Phase 1: Strip encoding attributes and loc annotations
+        # Phase 1: Strip encoding attributes and loc annotations.
+        #
+        # When tt.dot is present, preserve encoding attribute aliases
+        # (e.g. `#shared = #ttg.swizzled_shared<...>`) and their
+        # references. The TTG MemDescType requires a shared encoding,
+        # and MMA lowering may read dot_op / blocked layouts. The C++
+        # pipeline can parse these now that the TTG dialect is linked.
         phase1_lines = []
         for line in annotated_lines:
             stripped = line.rstrip()
 
-            # Skip #name = #ttg.blocked<...> alias definitions
+            # Handle #name = #ttg.X<...> alias definitions
             if re.match(r'^#\w+ = #ttg\.', stripped):
+                if has_dot:
+                    phase1_lines.append(stripped)
                 continue
 
             # Skip #locN = loc(...) alias definitions
             if re.match(r'^#loc\d*\s*=\s*loc\(', stripped):
                 continue
 
-            # Remove , #blocked from tensor types (simple alias references)
-            stripped = re.sub(r',\s*#\w+>', '>', stripped)
+            if not has_dot:
+                # Remove trailing encoding alias references from tensor/memdesc
+                # types. Loop to handle multiple (e.g. `<32x32xf16, #shared,
+                # #smem>`) since re.sub only replaces non-overlapping matches
+                # in one pass.
+                while True:
+                    new_stripped = re.sub(r',\s*#\w+>', '>', stripped)
+                    if new_stripped == stripped:
+                        break
+                    stripped = new_stripped
 
-            # Remove inline TTG type annotations:
-            #   , #ttg.slice<{dim = 1, parent = #blocked1}>
-            #   , #ttg.dot_op<{opIdx = 0, parent = #blocked}>
-            #   , #ttg.swizzled_shared<{...}>
-            # These appear inside tensor<...> types. Match , #ttg.X<{...}>
-            stripped = re.sub(
-                r',\s*#ttg\.\w+<\{[^}]*\}>', '', stripped
-            )
+                # Remove inline TTG type annotations:
+                #   , #ttg.slice<{dim = 1, parent = #blocked1}>
+                #   , #ttg.dot_op<{opIdx = 0, parent = #blocked}>
+                #   , #ttg.swizzled_shared<{...}>
+                # These appear inside tensor<...> types. Match , #ttg.X<{...}>
+                stripped = re.sub(
+                    r',\s*#ttg\.\w+<\{[^}]*\}>', '', stripped
+                )
 
-            # Remove ttg.* module attributes
-            stripped = re.sub(r'"ttg\.[^"]*"\s*=\s*[^,}]+[,]?\s*', '', stripped)
-            stripped = re.sub(r'ttg\.\w+\s*=\s*"[^"]*"[,]?\s*', '', stripped)
+            # Remove ttg.* module attributes — but preserve ttg.num-warps,
+            # ttg.num-ctas, ttg.threads-per-warp, ttg.target when tt.dot is
+            # present. TTG layout verifiers require these to compute warp
+            # layout for MMA operands.
+            if not has_dot:
+                stripped = re.sub(r'"ttg\.[^"]*"\s*=\s*[^,}]+[,]?\s*', '', stripped)
+                stripped = re.sub(r'ttg\.\w+\s*=\s*"[^"]*"[,]?\s*', '', stripped)
 
             # Remove loc(...) annotations — handle nested parens.
             while 'loc(' in stripped:
@@ -455,12 +501,19 @@ class MetalBackend(BaseBackend):
             if stripped.strip():
                 phase1_lines.append(stripped)
 
-        # Phase 2: Strip TTG ops.
+        # Phase 2: Strip TTG ops — SKIPPED when tt.dot is present.
         #
-        # Build maps from TTG op results to their original operands, then
-        # remove TTG op lines and substitute references.
-        # (tt.dot is preserved — handled by C++ DotOpToLLVM pattern or MSL
-        # _detect_simple_dot path.)
+        # When tt.dot is in the kernel, we preserve ttg.local_alloc/load/
+        # convert_layout/memdesc_trans so the C++ DotOpConversion +
+        # SharedMemoryOpToLLVM patterns can lower them with proper memdesc
+        # semantics. tt.trans inside a matmul chain stays too.
+        #
+        # For non-matmul kernels, we continue the text-level passthrough
+        # rewrites (this keeps the existing elementwise/reduce path
+        # intact).
+        if has_dot:
+            return '\n'.join(phase1_lines) + '\n'
+
         alloc_map = {}    # ttg.local_alloc result -> input operand
         replace_map = {}  # value to replace -> replacement value
 
@@ -995,13 +1048,6 @@ class MetalBackend(BaseBackend):
             else:
                 # 1D kernel: use the largest make_range end value
                 block_size = max(mr_ends)
-        # For generated matmul kernels, use the make_range end from the
-        # generated MLIR (which has end=BLOCK_M*BLOCK_N)
-        if matmul_mlir is not None:
-            gen_mr = re.search(r'tt\.make_range\s*\{[^}]*end\s*=\s*(\d+)', stripped)
-            if gen_mr:
-                block_size = int(gen_mr.group(1))
-
         # Run C++ pass pipeline: TTGIR → LLVM IR with AIR metadata
         air_llvm_ir_opaque = cpp.run_to_llvm(stripped)
 

@@ -83,6 +83,16 @@ void aliasSharedMemoryGlobals(llvm::Module &mod) {
         if (ri.first <= rj.second && rj.first <= ri.second) {
           adj[i].insert(j);
           adj[j].insert(i);
+          continue;
+        }
+        // Never merge globals with different value types: downstream
+        // typed-pointer conversion preserves the original GEP element
+        // types, and mixing e.g. [32 x float] with [1024 x float] under
+        // the same symbol yields "defined with type X but expected Y"
+        // errors from Metal's non-opaque-pointer compiler.
+        if (globals[i]->getValueType() != globals[j]->getValueType()) {
+          adj[i].insert(j);
+          adj[j].insert(i);
         }
       }
     }

@@ -300,6 +300,14 @@ class MetalBackend(BaseBackend):
             if op not in allowed_ops:
                 return True
 
+        # FlashAttention-like pattern guard: kernels with BOTH tt.dot and
+        # tt.reduce have a C++-path correctness bug (nested dot+reduce+
+        # softmax+dot produces wrong results, and HEAD_DIM=64 triggers a
+        # PHI-node mismatch). Route these to MSL where _detect_simple_dot
+        # + template matmul handles them correctly.
+        if 'tt.dot' in ops_in_kernel and 'tt.reduce' in ops_in_kernel:
+            return True
+
         # Shared memory budget check: detect kernels whose effective
         # threadgroup memory demand exceeds Metal's 32KB cap. This is a
         # pre-lowering safety net; the C++ path also enforces this inside

@@ -98,7 +98,7 @@ UNIMPLEMENTED_FEATURES = {
     "test_dot[1-128-128-64-4-False-False-chain-dot-ieee-float8e5-float32-1-None]",
     "test_dot[1-128-128-64-4-False-False-chain-dot-ieee-float8e4nv-float32-1-None]",
     # Features requiring CUDA-specific infrastructure
-    "test_num_programs",
+    # "test_num_programs",  # Enabled 2026-04-16: grid metadata plumbed through driver
     "test_tensor_descriptor",
     "test_tma",
     # Multi-dim indexing/reshape/permute — requires 2D+ tensor support

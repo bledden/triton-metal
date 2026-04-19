@@ -130,7 +130,11 @@ public:
                                           "__metal_get_local_id", lidFnTy);
       }
       auto lid = LLVM::CallOp::create(rewriter, loc, lidFn, ValueRange{});
-      auto arrTy = LLVM::LLVMArrayType::get(elemTy, shape[0]);
+      // Array type must match the global's flattened element count, not
+      // just the leading dim — we allocate the full `prod(shape)` slots.
+      uint64_t totalElems = 1;
+      for (int64_t d : shape) totalElems *= static_cast<uint64_t>(d);
+      auto arrTy = LLVM::LLVMArrayType::get(elemTy, totalElems);
       Value zero = LLVM::ConstantOp::create(
           rewriter, loc, i32Ty, rewriter.getI32IntegerAttr(0));
       Value slotPtr = LLVM::GEPOp::create(

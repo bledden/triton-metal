@@ -709,6 +709,59 @@ class MetalBackend(BaseBackend):
             if sig_param_addrspaces.get(pname) == '2':
                 const_param_type_by_name[pname] = const_elem_types.get(i, 'i32')
 
+        # Pass 0.75: Rewrite AIR intrinsic declarations (and their call-site
+        # pointer-operand types) from opaque `ptr addrspace(N)` to typed
+        # pointers. The element type is encoded in the intrinsic's `.pNT`
+        # suffix (e.g. `p3f32` -> `float addrspace(3)*`). Metal's compiler
+        # rejects opaque pointers in `declare` lines with:
+        #   "ptr type is only supported in -opaque-pointers mode".
+        _PTR_SUFFIX_MAP = {
+            'p0f32': ('float*', '0', 'float'),
+            'p1f32': ('float addrspace(1)*', '1', 'float'),
+            'p2f32': ('float addrspace(2)*', '2', 'float'),
+            'p3f32': ('float addrspace(3)*', '3', 'float'),
+            'p0f16': ('half*', '0', 'half'),
+            'p1f16': ('half addrspace(1)*', '1', 'half'),
+            'p2f16': ('half addrspace(2)*', '2', 'half'),
+            'p3f16': ('half addrspace(3)*', '3', 'half'),
+            'p0i32': ('i32*', '0', 'i32'),
+            'p1i32': ('i32 addrspace(1)*', '1', 'i32'),
+            'p2i32': ('i32 addrspace(2)*', '2', 'i32'),
+            'p3i32': ('i32 addrspace(3)*', '3', 'i32'),
+        }
+        # Map intrinsic-name -> typed-pointer string (for the pointer operand).
+        air_intrinsic_ptr_types = {}
+        for line in lines:
+            m = re.match(r'\s*declare\s+.*@(air\.[\w.]+)\(', line)
+            if not m:
+                continue
+            iname = m.group(1)
+            # Find the FIRST pN<type> suffix; AIR names may stack suffixes
+            # like `.v64f32.p3f32` so we want the *pointer* one.
+            psuf = re.search(r'\.(p[0-3][a-z0-9]+)', iname)
+            if not psuf:
+                continue
+            entry = _PTR_SUFFIX_MAP.get(psuf.group(1))
+            if not entry:
+                continue
+            air_intrinsic_ptr_types[iname] = entry
+        # Rewrite `ptr addrspace(N)` occurrences on the declare/call lines
+        # of each AIR intrinsic to the typed form.
+        if air_intrinsic_ptr_types:
+            new_lines = []
+            for line in lines:
+                for iname, (typed_ptr, addr, _elem) in (
+                        air_intrinsic_ptr_types.items()):
+                    if f'@{iname}' not in line:
+                        continue
+                    line = re.sub(
+                        rf'ptr\s+addrspace\({addr}\)',
+                        typed_ptr,
+                        line,
+                    )
+                new_lines.append(line)
+            lines = new_lines
+
         # Pass 1: Process each line
         out_lines = []
         fn_name = None
@@ -718,6 +771,47 @@ class MetalBackend(BaseBackend):
             # Skip addrspacecast lines
             if re.match(r'\s*%\S+\s*=\s*addrspacecast\s+.*to\s+ptr', line):
                 continue
+
+            # Strip `nuw` / `nsw` flags from getelementptr (both instruction
+            # and constant-expression forms). Metal's older LLVM parser
+            # rejects these flags with "expected '(' in constantexpr".
+            line = re.sub(
+                r'getelementptr\s+((?:inbounds\s+)?)(?:nuw|nsw)\s+',
+                r'getelementptr \1',
+                line,
+            )
+
+            # Normalize byte-offset GEPs back to element-typed GEPs.
+            # LLVM InstCombine rewrites `GEP(half*, i64 8)` into
+            # `GEP(i8, half addrspace(3)* p, i64 16)` — in typed-pointer
+            # mode this is rejected ("i8 vs half"). Convert back to
+            # `GEP(half, half addrspace(3)* p, i64 8)`.
+            _ELEM_BYTES = {'half': 2, 'float': 4, 'bfloat': 2,
+                           'i8': 1, 'i16': 2, 'i32': 4, 'i64': 8}
+            def _fix_byte_gep(m):
+                prefix = m.group(1)        # `inbounds ` or ''
+                elem_ptr_ty = m.group(2)   # `half` or `float` etc.
+                addr_space = m.group(3)    # '1', '2', '3'
+                ptr_expr = m.group(4)      # `@name` or `%name` or nested GEP
+                byte_off = int(m.group(5))
+                size = _ELEM_BYTES.get(elem_ptr_ty)
+                if size is None or byte_off % size != 0:
+                    return m.group(0)
+                elem_off = byte_off // size
+                return (f'getelementptr {prefix}({elem_ptr_ty}, '
+                        f'{elem_ptr_ty} addrspace({addr_space})* {ptr_expr}'
+                        f', i64 {elem_off})')
+            # This handles `getelementptr [inbounds] (i8, <T> addrspace(N)* <P>,
+            # i64 <N>)` where <P> may itself be a constant expression without
+            # parens in it. We match non-greedily up to the matching `)` by
+            # disallowing any other comma after the second arg.
+            line = re.sub(
+                r'getelementptr\s+((?:inbounds\s+)?)'
+                r'\(i8,\s*(\w+)\s+addrspace\((\d+)\)\*\s+'
+                r'(@[\w.]+|getelementptr\([^)]*\))\s*,\s*i64\s+(\d+)\)',
+                _fix_byte_gep,
+                line,
+            )
 
             # Replace cast names with source names (longest first for safety)
             for name in sorted(cast_map.keys(), key=len, reverse=True):
@@ -799,19 +893,48 @@ class MetalBackend(BaseBackend):
             # ---- Threadgroup shared memory (addrspace 3) patterns ----
             # These are generated by the reduce op lowering.
 
-            # GEP with array type base: getelementptr [N x float], ptr addrspace(3) @name, ...
-            # -> getelementptr [N x float], [N x float] addrspace(3)* @name, ...
+            # GEP with array type base: getelementptr [N x <elem>], ptr addrspace(3) @name, ...
+            # -> getelementptr [N x <elem>], [N x <elem>] addrspace(3)* @name, ...
+            # Generalized over element types (float, half, i32, ...).
             line = re.sub(
-                r'getelementptr\s+(\[\d+ x float\]),\s*ptr addrspace\(3\)\s+([%@]\S+)',
+                r'getelementptr\s+(\[\d+ x \w+\]),\s*ptr addrspace\(3\)\s+([%@]\S+)',
                 r'getelementptr \1, \1 addrspace(3)* \2',
                 line
             )
 
-            # Store to threadgroup: store float %v, ptr addrspace(3) %slot or @global
-            # For direct global refs (declared as `[N x float]`), insert GEP to
-            # get float* from [N x float]*. `__tg_merged_*` globals are emitted
-            # by SharedMemoryAliasingPass when it coalesces reduce globals with
-            # non-overlapping live ranges; they keep the `[32 x float]` type.
+            # When an AIR intrinsic (or other typed-pointer call) receives a
+            # threadgroup *global* directly — e.g. `half addrspace(3)* @__tg_shared_0`
+            # — the global's actual type is `[N x half]`, so Metal's typed-
+            # pointer mode rejects the implicit decay. Wrap those references
+            # with a GEP to the first element:
+            #   half addrspace(3)* @g   -->
+            #   half addrspace(3)* getelementptr([N x half], [N x half]
+            #                      addrspace(3)* @g, i32 0, i32 0)
+            def _wrap_tg_global(m):
+                elem = m.group(1)
+                gname = m.group(2)
+                gty = tg_global_types.get(gname)
+                if gty is None:
+                    return m.group(0)
+                # Only wrap when the stored global is an array of the same
+                # element type (i.e. `[N x <elem>]`), otherwise leave alone.
+                arr_m = re.match(r'\[(\d+) x (\w+)\]', gty)
+                if not arr_m or arr_m.group(2) != elem:
+                    return m.group(0)
+                return (f'{elem} addrspace(3)* getelementptr({gty}, {gty}'
+                        f' addrspace(3)* {gname}, i32 0, i32 0)')
+            line = re.sub(
+                r'(\w+)\s+addrspace\(3\)\*\s+(@[\w.]+)',
+                _wrap_tg_global,
+                line,
+            )
+
+            # Store to threadgroup: store <elem> %v, ptr addrspace(3) %slot or @global
+            # For direct global refs to reduce/merged pools (declared as
+            # `[N x float]`), insert an extra GEP to get the scalar pointer.
+            # `__tg_merged_*` globals are emitted by SharedMemoryAliasingPass
+            # when it coalesces reduce globals with non-overlapping live
+            # ranges; they keep the `[32 x float]` type.
             m_tg_store = re.match(
                 r'(\s*store\s+float\s+\S+),\s*ptr addrspace\(3\)\s+'
                 r'(@(?:__reduce_shared_|__tg_merged_)\d+)(.*)',
@@ -822,13 +945,14 @@ class MetalBackend(BaseBackend):
                         f'getelementptr([32 x float], [32 x float] addrspace(3)* '
                         f'{m_tg_store.group(2)}, i32 0, i32 0){m_tg_store.group(3)}')
             else:
+                # Generalized scalar store: any scalar element type.
                 line = re.sub(
-                    r'store\s+(float)\s+(%\S+),\s*ptr addrspace\(3\)\s+([%@]\S+)',
+                    r'store\s+(\w+)\s+(%\S+),\s*ptr addrspace\(3\)\s+([%@]\S+)',
                     r'store \1 \2, \1 addrspace(3)* \3',
                     line
                 )
 
-            # Load from threadgroup: load float, ptr addrspace(3) %slot or @global
+            # Load from threadgroup: load <elem>, ptr addrspace(3) %slot or @global
             m_tg_load = re.match(
                 r'(\s*%\S+\s*=\s*load\s+float),\s*ptr addrspace\(3\)\s+'
                 r'(@(?:__reduce_shared_|__tg_merged_)\d+)(.*)',
@@ -840,7 +964,7 @@ class MetalBackend(BaseBackend):
                         f'{m_tg_load.group(2)}, i32 0, i32 0){m_tg_load.group(3)}')
             else:
                 line = re.sub(
-                    r'load\s+(float),\s*ptr addrspace\(3\)\s+([%@]\S+)',
+                    r'load\s+(\w+),\s*ptr addrspace\(3\)\s+([%@]\S+)',
                     r'load \1, \1 addrspace(3)* \2',
                     line
                 )
@@ -1024,30 +1148,34 @@ class MetalBackend(BaseBackend):
         # -- Compute block_size early (needed for wrapping loop decision) ----
         import re
         block_size = options.num_warps * 32  # default
-        mr_ends = set()
+        # Collect (end, slice_dim) pairs, one per tt.make_range occurrence,
+        # so we can compute block_size = prod(end for each distinct slice dim)
+        # for 2D kernels (e.g. 32x32 matmul = 1024 threads), not prod(set()).
+        mr_entries = []  # list of (end, slice_dim or None)
         for mr_match in re.finditer(
-            r'tt\.make_range\s*\{[^}]*end\s*=\s*(\d+)',
-            ttgir_text
+            r'tt\.make_range\s*\{[^}]*end\s*=\s*(\d+)[^}]*\}\s*:\s*tensor<'
+            r'\d+xi32(?:,\s*#ttg\.slice<\{dim\s*=\s*(\d+))?',
+            ttgir_text,
         ):
-            mr_ends.add(int(mr_match.group(1)))
-        if mr_ends:
-            # Check if this is a 2D kernel by looking for make_range with
-            # different slice dimensions
-            slice_dims = set()
-            for sl_m in re.finditer(
-                r'tt\.make_range\s*\{[^}]*\}\s*:\s*tensor<\d+xi32,\s*#ttg\.slice<\{dim\s*=\s*(\d+)',
-                ttgir_text
-            ):
-                slice_dims.add(int(sl_m.group(1)))
-            if len(slice_dims) > 1:
-                # 2D kernel: block_size = product of all unique end values
+            end = int(mr_match.group(1))
+            dim = int(mr_match.group(2)) if mr_match.group(2) is not None else None
+            mr_entries.append((end, dim))
+        if mr_entries:
+            dim_to_end = {}
+            for end, dim in mr_entries:
+                if dim is None:
+                    # No slice -> 1D kernel; fall back to max end.
+                    continue
+                # If multiple make_range ops map to the same dim, take the
+                # largest end (they represent the same axis of the tile).
+                dim_to_end[dim] = max(dim_to_end.get(dim, 0), end)
+            if len(dim_to_end) > 1:
                 product = 1
-                for end_val in mr_ends:
-                    product *= end_val
+                for e in dim_to_end.values():
+                    product *= e
                 block_size = product
             else:
-                # 1D kernel: use the largest make_range end value
-                block_size = max(mr_ends)
+                block_size = max(end for end, _ in mr_entries)
         # Run C++ pass pipeline: TTGIR → LLVM IR with AIR metadata
         air_llvm_ir_opaque = cpp.run_to_llvm(stripped)
 

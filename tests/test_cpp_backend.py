@@ -479,17 +479,13 @@ def test_cpp_layer_norm():
 
 @requires_cpp
 @requires_metal
-@pytest.mark.xfail(
-    reason="K-loop matmul: DotOpConversion initializes C accumulator to zero "
-           "each tt.dot call, discarding the iter_arg. Single-tile 32x32 "
-           "matmul works (test_cpp_dot_32x32). Fixing this requires threading "
-           "the input C value through the simdgroup MMA (load from threadgroup "
-           "memory at the start, store back for next iteration). Tracked as "
-           "follow-up.",
-    strict=True,
-)
 def test_cpp_dot_k_loop():
-    """Matmul with K-loop (scf.for wrapping tt.dot). XFAIL — C-accumulator threading pending."""
+    """Matmul with K-loop (scf.for wrapping tt.dot).
+
+    DotOpConversion threads the input C accumulator through a threadgroup
+    buffer so that the iter_arg from a prior iteration is preserved across
+    successive tt.dot calls (not just the common tl.zeros fast path).
+    """
     import os
     import torch
     import triton

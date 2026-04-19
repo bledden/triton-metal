@@ -116,6 +116,13 @@ public:
                                   LLVM::LLVMVoidType::get(ctx),
                                   {cMatTy, tgPtrTy, i64Ty, vec2I64, i1Ty});
 
+    // The loadC intrinsic is always v64f32 over p3f32 since the accumulator
+    // is f32 in both supported mixes (f16*f16->f32 and f32*f32->f32).
+    std::string loadCName =
+        "air.simdgroup_matrix_8x8_load.v64f32.p3f32";
+    auto loadCFn = getOrInsertFn(loadCName, cMatTy,
+                                  {tgPtrTy, i64Ty, vec2I64, i1Ty});
+
     // Per-thread model: spill the full MxN tile to a threadgroup buffer
     // so that each thread can read its own scalar element back at its lid.
     static unsigned dotOutCounter = 0;
@@ -133,6 +140,68 @@ public:
     }
     Value outBasePtr = LLVM::AddressOfOp::create(rewriter, loc, tgPtrTy,
                                                    outGlobal.getSymName());
+
+    // Check if the input C is a known-zero constant. If so, we can skip
+    // the threadgroup-memory roundtrip and use the fast init_filled path.
+    // This is the common case: tl.zeros((M, N), tl.float32) before the
+    // K-loop, which lowers to arith.constant dense<0> -> LLVM constant 0.0.
+    bool cIsZero = false;
+    if (auto defOp = adaptor.getC().getDefiningOp<LLVM::ConstantOp>()) {
+      if (auto floatAttr = dyn_cast<FloatAttr>(defOp.getValue())) {
+        if (floatAttr.getValueAsDouble() == 0.0) {
+          cIsZero = true;
+        }
+      }
+    }
+
+    // For non-zero C (e.g. K-loop iter_arg), allocate a separate
+    // threadgroup buffer for the input C, store each thread's scalar at
+    // its lid, barrier, and load simdgroup matrices from it.
+    Value cInBasePtr = nullptr;
+    LLVM::LLVMArrayType cInArrTy;
+    if (!cIsZero) {
+      static unsigned dotCInCounter = 0;
+      cInArrTy = LLVM::LLVMArrayType::get(cElem, M * N);
+      std::string cInName = "__tg_dot_cin_" + std::to_string(dotCInCounter++);
+      LLVM::GlobalOp cInGlobal;
+      {
+        OpBuilder::InsertionGuard guard(rewriter);
+        rewriter.setInsertionPointToStart(module.getBody());
+        cInGlobal = LLVM::GlobalOp::create(
+            rewriter, loc, cInArrTy, /*isConstant=*/false,
+            LLVM::Linkage::Internal, cInName,
+            /*value=*/Attribute(),
+            /*alignment=*/16, /*addrSpace=*/3);
+      }
+      cInBasePtr = LLVM::AddressOfOp::create(rewriter, loc, tgPtrTy,
+                                              cInGlobal.getSymName());
+
+      // Store each thread's scalar C into its slot in the buffer. Use the
+      // array-typed GEP form (`[M*N x cElem]`) so that the Python
+      // opaque-to-typed post-pass rewrites it to a typed-pointer GEP
+      // compatible with Metal's non-opaque-pointer mode.
+      auto cInLidFn = getOrInsertFn("__metal_get_local_id", i32Ty, {});
+      auto cInLid = LLVM::CallOp::create(rewriter, loc, cInLidFn,
+                                           ValueRange{});
+      Value cInZeroIdx = LLVM::ConstantOp::create(
+          rewriter, loc, i32Ty, rewriter.getI32IntegerAttr(0));
+      Value cInSlotPtr = LLVM::GEPOp::create(
+          rewriter, loc, tgPtrTy, cInArrTy, cInBasePtr,
+          ValueRange{cInZeroIdx, cInLid.getResult()});
+      LLVM::StoreOp::create(rewriter, loc, adaptor.getC(), cInSlotPtr);
+
+      // Barrier so every thread's store to the C input buffer is visible
+      // before any simdgroup_matrix_8x8_load reads it.
+      auto cInVoidTy = LLVM::LLVMVoidType::get(ctx);
+      auto cInBarrierFn = getOrInsertFn("air.wg.barrier", cInVoidTy,
+                                          {i32Ty, i32Ty});
+      Value cInTwo = LLVM::ConstantOp::create(rewriter, loc, i32Ty,
+                                                rewriter.getI32IntegerAttr(2));
+      Value cInOne = LLVM::ConstantOp::create(rewriter, loc, i32Ty,
+                                                rewriter.getI32IntegerAttr(1));
+      LLVM::CallOp::create(rewriter, loc, cInBarrierFn,
+                             ValueRange{cInTwo, cInOne});
+    }
 
     // Resolve A / B base pointers. In TTGIR the DotOp's operands are
     // tensor-typed and produced by ttg.local_load on a memdesc source.
@@ -194,8 +263,30 @@ public:
     int64_t tilesM = M / 8, tilesN = N / 8, tilesK = K / 8;
     for (int64_t mi = 0; mi < tilesM; ++mi) {
       for (int64_t ni = 0; ni < tilesN; ++ni) {
-        Value acc = LLVM::CallOp::create(rewriter, loc, initFn,
-                                           ValueRange{cZero}).getResult();
+        Value acc;
+        if (cIsZero) {
+          // Fast path: initialize accumulator to zero directly.
+          acc = LLVM::CallOp::create(rewriter, loc, initFn,
+                                       ValueRange{cZero}).getResult();
+        } else {
+          // Load the C tile at (mi*8, ni*8) from the C input threadgroup
+          // buffer. Row-major offset = mi*8*N + ni*8. Use array-typed GEP
+          // so the opaque-to-typed post-pass produces a typed-pointer
+          // GEP accepted by Metal's non-opaque-pointer mode.
+          int64_t cInOffset = mi * 8 * N + ni * 8;
+          Value cInOffsetZero = LLVM::ConstantOp::create(
+              rewriter, loc, i32Ty, rewriter.getI32IntegerAttr(0));
+          Value cInOffsetC = LLVM::ConstantOp::create(
+              rewriter, loc, i32Ty,
+              rewriter.getI32IntegerAttr(cInOffset));
+          Value cInTilePtr = LLVM::GEPOp::create(
+              rewriter, loc, tgPtrTy, cInArrTy, cInBasePtr,
+              ValueRange{cInOffsetZero, cInOffsetC});
+          acc = LLVM::CallOp::create(
+              rewriter, loc, loadCFn,
+              ValueRange{cInTilePtr, strideN, zeroOffset, falseBool})
+                    .getResult();
+        }
 
         for (int64_t ki = 0; ki < tilesK; ++ki) {
           // A tile at (mi*8, ki*8); row-major offset = mi*8*K + ki*8

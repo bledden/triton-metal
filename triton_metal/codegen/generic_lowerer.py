@@ -3585,9 +3585,28 @@ class GenericLowerer:
         # Check if this is a hex integer that should be interpreted as float
         is_float_type = ssa.elem_type in ("f32", "f16", "bf16", "f64")
         if isinstance(value, int) and is_float_type:
-            # Hex-encoded IEEE 754 bit pattern
+            # Hex-encoded IEEE 754 bit pattern — width depends on elem_type.
+            # MLIR encodes special floats (inf/nan) as hex integers of the
+            # corresponding float type's width, so we must unpack using the
+            # matching width (not always f32) to correctly recover NaN/Inf.
             try:
-                float_val = _struct.unpack('f', _struct.pack('I', value & 0xFFFFFFFF))[0]
+                if ssa.elem_type == "f64":
+                    float_val = _struct.unpack(
+                        '<d', _struct.pack('<Q', value & 0xFFFFFFFFFFFFFFFF)
+                    )[0]
+                elif ssa.elem_type == "f16":
+                    float_val = _struct.unpack(
+                        '<e', _struct.pack('<H', value & 0xFFFF)
+                    )[0]
+                elif ssa.elem_type == "bf16":
+                    # bfloat16: upper 16 bits of an f32 bit pattern
+                    float_val = _struct.unpack(
+                        '<f', _struct.pack('<I', (value & 0xFFFF) << 16)
+                    )[0]
+                else:  # f32
+                    float_val = _struct.unpack(
+                        '<f', _struct.pack('<I', value & 0xFFFFFFFF)
+                    )[0]
             except _struct.error:
                 float_val = 0.0
 

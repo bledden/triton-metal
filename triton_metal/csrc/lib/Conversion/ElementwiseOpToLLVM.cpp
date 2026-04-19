@@ -595,6 +595,21 @@ static float getIdentityValue(ReduceCombineKind kind) {
   }
 }
 
+/// Emit a scalar combine op (f32) for the given kind.
+static Value emitCombine(ConversionPatternRewriter &rewriter, Location loc,
+                          ReduceCombineKind kind, Value acc, Value next) {
+  switch (kind) {
+  case ReduceCombineKind::Sum:
+    return LLVM::FAddOp::create(rewriter, loc, acc, next);
+  case ReduceCombineKind::Max:
+    return LLVM::MaxNumOp::create(rewriter, loc, acc, next);
+  case ReduceCombineKind::Min:
+    return LLVM::MinNumOp::create(rewriter, loc, acc, next);
+  default:
+    return acc;
+  }
+}
+
 struct ReduceOpConversion
     : public ConvertOpToLLVMPattern<triton::ReduceOp> {
   using ConvertOpToLLVMPattern<triton::ReduceOp>::ConvertOpToLLVMPattern;
@@ -630,9 +645,29 @@ struct ReduceOpConversion
     // Get the input value (already a scalar in our per-thread model).
     Value inputVal = adaptor.getSrcs()[0];
 
+    // ---- Shape inspection for 2D axis-aware reduce ----
+    //
+    // The current SIMD path collapses ALL threadgroup elements to one scalar
+    // — correct for 1D reductions but WRONG for 2D tensors. Detect the 2D
+    // case (tensor<MxN> with both dims > 1) and dispatch to a per-thread
+    // threadgroup-memory scan that respects op.getAxis().
+    Type origSrcTy = op.getSrcs()[0].getType();
+    auto rankedTy = dyn_cast<RankedTensorType>(origSrcTy);
+    bool is2D = false;
+    int64_t dimM = 1, dimN = 1;
+    int64_t axis = op.getAxis();
+    if (rankedTy) {
+      auto shape = rankedTy.getShape();
+      if (shape.size() == 2 && shape[0] > 1 && shape[1] > 1) {
+        is2D = true;
+        dimM = shape[0];
+        dimN = shape[1];
+      }
+    }
+
     // ---- Declare helper functions ----
 
-    // air.simd_{sum,max,min}.f32
+    // air.simd_{sum,max,min}.f32 (only used on the 1D path below)
     StringRef simdName = getAIRSimdIntrinsic(kind);
     auto simdFnTy = LLVM::LLVMFunctionType::get(f32Ty, {f32Ty});
     auto simdFn = getOrInsertFunction(module, rewriter, simdName, simdFnTy);
@@ -649,6 +684,105 @@ struct ReduceOpConversion
     // __metal_get_tiisg → thread_index_in_simdgroup
     auto tiisgFn = getOrInsertFunction(module, rewriter,
                                        "__metal_get_tiisg", idFnTy);
+    // __metal_get_local_id → thread_position_in_threadgroup (linear)
+    auto lidFn = getOrInsertFunction(module, rewriter,
+                                     "__metal_get_local_id", idFnTy);
+
+    // ============================================================
+    // 2D axis-aware reduce path (tensor<MxN> -> tensor<M> or <N>)
+    // ============================================================
+    if (is2D) {
+      int64_t totalElems = dimM * dimN;
+
+      // Allocate shared memory [M*N x f32] addrspace(3).
+      static unsigned reduce2DCounter = 0;
+      std::string sharedName =
+          "__reduce2d_shared_" + std::to_string(reduce2DCounter++);
+      auto f32ArrTy = LLVM::LLVMArrayType::get(f32Ty, totalElems);
+      auto tgPtrTy = LLVM::LLVMPointerType::get(ctx, 3);
+      {
+        OpBuilder::InsertionGuard guard(rewriter);
+        rewriter.setInsertionPointToStart(module.getBody());
+        LLVM::GlobalOp::create(rewriter, loc, f32ArrTy, /*isConstant=*/false,
+            LLVM::Linkage::Internal, sharedName,
+            /*value=*/Attribute(),
+            /*alignment=*/0, /*addrSpace=*/3);
+      }
+
+      // Get linear local id.
+      auto lidCall = LLVM::CallOp::create(rewriter, loc, lidFn, ValueRange{});
+      Value lid = lidCall.getResult();
+
+      // Store this thread's input scalar to shared[lid].
+      auto sharedAddr = LLVM::AddressOfOp::create(rewriter, loc, tgPtrTy,
+                                                  sharedName);
+      Value zero = LLVM::ConstantOp::create(rewriter, loc, i32Ty,
+          rewriter.getI32IntegerAttr(0));
+      Value slotPtr = LLVM::GEPOp::create(rewriter, loc, tgPtrTy, f32ArrTy,
+                                           sharedAddr, ValueRange{zero, lid});
+      LLVM::StoreOp::create(rewriter, loc, inputVal, slotPtr);
+
+      // Barrier: wait for all threads to publish their inputs.
+      Value two = LLVM::ConstantOp::create(rewriter, loc, i32Ty,
+          rewriter.getI32IntegerAttr(2));
+      Value one = LLVM::ConstantOp::create(rewriter, loc, i32Ty,
+          rewriter.getI32IntegerAttr(1));
+      LLVM::CallOp::create(rewriter, loc, barrierFn, ValueRange{two, one});
+
+      // Compute the base index + stride for this thread's reduction group.
+      //   axis=1: base = (lid/N)*N, stride = 1,  count = N
+      //   axis=0: base = lid % N,   stride = N,  count = M
+      Value nConst = LLVM::ConstantOp::create(rewriter, loc, i32Ty,
+          rewriter.getI32IntegerAttr(dimN));
+      Value base;
+      int64_t stride;
+      int64_t count;
+      if (axis == 1) {
+        Value row = LLVM::UDivOp::create(rewriter, loc, i32Ty, lid, nConst);
+        base = LLVM::MulOp::create(rewriter, loc, i32Ty, row, nConst);
+        stride = 1;
+        count = dimN;
+      } else if (axis == 0) {
+        base = LLVM::URemOp::create(rewriter, loc, i32Ty, lid, nConst);
+        stride = dimN;
+        count = dimM;
+      } else {
+        return rewriter.notifyMatchFailure(op, "2D reduce: axis out of range");
+      }
+
+      // Seed accumulator with identity value.
+      float identityVal = getIdentityValue(kind);
+      Value acc = LLVM::ConstantOp::create(rewriter, loc, f32Ty,
+          rewriter.getF32FloatAttr(identityVal));
+
+      // Unrolled per-thread scan of `count` elements.
+      // For count=32 (FA critical path) this is 32 scalar ops — Metal
+      // will further optimize.
+      for (int64_t i = 0; i < count; ++i) {
+        Value offset;
+        if (stride == 1) {
+          Value iConst = LLVM::ConstantOp::create(rewriter, loc, i32Ty,
+              rewriter.getI32IntegerAttr(i));
+          offset = LLVM::AddOp::create(rewriter, loc, i32Ty, base, iConst);
+        } else {
+          Value iConst = LLVM::ConstantOp::create(rewriter, loc, i32Ty,
+              rewriter.getI32IntegerAttr(i * stride));
+          offset = LLVM::AddOp::create(rewriter, loc, i32Ty, base, iConst);
+        }
+        Value elemPtr = LLVM::GEPOp::create(rewriter, loc, tgPtrTy, f32ArrTy,
+            sharedAddr, ValueRange{zero, offset});
+        Value elem = LLVM::LoadOp::create(rewriter, loc, f32Ty, elemPtr);
+        acc = emitCombine(rewriter, loc, kind, acc, elem);
+      }
+
+      // No barrier needed after the read-only scan; each thread's `acc`
+      // is independently computed from threadgroup memory that no further
+      // writers will touch. Threads in the same reduction group all
+      // produce the same value, matching the broadcast semantics of the
+      // original reduce.
+      rewriter.replaceOp(op, acc);
+      return success();
+    }
 
     // ---- Get thread indices ----
     auto sgitg = LLVM::CallOp::create(rewriter, loc, sgitgFn, ValueRange{});

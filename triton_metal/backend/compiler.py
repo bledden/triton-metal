@@ -300,11 +300,29 @@ class MetalBackend(BaseBackend):
             if op not in allowed_ops:
                 return True
 
-        # FlashAttention-like pattern guard: kernels with BOTH tt.dot and
-        # tt.reduce have a C++-path correctness bug (nested dot+reduce+
-        # softmax+dot produces wrong results, and HEAD_DIM=64 triggers a
-        # PHI-node mismatch). Route these to MSL where _detect_simple_dot
-        # + template matmul handles them correctly.
+        # FlashAttention-like pattern guard: kernels combining tt.dot,
+        # tt.reduce, and inter-iteration shared-memory reuse (classic FA
+        # pattern: q·k^T -> reduce -> p·v with p/q sharing a buffer) still
+        # produce wrong results on the C++ path. Route these to MSL where
+        # _detect_simple_dot + template matmul handles them correctly.
+        #
+        # History (2026-04-16):
+        #   Bug A: ReduceOpConversion ignored op.getAxis() and collapsed
+        #          ALL threadgroup elements to one scalar — broken for any
+        #          2D tensor reduction.  FIXED: ReduceOpConversion now
+        #          dispatches to a shape-aware axis-scoped per-thread
+        #          threadgroup-memory scan for 2D inputs (axis=0 and
+        #          axis=1).  Verified on standalone row_sum/row_max/
+        #          col_sum kernels that produce correct results on the
+        #          C++ path.
+        #   Bug B: FA's shared-memory aliasing pass reuses the buffer that
+        #          holds `q` to hold `p = exp(qk - m_new[:,None])` within
+        #          a loop iteration.  On the 2nd loop iteration, the MMA
+        #          re-reads `__tg_merged_2` expecting `q` but sees `p`,
+        #          producing wrong output for any FA with N_CTX > BLOCK_N.
+        #          NOT FIXED — keep the guard for dot+reduce kernels until
+        #          the C++ path grows proper per-iteration memory liveness
+        #          analysis.
         if 'tt.dot' in ops_in_kernel and 'tt.reduce' in ops_in_kernel:
             return True
 

@@ -2525,25 +2525,86 @@ class GenericLowerer:
         if self._effective_2d_shape is None:
             self._effective_2d_shape = max_2d_shape
 
+        # Build a users map (value id -> list of ops that use it as operand)
+        # so we can walk expand_dims chains forward to find the final N-D shape.
+        # Limited to ops in this scope; for chains crossing scopes we fall back
+        # to the axis-based heuristic.
+        users_map = {}
+        for ssa in ops:
+            for oid in ssa.operand_ids:
+                users_map.setdefault(oid, []).append(ssa)
+
+        def _final_expand_shape(first_ed_ssa):
+            """Walk forward through consecutive expand_dims ops and return
+            the shape of the outermost expand_dims (the one whose result
+            is consumed by broadcast/addi/load/etc, not by another expand_dims).
+            """
+            cur = first_ed_ssa
+            while True:
+                next_ed = None
+                for user in users_map.get(cur.id, []):
+                    if user.op == "tt.expand_dims":
+                        next_ed = user
+                        break
+                if next_ed is None:
+                    break
+                cur = next_ed
+            return _extract_shape(cur.type_str)
+
         # Find expand_dims ops and trace back to make_range.
         # Also record expand_dims by parent layout to pair dim=0/dim=1 siblings
         # so each make_range can know its tile's inner dimension.
         # Use an instance-level dict to accumulate across recursive prescan calls.
         if not hasattr(self, '_expand_by_parent'):
             self._expand_by_parent = {}
+        if not hasattr(self, '_make_range_stride_below'):
+            self._make_range_stride_below = {}
+        if not hasattr(self, '_make_range_full_shape'):
+            self._make_range_full_shape = {}
         expand_by_parent = self._expand_by_parent
         for ssa in ops:
             if ssa.op == "tt.expand_dims" and ssa.operand_ids:
                 axis = ssa.attrs.get("axis", 0)
                 src_id = ssa.operand_ids[0]
+                # Only start a chain-walk at the INNERMOST expand_dims: the one
+                # whose source is NOT itself an expand_dims. This avoids
+                # assigning dims multiple times per make_range.
+                src_op = op_by_id.get(src_id)
+                if src_op is not None and src_op.op == "tt.expand_dims":
+                    continue
                 # Trace back through passthroughs to find the make_range
                 mr_id = self._trace_to_make_range(src_id, ops, op_by_id)
                 if mr_id is not None:
-                    # axis tells us which NEW dimension was inserted:
-                    # expand_dims(x, axis=1): x becomes row dim (dim 0)
-                    # expand_dims(x, axis=0): x becomes col dim (dim 1)
-                    dim = 0 if axis == 1 else (len(max_2d_shape) - 1)
+                    # Walk forward through the expand_dims chain to find the
+                    # final N-D shape (all dims are 1 except the make_range's
+                    # position). The position of the non-1 axis gives the
+                    # true dim in the broadcast target.
+                    final_shape = _final_expand_shape(ssa)
+                    dim = None
+                    if final_shape and len(final_shape) >= 2:
+                        non_one = [i for i, s in enumerate(final_shape) if s != 1]
+                        if len(non_one) == 1:
+                            dim = non_one[0]
+                        elif len(non_one) == 0:
+                            # Range of size 1 (degenerate). Fall back to axis heuristic.
+                            dim = 0 if axis == 1 else (len(final_shape) - 1)
+                    if dim is None:
+                        # Fallback to the original 2D axis-based heuristic
+                        dim = 0 if axis == 1 else (len(max_2d_shape) - 1)
+                        final_shape = max_2d_shape
                     self._make_range_dim[mr_id] = dim
+                    # Use the (broadcast) max_2d_shape for stride_below, since
+                    # broadcast expands size-1 dims to the enclosing tensor's
+                    # sizes. The position `dim` is the make_range's axis in
+                    # that shape; stride_below = product of broadcast dims
+                    # after `dim`.
+                    broadcast_shape = max_2d_shape if (max_2d_shape and
+                        len(max_2d_shape) == len(final_shape)) else final_shape
+                    self._make_range_full_shape[mr_id] = broadcast_shape
+                    stride_below = 1
+                    for s in broadcast_shape[dim + 1:]:
+                        stride_below *= s
+                    self._make_range_stride_below[mr_id] = stride_below
 
                     # Extract the parent layout from the expand_dims source type
                     # e.g., "tensor<32xi32, #ttg.slice<{dim = 1, parent = #blocked}>>"
@@ -2843,7 +2904,7 @@ class GenericLowerer:
         start = ssa.attrs.get("start", 0)
         end = ssa.attrs.get("end", self.graph.block_size)
 
-        # Check if this make_range is part of a 2D pattern
+        # Check if this make_range is part of a 2D/N-D pattern
         if self._is_2d and ssa.id in self._make_range_dim:
             dim = self._make_range_dim[ssa.id]
             range_size = end - start
@@ -2853,24 +2914,38 @@ class GenericLowerer:
             # correct index decomposition when wrapping loop is active.
             total = getattr(self, "_total_elements", self.effective_block_size)
 
-            # Compute the inner dimension N from range_size and total.
-            # A kernel may have multiple 2D shapes (e.g., transpose: input (2,4)
-            # and output (4,2)), so each make_range derives N from its own range.
-            # For row (dim 0): range covers rows, N = total / range = inner dim
-            # For col (dim 1): range IS the inner dim, N = range_size
-            #
-            # When the kernel has tiles of different sizes (e.g., 32x64 for Q/K/V
-            # and 32x32 for QK^T), use the per-tile inner N from _make_range_inner_N
-            # instead of the global total.
-            if dim == 0:
-                inner_N_map = getattr(self, '_make_range_inner_N', {})
-                if ssa.id in inner_N_map:
-                    N = inner_N_map[ssa.id]
+            # If the prescan computed a per-range stride_below (product of dims
+            # after `dim` in the make_range's final N-D shape), use the general
+            # decomposition: (lid / stride_below) % range_size. This handles
+            # both 2D and 3D+ patterns correctly:
+            #   2D (M, N), dim 0 (row):   stride_below = N, expr = (lid / N) % M
+            #   2D (M, N), dim 1 (col):   stride_below = 1, expr = lid % N
+            #   3D (M, N, K), dim 0:      stride_below = N*K
+            #   3D (M, N, K), dim 1:      stride_below = K
+            #   3D (M, N, K), dim 2:      stride_below = 1
+            stride_below_map = getattr(self, '_make_range_stride_below', {})
+            full_shape = getattr(self, '_make_range_full_shape', {}).get(ssa.id)
+            if ssa.id in stride_below_map and full_shape and len(full_shape) >= 3:
+                stride_below = stride_below_map[ssa.id]
+                if stride_below == 1:
+                    expr = f"({lid} % {range_size}u)"
                 else:
-                    N = total // range_size if range_size > 0 else 1
-                expr = f"{lid} / {N}u"
+                    expr = f"(({lid} / {stride_below}u) % {range_size}u)"
             else:
-                expr = f"{lid} % {range_size}u"
+                # 2D path: preserved for backward compatibility and the
+                # dim-0 inner_N pairing (transpose tiles, FlashAttention, etc).
+                # Compute the inner dimension N from range_size and total.
+                # For row (dim 0): range covers rows, N = total / range = inner dim
+                # For col (dim 1): range IS the inner dim, N = range_size
+                if dim == 0:
+                    inner_N_map = getattr(self, '_make_range_inner_N', {})
+                    if ssa.id in inner_N_map:
+                        N = inner_N_map[ssa.id]
+                    else:
+                        N = total // range_size if range_size > 0 else 1
+                    expr = f"{lid} / {N}u"
+                else:
+                    expr = f"{lid} % {range_size}u"
 
             if start != 0:
                 expr = f"({expr} + {start}u)"

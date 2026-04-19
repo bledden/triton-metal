@@ -480,23 +480,16 @@ def test_cpp_layer_norm():
 @requires_cpp
 @requires_metal
 @pytest.mark.xfail(
-    reason="MSL fallback path produces incorrect results for tt.dot in all "
-           "shapes tested here (16x16x16 no-loop, 16x16x32 K-loop, 32x32x64 "
-           "K-loop all show max error > 16). Task 12 found that matmul kernels "
-           "fall back to MSL because _strip_ttg_annotations has a bug and "
-           "ttg.convert_layout is not in the allowlist, so the C++ tiled-MMA "
-           "path is not exercised. This test validates SCF→CF lowering at the "
-           "structural level; numerical correctness will come once the C++ "
-           "path is wired up (tracked separately from Task 13).",
+    reason="K-loop matmul: DotOpConversion initializes C accumulator to zero "
+           "each tt.dot call, discarding the iter_arg. Single-tile 32x32 "
+           "matmul works (test_cpp_dot_32x32). Fixing this requires threading "
+           "the input C value through the simdgroup MMA (load from threadgroup "
+           "memory at the start, store back for next iteration). Tracked as "
+           "follow-up.",
     strict=True,
 )
 def test_cpp_dot_k_loop():
-    """Matmul with K-loop (scf.for wrapping tt.dot).
-
-    NOTE: Currently fails numerically via MSL fallback. The test documents
-    the expected kernel shape; correctness validation is pending the
-    _strip_ttg_annotations / convert_layout fix from Task 12.
-    """
+    """Matmul with K-loop (scf.for wrapping tt.dot). XFAIL — C-accumulator threading pending."""
     import os
     import torch
     import triton

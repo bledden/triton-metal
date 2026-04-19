@@ -320,9 +320,16 @@ class MetalBackend(BaseBackend):
         #          a loop iteration.  On the 2nd loop iteration, the MMA
         #          re-reads `__tg_merged_2` expecting `q` but sees `p`,
         #          producing wrong output for any FA with N_CTX > BLOCK_N.
-        #          NOT FIXED — keep the guard for dot+reduce kernels until
-        #          the C++ path grows proper per-iteration memory liveness
-        #          analysis.
+        #          PARTIALLY FIXED (2026-04-16): SharedMemoryAliasingPass
+        #          now extends live ranges across loop back-edges so any
+        #          global that crosses a loop boundary (e.g. `q` loaded
+        #          before the loop and read inside) cannot merge with an
+        #          inside-loop write buffer.  Aliasing is now sound for this
+        #          pattern.  However, the FA C++ path still produces wrong
+        #          output even with correct aliasing — root cause is an
+        #          additional PHI-mismatch bug in the tt.dot lowering.  Keep
+        #          this guard until that is fixed; see the Apr 19 notes in
+        #          SharedMemoryAliasingPass.cpp for the aliasing fix.
         if 'tt.dot' in ops_in_kernel and 'tt.reduce' in ops_in_kernel:
             return True
 

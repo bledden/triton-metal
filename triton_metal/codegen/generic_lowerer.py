@@ -4969,10 +4969,23 @@ class GenericLowerer:
                     src_ptr_name = ptr_info[0]
                 break
 
+        # Mask handling: the mask was computed inside the (now-closed) wrapping
+        # loop, so its variable is out of scope in the histogram loop. Recompute
+        # it symbolically using `_h` as the loop index. Fall back to the original
+        # variable reference when we aren't inside a wrapping loop (still in scope).
         mask_extra = ""
         if len(ssa.operand_ids) >= 2:
-            mask_var = self._lookup(ssa.operand_ids[1])
-            mask_extra = f" && {mask_var}"
+            mask_operand_id = ssa.operand_ids[1]
+            if in_loop and src_ptr_name:
+                recomputed = self._synthesize_mask_for_index(mask_operand_id, "_h")
+                if recomputed is not None:
+                    mask_extra = f" && ({recomputed})"
+                # If we couldn't recompute, omit the mask rather than reference
+                # an out-of-scope variable. The bounds check `_h < M` still keeps
+                # us from reading past the input.
+            else:
+                mask_var = self._lookup(mask_operand_id)
+                mask_extra = f" && {mask_var}"
 
         if src_ptr_name:
             self.kb.raw_line(f"    for (uint _h = lid; _h < {M}u; _h += {bs}u) {{")
@@ -4984,18 +4997,122 @@ class GenericLowerer:
             self.kb.raw_line(f"    if (lid < {M}u{mask_extra}) atomic_fetch_add_explicit(&{hist_name}[(uint){input_var}], 1, memory_order_relaxed);")
         self.kb.raw_line(f"    threadgroup_barrier(mem_flags::mem_threadgroup);")
 
-        # Read result
+        # Read result. When N <= block_size each thread holds a unique bin
+        # (bin[lid]). When N > block_size the result is consumed inside the
+        # reopened wrapping loop, so we must load bin[_loop_e] per iteration
+        # — otherwise every iteration writes the same bin[lid] and downstream
+        # stores end up with wrong values at the outer indices.
         result_var = self._next_var("hist")
-        self.kb.raw_line(f"    int {result_var} = (lid < {N}u) ? atomic_load_explicit(&{hist_name}[lid], memory_order_relaxed) : 0;")
-
-        if in_loop:
-            # Reopen wrapping loop for remaining ops (stores)
+        if in_loop and N > bs:
+            # Reopen wrapping loop and load hist_0[_loop_e] per iteration.
             total = getattr(self, "_total_elements", self.effective_block_size)
             self.kb.raw_line(f"    for (uint _loop_e = lid; _loop_e < {total}u; _loop_e += {bs}u) {{")
+            self.kb.raw_line(f"    int {result_var} = (_loop_e < {N}u) ? atomic_load_explicit(&{hist_name}[_loop_e], memory_order_relaxed) : 0;")
+        else:
+            self.kb.raw_line(f"    int {result_var} = (lid < {N}u) ? atomic_load_explicit(&{hist_name}[lid], memory_order_relaxed) : 0;")
+            if in_loop:
+                # Reopen wrapping loop for remaining ops (stores)
+                total = getattr(self, "_total_elements", self.effective_block_size)
+                self.kb.raw_line(f"    for (uint _loop_e = lid; _loop_e < {total}u; _loop_e += {bs}u) {{")
 
         self.env[ssa.id] = result_var
         self.env_types[ssa.id] = "i32"
         self.env_shapes[ssa.id] = (N,)
+
+    def _synthesize_mask_for_index(self, mask_id: int, index_var: str, _depth: int = 0):
+        """Recompute a boolean mask expression using `index_var` as the loop index.
+
+        Used by tt.histogram, which closes the enclosing wrapping loop and opens
+        its own accumulation loop with a fresh index variable. Any mask computed
+        inside the original loop references `_loop_e`, which is out of scope by
+        then, so we trace the mask's producers and rebuild the expression with
+        `index_var` substituted for make_range-derived values.
+
+        Returns an MSL expression string (parenthesized) on success, or None if
+        the mask is too complex to synthesize (caller falls back to dropping the
+        mask, relying on the bounds check to keep reads safe).
+        """
+        if _depth > 8:
+            return None
+
+        op_by_id = {op.id: op for op in self.graph.ops}
+        op = op_by_id.get(mask_id)
+        if op is None:
+            return None
+
+        name = op.op
+
+        # make_range(start, end) — per-thread index; substitute the loop index
+        if name == "tt.make_range":
+            start = op.attrs.get("start", 0)
+            if start:
+                return f"((int){index_var} + {int(start)})"
+            return f"(int){index_var}"
+
+        # splat/broadcast/convert_layout — pass through
+        if name in ("tt.splat", "tt.broadcast", "ttg.convert_layout",
+                    "tt.expand_dims", "tt.unsplat"):
+            if not op.operand_ids:
+                return None
+            return self._synthesize_mask_for_index(op.operand_ids[0], index_var, _depth + 1)
+
+        # arith.constant — emit the scalar value
+        if name == "arith.constant":
+            value = op.attrs.get("value")
+            if value is None:
+                return None
+            if isinstance(value, bool):
+                return "true" if value else "false"
+            if isinstance(value, int):
+                return f"({int(value)})"
+            if isinstance(value, float):
+                return f"({float(value)}f)"
+            return None
+
+        # arith.cmpi — binary comparison
+        if name == "arith.cmpi":
+            if len(op.operand_ids) < 2:
+                return None
+            a = self._synthesize_mask_for_index(op.operand_ids[0], index_var, _depth + 1)
+            b = self._synthesize_mask_for_index(op.operand_ids[1], index_var, _depth + 1)
+            if a is None or b is None:
+                return None
+            pred_name = op.attrs.get("predicate_name")
+            pred_int = op.attrs.get("predicate")
+            if pred_name and pred_name in CMPI_NAMED:
+                op_str = CMPI_NAMED[pred_name]
+            elif pred_int is not None and pred_int in CMPI_PREDICATES:
+                op_str = CMPI_PREDICATES[pred_int]
+            else:
+                return None
+            is_unsigned = pred_name in ("ult", "ule", "ugt", "uge") if pred_name else False
+            cast = "(uint)" if is_unsigned else "(int)"
+            return f"({cast}{a} {op_str} {cast}{b})"
+
+        # arith.andi / arith.ori / arith.xori on i1 — logical combinators
+        if name in ("arith.andi", "arith.ori", "arith.xori"):
+            if len(op.operand_ids) < 2:
+                return None
+            a = self._synthesize_mask_for_index(op.operand_ids[0], index_var, _depth + 1)
+            b = self._synthesize_mask_for_index(op.operand_ids[1], index_var, _depth + 1)
+            if a is None or b is None:
+                return None
+            logical = {"arith.andi": "&&", "arith.ori": "||", "arith.xori": "!="}[name]
+            return f"({a} {logical} {b})"
+
+        # Simple integer arithmetic on the index — supports offset patterns like
+        # `make_range + scalar` used as a mask input.
+        if name in ("arith.addi", "arith.subi", "arith.muli"):
+            if len(op.operand_ids) < 2:
+                return None
+            a = self._synthesize_mask_for_index(op.operand_ids[0], index_var, _depth + 1)
+            b = self._synthesize_mask_for_index(op.operand_ids[1], index_var, _depth + 1)
+            if a is None or b is None:
+                return None
+            op_str = {"arith.addi": "+", "arith.subi": "-", "arith.muli": "*"}[name]
+            return f"({a} {op_str} {b})"
+
+        return None
 
     def _lower_tt_gather(self, ssa: SSAValue):
         """tt.gather → shared memory indexed lookup.

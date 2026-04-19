@@ -208,13 +208,36 @@ public:
     // Our type converter maps tensor -> scalar, so we can't take
     // adaptor.getA() directly as the tile base; we need the source memdesc,
     // which the SharedMemoryOp converter has lowered to ptr addrspace(3).
-    auto getMemdescPtr = [&](Value tensorOperand) -> Value {
+    //
+    // If the memdesc source is a ttg.memdesc_trans, the underlying buffer
+    // holds the un-transposed matrix (MemDescTransOpConversion is a
+    // pass-through). We must account for that here: the logical tile at
+    // (r, c) lives at (c, r) in the underlying buffer and must be loaded
+    // with the intrinsic's transpose flag set. This is critical for
+    // FlashAttention's qk = q @ trans(k) pattern.
+    auto resolveMemdesc = [&](Value tensorOperand,
+                              bool &outTransposed) -> Value {
+      outTransposed = false;
       auto localLoad = tensorOperand.getDefiningOp<triton::gpu::LocalLoadOp>();
       if (!localLoad) return nullptr;
-      return rewriter.getRemappedValue(localLoad.getSrc());
+      Value src = localLoad.getSrc();
+      // Walk through any memdesc_trans in the chain.
+      while (auto transOp =
+                 src.getDefiningOp<triton::gpu::MemDescTransOp>()) {
+        auto order = transOp.getOrder();
+        // Only a 2D [1, 0] swap is handled here (the classic trans(k)).
+        if (order.size() == 2 && order[0] == 1 && order[1] == 0) {
+          outTransposed = !outTransposed;
+          src = transOp.getSrc();
+          continue;
+        }
+        break;
+      }
+      return rewriter.getRemappedValue(src);
     };
-    Value aBasePtr = getMemdescPtr(op.getA());
-    Value bBasePtr = getMemdescPtr(op.getB());
+    bool aTransposed = false, bTransposed = false;
+    Value aBasePtr = resolveMemdesc(op.getA(), aTransposed);
+    Value bBasePtr = resolveMemdesc(op.getB(), bTransposed);
     if (!aBasePtr || !bBasePtr)
       return rewriter.notifyMatchFailure(op,
           "tt.dot operands must come from ttg.local_load");
@@ -244,6 +267,8 @@ public:
                                               rewriter.getI64IntegerAttr(K));
     Value strideN = LLVM::ConstantOp::create(rewriter, loc, i64Ty,
                                               rewriter.getI64IntegerAttr(N));
+    Value strideM = LLVM::ConstantOp::create(rewriter, loc, i64Ty,
+                                              rewriter.getI64IntegerAttr(M));
     Value zeroI64 = LLVM::ConstantOp::create(rewriter, loc, i64Ty,
                                               rewriter.getI64IntegerAttr(0));
     Value idx0 = LLVM::ConstantOp::create(rewriter, loc, i32Ty,
@@ -257,8 +282,22 @@ public:
         rewriter, loc, zeroOffset, zeroI64, idx1);
     Value falseBool = LLVM::ConstantOp::create(rewriter, loc, i1Ty,
                                                 rewriter.getBoolAttr(false));
+    Value trueBool = LLVM::ConstantOp::create(rewriter, loc, i1Ty,
+                                                rewriter.getBoolAttr(true));
     Value cZero = LLVM::ConstantOp::create(rewriter, loc, cElem,
                                             rewriter.getZeroAttr(cElem));
+
+    // For a transposed B, the underlying buffer is stored as (N x K)
+    // row-major with row stride K (the logical K-dim of the dot). The
+    // non-transposed case has B stored as (K x N) with row stride N.
+    Value bLoadStride = bTransposed ? strideK : strideN;
+    Value bLoadTranspose = bTransposed ? trueBool : falseBool;
+    // For a transposed A, the underlying buffer is stored as (K x M)
+    // row-major with row stride M. Non-transposed A is (M x K) with row
+    // stride K. (Currently A is always non-transposed in TTGIR we emit,
+    // but handle symmetrically for completeness.)
+    Value aLoadStride = aTransposed ? strideM : strideK;
+    Value aLoadTranspose = aTransposed ? trueBool : falseBool;
 
     int64_t tilesM = M / 8, tilesN = N / 8, tilesK = K / 8;
     for (int64_t mi = 0; mi < tilesM; ++mi) {
@@ -289,8 +328,13 @@ public:
         }
 
         for (int64_t ki = 0; ki < tilesK; ++ki) {
-          // A tile at (mi*8, ki*8); row-major offset = mi*8*K + ki*8
-          int64_t aOffset = mi * 8 * K + ki * 8;
+          // A tile at logical (mi*8, ki*8). If A is not transposed, the
+          // underlying buffer is (M x K) row-major, offset = mi*8*K+ki*8.
+          // If A is transposed (buffer stored as (K x M) row-major),
+          // tile (mi, ki) in logical A = tile (ki, mi) in buffer,
+          // offset = ki*8*M + mi*8.
+          int64_t aOffset = aTransposed ? (ki * 8 * M + mi * 8)
+                                        : (mi * 8 * K + ki * 8);
           Value aOffsetC = LLVM::ConstantOp::create(
               rewriter, loc, i32Ty,
               rewriter.getI32IntegerAttr(aOffset));
@@ -299,10 +343,16 @@ public:
               ValueRange{aOffsetC});
           Value aMat = LLVM::CallOp::create(
               rewriter, loc, loadAFn,
-              ValueRange{aTilePtr, strideK, zeroOffset, falseBool}).getResult();
+              ValueRange{aTilePtr, aLoadStride, zeroOffset,
+                         aLoadTranspose}).getResult();
 
-          // B tile at (ki*8, ni*8); row-major offset = ki*8*N + ni*8
-          int64_t bOffset = ki * 8 * N + ni * 8;
+          // B tile at logical (ki*8, ni*8). If B is not transposed, the
+          // underlying buffer is (K x N) row-major, offset = ki*8*N+ni*8.
+          // If B is transposed (buffer stored as (N x K) row-major — the
+          // classic FlashAttention qk = q @ trans(k) case), tile (ki, ni)
+          // in logical B = tile (ni, ki) in buffer, offset = ni*8*K+ki*8.
+          int64_t bOffset = bTransposed ? (ni * 8 * K + ki * 8)
+                                        : (ki * 8 * N + ni * 8);
           Value bOffsetC = LLVM::ConstantOp::create(
               rewriter, loc, i32Ty,
               rewriter.getI32IntegerAttr(bOffset));
@@ -311,7 +361,8 @@ public:
               ValueRange{bOffsetC});
           Value bMat = LLVM::CallOp::create(
               rewriter, loc, loadBFn,
-              ValueRange{bTilePtr, strideN, zeroOffset, falseBool}).getResult();
+              ValueRange{bTilePtr, bLoadStride, zeroOffset,
+                         bLoadTranspose}).getResult();
 
           // MMA: acc = A * B + acc
           acc = LLVM::CallOp::create(

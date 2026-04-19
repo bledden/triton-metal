@@ -300,38 +300,72 @@ class MetalBackend(BaseBackend):
             if op not in allowed_ops:
                 return True
 
-        # FlashAttention-like pattern guard: kernels combining tt.dot,
-        # tt.reduce, and inter-iteration shared-memory reuse (classic FA
-        # pattern: q·k^T -> reduce -> p·v with p/q sharing a buffer) still
-        # produce wrong results on the C++ path. Route these to MSL where
-        # _detect_simple_dot + template matmul handles them correctly.
-        #
         # History (2026-04-16):
         #   Bug A: ReduceOpConversion ignored op.getAxis() and collapsed
         #          ALL threadgroup elements to one scalar — broken for any
         #          2D tensor reduction.  FIXED: ReduceOpConversion now
         #          dispatches to a shape-aware axis-scoped per-thread
         #          threadgroup-memory scan for 2D inputs (axis=0 and
-        #          axis=1).  Verified on standalone row_sum/row_max/
-        #          col_sum kernels that produce correct results on the
-        #          C++ path.
-        #   Bug B: FA's shared-memory aliasing pass reuses the buffer that
-        #          holds `q` to hold `p = exp(qk - m_new[:,None])` within
-        #          a loop iteration.  On the 2nd loop iteration, the MMA
-        #          re-reads `__tg_merged_2` expecting `q` but sees `p`,
-        #          producing wrong output for any FA with N_CTX > BLOCK_N.
-        #          PARTIALLY FIXED (2026-04-16): SharedMemoryAliasingPass
-        #          now extends live ranges across loop back-edges so any
-        #          global that crosses a loop boundary (e.g. `q` loaded
-        #          before the loop and read inside) cannot merge with an
-        #          inside-loop write buffer.  Aliasing is now sound for this
-        #          pattern.  However, the FA C++ path still produces wrong
-        #          output even with correct aliasing — root cause is an
-        #          additional PHI-mismatch bug in the tt.dot lowering.  Keep
-        #          this guard until that is fixed; see the Apr 19 notes in
-        #          SharedMemoryAliasingPass.cpp for the aliasing fix.
-        if 'tt.dot' in ops_in_kernel and 'tt.reduce' in ops_in_kernel:
-            return True
+        #          axis=1).
+        #   Bug B: SharedMemoryAliasingPass merged pre-loop `q` with
+        #          in-loop `p`, clobbering `q` on iteration 2+. FIXED
+        #          by extending live ranges across loop back-edges.
+        #   Bug C: DotOpConversion treated B operand as row-major
+        #          (K_dim x N_dim) regardless of whether the source
+        #          memdesc had a `ttg.memdesc_trans` in its chain. For
+        #          FA's qk = q @ trans(k) the B buffer actually holds
+        #          K un-transposed, so the dot was computing q @ k
+        #          instead of q @ k^T.  FIXED: DotOpConversion now walks
+        #          through memdesc_trans, computes swapped-index tile
+        #          offsets, and passes `transpose=true` to the simdgroup
+        #          load intrinsic.
+        #   Bug D: The >1024-element wrapping-loop injection in
+        #          _inject_wrapping_loop (compiler.py) moved the original
+        #          entry compute lines into the new `_wl_header` block
+        #          without rewriting phi-node predecessor labels, so any
+        #          scf.for loop-header phi that referenced the original
+        #          entry block still named the wrong predecessor. FIXED
+        #          by rewriting phi incoming labels from %<entry> to
+        #          %_wl_header after the entry split.
+        #
+        # FlashAttention-class budget guard: the C++ path aliasing pass
+        # currently leaves the pre-loop `q` alloc live across the whole
+        # loop (correct aliasing per 2026-04-16 fix), so for HEAD_DIM=64
+        # with BLOCK=32 the cumulative threadgroup demand (q+k+v+qk+p +
+        # per-dot scratch + reduce scratch) exceeds Metal's 32KB cap even
+        # though each individual alloc is <= 8KB. Detect this by summing
+        # `ttg.local_alloc` shared-memory requirements and routing to MSL
+        # if the total exceeds the cap. MSL has its own aliasing pass that
+        # folds dead-after-barrier buffers and tends to fit.
+        if 'tt.dot' in ops_in_kernel:
+            total_shared = 0
+            alloc_size_bytes = {
+                'i1': 1, 'i8': 1, 'i16': 2, 'i32': 4, 'i64': 8,
+                'f16': 2, 'bf16': 2, 'f32': 4, 'f64': 8,
+            }
+            for m in re.finditer(
+                r'ttg\.local_alloc[^:]*:\s*\(?tensor<([\dx]+)x(\w+)',
+                ttgir_text,
+            ):
+                dims_str, elem_ty = m.group(1), m.group(2)
+                try:
+                    dims = [int(d) for d in dims_str.split('x') if d]
+                except ValueError:
+                    continue
+                size = alloc_size_bytes.get(elem_ty, 4)
+                n = 1
+                for d in dims:
+                    n *= d
+                total_shared += n * size
+            # Include estimated per-op scratch: each tt.dot adds two M*N*4
+            # -typed scratch globals (__tg_dot_out + __tg_dot_cin). Each
+            # tt.reduce adds a threadgroup scratch slot as well. When
+            # memdesc live ranges don't collapse perfectly, the aliasing
+            # pass conservatively keeps them distinct, so budget with
+            # headroom. Use 24KB as the threshold — empirically covers the
+            # HEAD_DIM=64 overflow while leaving room for regular matmul.
+            if total_shared > 24 * 1024:
+                return True
 
         # Shared memory budget check: detect kernels whose effective
         # threadgroup memory demand exceeds Metal's 32KB cap. This is a
@@ -1345,6 +1379,32 @@ class MetalBackend(BaseBackend):
 
         compute_text = replace_lid('\n'.join(compute_lines))
         other_text = replace_lid('\n'.join(other_blocks))
+
+        # ---- rewrite phi incoming labels from %<entry> to %_wl_header -------
+        # After wrapping, the entry block ends with `br label %_wl_header`
+        # (not fall-through into the original compute block), so any phi in
+        # `other_text` that named `%<entry_label>` as its incoming predecessor
+        # must now name `%_wl_header`. Without this the LLVM verifier errors
+        # out with "PHI node entries do not match predecessors!" and the
+        # metallib compile aborts (seen on FA HEAD_DIM=64 where the scf.for
+        # header phi referenced the entry block directly).
+        def rewrite_phi_preds(text):
+            # Match phi lines: `%foo = phi T [ val, %N ], [ val, %M ], ...`
+            # Inside each bracketed pair, replace `%<entry>` with
+            # `%_wl_header`. We scan line-by-line to avoid touching lines
+            # like `br label %N` where %N is a branch target, not a phi pred.
+            out_lines = []
+            for ln in text.split('\n'):
+                if ' = phi ' in ln:
+                    ln = re.sub(
+                        r'(\[\s*[^,\]]+,\s*)%' + re.escape(entry_label) + r'(\s*\])',
+                        r'\g<1>%_wl_header\g<2>', ln,
+                    )
+                out_lines.append(ln)
+            return '\n'.join(out_lines)
+
+        compute_text = rewrite_phi_preds(compute_text)
+        other_text = rewrite_phi_preds(other_text)
 
         # ---- find the merge block (the one with 'ret void') ----------------
         # In the other_blocks text, replace 'ret void' with a branch to the

@@ -312,8 +312,10 @@ class _ModuleTextIndex:
         result = {}
         # Match: %name = arith.constant VALUE : TYPE
         # or: %name = arith.constant dense<VALUE> : tensor<...>
+        # SSA names may contain `-`, `.`, and `$` in addition to \w — MLIR
+        # constants with negative values often get printed as e.g. `%c-123_i32`.
         for m in re.finditer(
-            r"%(\w+(?::\d+)?)\s*=\s*arith\.constant\s+(.+?)(?:\s+loc\(|$)",
+            r"%([\w.$-]+(?::\d+)?)\s*=\s*arith\.constant\s+(.+?)(?:\s+loc\(|$)",
             self.text, re.MULTILINE
         ):
             ssa_name = m.group(1)
@@ -347,8 +349,10 @@ class _ModuleTextIndex:
         by text position, suitable for walk-order matching.
         """
         result = []
+        # SSA names may contain `-`, `.`, and `$` in addition to \w — MLIR
+        # constants with negative values often get printed as e.g. `%c-123_i32`.
         for m in re.finditer(
-            r"%(\w+(?::\d+)?)\s*=\s*arith\.constant\s+(.+?)(?:\s+loc\(|$)",
+            r"%([\w.$-]+(?::\d+)?)\s*=\s*arith\.constant\s+(.+?)(?:\s+loc\(|$)",
             self.text, re.MULTILINE
         ):
             rest = m.group(2).strip()
@@ -545,9 +549,13 @@ class MLIRWalker:
         self._extern_elementwise_walk_index = 0
 
     def _get_constant_ssa_names_in_order(self) -> List[str]:
-        """Get arith.constant SSA names in text order."""
+        r"""Get arith.constant SSA names in text order.
+
+        SSA names may contain `-`, `.`, and `$` in addition to \w — MLIR
+        constants with negative values often get printed as `%c-123_i32`.
+        """
         return [m.group(1) for m in re.finditer(
-            r"%(\w+(?::\d+)?)\s*=\s*arith\.constant",
+            r"%([\w.$-]+(?::\d+)?)\s*=\s*arith\.constant",
             self._mod_text
         )]
 

@@ -3775,10 +3775,28 @@ class GenericLowerer:
         """Check if an SSA value is a boolean mask."""
         if ssa_id in self.env_is_mask:
             return True
-        # Check type: i1 or tensor<...xi1> (exact match, not substring)
-        for ssa in self.graph.ops:
-            if ssa.id == ssa_id:
-                return ssa.elem_type == "i1" or ssa.op in ("arith.cmpi", "arith.cmpf")
+
+        # Check type: i1 or tensor<...xi1> (exact match, not substring).
+        # Walk nested regions too — ops inside scf.for / scf.if bodies live
+        # in region_ops, not at the top level, so a top-level-only scan
+        # misses masks defined inside a K-loop.
+        def _find(ops):
+            for ssa in ops:
+                if ssa.id == ssa_id:
+                    return ssa
+                if ssa.region_ops:
+                    hit = _find(ssa.region_ops)
+                    if hit is not None:
+                        return hit
+                if ssa.else_ops:
+                    hit = _find(ssa.else_ops)
+                    if hit is not None:
+                        return hit
+            return None
+
+        ssa = _find(self.graph.ops)
+        if ssa is not None:
+            return ssa.elem_type == "i1" or ssa.op in ("arith.cmpi", "arith.cmpf")
         return False
 
     def _is_scalar_ptr(self, ssa_id: int) -> bool:
@@ -4111,6 +4129,14 @@ class GenericLowerer:
         self.env_types[ssa.id] = dtype
         # Shape: element-wise binary inherits shape from operands
         self._propagate_shape_elementwise(ssa)
+        # Mask propagation: when an i1-producing op combines two masks
+        # (arith.andi / ori / xori on i1), the result is itself a mask.
+        # Without this, tt.load / tt.store downstream can't recognize
+        # `rmask & xmask` as a mask and emit unmasked memory ops.
+        if ssa.elem_type == "i1" and ssa.op in (
+            "arith.andi", "arith.ori", "arith.xori"
+        ):
+            self.env_is_mask[ssa.id] = True
 
     def _is_float_op(self, ssa: SSAValue) -> bool:
         """Check if an SSA op produces a float result."""

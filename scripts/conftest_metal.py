@@ -124,10 +124,6 @@ UNIMPLEMENTED_FEATURES = {
     "test_disable_licm",
     "test_assume",
     "test_poison_return",
-    # test_ptx_cast: re-disabled 2026-04-16 after session changes regressed the
-    # k-loop reduction/mask handling (sporadic -10000 leaking through tl.where).
-    # Likely related to loop-aware aliasing / mask recomputation; needs follow-up.
-    "test_ptx_cast",
     # Newly exposed failures (were hidden by overly-broad parametrize skip):
     # "test_broadcast",  # Enabled: 2D broadcast via wrapping loop (>1024 threads)
     # "test_abs",  # Enabled: math.absi → MSL abs() for integer types

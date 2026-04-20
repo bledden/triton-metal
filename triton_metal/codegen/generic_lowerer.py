@@ -4881,7 +4881,23 @@ class GenericLowerer:
         # Sanitize function name for MSL (strip leading underscores from __nv_* etc.)
         # Common pattern: __nv_sinf → sin, __nv_expf → exp
         safe_name = func_name
-        if safe_name.startswith("__nv_"):
+
+        # Explicit CUDA→MSL renames for functions whose MSL name doesn't match
+        # the "drop __nv_ prefix and trailing f" rule. MSL's isfinite/isinf/isnan
+        # take a single fp arg and return bool. Precedence over the prefix strip.
+        _NV_TO_MSL = {
+            "__nv_finitef": "isfinite",
+            "__nv_isfinited": "isfinite",
+            "__nv_isinff": "isinf",
+            "__nv_isinfd": "isinf",
+            "__nv_isnanf": "isnan",
+            "__nv_isnand": "isnan",
+            "__nv_signbitf": "signbit",
+            "__nv_signbitd": "signbit",
+        }
+        if safe_name in _NV_TO_MSL:
+            safe_name = _NV_TO_MSL[safe_name]
+        elif safe_name.startswith("__nv_"):
             # CUDA libdevice function — strip prefix and trailing 'f' if present
             stripped = safe_name[5:]  # remove "__nv_"
             if stripped.endswith("f") and len(stripped) > 1:

@@ -282,14 +282,48 @@ def _erfinv_large(w):
     return p
 
 
-@triton.jit
-def isinf(x):
-    return (x == float("inf")) | (x == float("-inf"))
+from triton.language import core as _core
 
 
-@triton.jit
-def isnan(x):
-    return x != x
+# NOTE: we lower these via tt.extern_elementwise rather than `x == x` / `x != inf`
+# tricks because the Metal shader compiler runs with fast-math ON by default,
+# which assumes no NaN/Inf and folds such comparisons to constants. Our
+# generic_lowerer maps these __nv_* symbols to MSL's native isinf/isnan/isfinite
+# built-ins, which are NOT affected by fast-math.
+
+@_core.extern
+def isinf(arg0, _semantic=None):
+    return _core.extern_elementwise(
+        "", "", [arg0], {
+            (_core.dtype("fp32"), ): ("__nv_isinff", _core.dtype("int32")),
+            (_core.dtype("fp64"), ): ("__nv_isinfd", _core.dtype("int32")),
+        }, is_pure=True, _semantic=_semantic).to(_core.int1, _semantic=_semantic)
+
+
+@_core.extern
+def isnan(arg0, _semantic=None):
+    return _core.extern_elementwise(
+        "", "", [arg0], {
+            (_core.dtype("fp32"), ): ("__nv_isnanf", _core.dtype("int32")),
+            (_core.dtype("fp64"), ): ("__nv_isnand", _core.dtype("int32")),
+        }, is_pure=True, _semantic=_semantic).to(_core.int1, _semantic=_semantic)
+
+
+@_core.extern
+def finitef(arg0, _semantic=None):
+    return _core.extern_elementwise(
+        "", "", [arg0], {
+            (_core.dtype("fp32"), ): ("__nv_finitef", _core.dtype("int32")),
+        }, is_pure=True, _semantic=_semantic).to(_core.int1, _semantic=_semantic)
+
+
+@_core.extern
+def isfinited(arg0, _semantic=None):
+    return _core.extern_elementwise(
+        "", "", [arg0], {
+            (_core.dtype("fp32"), ): ("__nv_isfinited", _core.dtype("int32")),
+            (_core.dtype("fp64"), ): ("__nv_isfinited", _core.dtype("int32")),
+        }, is_pure=True, _semantic=_semantic).to(_core.int1, _semantic=_semantic)
 
 
 @triton.jit
@@ -339,12 +373,45 @@ def ldexp(x, n):
     return x * tl.math.exp2(n.to(tl.float32))
 
 
-# Package this module's functions as a module object for Inductor
+# Package this module's functions as a module object.
+#
+# Used in two places:
+#   1. Inductor's triton_compat.libdevice (monkey-patched in inductor/__init__.py)
+#   2. MetalBackend.get_module_map() remaps triton.language.extra.libdevice →
+#      metal_libdevice during ast_to_ttir, so `from triton.language.extra import
+#      libdevice` followed by `libdevice.exp(x)` inside a @triton.jit resolves
+#      here. See triton_metal/backend/compiler.py.
+#
+# Completeness: the compiler walks the kernel's module globals and for any
+# global whose __module__ == "triton.language.extra.libdevice" does
+# `getattr(metal_libdevice, <name>)`. Missing attrs raise AttributeError during
+# make_ir even if the kernel never calls them. So we first copy ALL names from
+# the upstream stub module (so lookups never miss), then override with our
+# implementations.
 metal_libdevice = types.ModuleType("metal_libdevice")
+
+# Seed with every public name from the upstream stub. These are mostly bodies
+# of `...` which would return None if called, but that's fine — they're only
+# problematic when invoked. This way, unused references (e.g. `my_fast_dividef
+# = libdevice.fast_dividef` at test-module scope) don't break unrelated kernels.
+try:
+    from triton.language.extra import libdevice as _upstream_stub
+    for _name in dir(_upstream_stub):
+        if _name.startswith("_"):
+            continue
+        metal_libdevice.__dict__[_name] = getattr(_upstream_stub, _name)
+except ImportError:
+    pass
+
+# Override with our Metal implementations.
+# Include both @triton.jit functions (hasattr 'fn') and @core.extern builtins
+# (hasattr 'signature' + marked with TRITON_BUILTIN).
+from triton.language.core import TRITON_BUILTIN as _TRITON_BUILTIN
 metal_libdevice.__dict__.update({
     name: obj for name, obj in globals().items()
     if not name.startswith("_") and name != "metal_libdevice"
-    and callable(obj) and hasattr(obj, "fn")  # @triton.jit functions
+    and callable(obj)
+    and (hasattr(obj, "fn") or getattr(obj, _TRITON_BUILTIN, False))
 })
 # Also add non-jit module references
 metal_libdevice.tl = tl

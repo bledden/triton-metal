@@ -129,7 +129,11 @@ class MetalBackend(BaseBackend):
         }
 
     def get_module_map(self) -> Dict[str, ModuleType]:
-        return {}
+        # Remap triton.language.extra.libdevice (stubs that return None) to
+        # our Metal-compatible implementation. Mirrors NVIDIA's pattern of
+        # pointing at triton.language.extra.cuda.libdevice.
+        from triton_metal.inductor.metal_libdevice import metal_libdevice
+        return {"triton.language.extra.libdevice": metal_libdevice}
 
     def load_dialects(self, ctx):
         # No custom MLIR dialects for now.

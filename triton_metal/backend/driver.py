@@ -440,22 +440,66 @@ class MetalLauncher:
         # If not provided (None), copy back all tensors (conservative).
         # output_arg_indices from the lowerer are relative to TTGIR args
         # (which exclude constexpr params). Remap to runtime arg indices.
+        # Flatten tuple args recursively so nested tuples (including tuples
+        # of tensors / pointers) are marshalled element-by-element. The
+        # Triton frontend flattens tuple arguments at the TTGIR level using
+        # dot-indexed names (e.g. `Ptrs.0`, `Ptrs.1`), so the launcher must
+        # emit one Metal buffer per leaf element. Per-element signatures are
+        # pulled from the top-level tuple signature (e.g. `('*fp32',)`).
+        def _flatten_arg(arg, sig):
+            """Yield (leaf_arg, leaf_sig) pairs in Triton flatten order.
+
+            `sig` may be None (unknown), a scalar string (e.g. 'i32',
+            '*fp32', 'constexpr'), or a tuple matching the structure of
+            `arg`. Nested tuples on either side are flattened together.
+            """
+            if isinstance(arg, tuple):
+                # Signature may be a tuple of per-element sigs; else None.
+                sig_tuple = sig if isinstance(sig, tuple) else None
+                for i, elem in enumerate(arg):
+                    elem_sig = sig_tuple[i] if (
+                        sig_tuple is not None and i < len(sig_tuple)
+                    ) else None
+                    yield from _flatten_arg(elem, elem_sig)
+            else:
+                yield arg, sig
+
+        flat_args = []       # list of leaf args in flattened order
+        flat_sigs = []       # parallel list of per-leaf signature strings
+        flat_origin = []     # original top-level arg index for each leaf
+        for orig_idx, arg in enumerate(args):
+            sig_ty = None
+            if orig_idx < len(self.arg_names):
+                sig_ty = self.signature.get(self.arg_names[orig_idx])
+            # Fully-constexpr tuple (e.g. `('constexpr',)`) is compiled
+            # into the kernel — skip it entirely.
+            if (
+                isinstance(arg, tuple)
+                and isinstance(sig_ty, tuple)
+                and all(s == "constexpr" for s in sig_ty)
+            ):
+                continue
+            if orig_idx in self.constexpr_indices:
+                continue
+            for leaf, leaf_sig in _flatten_arg(arg, sig_ty):
+                flat_args.append(leaf)
+                flat_sigs.append(leaf_sig)
+                flat_origin.append(orig_idx)
+
         output_arg_indices = None
         if kernel_metadata and len(kernel_metadata) > 4 and kernel_metadata[4] is not None:
             ttgir_indices = kernel_metadata[4]
-            # Build mapping: TTGIR position → runtime arg index
-            ttgir_to_runtime = []
-            for i in range(len(args)):
-                if i not in self.constexpr_indices:
-                    ttgir_to_runtime.append(i)
+            # TTGIR position i corresponds directly to flat_args[i] since
+            # both exclude constexpr args and both flatten tuple args.
             output_arg_indices = set()
             for ti in ttgir_indices:
-                if ti < len(ttgir_to_runtime):
-                    output_arg_indices.add(ttgir_to_runtime[ti])
+                if ti < len(flat_args):
+                    output_arg_indices.add(ti)
 
-        for arg_idx, arg in enumerate(args):
-            # Skip constexpr args — already compiled into the kernel.
-            if arg_idx in self.constexpr_indices:
+        for arg_idx, arg in enumerate(flat_args):
+            # Per-leaf constexpr entries (e.g. constexpr element inside a
+            # mixed tuple) are already compiled into the kernel — skip.
+            if flat_sigs[arg_idx] == "constexpr":
                 continue
             if hasattr(arg, "data_ptr"):
                 import torch as _torch
@@ -528,9 +572,6 @@ class MetalLauncher:
                 struct.pack_into("i", view, 0, int(arg))
                 buffers.append((buf, 0))
                 pool_releases.append(("scalar", buf, 4))
-            elif isinstance(arg, tuple):
-                # Constexpr tuple argument — already compiled into kernel.
-                continue
             elif isinstance(arg, int):
                 if arg > 0x7FFFFFFFFFFFFFFF:
                     buf = pool.acquire_scalar(8)
@@ -556,9 +597,7 @@ class MetalLauncher:
                 # signature so that bf16/fp16 scalar args are marshalled as
                 # 2 bytes (matching MSL `half&` / `bfloat&` parameters)
                 # instead of being silently packed as 4-byte fp32.
-                sig_ty = None
-                if arg_idx < len(self.arg_names):
-                    sig_ty = self.signature.get(self.arg_names[arg_idx])
+                sig_ty = flat_sigs[arg_idx]
                 if sig_ty == "fp16":
                     buf = pool.acquire_scalar(2)
                     view = buf.contents().as_buffer(2)

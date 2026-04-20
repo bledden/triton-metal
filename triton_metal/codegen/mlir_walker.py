@@ -216,7 +216,8 @@ class _ModuleTextIndex:
                 depth -= 1
             i += 1
         args_text = self.text[start:i - 1]  # Exclude the closing ')'
-        return [am.group(1) for am in re.finditer(r"%(\w+)\s*:", args_text)]
+        # Arg names may contain '.' (e.g. tuple-flattened names like "Ptrs.0").
+        return [am.group(1) for am in re.finditer(r"%([\w.]+)\s*:", args_text)]
 
     def _parse_call_targets(self) -> Dict[str, str]:
         """Parse tt.call ops and map SSA name -> callee function name.
@@ -271,12 +272,13 @@ class _ModuleTextIndex:
                 i += 1
             args_text = self.text[start:i - 1]
 
-            # Extract arg names and types
-            arg_names = [am.group(1) for am in re.finditer(r"%(\w+)\s*:", args_text)]
+            # Extract arg names and types. Arg names may contain '.'
+            # (e.g. tuple-flattened names like "Ptrs.0").
+            arg_names = [am.group(1) for am in re.finditer(r"%([\w.]+)\s*:", args_text)]
 
             # Extract arg types
             arg_types = []
-            for am in re.finditer(r"%\w+\s*:\s*([^\s{,]+(?:<[^>]+>)?)", args_text):
+            for am in re.finditer(r"%[\w.]+\s*:\s*([^\s{,]+(?:<[^>]+>)?)", args_text):
                 arg_types.append(am.group(1))
 
             # Parse return types: ) -> TYPE or ) -> (TYPE, TYPE)
@@ -1050,6 +1052,11 @@ class MLIRWalker:
             elem_type = _extract_elem_type(type_str)
             is_ptr = _is_ptr_type(type_str)
             name = arg_names[i] if i < len(arg_names) else f"arg{i}"
+            # Triton frontend flattens tuple args into dot-indexed names
+            # (e.g. `Ptrs.0`). Dots are not valid in C identifiers, so
+            # rewrite to underscores for the MSL emission.
+            if "." in name:
+                name = name.replace(".", "_")
 
             func_arg = FuncArg(
                 id=arg_id,

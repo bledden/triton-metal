@@ -369,6 +369,14 @@ class GenericLowerer:
         self.env_is_mask = {}   # ssa_id -> True if this is a bool mask
         self.env_is_ptr = {}    # ssa_id -> (base_ptr_name, offsets_var)
         self.env_shapes = {}    # ssa_id -> shape tuple, e.g., (32, 64)
+        # Some per-thread scalar values come from a broadcast-redundant layout:
+        # thread `lid` does not hold the element at flat index `lid`, but at a
+        # different index (e.g., after a 3D reduce that broadcasts the reduced
+        # axis's K copies). `self._bcast_layout[ssa_id]` records the MSL
+        # expression that, given `lid`, yields the flat index into the logical
+        # result tensor that thread `lid` actually holds. Consumers (e.g., a
+        # subsequent 2D reduce or a tt.store) use this to re-stage correctly.
+        self._bcast_layout = {}
         self.kb = None
         self._var_counter = 0
 
@@ -4230,6 +4238,26 @@ class GenericLowerer:
             "arith.andi", "arith.ori", "arith.xori"
         ):
             self.env_is_mask[ssa.id] = True
+        self._propagate_bcast_layout_binary(ssa)
+
+    def _propagate_bcast_layout_binary(self, ssa: SSAValue) -> None:
+        """Propagate `_bcast_layout` from operands to the result of an
+        elementwise binary op.
+
+        If either operand has a tracked broadcast layout, the result keeps
+        that layout (both operands must match, but in practice when only
+        one has it the other is a constant/scalar accumulator).
+        """
+        if len(ssa.operand_ids) < 2:
+            return
+        a_lay = self._bcast_layout.get(ssa.operand_ids[0])
+        b_lay = self._bcast_layout.get(ssa.operand_ids[1])
+        if a_lay is not None and b_lay is None:
+            self._bcast_layout[ssa.id] = a_lay
+        elif b_lay is not None and a_lay is None:
+            self._bcast_layout[ssa.id] = b_lay
+        elif a_lay is not None and b_lay is not None and a_lay == b_lay:
+            self._bcast_layout[ssa.id] = a_lay
 
     def _is_float_op(self, ssa: SSAValue) -> bool:
         """Check if an SSA op produces a float result."""
@@ -4286,6 +4314,7 @@ class GenericLowerer:
         self.env_types[ssa.id] = dtype
         # Shape: element-wise builtin binary inherits shape from operands
         self._propagate_shape_elementwise(ssa)
+        self._propagate_bcast_layout_binary(ssa)
 
     def _emit_nan_propagating_minmax(self, ssa: SSAValue, fn_name: str):
         """Emit NaN-propagating min/max: if either operand is NaN, result is NaN."""
@@ -4302,6 +4331,7 @@ class GenericLowerer:
         self.env_types[ssa.id] = "fp32"
         # Shape: element-wise binary inherits shape from operands
         self._propagate_shape_elementwise(ssa)
+        self._propagate_bcast_layout_binary(ssa)
 
     def _lower_clampf(self, ssa: SSAValue):
         """tt.clampf → clamp(x, min, max) with optional NaN propagation.
@@ -6415,9 +6445,27 @@ class GenericLowerer:
 
         result_var = self._next_var("reduced")
 
-        # Store all values to shared memory (skip if already there)
+        # Store all values to shared memory (skip if already there).
+        # If the input has a tracked broadcast layout, thread `lid` does not
+        # hold the value at flat index `lid` — it holds the value at
+        # `bcast_layout[ssa.id]` in the logical shape. Use that expression
+        # as the write index so that shared_name has a row-major layout
+        # matching the reduce's expectations.
+        input_bcast_idx = None
+        if ssa.operand_ids:
+            input_bcast_idx = self._bcast_layout.get(ssa.operand_ids[0])
         if not existing_shared:
-            self.kb.raw_line(f"    if (lid < {total}u) {shared_name}[lid] = {input_var};")
+            if input_bcast_idx is not None:
+                # All threads with lid < block_size participate; threads that
+                # map to the same (i, j) write the same value (harmless,
+                # last-writer-wins).  Threads whose mapped index is out of
+                # range (shouldn't happen for consistent layouts) are guarded.
+                bs = self.effective_block_size
+                self.kb.raw_line(
+                    f"    if (lid < {bs}u) {shared_name}[{input_bcast_idx}] = {input_var};"
+                )
+            else:
+                self.kb.raw_line(f"    if (lid < {total}u) {shared_name}[lid] = {input_var};")
             self.kb.raw_line(f"    threadgroup_barrier(mem_flags::mem_threadgroup);")
 
         # Use a second shared array to broadcast results to all threads
@@ -6596,6 +6644,11 @@ class GenericLowerer:
         self.env[ssa.id] = result_var
         self.env_types[ssa.id] = shared_dtype
         self.env_shapes[ssa.id] = result_dims
+        # Record the broadcast layout: thread `lid` holds the value at flat
+        # index `read_idx` of the logical (M, N)-or-(M, K)-or-(N, K) result.
+        # Downstream reduces/stores use this to re-stage data correctly when
+        # the logical mapping is not lid → lid.
+        self._bcast_layout[ssa.id] = read_idx
 
     def _lower_reduce_nd(self, ssa, input_var, axis, combine_op,
                          msl_type, shared_dtype, input_shape):
@@ -7532,13 +7585,17 @@ class GenericLowerer:
                             self._smem_iter_args = {}
                         self._smem_iter_args[ba_id] = var
 
-        # Process body ops
+        # Process body ops.  Track the yielded SSA id per iter_arg so we can
+        # propagate metadata (e.g., _bcast_layout) from the yielded value to
+        # the scf.for result variable below.
+        yielded_ids: list = [None] * n_iter_args
         if ssa.region_ops:
             for body_op in ssa.region_ops:
                 if body_op.op == "scf.yield":
                     # Update iter_arg variables from yield operands
                     for i, yield_id in enumerate(body_op.operand_ids):
                         if i < len(iter_vars):
+                            yielded_ids[i] = yield_id
                             # Skip scalar assignment for smem-backed iter_args;
                             # the shared memory was already updated in-place by
                             # the dot or strided binary op.
@@ -7590,17 +7647,34 @@ class GenericLowerer:
                         if not hasattr(self, '_shared_mem_descs'):
                             self._shared_mem_descs = {}
                         self._shared_mem_descs[rid] = (var, init_shape, "fp32")
+                    # Propagate broadcast-layout from the yielded value. The
+                    # init value is typically a constant (no layout); after
+                    # the first iteration, the iter_arg takes on the layout
+                    # of `yielded`, which stays invariant for subsequent
+                    # iterations (consistent layout in / out of body).
+                    if i < len(yielded_ids) and yielded_ids[i] is not None:
+                        lay = self._bcast_layout.get(yielded_ids[i])
+                        if lay is not None:
+                            self._bcast_layout[rid] = lay
         elif n_iter_args == 1 and iter_vars:
             self.env[ssa.id] = iter_vars[0]
             self.env_types[ssa.id] = iter_dtypes[0] if iter_dtypes else "fp32"
             if init_ids and init_ids[0] in self.env_shapes:
                 self.env_shapes[ssa.id] = self.env_shapes[init_ids[0]]
+            if yielded_ids and yielded_ids[0] is not None:
+                lay = self._bcast_layout.get(yielded_ids[0])
+                if lay is not None:
+                    self._bcast_layout[ssa.id] = lay
         elif iter_vars:
             # Fallback: single result maps to first iter_var
             self.env[ssa.id] = iter_vars[0]
             self.env_types[ssa.id] = iter_dtypes[0] if iter_dtypes else "fp32"
             if init_ids and init_ids[0] in self.env_shapes:
                 self.env_shapes[ssa.id] = self.env_shapes[init_ids[0]]
+            if yielded_ids and yielded_ids[0] is not None:
+                lay = self._bcast_layout.get(yielded_ids[0])
+                if lay is not None:
+                    self._bcast_layout[ssa.id] = lay
 
     def _lower_scf_if(self, ssa: SSAValue):
         """scf.if → MSL if/else block with optional results."""

@@ -4797,7 +4797,14 @@ class GenericLowerer:
         self._propagate_shape_elementwise(ssa)
 
     def _lower_select(self, ssa: SSAValue):
-        """arith.select → ternary operator with inferred type."""
+        """arith.select → ternary operator with inferred type.
+
+        Preserves the logical float dtype (fp16/bf16/fp32/fp64) from the IR
+        when available so that subsequent arith.bitcast uses the correct width.
+        Narrow floats (fp16/bf16) still compute in ``float`` (matching the rest
+        of the codegen), but their logical dtype is tracked in env_types so
+        that a later bitcast to i16/i32 narrows the operand first.
+        """
         if len(ssa.operand_ids) < 3:
             return
         cond = self._lookup(ssa.operand_ids[0])
@@ -4805,11 +4812,30 @@ class GenericLowerer:
         false_val = self._lookup(ssa.operand_ids[2])
         var_name = self._next_var("r")
 
-        # Infer type from the true-value operand
+        # Prefer ssa.elem_type (from the IR's result type) over operand tracking.
+        # This preserves fp16/bf16 across select even though operands may have
+        # been widened to float earlier.
+        ir_dtype = _mlir_to_triton_dtype(ssa.elem_type) if ssa.elem_type else None
         true_dtype = self.env_types.get(ssa.operand_ids[1], "fp32")
-        if true_dtype.startswith("fp") or true_dtype.startswith("bf"):
+
+        if ir_dtype and (ir_dtype.startswith("fp") or ir_dtype.startswith("bf")):
+            # Narrow float (fp16/bf16) computes in float; wider uses its own type.
+            if ir_dtype in ("fp16", "bf16"):
+                ty = "float"
+            elif ir_dtype == "fp64":
+                ty = "double"
+            else:
+                ty = "float"
+            dtype = ir_dtype
+        elif ir_dtype and ir_dtype.startswith("i"):
+            ty = "int"
+            dtype = ir_dtype
+        elif ir_dtype and ir_dtype.startswith("u"):
+            ty = "uint"
+            dtype = ir_dtype
+        elif true_dtype.startswith("fp") or true_dtype.startswith("bf"):
             ty = "float"
-            dtype = "fp32"
+            dtype = true_dtype if true_dtype in ("fp16", "bf16", "fp32", "fp64") else "fp32"
         elif true_dtype.startswith("u"):
             ty = "uint"
             dtype = "u32"

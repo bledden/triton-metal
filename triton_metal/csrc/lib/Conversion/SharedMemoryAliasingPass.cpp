@@ -85,6 +85,7 @@ void aliasSharedMemoryGlobals(llvm::Module &mod) {
     auto name = G.getName();
     if (!name.starts_with("__tg_shared_") &&
         !name.starts_with("__reduce_shared_") &&
+        !name.starts_with("__reduce2d_shared_") &&
         !name.starts_with("__tg_dot_out_")) continue;
     tgGlobals.push_back(&G);
   }

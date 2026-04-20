@@ -179,14 +179,17 @@ def _alias_shared_memory(msl: str) -> str:
 
     lines = msl.split('\n')
 
-    # 1. Parse declarations: name -> (size, decl_line_idx)
-    decl_re = re.compile(r'^\s*threadgroup\s+float\s+(\w+)\[(\d+)\];')
-    decls = {}  # name -> (size, line_idx)
+    # 1. Parse declarations: name -> (size, decl_line_idx, dtype)
+    # Handle common threadgroup types: float, int, uint, half, etc.
+    decl_re = re.compile(
+        r'^\s*threadgroup\s+(float|int|uint|half|short|ushort|char|uchar|bool)\s+(\w+)\[(\d+)\];'
+    )
+    decls = {}  # name -> (size, line_idx, dtype)
     for i, line in enumerate(lines):
         m = decl_re.match(line)
         if m:
-            name, size = m.group(1), int(m.group(2))
-            decls[name] = (size, i)
+            dtype, name, size = m.group(1), m.group(2), int(m.group(3))
+            decls[name] = (size, i, dtype)
 
     if len(decls) < 2:
         return msl  # nothing to alias
@@ -297,19 +300,50 @@ def _alias_shared_memory(msl: str) -> str:
         slot_max_size[phys_name] = max_size
 
     # Process lines: rename, update sizes, remove duplicate declarations
+    # Only alias arrays of the same dtype within a slot. Pre-filter slots so
+    # each slot contains only same-dtype members (re-greedy over dtype groups
+    # would be more optimal; this is a conservative correctness fix).
+    # Here, enforce dtype homogeneity by splitting mixed slots before renaming.
+    dtype_by_name = {n: decls[n][2] for n in decls}
+    homogeneous_slots = []
+    for slot in slots:
+        phys_name, max_size, members = slot
+        # Group members by dtype
+        by_dtype = {}
+        for m in members:
+            by_dtype.setdefault(dtype_by_name[m], []).append(m)
+        for dt, ms in by_dtype.items():
+            size_max = max(decls[m][0] for m in ms)
+            homogeneous_slots.append([ms[0], size_max, ms, dt])
+    # Rebuild assignment from homogeneous slots
+    assignment = {}
+    slot_max_size = {}
+    slot_dtype = {}
+    for slot in homogeneous_slots:
+        phys_name, max_size, members, dt = slot
+        slot_max_size[phys_name] = max_size
+        slot_dtype[phys_name] = dt
+        for m in members:
+            assignment[m] = phys_name
+    renames = {n: assignment[n] for n in decls if assignment.get(n) != n}
+    if not renames:
+        return msl
+
     seen_decls = set()
     new_lines = []
     for i, line in enumerate(lines):
         m = decl_re.match(line)
         if m:
-            name = m.group(1)
+            dtype, name, _size = m.group(1), m.group(2), m.group(3)
             phys_name = assignment.get(name, name)
             if phys_name in seen_decls:
                 continue  # remove duplicate declaration
             seen_decls.add(phys_name)
-            # Update size to group maximum
-            max_size = slot_max_size.get(phys_name, int(m.group(2)))
-            new_lines.append(f"    threadgroup float {phys_name}[{max_size}];")
+            # Update size and dtype to the slot's
+            max_size = slot_max_size.get(phys_name, int(_size))
+            phys_dtype = slot_dtype.get(phys_name, dtype)
+            new_lines.append(
+                f"    threadgroup {phys_dtype} {phys_name}[{max_size}];")
         else:
             new_line = line
             for old, new in renames.items():
@@ -814,6 +848,8 @@ class GenericLowerer:
         # per-row/per-column results (not full-array reductions).
         # Multipass is incompatible with these because the per-thread
         # accumulator mixes values from different rows/columns.
+        # Also covers N-D axis reductions (e.g. tl.sort reshapes to (2,)*n and
+        # reduces along a specific axis per compare-and-swap step).
         has_2d_axis_reduce = False
         if self._is_2d and self._effective_2d_shape and has_reduce_ops:
             for ssa in all_ops_iter:
@@ -822,11 +858,15 @@ class GenericLowerer:
                     # Extract shape from the reduce input's type_str in the IR
                     inp_type = self._find_op_type_str(ssa.operand_ids[0])
                     inp_shape = _extract_shape(inp_type) if inp_type else None
-                    # A true 2D reduce: multi-row/col input with axis-specific reduction
+                    # A true axis-specific reduce: multi-dim input where more
+                    # than one non-reduced axis has size > 1. For N-D, check
+                    # whether the non-reduced axes together have > 1 element.
                     if inp_shape and len(inp_shape) >= 2:
-                        if inp_shape[0] > 1 and reduce_axis == 1:
-                            has_2d_axis_reduce = True
-                        elif inp_shape[1] > 1 and reduce_axis == 0:
+                        other_size = 1
+                        for i, s in enumerate(inp_shape):
+                            if i != reduce_axis:
+                                other_size *= s
+                        if other_size > 1:
                             has_2d_axis_reduce = True
 
         # Decide wrapping strategy:
@@ -2798,6 +2838,59 @@ class GenericLowerer:
         if not hasattr(self, '_make_range_full_shape'):
             self._make_range_full_shape = {}
         expand_by_parent = self._expand_by_parent
+
+        # Also detect tt.reshape of a make_range (or a chain ending in one) to
+        # a shape where exactly one axis has non-1 size — semantically
+        # equivalent to an expand_dims chain for our lowering purposes. This
+        # is how tl.sort's _indicator emits its per-axis ranges.
+        # The stride_below is computed against the eventual broadcast target
+        # (the largest same-rank tensor in the kernel) so it reflects the
+        # enclosing tensor's actual strides.
+        def _max_shape_with_rank(rank):
+            """Find the largest tensor (by element count) with the given rank."""
+            best = None
+            best_numel = 0
+            for s_ssa in ops:
+                s_shape = _extract_shape(s_ssa.type_str)
+                if s_shape and len(s_shape) == rank:
+                    numel = 1
+                    for d in s_shape:
+                        numel *= d
+                    if numel > best_numel:
+                        best = s_shape
+                        best_numel = numel
+            return best
+
+        for ssa in ops:
+            if ssa.op != "tt.reshape" or not ssa.operand_ids:
+                continue
+            src_id = ssa.operand_ids[0]
+            mr_id = self._trace_to_make_range(src_id, ops, op_by_id)
+            if mr_id is None:
+                continue
+            if mr_id in self._make_range_dim:
+                # Already assigned by an expand_dims chain; do not override.
+                continue
+            out_shape = _extract_shape(ssa.type_str)
+            if not out_shape or len(out_shape) < 2:
+                continue
+            non_one = [i for i, s in enumerate(out_shape) if s != 1]
+            if len(non_one) != 1:
+                continue
+            dim = non_one[0]
+            self._make_range_dim[mr_id] = dim
+            # Broadcast target: largest same-rank tensor in the kernel. For
+            # tl.sort, the reshape output is e.g. (1,1,1,2) and the broadcast
+            # target is (2,2,2,2). Using the actual broadcast shape ensures
+            # stride_below reflects the enclosing tensor's strides.
+            same_rank = _max_shape_with_rank(len(out_shape))
+            broadcast_shape = tuple(same_rank) if same_rank else tuple(out_shape)
+            self._make_range_full_shape[mr_id] = broadcast_shape
+            stride_below = 1
+            for s in broadcast_shape[dim + 1:]:
+                stride_below *= s
+            self._make_range_stride_below[mr_id] = stride_below
+
         for ssa in ops:
             if ssa.op == "tt.expand_dims" and ssa.operand_ids:
                 axis = ssa.attrs.get("axis", 0)
@@ -5793,6 +5886,14 @@ class GenericLowerer:
                                   msl_type, shared_dtype, input_shape)
             return
 
+        # N-D axis-specific reduce (n >= 4). Used by e.g. tl.sort's bitonic
+        # decomposition, which reshapes to (2,)*n and reduces along a specific
+        # axis per compare-and-swap step.
+        if input_shape and len(input_shape) >= 4:
+            self._lower_reduce_nd(ssa, input_var, axis, combine_op,
+                                  msl_type, shared_dtype, input_shape)
+            return
+
         if self._is_2d and input_shape and len(input_shape) >= 2:
             # For triton_per_* kernels with shape (1, N) or (XBLOCK, R_BLOCK)
             # where dim_0 == 1 and axis == 1, this is really a 1D reduction
@@ -6392,13 +6493,199 @@ class GenericLowerer:
         self.kb.raw_line(f"    }}")
         self.kb.raw_line(f"    threadgroup_barrier(mem_flags::mem_threadgroup);")
 
-        # All threads read their result
+        # All threads read their result. Each thread with linear coord lid =
+        # i*N*K + j*K + k reads the reduce output that corresponds to its
+        # position in the original 3D tensor with the reduced axis collapsed.
+        # This matches the semantics of reduce-then-expand_dims-then-broadcast:
+        # after broadcast to the original shape, each position (i,j,k) holds
+        # the reduce output at the corresponding coordinates of the collapsed
+        # shape.
+        #   axis=0 → output (j,k) at idx lid % (N*K)
+        #   axis=1 → output (i,k) at idx (lid/(N*K))*K + lid%K
+        #   axis=2 → output (i,j) at idx (lid/(N*K))*N + (lid%(N*K))/K
         result_var = self._next_var("reduced")
-        self.kb.raw_line(f"    {msl_type} {result_var} = {result_shared}[lid % {result_total}u];")
+        if axis == 0:
+            read_idx = f"(lid % {N * K}u)"
+        elif axis == 1:
+            read_idx = f"((lid / {N * K}u) * {K}u + (lid % {K}u))"
+        else:  # axis == 2
+            read_idx = f"((lid / {N * K}u) * {N}u + ((lid % {N * K}u) / {K}u))"
+        self.kb.raw_line(f"    {msl_type} {result_var} = {result_shared}[{read_idx}];")
 
         self.env[ssa.id] = result_var
         self.env_types[ssa.id] = shared_dtype
         self.env_shapes[ssa.id] = result_dims
+
+    def _lower_reduce_nd(self, ssa, input_var, axis, combine_op,
+                         msl_type, shared_dtype, input_shape):
+        """Lower an axis-specific reduction for N-D tensors (N >= 4).
+
+        Used by tl.sort's bitonic decomposition, which reshapes to (2,)*n and
+        reduces along a specific axis per compare-and-swap step.
+
+        Strategy:
+          1. Stage the input tensor to shared memory (each thread writes its
+             linear-index position).
+          2. For each position in the output tensor (shape with axis collapsed),
+             a single thread loops over the reduce axis and combines values.
+          3. Each thread reads back its result: the output position that
+             matches its coords in the original tensor with axis d removed.
+
+        Index math uses strides computed from the shape:
+          src_stride[i] = product of input_shape[i+1:]
+          res_stride[j] = product of result_shape[j+1:] (result_shape drops axis d)
+        """
+        n = len(input_shape)
+        total = 1
+        for s in input_shape:
+            total *= s
+        block_size = self.kb.block_size
+
+        # Compute strides for input (row-major)
+        src_strides = [1] * n
+        for i in range(n - 2, -1, -1):
+            src_strides[i] = src_strides[i + 1] * input_shape[i + 1]
+
+        # Result shape = input_shape with axis removed
+        result_shape = tuple(input_shape[:axis]) + tuple(input_shape[axis + 1:])
+        result_total = 1
+        for s in result_shape:
+            result_total *= s
+        nr = len(result_shape)
+        res_strides = [1] * nr
+        for i in range(nr - 2, -1, -1):
+            res_strides[i] = res_strides[i + 1] * result_shape[i + 1]
+
+        # Find the source data pointer (first pointer arg = X)
+        x_ptr_name = None
+        for arg in self.graph.args:
+            if arg.is_ptr:
+                x_ptr_name = arg.name
+                break
+
+        # Identity and combine expression
+        if combine_op == "sum":
+            identity = "0.0f" if msl_type == "float" else "0"
+            combine_expr = "acc + val"
+        elif combine_op == "max":
+            identity = "(-INFINITY)" if msl_type == "float" else "INT_MIN"
+            combine_expr = ("fmax(acc, val)" if msl_type == "float"
+                            else "max(acc, val)")
+        elif combine_op == "min":
+            identity = "INFINITY" if msl_type == "float" else "INT_MAX"
+            combine_expr = ("fmin(acc, val)" if msl_type == "float"
+                            else "min(acc, val)")
+        elif combine_op == "xor":
+            identity = "0"
+            combine_expr = "acc ^ val"
+        else:
+            identity = "0.0f" if msl_type == "float" else "0"
+            combine_expr = "acc + val"
+
+        # Allocate shared memory for the full N-D tensor
+        shared_name = f"shared_{self._shared_counter}"
+        self._shared_counter += 1
+        self.kb.declare_threadgroup_array(
+            shared_name, dtype=shared_dtype, size=total)
+
+        # Stage values to shared memory from the already-computed input_var
+        if total <= block_size:
+            self.kb.raw_line(
+                f"    if (lid < {total}u) {shared_name}[lid] = {input_var};")
+        else:
+            if x_ptr_name is None:
+                # Fallback — cannot handle without a source pointer
+                return
+            self.kb.raw_line(
+                f"    for (uint _e = lid; _e < {total}u; _e += {block_size}u) {{")
+            self.kb.raw_line(
+                f"        {shared_name}[_e] = ({msl_type}){x_ptr_name}[_e];")
+            self.kb.raw_line(f"    }}")
+        self.kb.raw_line(
+            f"    threadgroup_barrier(mem_flags::mem_threadgroup);")
+
+        # Allocate result shared memory
+        result_shared = f"shared_{self._shared_counter}"
+        self._shared_counter += 1
+        self.kb.declare_threadgroup_array(
+            result_shared, dtype=shared_dtype, size=result_total)
+
+        # Per-output-position reduction: thread _r reduces along the reduce axis
+        axis_size = input_shape[axis]
+        self.kb.raw_line(
+            f"    for (uint _r = lid; _r < {result_total}u; "
+            f"_r += {block_size}u) {{")
+        self.kb.raw_line(f"        {msl_type} acc = {identity};")
+
+        # Decompose _r into result coords, then build src base offset by
+        # inserting a 0 at position axis and combining with src_strides.
+        # Skip decomposition for 1D result (trivial case).
+        if nr == 0:
+            # All axes reduced to a single scalar (impossible here since
+            # we require n >= 4 and we only collapse one axis).
+            self.kb.raw_line(f"        uint _base = 0u;")
+        else:
+            # Decompose _r into coords c_0, c_1, ..., c_{nr-1} of the result
+            # Then map to source coords: for i < axis, src_c[i] = res_c[i];
+            # for i > axis, src_c[i] = res_c[i-1].
+            # Base offset (with axis coord = 0) = sum over i != axis of
+            #   res_c[...] * src_strides[i]
+            parts = []
+            for j in range(nr):
+                src_i = j if j < axis else j + 1
+                rs = res_strides[j]
+                ss = src_strides[src_i]
+                if rs == 1:
+                    coord = f"(_r % {result_shape[j]}u)"
+                else:
+                    coord = f"((_r / {rs}u) % {result_shape[j]}u)"
+                parts.append(f"{coord} * {ss}u")
+            self.kb.raw_line(f"        uint _base = {' + '.join(parts)};")
+
+        self.kb.raw_line(
+            f"        for (uint _a = 0; _a < {axis_size}u; _a++) {{")
+        self.kb.raw_line(
+            f"            {msl_type} val = {shared_name}"
+            f"[_base + _a * {src_strides[axis]}u];")
+        self.kb.raw_line(f"            acc = {combine_expr};")
+        self.kb.raw_line(f"        }}")
+        self.kb.raw_line(f"        {result_shared}[_r] = acc;")
+        self.kb.raw_line(f"    }}")
+        self.kb.raw_line(
+            f"    threadgroup_barrier(mem_flags::mem_threadgroup);")
+
+        # Readback: each thread computes the result position corresponding to
+        # its own coords in the original N-D tensor, with axis d removed.
+        # Extract axis coord using src_strides[axis] then derive result index.
+        # For each result axis j (mapping back to input axis src_i):
+        #   res_coord[j] = (lid / src_strides[src_i]) % input_shape[src_i]
+        # then result_idx = sum_j res_coord[j] * res_strides[j].
+        result_var = self._next_var("reduced")
+        if nr == 0:
+            self.kb.raw_line(
+                f"    {msl_type} {result_var} = {result_shared}[0];")
+        else:
+            read_parts = []
+            for j in range(nr):
+                src_i = j if j < axis else j + 1
+                ss = src_strides[src_i]
+                size_i = input_shape[src_i]
+                rs = res_strides[j]
+                if ss == 1:
+                    coord = f"(lid % {size_i}u)"
+                else:
+                    coord = f"((lid / {ss}u) % {size_i}u)"
+                if rs == 1:
+                    read_parts.append(coord)
+                else:
+                    read_parts.append(f"{coord} * {rs}u")
+            read_idx = " + ".join(read_parts)
+            self.kb.raw_line(
+                f"    {msl_type} {result_var} = {result_shared}[{read_idx}];")
+
+        self.env[ssa.id] = result_var
+        self.env_types[ssa.id] = shared_dtype
+        self.env_shapes[ssa.id] = result_shape
 
     # -- Prefix scan (tt.scan) --
 

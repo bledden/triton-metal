@@ -1237,6 +1237,12 @@ class MLIRWalker:
             # 0 = none (NaN-quiet), 0xffff = all (NaN-propagating)
             attrs["propagateNan"] = "all" if propagate_nan else "none"
 
+        elif name == "tt.fp_to_fp":
+            # Optional rounding mode: 0 = RTZ, 1 = RTNE
+            rounding = op.get_int_attr("rounding")
+            if rounding is not None:
+                attrs["rounding"] = "rtz" if rounding == 0 else "rtne"
+
         elif name == "tt.atomic_rmw":
             # Look up rmw_op and sem from pre-parsed module text by walk order
             idx = self._atomic_rmw_walk_index

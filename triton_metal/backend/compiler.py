@@ -1883,6 +1883,11 @@ class MetalBackend(BaseBackend):
                 metal_std_flag = f"-std=metal{options.target_metal_version}"
 
             # Compile MSL -> AIR
+            # -fno-fast-math: disable algebraic re-association so IEEE-754
+            # rounding tricks like (x + 2^23) - 2^23 are preserved verbatim.
+            # The Triton test suite (test_conversions.py) relies on this
+            # idiom for round-to-nearest-even emulation; with fast-math the
+            # add/sub gets folded away, breaking rounding correctness.
             try:
                 subprocess.run(
                     [
@@ -1892,6 +1897,7 @@ class MetalBackend(BaseBackend):
                         metal_std_flag,
                         "-mmacosx-version-min=15.0",
                         "-O2",
+                        "-fno-fast-math",
                     ],
                     capture_output=True,
                     check=True,

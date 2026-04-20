@@ -4423,28 +4423,35 @@ class GenericLowerer:
                 self.env_types[ssa.id] = matched_dtype
             self._propagate_shape_elementwise(ssa)
         elif not src_is_float and dst_is_float:
-            # int -> float bitcast. MSL as_type requires matching widths, so
-            # pick the float MSL type to match the source int width; then
-            # cast to the requested destination float type if different.
+            # int -> float bitcast. MSL as_type requires matching widths.
+            # When the destination is bf16, bitcast directly to bfloat — using
+            # half as an intermediate would later get value-converted to bfloat
+            # at the store boundary, corrupting the bit pattern. Otherwise pick
+            # the width-matching float type and cast if widths differ.
             src_int_width = _INT_WIDTH_FROM_DTYPE.get(src_dtype, 32)
             # Find matching float type by width
             _WIDTH_TO_FP = {16: ("half", "fp16"), 32: ("float", "fp32"),
                             64: ("double", "fp64")}
-            matched_fp, matched_fp_dtype = _WIDTH_TO_FP.get(src_int_width, ("float", "fp32"))
-            var_name = self._next_var("bc")
-            self.kb.raw_line(f"    {matched_fp} {var_name} = as_type<{matched_fp}>({src_var});")
-            # Determine destination float type
             dst_msl_fp = _FP_ELEM_TO_MSL.get(dst_elem, "float")
             dst_width = _FP_WIDTH.get(dst_msl_fp, 32)
             dst_dtype_name = _FP_ELEM_TO_DTYPE.get(dst_elem, "fp32")
-            if dst_width != src_int_width:
-                # Widths disagree — emit explicit float-to-float cast.
+            if dst_width == src_int_width:
+                # Bitcast directly to the requested destination float type so
+                # the bit pattern is preserved (especially important for bf16
+                # vs half which share width but differ in encoding).
+                var_name = self._next_var("bc")
+                self.kb.raw_line(f"    {dst_msl_fp} {var_name} = as_type<{dst_msl_fp}>({src_var});")
+                self.env[ssa.id] = var_name
+                self.env_types[ssa.id] = dst_dtype_name
+            else:
+                # Widths disagree — bitcast to width-matching float then value
+                # convert to the destination type.
+                matched_fp, matched_fp_dtype = _WIDTH_TO_FP.get(src_int_width, ("float", "fp32"))
+                var_name = self._next_var("bc")
+                self.kb.raw_line(f"    {matched_fp} {var_name} = as_type<{matched_fp}>({src_var});")
                 cast_name = self._next_var("bc")
                 self.kb.raw_line(f"    {dst_msl_fp} {cast_name} = static_cast<{dst_msl_fp}>({var_name});")
                 self.env[ssa.id] = cast_name
-                self.env_types[ssa.id] = dst_dtype_name
-            else:
-                self.env[ssa.id] = var_name
                 self.env_types[ssa.id] = dst_dtype_name
             self._propagate_shape_elementwise(ssa)
         else:
@@ -4471,6 +4478,9 @@ class GenericLowerer:
 
         FP8 → wider (extf direction): load already converted to float, passthrough.
         wider → FP8 (truncf direction): convert float to FP8 encoding.
+        Non-FP8 narrowing with rounding=rtz: pre-mask mantissa bits before
+        the standard cast so the (default RNE) hardware cast produces the
+        truncated value.
         """
         if not ssa.operand_ids:
             return
@@ -4479,6 +4489,7 @@ class GenericLowerer:
         src_dtype = self.env_types.get(src_id, "fp32")
         dst_elem = ssa.elem_type or "f32"
         dst_dtype = _mlir_to_triton_dtype(dst_elem)
+        rounding = ssa.attrs.get("rounding") if ssa.attrs else None
 
         from triton_metal.codegen.msl_builtins import is_fp8_type, fp8_to_float_func, fp8_from_float_func
 
@@ -4510,6 +4521,50 @@ class GenericLowerer:
                 f"    float {var_name} = {to_func}({from_func}(static_cast<float>({src_var})));"
             )
             self.env[ssa.id] = var_name
+            self.env_types[ssa.id] = dst_dtype
+        elif rounding == "rtz" and src_dtype == "fp32" and dst_dtype in ("fp16", "bf16"):
+            # f32 → narrow float with round-toward-zero. MSL's static_cast uses
+            # round-to-nearest-even; pre-mask bits the destination cannot
+            # represent so the cast becomes exact (equivalent to truncation
+            # toward zero) for the bulk of values. For values that fall in the
+            # destination's subnormal range, fall back to: cast back, compare,
+            # nudge by 1 ULP toward zero if we rounded away. fp16 keeps 10
+            # mantissa bits (clear bottom 13); bf16 keeps 7 (clear bottom 16).
+            mask = 0xFFFFE000 if dst_dtype == "fp16" else 0xFFFF0000
+            dst_msl = "half" if dst_dtype == "fp16" else "bfloat"
+            bits_var = self._next_var("rtzb")
+            masked_var = self._next_var("rtzm")
+            f32_var = self._next_var("rtzf")
+            cand_var = self._next_var("rtzc")
+            back_var = self._next_var("rtzbk")
+            adj_var = self._next_var("rtzab")
+            adj_bits = self._next_var("rtzai")
+            out_var = self._next_var("rtz")
+            self.kb.raw_line(f"    int {bits_var} = as_type<int>(static_cast<float>({src_var}));")
+            self.kb.raw_line(f"    int {masked_var} = {bits_var} & static_cast<int>({mask:#x}u);")
+            self.kb.raw_line(f"    float {f32_var} = as_type<float>({masked_var});")
+            self.kb.raw_line(f"    {dst_msl} {cand_var} = static_cast<{dst_msl}>({f32_var});")
+            # Round-trip back to f32 to detect cases where the cast still
+            # rounded away from zero (i.e., the destination subnormal range
+            # where the mask trick is insufficient).
+            self.kb.raw_line(f"    float {back_var} = static_cast<float>({cand_var});")
+            # If |back| > |orig| and orig is finite, nudge toward zero by 1 ULP.
+            self.kb.raw_line(
+                f"    bool {adj_var} = isfinite({f32_var}) && (fabs({back_var}) > fabs({f32_var}));"
+            )
+            # Compute one-ULP-nudge toward zero. IEEE 754 bit patterns grow
+            # in magnitude with the float's magnitude on each side of zero;
+            # in two's-complement representation of the underlying short,
+            # decrementing reduces magnitude regardless of sign (e.g. f16
+            # 0xC000 = -2.0 → 0xBFFF = -1.999, magnitude shrinks toward 0).
+            self.kb.raw_line(
+                f"    short {adj_bits} = as_type<short>({cand_var});"
+            )
+            self.kb.raw_line(
+                f"    {adj_bits} = {adj_var} ? (short)({adj_bits} - 1) : {adj_bits};"
+            )
+            self.kb.raw_line(f"    {dst_msl} {out_var} = as_type<{dst_msl}>({adj_bits});")
+            self.env[ssa.id] = out_var
             self.env_types[ssa.id] = dst_dtype
         else:
             # non-FP8 → non-FP8: passthrough (regular float precision change)

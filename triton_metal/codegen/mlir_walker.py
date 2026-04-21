@@ -693,8 +693,10 @@ class MLIRWalker:
 
         Strategy: the walk is post-order, so nested body ops (reduce, for)
         appear before their parent op. We track block IDs to distinguish
-        entry-block ops from nested ops. We DON'T call block.get_parent()
-        as it crashes in the C++/Python boundary.
+        entry-block ops from nested ops. For each block, we record its
+        parent region ID (via block.get_parent()) so that nested
+        region-owning ops (scf.for inside scf.for) can correctly claim
+        their body ops via region containment.
 
         Child scoping for nested region-containing ops: when a nested scf.if/for
         pops its children, it uses block_first_seen ordering to only claim ops
@@ -713,6 +715,7 @@ class MLIRWalker:
         function's body ops before the tt.func op itself. We use tt.func
         boundaries to separate entry function ops from callee function ops.
         """
+        import os as _os
         top_level = []
         pending_stack = [[]]
         nested = {}
@@ -722,6 +725,8 @@ class MLIRWalker:
         block_args_map = {}
         # Track when each block was first seen (walk order)
         block_first_seen = {}
+        # Map block_id -> parent region id (for nested-region containment checks)
+        block_parent_region = {}
         walk_counter = [0]
 
         # Multi-function tracking: collect callee function data
@@ -739,6 +744,7 @@ class MLIRWalker:
         callee_nested = [{}]           # parent_id -> children ops
         callee_entry_block_id = [None] # entry block of current callee
         callee_block_first_seen = [{}] # block_id -> walk order
+        callee_block_parent_region = [{}] # block_id -> parent region id
 
         def walk_fn(op):
             name = op.get_name()
@@ -769,6 +775,7 @@ class MLIRWalker:
                     callee_nested[0] = {}
                     callee_entry_block_id[0] = None
                     callee_block_first_seen[0] = {}
+                    callee_block_parent_region[0] = {}
                 return
 
             # Skip other structural ops
@@ -794,9 +801,14 @@ class MLIRWalker:
                     if callee_entry_block_id[0] is None:
                         callee_entry_block_id[0] = block_id
 
-                    # Track block first-seen order for callee
+                    # Track block first-seen order and parent region for callee
                     if block_id not in callee_block_first_seen[0]:
                         callee_block_first_seen[0][block_id] = walk_counter[0]
+                        try:
+                            parent_region = block.get_parent()
+                            callee_block_parent_region[0][block_id] = parent_region.id()
+                        except Exception:
+                            callee_block_parent_region[0][block_id] = None
 
                     # Extract block arguments for callee blocks
                     if block_id not in block_args_map and block is not None:
@@ -840,16 +852,23 @@ class MLIRWalker:
                         parent_counter[0] += 1
                         ssa.attrs["_parent_id"] = pid
 
-                        # Scope children: only take ops in blocks first seen
-                        # AFTER this op's own block was first seen
-                        own_block_first = callee_block_first_seen[0].get(block_id, 0)
+                        # Collect own region IDs for containment check
+                        own_region_ids = set()
+                        try:
+                            for ri in range(op.get_num_regions()):
+                                own_region_ids.add(op.get_region(ri).id())
+                        except Exception:
+                            pass
+
+                        # Scope children via region parent (robust for nested
+                        # scf.for / scf.if)
                         current_pending = callee_pending_stack[0][-1]
                         children = []
                         remaining = []
                         for pending_op in current_pending:
                             pb = pending_op.attrs.get("_block_id")
-                            pb_first = callee_block_first_seen[0].get(pb, 0)
-                            if pb != block_id and pb_first > own_block_first:
+                            pr = callee_block_parent_region[0].get(pb)
+                            if pb != block_id and pr is not None and pr in own_region_ids:
                                 children.append(pending_op)
                             else:
                                 remaining.append(pending_op)
@@ -878,9 +897,14 @@ class MLIRWalker:
             if is_nested:
                 entry_func_block_ids.add(block_id)
 
-            # Track block first-seen order
+            # Track block first-seen order and parent region id
             if block_id is not None and block_id not in block_first_seen:
                 block_first_seen[block_id] = walk_counter[0]
+                try:
+                    parent_region = block.get_parent()
+                    block_parent_region[block_id] = parent_region.id()
+                except Exception:
+                    block_parent_region[block_id] = None
 
             # Extract block arguments the first time we see a nested block
             if is_nested and block_id not in block_args_map and block is not None:
@@ -921,17 +945,27 @@ class MLIRWalker:
                     parent_counter[0] += 1
                     ssa.attrs["_parent_id"] = pid
 
-                    # Scope children correctly: only take ops in blocks that
-                    # were first seen AFTER this op's own block was first seen.
-                    # This prevents grabbing sibling-block ops from outer scopes.
-                    own_block_first = block_first_seen.get(block_id, 0)
+                    # Collect this op's own region IDs (the regions it contains)
+                    own_region_ids = set()
+                    try:
+                        for ri in range(op.get_num_regions()):
+                            own_region_ids.add(op.get_region(ri).id())
+                    except Exception:
+                        pass
+
+                    # Scope children: claim pending ops whose block's parent
+                    # region is one of our regions. This is robust for deeply
+                    # nested scf.for / scf.if, because nested region-owning
+                    # ops are themselves claimed as direct children (their
+                    # own bodies have already been claimed recursively before
+                    # this op is post-order visited).
                     current_pending = pending_stack[-1]
                     children = []
                     remaining = []
                     for pending_op in current_pending:
                         pb = pending_op.attrs.get("_block_id")
-                        pb_first = block_first_seen.get(pb, 0)
-                        if pb != block_id and pb_first > own_block_first:
+                        pr = block_parent_region.get(pb)
+                        if pb != block_id and pr is not None and pr in own_region_ids:
                             children.append(pending_op)
                         else:
                             remaining.append(pending_op)

@@ -660,12 +660,13 @@ def _run_fa_cpp(N_CTX, HEAD_DIM):
 @requires_cpp
 @requires_metal
 def test_cpp_flash_attention_head32():
-    """FlashAttention HEAD_DIM=32 with TRITON_METAL_USE_CPP=1 set.
+    """FlashAttention HEAD_DIM=32 through the C++ metallib path.
 
-    tt.dot-using kernels fall back to MSL today (the C++ dot-lowering path
-    is not yet wired end-to-end). This test verifies the fallback preserves
-    FA correctness when USE_CPP=1 is enabled, mirroring the strided pattern
-    used by tests/test_flash_attention.py which already passes 11/11.
+    Tile = BLOCK_M*HEAD_DIM = 32*32 = 1024, which fits within Metal's 1024
+    thread cap so no wrap loop is injected, and the C++ path's tt.dot
+    lowering (simdgroup_matrix_8x8 + memdesc_trans for q@k^T) handles the
+    kernel end-to-end. See _has_complex_ops for the wrap-loop + tt.dot
+    incompatibility that routes HEAD_DIM=64 to MSL.
     """
     max_err = _run_fa_cpp(N_CTX=64, HEAD_DIM=32)
     assert max_err < 5e-2, f"FA HEAD_DIM=32: max error {max_err}"
@@ -676,8 +677,12 @@ def test_cpp_flash_attention_head32():
 def test_cpp_flash_attention_head64():
     """FlashAttention HEAD_DIM=64 with TRITON_METAL_USE_CPP=1 set.
 
-    Same as HEAD_DIM=32 test but larger head dimension. Under MSL path,
-    this uses the existing shared memory aliasing pass for 32KB budget.
+    Tile = BLOCK_M*HEAD_DIM = 32*64 = 2048 > 1024, so make_llir would
+    inject a wrapping loop over the kernel body. The wrap loop is
+    fundamentally incompatible with tt.dot (simdgroup_matrix reads the
+    whole tile but the populate under the wrap only fills half on
+    iteration 0), so _has_complex_ops routes this to MSL, which uses a
+    different (threadgroup-wide) code model for tt.dot.
     """
     max_err = _run_fa_cpp(N_CTX=64, HEAD_DIM=64)
     assert max_err < 5e-2, f"FA HEAD_DIM=64: max error {max_err}"

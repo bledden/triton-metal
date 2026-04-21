@@ -332,43 +332,59 @@ class MetalBackend(BaseBackend):
         #          by rewriting phi incoming labels from %<entry> to
         #          %_wl_header after the entry split.
         #
-        # FlashAttention-class budget guard: the C++ path aliasing pass
-        # currently leaves the pre-loop `q` alloc live across the whole
-        # loop (correct aliasing per 2026-04-16 fix), so for HEAD_DIM=64
-        # with BLOCK=32 the cumulative threadgroup demand (q+k+v+qk+p +
-        # per-dot scratch + reduce scratch) exceeds Metal's 32KB cap even
-        # though each individual alloc is <= 8KB. Detect this by summing
-        # `ttg.local_alloc` shared-memory requirements and routing to MSL
-        # if the total exceeds the cap. MSL has its own aliasing pass that
-        # folds dead-after-barrier buffers and tends to fit.
+        # tt.dot + wrap-loop fundamental incompatibility guard.
+        #
+        # When the kernel tile size (block_size) exceeds Metal's 1024
+        # thread cap, make_llir injects a wrapping loop in
+        # _inject_wrapping_loop: `for (_wlid = lid; _wlid < total;
+        # _wlid += 1024)`. Each thread iterates, processing multiple
+        # elements. This works for elementwise / reduce kernels where
+        # each thread's computation is per-element.
+        #
+        # For tt.dot, it breaks: tt.dot lowers to simdgroup_matrix_8x8
+        # ops that read a full M*N tile from threadgroup memory as a
+        # cooperative operation (all threads in a simdgroup participate,
+        # and the tile spans the whole 32x64 = 2048 shared-memory buffer).
+        # On wrap iteration 0 only positions lid < 1024 are populated in
+        # that buffer; the simdgroup load reads all 2048 positions and
+        # gets garbage beyond index 1023. The wrap loop cannot be moved
+        # inside the simdgroup op (it's atomic from our IR's perspective),
+        # and the current populate-then-compute structure has the populate
+        # under the outer wrap loop too, so splitting the wrap into
+        # populate-only and compute-only phases would need per-load inner
+        # stride loops that re-parameterize `%lid` — a non-trivial
+        # restructuring of the wrap injection pass.
+        #
+        # Concretely this bites FlashAttention HEAD_DIM=64 (BLOCK_M=BLOCK_N
+        # =32, HEAD_DIM=64, tile = 32*64 = 2048 > 1024) and any matmul
+        # with M*N > 1024. FA HEAD_DIM=32 (tile = 32*32 = 1024) is fine.
+        #
+        # Route to MSL, which has a different code model (threadgroup-wide
+        # tile population without per-thread wrap) and handles large tiles
+        # correctly.
         if 'tt.dot' in ops_in_kernel:
-            total_shared = 0
-            alloc_size_bytes = {
-                'i1': 1, 'i8': 1, 'i16': 2, 'i32': 4, 'i64': 8,
-                'f16': 2, 'bf16': 2, 'f32': 4, 'f64': 8,
-            }
-            for m in re.finditer(
-                r'ttg\.local_alloc[^:]*:\s*\(?tensor<([\dx]+)x(\w+)',
+            # Compute block_size the same way make_llir does: product of
+            # max `end` per slice dim for 2D kernels, else max end.
+            dim_to_end = {}
+            max_end_any = 0
+            for mr in re.finditer(
+                r'tt\.make_range\s*\{[^}]*end\s*=\s*(\d+)[^}]*\}\s*:\s*'
+                r'tensor<\d+xi32(?:,\s*#ttg\.slice<\{dim\s*=\s*(\d+))?',
                 ttgir_text,
             ):
-                dims_str, elem_ty = m.group(1), m.group(2)
-                try:
-                    dims = [int(d) for d in dims_str.split('x') if d]
-                except ValueError:
-                    continue
-                size = alloc_size_bytes.get(elem_ty, 4)
-                n = 1
-                for d in dims:
-                    n *= d
-                total_shared += n * size
-            # Include estimated per-op scratch: each tt.dot adds two M*N*4
-            # -typed scratch globals (__tg_dot_out + __tg_dot_cin). Each
-            # tt.reduce adds a threadgroup scratch slot as well. When
-            # memdesc live ranges don't collapse perfectly, the aliasing
-            # pass conservatively keeps them distinct, so budget with
-            # headroom. Use 24KB as the threshold — empirically covers the
-            # HEAD_DIM=64 overflow while leaving room for regular matmul.
-            if total_shared > 24 * 1024:
+                end = int(mr.group(1))
+                dim = int(mr.group(2)) if mr.group(2) is not None else None
+                if end > max_end_any:
+                    max_end_any = end
+                if dim is not None:
+                    dim_to_end[dim] = max(dim_to_end.get(dim, 0), end)
+            if len(dim_to_end) > 1:
+                block_size = 1
+                for e in dim_to_end.values():
+                    block_size *= e
+            else:
+                block_size = max_end_any
+            if block_size > 1024:
                 return True
 
         # Shared memory budget check: detect kernels whose effective

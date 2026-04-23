@@ -3044,6 +3044,68 @@ class GenericLowerer:
                 for mr_id, _ in dim0_entries:
                     self._make_range_inner_N[mr_id] = inner_N
 
+        # Use analysis: figure out which make_ranges flow ONLY to tt.store
+        # (not to tt.load). For such store-only make_ranges, when the tile
+        # (range × inner_N) is smaller than the kernel's total element count,
+        # the default lid/inner_N row expression aliases multiple rows onto
+        # the same M coord. Mark them for inner_N scaling at lowering time.
+        #
+        # This happens in tl.topk M>1: the Z-offset make_range has parent
+        # layout for the (M, k) output tile, which is smaller than the block
+        # that processes the (M, N) input.
+        if not hasattr(self, '_make_range_store_only'):
+            self._make_range_store_only = set()
+
+        # Build a use map: SSA id -> set of op IDs that use it
+        use_of = {}
+        all_oplist = []
+        def _coll(ops):
+            for o in ops:
+                all_oplist.append(o)
+                if o.region_ops:
+                    _coll(o.region_ops)
+                if o.else_ops:
+                    _coll(o.else_ops)
+        _coll(ops)
+        for o in all_oplist:
+            if o.operand_ids:
+                for oid in o.operand_ids:
+                    use_of.setdefault(oid, set()).add(o.id)
+
+        # For each make_range, do a transitive use walk; check if it reaches
+        # any tt.load (or tt.gather etc.) as well as any tt.store.
+        op_by_id2 = {o.id: o for o in all_oplist}
+        def _transitive_uses(start_id):
+            seen = {start_id}
+            stack = [start_id]
+            reaches_load = False
+            reaches_store = False
+            while stack:
+                cur = stack.pop()
+                for u in use_of.get(cur, ()):
+                    if u in seen:
+                        continue
+                    seen.add(u)
+                    u_op = op_by_id2.get(u)
+                    if u_op is None:
+                        continue
+                    # A make_range used as the PTR operand of a store would
+                    # make that store a store-target user. But here we care
+                    # about offset_operand: make_range flows through expand,
+                    # muli, broadcast, addi into addptr, then into store.
+                    if u_op.op == "tt.load":
+                        reaches_load = True
+                    elif u_op.op in ("tt.store", "tt.atomic_rmw"):
+                        reaches_store = True
+                    stack.append(u)
+            return reaches_load, reaches_store
+
+        for parent_key, entries in expand_by_parent.items():
+            for _d, mr_id, _rs in entries:
+                rl, rs = _transitive_uses(mr_id)
+                if rs and not rl:
+                    self._make_range_store_only.add(mr_id)
+
     def _trace_to_make_range(self, ssa_id, ops, op_by_id):
         """Trace an SSA ID back through passthrough ops to find a make_range.
 
@@ -3322,6 +3384,13 @@ class GenericLowerer:
                         N = inner_N_map[ssa.id]
                     else:
                         N = total // range_size if range_size > 0 else 1
+                    # Store-only make_ranges whose tile is smaller than the
+                    # kernel's element count: scale inner_N so lid/N still
+                    # yields the correct M-index (see tl.topk M>1 case).
+                    store_only = getattr(self, '_make_range_store_only', set())
+                    if (ssa.id in store_only and range_size > 0
+                            and total > range_size * N):
+                        N = total // range_size
                     expr = f"{lid} / {N}u"
                 else:
                     expr = f"{lid} % {range_size}u"

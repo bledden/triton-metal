@@ -747,6 +747,14 @@ class TTGIRParser:
         # Instance norm: reductions with 1 input ptr (per-channel spatial norm)
         if self.reduce_ops and self._is_instance_norm_pattern():
             return self._build_instance_norm_kernel(kb, primary_dtype)
+        # Bitonic sort / top-k that the generic lowerer had to skip: emitting
+        # a scalar reduction here would silently produce wrong data. Fall
+        # through to a no-op (empty-body) kernel that the runtime will fail
+        # on, making the unsupported case visible rather than silent.
+        if self.reduce_ops and self._is_bitonic_sort_pattern():
+            kb.comment(
+                "Unsupported: bitonic sort / top-k with > 1024 elements")
+            return kb
         if self.reduce_ops:
             return self._build_reduction_kernel(kb, n_arg, primary_dtype)
 
@@ -998,11 +1006,49 @@ class TTGIRParser:
             kb.raw_line(f"acc = {combine}(acc, elem);")
 
     def _is_softmax_pattern(self):
-        """Check if multi-reduce pattern matches softmax (max + sum)."""
+        """Check if multi-reduce pattern matches softmax (max + sum).
+
+        Requires the canonical softmax signature: a max reduce, a subtract,
+        an exp, and a sum reduce. Bitonic sort also produces max/sum-like
+        reduces (actually xori classified as 'sum' fallback) but has no
+        math.exp — this guard keeps sort out of the softmax template.
+        """
         if len(self.reduce_ops) < 2:
             return False
         ops = [r[2] for r in self.reduce_ops]
-        return "max" in ops and "sum" in ops
+        if "max" not in ops or "sum" not in ops:
+            return False
+        # Softmax has exp(x - max) between the max reduce and sum reduce.
+        # Sort's xor reduces have no exp.
+        has_exp = ("math.exp" in self.ir_text
+                   or "math.exp2" in self.ir_text)
+        has_sub = ("arith.subf" in self.ir_text)
+        return has_exp and has_sub
+
+    def _is_bitonic_sort_pattern(self):
+        """Detect tl.sort / tl.topk's bitonic-sort lowering.
+
+        Signatures:
+          - Many reduces (>= 3) with xor combine bodies (arith.xori) —
+            tl.sort reshapes to (2,)*n and uses xor as a placeholder axis
+            reducer to produce the compare-and-swap mask.
+          - No exp / divf / subf (not softmax-like).
+          - Frequent arith.cmpf + arith.select (compare-and-swap).
+        """
+        if not self.reduce_ops or len(self.reduce_ops) < 3:
+            return False
+        xor_count = self.ir_text.count("arith.xori")
+        if xor_count < len(self.reduce_ops):
+            return False
+        if ("arith.cmpf" not in self.ir_text
+                or "arith.select" not in self.ir_text):
+            return False
+        # Soft negative checks: not softmax / layer-norm
+        if ("math.exp" in self.ir_text
+                or "arith.divf" in self.ir_text
+                or "math.rsqrt" in self.ir_text):
+            return False
+        return True
 
     def _is_layer_norm_pattern(self):
         """Check if multi-reduce pattern matches layer norm (sum + sum).

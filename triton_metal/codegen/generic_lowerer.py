@@ -151,6 +151,46 @@ def _shape_numel(shape: tuple) -> int:
     return result
 
 
+def _extract_layout_signature(type_str):
+    """Extract the layout portion of an MLIR tensor type string.
+
+    Returns the substring after the first ``,`` (skipping shape/element type)
+    up to the closing ``>`` of the outermost ``tensor<`` — i.e., the layout
+    attribute.  Returns None if the type has no layout (e.g. bare tensor).
+
+    Examples:
+        tensor<256xf32, #blocked> → "#blocked"
+        tensor<1x1x2xi32, #ttg.slice<{dim = 5, parent = #blocked}>>
+            → "#ttg.slice<{dim = 5, parent = #blocked}>"
+    """
+    if not type_str or "tensor<" not in type_str:
+        return None
+    # Find the outermost tensor< ... > and extract everything after the first
+    # comma inside it (which separates shape/element from layout).
+    start = type_str.find("tensor<")
+    if start < 0:
+        return None
+    # Skip past "tensor<"
+    i = start + len("tensor<")
+    depth = 1
+    comma_pos = -1
+    while i < len(type_str) and depth > 0:
+        c = type_str[i]
+        if c == "<":
+            depth += 1
+        elif c == ">":
+            depth -= 1
+            if depth == 0:
+                break
+        elif c == "," and depth == 1 and comma_pos < 0:
+            comma_pos = i
+        i += 1
+    if depth != 0 or comma_pos < 0:
+        return None
+    layout = type_str[comma_pos + 1:i].strip()
+    return layout if layout else None
+
+
 # ---------------------------------------------------------------------------
 # Shared memory aliasing post-pass
 # ---------------------------------------------------------------------------
@@ -377,6 +417,13 @@ class GenericLowerer:
         # result tensor that thread `lid` actually holds. Consumers (e.g., a
         # subsequent 2D reduce or a tt.store) use this to re-stage correctly.
         self._bcast_layout = {}
+        # Track ssa_ids whose value is the SAME on every thread (splat-like).
+        # Includes: arith.constant tensors, tt.splat, and elementwise ops whose
+        # operands are all splat.  Used to decide whether combining with a
+        # bcast-laid-out value preserves the layout (splat operand doesn't
+        # absorb the broadcast-redundancy) or collapses it to canonical (a
+        # per-thread distinct operand does absorb).
+        self._is_splat = set()
         self.kb = None
         self._var_counter = 0
 
@@ -3131,12 +3178,7 @@ class GenericLowerer:
         elif op.startswith("ttg."):
             self._lower_ttg(ssa)
         elif op == "tt.reshape":
-            self._emit_passthrough(ssa)
-            # Propagate output shape from type_str for downstream reduce detection
-            if ssa.type_str:
-                out_shape = _extract_shape(ssa.type_str)
-                if out_shape:
-                    self.env_shapes[ssa.id] = out_shape
+            self._lower_reshape(ssa)
         elif op == "tt.trans":
             self._lower_tt_trans(ssa)
         elif op == "tt.join":
@@ -3340,6 +3382,8 @@ class GenericLowerer:
         that the value has been "splatted" but each thread still holds a
         single scalar copy.
         """
+        # Splat produces a value that's the same on every thread.
+        self._is_splat.add(ssa.id)
         if ssa.operand_ids:
             src_id = ssa.operand_ids[0]
             self.env[ssa.id] = self._lookup(src_id)
@@ -3416,6 +3460,125 @@ class GenericLowerer:
         shape = _extract_shape(ssa.type_str)
         if shape:
             self.env_shapes[ssa.id] = shape
+
+    def _lower_reshape(self, ssa: SSAValue):
+        """tt.reshape → passthrough with optional bcast-layout rewrite.
+
+        Most reshapes are passthrough (same per-thread value, just a type
+        change). But there's a critical case for tl.sort's bitonic topk:
+
+        When a make_range is reshaped into a slice layout (e.g.
+        ``#ttg.slice<{dim = 5, parent = #blocked}>``), the reshape operates
+        in the post-reduce broadcast-layout regime.  In that regime, thread
+        ``lid`` no longer canonically holds element ``tensor[lid]``; it
+        holds ``tensor[bcast_layout(lid)]``.  The original make_range
+        variable (computed at the top of the kernel with ``(lid/stride) %
+        range``) is wrong in this context.
+
+        The fix: when the reshape output is in a slice layout AND there is
+        an active bcast_layout from a preceding reduce, emit a fresh
+        variable computing ``(bcast_layout / stride_below) % range_size``.
+        The fresh variable shadows the original make_range value for this
+        reshape SSA (and thus for all its downstream consumers).
+
+        Otherwise (no slice layout, or source isn't a make_range), fall
+        back to the passthrough behavior.
+        """
+        if not ssa.operand_ids:
+            self._emit_passthrough(ssa)
+            if ssa.type_str:
+                out_shape = _extract_shape(ssa.type_str)
+                if out_shape:
+                    self.env_shapes[ssa.id] = out_shape
+            return
+
+        # Check whether this reshape needs a bcast-layout rewrite.
+        did_rewrite = self._maybe_rewrite_make_range_reshape(ssa)
+        if not did_rewrite:
+            self._emit_passthrough(ssa)
+
+        # Propagate output shape from type_str for downstream reduce detection
+        if ssa.type_str:
+            out_shape = _extract_shape(ssa.type_str)
+            if out_shape:
+                self.env_shapes[ssa.id] = out_shape
+
+    def _maybe_rewrite_make_range_reshape(self, ssa: SSAValue) -> bool:
+        """Emit a bcast-layout-aware expression for a reshape-of-make_range.
+
+        Returns True if the reshape was rewritten, False otherwise (caller
+        should fall back to passthrough).
+        """
+        if not ssa.operand_ids:
+            return False
+
+        # Only rewrite when the reshape output is in a slice layout.  Other
+        # reshapes (e.g. 1D → 9D parent) are canonical.
+        if not ssa.type_str or "#ttg.slice<" not in ssa.type_str:
+            return False
+
+        # The source must trace to a make_range, and the output shape must
+        # have exactly one non-1 axis (so we can interpret it as a per-axis
+        # range indicator).
+        out_shape = _extract_shape(ssa.type_str)
+        if not out_shape or len(out_shape) < 2:
+            return False
+        non_one = [i for i, s in enumerate(out_shape) if s != 1]
+        if len(non_one) != 1:
+            return False
+        dim = non_one[0]
+        range_size = out_shape[dim]
+
+        # Trace the source through passthroughs to find the make_range.
+        ops_list = list(self.graph.ops)
+        op_by_id = {o.id: o for o in ops_list}
+        mr_id = self._trace_to_make_range(ssa.operand_ids[0], ops_list,
+                                          op_by_id)
+        if mr_id is None:
+            return False
+
+        # Primary lookup: match by layout signature.  The reshape's output
+        # layout (e.g. ``#ttg.slice<{dim = 5, parent = #blocked}>``) should
+        # exactly match a reduce output in the same bitonic stage.
+        consumer_layout = None
+        bcast_shape = None
+        layouts_by_layout = getattr(self, "_bcast_layouts_by_layout", {})
+        sig = _extract_layout_signature(ssa.type_str)
+        if sig is not None and sig in layouts_by_layout:
+            bcast_shape, consumer_layout = layouts_by_layout[sig]
+
+        # Fallback: match by shape compatibility.
+        if consumer_layout is None:
+            layouts_by_shape = getattr(self, "_bcast_layouts_by_shape", {})
+            for shape, layout in layouts_by_shape.items():
+                if len(shape) != len(out_shape):
+                    continue
+                compatible = True
+                for i in range(len(out_shape)):
+                    if out_shape[i] != 1 and out_shape[i] != shape[i]:
+                        compatible = False
+                        break
+                if compatible:
+                    if bcast_shape is None or _shape_numel(shape) > _shape_numel(bcast_shape):
+                        bcast_shape = shape
+                        consumer_layout = layout
+        if consumer_layout is None:
+            return False
+
+        stride_below = 1
+        for s in bcast_shape[dim + 1:]:
+            stride_below *= s
+
+        var_name = self._next_var("idx")
+        if stride_below == 1:
+            expr = f"(({consumer_layout}) % {range_size}u)"
+        else:
+            expr = f"((({consumer_layout}) / {stride_below}u) % {range_size}u)"
+        self.kb.raw_line(f"    uint {var_name} = {expr};")
+        self.env[ssa.id] = var_name
+        self.env_types[ssa.id] = "i32"
+        self.env_shapes[ssa.id] = tuple(out_shape)
+        return True
 
     def _lower_addptr(self, ssa: SSAValue):
         """tt.addptr → pointer + offset indexing.
@@ -3927,6 +4090,9 @@ class GenericLowerer:
         import math
         import struct as _struct
 
+        # Constants are splat-like: every thread holds the same value.
+        self._is_splat.add(ssa.id)
+
         value = ssa.attrs.get("value")
         var_name = self._next_var("c")
 
@@ -4238,26 +4404,76 @@ class GenericLowerer:
             "arith.andi", "arith.ori", "arith.xori"
         ):
             self.env_is_mask[ssa.id] = True
+        # Splat-ness propagates when both operands are splat.
+        if (ssa.operand_ids
+            and ssa.operand_ids[0] in self._is_splat
+            and ssa.operand_ids[1] in self._is_splat):
+            self._is_splat.add(ssa.id)
         self._propagate_bcast_layout_binary(ssa)
 
     def _propagate_bcast_layout_binary(self, ssa: SSAValue) -> None:
         """Propagate `_bcast_layout` from operands to the result of an
         elementwise binary op.
 
-        If either operand has a tracked broadcast layout, the result keeps
-        that layout (both operands must match, but in practice when only
-        one has it the other is a constant/scalar accumulator).
+        Rules:
+          1. Both operands have the same layout → keep it.
+          2. Both different layouts → pick the one with the larger shape
+             (the broader frame); this happens during chained N-D reduces
+             in tl.sort where 8D ⊃ 7D layouts xor within a stage.
+          3. One operand has a layout and the other does not → propagate
+             (matching the original simple behavior that many existing
+             patterns depend on, including scf.for loop-carried accums
+             with constant init).
         """
         if len(ssa.operand_ids) < 2:
             return
-        a_lay = self._bcast_layout.get(ssa.operand_ids[0])
-        b_lay = self._bcast_layout.get(ssa.operand_ids[1])
-        if a_lay is not None and b_lay is None:
-            self._bcast_layout[ssa.id] = a_lay
-        elif b_lay is not None and a_lay is None:
-            self._bcast_layout[ssa.id] = b_lay
-        elif a_lay is not None and b_lay is not None and a_lay == b_lay:
-            self._bcast_layout[ssa.id] = a_lay
+        a_id = ssa.operand_ids[0]
+        b_id = ssa.operand_ids[1]
+        a_lay = self._bcast_layout.get(a_id)
+        b_lay = self._bcast_layout.get(b_id)
+        if a_lay is None and b_lay is None:
+            return
+        if a_lay is not None and b_lay is not None:
+            if a_lay == b_lay:
+                self._bcast_layout[ssa.id] = a_lay
+                # The result inherits splat-ness if both operands are splats.
+                if a_id in self._is_splat and b_id in self._is_splat:
+                    self._is_splat.add(ssa.id)
+                return
+            # Different layouts — pick broader (more elements).
+            layouts_by_shape = getattr(self, "_bcast_layouts_by_shape", {})
+            a_shape = None
+            b_shape = None
+            for shape, lay in layouts_by_shape.items():
+                if lay == a_lay and (a_shape is None or _shape_numel(shape) > _shape_numel(a_shape)):
+                    a_shape = shape
+                if lay == b_lay and (b_shape is None or _shape_numel(shape) > _shape_numel(b_shape)):
+                    b_shape = shape
+            if a_shape is not None and b_shape is not None:
+                self._bcast_layout[ssa.id] = (
+                    a_lay if _shape_numel(a_shape) >= _shape_numel(b_shape) else b_lay
+                )
+            else:
+                self._bcast_layout[ssa.id] = a_lay
+            return
+        # Exactly one operand has layout.  Check whether the unlaid operand
+        # is "splat-like" (same value on every thread: constant, tt.splat,
+        # or transitively derived from them).  Splat operand preserves
+        # broadcast redundancy; canonical per-thread operand collapses it.
+        other_id = b_id if a_lay is not None else a_id
+        lay = a_lay if a_lay is not None else b_lay
+        if other_id in self._is_splat:
+            self._bcast_layout[ssa.id] = lay
+            return
+        other_shape = self.env_shapes.get(other_id)
+        if other_shape is None or other_shape == ():
+            # Scalar — preserve layout.
+            self._bcast_layout[ssa.id] = lay
+            return
+        # A full per-thread-distinct canonical tensor absorbs the layout
+        # back to canonical. Drop.
+        # (This matches tl.sort's `val_load ^ reduce_result` pattern.)
+        return
 
     def _is_float_op(self, ssa: SSAValue) -> bool:
         """Check if an SSA op produces a float result."""
@@ -4452,6 +4668,11 @@ class GenericLowerer:
                 self.env[ssa.id] = var_name
                 self.env_types[ssa.id] = matched_dtype
             self._propagate_shape_elementwise(ssa)
+            # Bitcast preserves per-thread element identity: propagate bcast
+            # layout so chained reduces in tl.sort can recognise post-reduce
+            # slice-layout operands.
+            if src_id in self._bcast_layout:
+                self._bcast_layout[ssa.id] = self._bcast_layout[src_id]
         elif not src_is_float and dst_is_float:
             # int -> float bitcast. MSL as_type requires matching widths.
             # When the destination is bf16, bitcast directly to bfloat — using
@@ -4484,6 +4705,8 @@ class GenericLowerer:
                 self.env[ssa.id] = cast_name
                 self.env_types[ssa.id] = dst_dtype_name
             self._propagate_shape_elementwise(ssa)
+            if src_id in self._bcast_layout:
+                self._bcast_layout[ssa.id] = self._bcast_layout[src_id]
         else:
             # Same category — passthrough (shape propagation handled inside)
             self._emit_passthrough(ssa)
@@ -4678,12 +4901,23 @@ class GenericLowerer:
                     self.env_shapes[ssa.id] = self.env_shapes[src_id]
             elif src_id in self.env_shapes:
                 self.env_shapes[ssa.id] = self.env_shapes[src_id]
+            # Propagate bcast layout: bitcast / trivial-reshape of a value
+            # keeps the same per-thread element identity, so the same
+            # (lid → flat-index) mapping applies to the result.  This is
+            # critical for chained reduces in tl.sort where reshape-to-slice
+            # and bitcast occur between reduce and the next reduce.
+            if src_id in self._bcast_layout:
+                self._bcast_layout[ssa.id] = self._bcast_layout[src_id]
+            # Splat-ness survives passthrough.
+            if src_id in self._is_splat:
+                self._is_splat.add(ssa.id)
 
     def _emit_cast(self, ssa: SSAValue, target_type: str, dtype: str = None):
         """Emit a type cast."""
         if not ssa.operand_ids:
             return
-        a = self._lookup(ssa.operand_ids[0])
+        src_id = ssa.operand_ids[0]
+        a = self._lookup(src_id)
         var_name = self._next_var("r")
         self.kb.raw_line(f"    {target_type} {var_name} = static_cast<{target_type}>({a});")
         self.env[ssa.id] = var_name
@@ -4696,6 +4930,10 @@ class GenericLowerer:
             self.env_types[ssa.id] = _mlir_to_triton_dtype(ssa.elem_type) if ssa.elem_type else "i32"
         # Shape: cast preserves shape from source operand
         self._propagate_shape_elementwise(ssa)
+        # Propagate bcast layout — elementwise casts preserve the per-thread
+        # identity, so the lid → flat-index mapping carries through.
+        if src_id in self._bcast_layout:
+            self._bcast_layout[ssa.id] = self._bcast_layout[src_id]
 
     def _emit_uitofp(self, ssa: SSAValue):
         """Emit unsigned-int-to-float conversion.
@@ -4788,6 +5026,10 @@ class GenericLowerer:
             self.env_is_ptr[ssa.id] = self.env_is_ptr[src_id]
         # Shape: integer cast preserves shape
         self._propagate_shape_elementwise(ssa)
+        # Propagate bcast layout across the integer cast — the per-thread
+        # element identity is preserved.
+        if src_id in self._bcast_layout:
+            self._bcast_layout[ssa.id] = self._bcast_layout[src_id]
 
     def _lower_cmpi(self, ssa: SSAValue):
         """arith.cmpi → comparison with unsigned cast when needed.
@@ -4830,6 +5072,9 @@ class GenericLowerer:
         self.env_types[ssa.id] = "i1"
         # Shape: comparison inherits shape from operands
         self._propagate_shape_elementwise(ssa)
+        # Propagate bcast layout across the comparison — the result has the
+        # same (lid → flat-index) mapping as its operands.
+        self._propagate_bcast_layout_binary(ssa)
 
     def _lower_cmpf(self, ssa: SSAValue):
         """arith.cmpf → float comparison with NaN-aware unordered predicates.
@@ -4880,6 +5125,9 @@ class GenericLowerer:
         self.env_types[ssa.id] = "i1"
         # Shape: comparison inherits shape from operands
         self._propagate_shape_elementwise(ssa)
+        # Propagate bcast layout across the comparison — the result has the
+        # same (lid → flat-index) mapping as its operands.
+        self._propagate_bcast_layout_binary(ssa)
 
     def _lower_select(self, ssa: SSAValue):
         """arith.select → ternary operator with inferred type.
@@ -4933,6 +5181,12 @@ class GenericLowerer:
         self.env_types[ssa.id] = dtype
         # Shape: select inherits shape from operands (cond, true, false)
         self._propagate_shape_elementwise(ssa)
+        # Propagate bcast layout across the ternary select — if any operand
+        # has a tracked layout, the result carries it.
+        for oid in ssa.operand_ids:
+            if oid in self._bcast_layout:
+                self._bcast_layout[ssa.id] = self._bcast_layout[oid]
+                break
 
     # -- Math ops --
 
@@ -6540,6 +6794,14 @@ class GenericLowerer:
             # Fallback — shouldn't happen
             return
 
+        # Check if input has a tracked broadcast layout from a prior reduce.
+        # When it does, thread `lid` holds the element at `input_bcast_idx`
+        # in the logical 3D tensor, not at `lid` — we must use that as the
+        # write index and as the effective lid for the readback.
+        input_bcast_idx = None
+        if ssa.operand_ids:
+            input_bcast_idx = self._bcast_layout.get(ssa.operand_ids[0])
+
         # Identity and combine expression
         if combine_op == "sum":
             identity = "0.0f" if msl_type == "float" else "0"
@@ -6565,7 +6827,13 @@ class GenericLowerer:
         # Stage values to shared memory from the already-loaded input_var
         # (not the raw pointer, which ignores strided/computed addresses)
         if total <= block_size:
-            self.kb.raw_line(f"    if (lid < {total}u) {shared_name}[lid] = {input_var};")
+            if input_bcast_idx is not None:
+                # Non-canonical layout: write at bcast position.
+                self.kb.raw_line(
+                    f"    if (lid < {block_size}u) {shared_name}[{input_bcast_idx}] = {input_var};"
+                )
+            else:
+                self.kb.raw_line(f"    if (lid < {total}u) {shared_name}[lid] = {input_var};")
         else:
             # Wrapping loop for large tensors — read from source pointer
             self.kb.raw_line(f"    for (uint _e = lid; _e < {total}u; _e += {block_size}u) {{")
@@ -6629,16 +6897,18 @@ class GenericLowerer:
         # after broadcast to the original shape, each position (i,j,k) holds
         # the reduce output at the corresponding coordinates of the collapsed
         # shape.
-        #   axis=0 → output (j,k) at idx lid % (N*K)
-        #   axis=1 → output (i,k) at idx (lid/(N*K))*K + lid%K
-        #   axis=2 → output (i,j) at idx (lid/(N*K))*N + (lid%(N*K))/K
+        #   axis=0 → output (j,k) at idx lid_input % (N*K)
+        #   axis=1 → output (i,k) at idx (lid_input/(N*K))*K + lid_input%K
+        #   axis=2 → output (i,j) at idx (lid_input/(N*K))*N + (lid_input%(N*K))/K
+        # `lid_input` is lid for canonical inputs, input_bcast_idx otherwise.
+        lid_input = input_bcast_idx if input_bcast_idx is not None else "lid"
         result_var = self._next_var("reduced")
         if axis == 0:
-            read_idx = f"(lid % {N * K}u)"
+            read_idx = f"({lid_input} % {N * K}u)"
         elif axis == 1:
-            read_idx = f"((lid / {N * K}u) * {K}u + (lid % {K}u))"
+            read_idx = f"(({lid_input} / {N * K}u) * {K}u + ({lid_input} % {K}u))"
         else:  # axis == 2
-            read_idx = f"((lid / {N * K}u) * {N}u + ((lid % {N * K}u) / {K}u))"
+            read_idx = f"(({lid_input} / {N * K}u) * {N}u + (({lid_input} % {N * K}u) / {K}u))"
         self.kb.raw_line(f"    {msl_type} {result_var} = {result_shared}[{read_idx}];")
 
         self.env[ssa.id] = result_var
@@ -6648,7 +6918,9 @@ class GenericLowerer:
         # index `read_idx` of the logical (M, N)-or-(M, K)-or-(N, K) result.
         # Downstream reduces/stores use this to re-stage data correctly when
         # the logical mapping is not lid → lid.
-        self._bcast_layout[ssa.id] = read_idx
+        self._bcast_layout[ssa.id] = f"({read_idx})"
+        self._register_bcast_layout_by_type(ssa.type_str, tuple(result_dims),
+                                            f"({read_idx})")
 
     def _lower_reduce_nd(self, ssa, input_var, axis, combine_op,
                          msl_type, shared_dtype, input_shape):
@@ -6716,6 +6988,21 @@ class GenericLowerer:
             identity = "0.0f" if msl_type == "float" else "0"
             combine_expr = "acc + val"
 
+        # Check if input has a tracked broadcast layout. If so, thread `lid`
+        # does not hold the value at flat position `lid` — it holds the value
+        # at `input_bcast_idx` in the logical N-D tensor. We use that as the
+        # write index so shared memory ends up canonically laid out.
+        input_bcast_idx = None
+        if ssa.operand_ids:
+            input_bcast_idx = self._bcast_layout.get(ssa.operand_ids[0])
+
+        # Check if input is an already-staged shared memory array with the
+        # same logical shape. If so, reuse to skip the copy.
+        input_id = ssa.operand_ids[0] if ssa.operand_ids else None
+        existing_shared = None
+        if input_id is not None:
+            existing_shared = getattr(self, '_shared_mem_descs', {}).get(input_id)
+
         # Allocate shared memory for the full N-D tensor
         shared_name = f"shared_{self._shared_counter}"
         self._shared_counter += 1
@@ -6724,8 +7011,17 @@ class GenericLowerer:
 
         # Stage values to shared memory from the already-computed input_var
         if total <= block_size:
-            self.kb.raw_line(
-                f"    if (lid < {total}u) {shared_name}[lid] = {input_var};")
+            if input_bcast_idx is not None:
+                # Non-canonical layout: thread lid holds element at
+                # input_bcast_idx. Write accordingly. Multiple threads may
+                # map to the same logical position (broadcast redundancy);
+                # they all write the same value so last-writer-wins is safe.
+                self.kb.raw_line(
+                    f"    if (lid < {block_size}u) {shared_name}[{input_bcast_idx}] = {input_var};"
+                )
+            else:
+                self.kb.raw_line(
+                    f"    if (lid < {total}u) {shared_name}[lid] = {input_var};")
         else:
             if x_ptr_name is None:
                 # Fallback — cannot handle without a source pointer
@@ -6792,12 +7088,20 @@ class GenericLowerer:
         # its own coords in the original N-D tensor, with axis d removed.
         # Extract axis coord using src_strides[axis] then derive result index.
         # For each result axis j (mapping back to input axis src_i):
-        #   res_coord[j] = (lid / src_strides[src_i]) % input_shape[src_i]
+        #   res_coord[j] = (lid_input / src_strides[src_i]) % input_shape[src_i]
         # then result_idx = sum_j res_coord[j] * res_strides[j].
+        #
+        # `lid_input` is the LOGICAL N-D flat position of thread lid's input
+        # element.  For a canonical input it's just ``lid``; for a post-reduce
+        # broadcast-layout input it's the prior reduce's readback (stored in
+        # `input_bcast_idx`).  Using lid when the input is non-canonical gives
+        # threads the wrong result element (bug in chained tl.sort reduces).
+        lid_input = input_bcast_idx if input_bcast_idx is not None else "lid"
         result_var = self._next_var("reduced")
         if nr == 0:
             self.kb.raw_line(
                 f"    {msl_type} {result_var} = {result_shared}[0];")
+            result_read_idx = None
         else:
             read_parts = []
             for j in range(nr):
@@ -6806,9 +7110,9 @@ class GenericLowerer:
                 size_i = input_shape[src_i]
                 rs = res_strides[j]
                 if ss == 1:
-                    coord = f"(lid % {size_i}u)"
+                    coord = f"({lid_input} % {size_i}u)"
                 else:
-                    coord = f"((lid / {ss}u) % {size_i}u)"
+                    coord = f"(({lid_input} / {ss}u) % {size_i}u)"
                 if rs == 1:
                     read_parts.append(coord)
                 else:
@@ -6816,10 +7120,37 @@ class GenericLowerer:
             read_idx = " + ".join(read_parts)
             self.kb.raw_line(
                 f"    {msl_type} {result_var} = {result_shared}[{read_idx}];")
+            result_read_idx = read_idx
 
         self.env[ssa.id] = result_var
         self.env_types[ssa.id] = shared_dtype
         self.env_shapes[ssa.id] = result_shape
+        # Record the broadcast layout: thread `lid` holds the value at flat
+        # index `read_idx` in the reduced result. Downstream ops (reduce,
+        # store, make_range rewrite) use this to re-stage data correctly.
+        if result_read_idx is not None and nr >= 2:
+            self._bcast_layout[ssa.id] = f"({result_read_idx})"
+            self._register_bcast_layout_by_type(ssa.type_str, tuple(result_shape),
+                                                f"({result_read_idx})")
+
+    def _register_bcast_layout_by_type(self, type_str: str, shape: tuple,
+                                       layout_expr: str) -> None:
+        """Register a reduce output's bcast_layout, keyed both by shape and
+        by the layout signature extracted from its type_str.
+
+        This enables downstream reshape-of-make_range rewrites to find the
+        layout matching the reshape's slice layout (rather than just any
+        same-rank reduce, which may differ during chained compare-and-swaps
+        within a single bitonic stage).
+        """
+        if not hasattr(self, "_bcast_layouts_by_shape"):
+            self._bcast_layouts_by_shape = {}
+        self._bcast_layouts_by_shape[shape] = layout_expr
+        if not hasattr(self, "_bcast_layouts_by_layout"):
+            self._bcast_layouts_by_layout = {}
+        sig = _extract_layout_signature(type_str)
+        if sig is not None:
+            self._bcast_layouts_by_layout[sig] = (shape, layout_expr)
 
     # -- Prefix scan (tt.scan) --
 
@@ -7572,6 +7903,13 @@ class GenericLowerer:
                     init_id = init_ids[i] if i < len(init_ids) else None
                     if init_id is not None and init_id in self.env_shapes:
                         self.env_shapes[ba_id] = self.env_shapes[init_id]
+                    # Propagate splat-ness from init value. If init is
+                    # broadcast-redundant (constant / splat), the block_arg
+                    # at the start of each iteration is also broadcast-
+                    # redundant; combining with a bcast-laid-out value
+                    # preserves that layout.
+                    if init_id is not None and init_id in self._is_splat:
+                        self._is_splat.add(ba_id)
                     # Register shared-memory-backed iter_args
                     if i in smem_iter_indices:
                         init_shape = self.env_shapes.get(

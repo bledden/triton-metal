@@ -4929,6 +4929,11 @@ class GenericLowerer:
         if force_unsigned and not is_float:
             unsigned_ty, _ = _msl_int_type(ssa.elem_type, unsigned=True)
             self.kb.raw_line(f"    {ty} {var_name} = {fn_name}(({unsigned_ty}){a}, ({unsigned_ty}){b});")
+        elif not is_float:
+            # MSL max/min have separate (int, int) and (uint, uint) overloads.
+            # Explicit casts avoid ambiguity when a literal `1` is passed to
+            # max/min against a uint operand (signed literal vs unsigned var).
+            self.kb.raw_line(f"    {ty} {var_name} = {fn_name}(({ty}){a}, ({ty}){b});")
         else:
             self.kb.raw_line(f"    {ty} {var_name} = {fn_name}({a}, {b});")
         self.env[ssa.id] = var_name

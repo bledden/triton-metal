@@ -373,6 +373,255 @@ def ldexp(x, n):
     return x * tl.math.exp2(n.to(tl.float32))
 
 
+# --- Bessel functions ---
+#
+# Abramowitz & Stegun polynomial approximations. MSL has no Bessel built-ins
+# and Apple GPUs have no libdevice. These @triton.jit helpers lower to standard
+# math ops (log/sqrt/sin/cos/exp) that our codegen already handles.
+#
+# Accuracy (fp32, from A&S 9.4.x / 9.8.x):
+#   j0, j1: ≤ 5e-8 (|x|≤3), ≤ 1.6e-8 / 4e-8 (|x|>3)
+#   y0, y1: ≤ 1.4e-8 / 1.1e-7 (0<x≤3), ≤ 7e-8 (x>3)
+#   i0:    ≤ 1.6e-7 (|x|≤3.75), ≤ 1.9e-7 (|x|>3.75)
+#   i1:    ≤ 8e-9  (|x|≤3.75), ≤ 2.2e-7 (|x|>3.75)
+# All are within torch.testing.assert_close fp32 default (rtol=1.3e-6, atol=1e-5).
+# fp64 inputs are downcast to fp32 on Apple GPUs (see msl_emitter warning).
+
+
+@triton.jit
+def _j0_small(ax):
+    # A&S 9.4.1, |x| ≤ 3
+    u = (ax / 3.0) * (ax / 3.0)
+    p = 0.0002100
+    p = -0.0039444 + p * u
+    p = 0.0444479 + p * u
+    p = -0.3163866 + p * u
+    p = 1.2656208 + p * u
+    p = -2.2499997 + p * u
+    return 1.0 + p * u
+
+
+@triton.jit
+def _j0_large(ax):
+    # A&S 9.4.3, x ≥ 3. theta = x - pi/4 + correction(3/x)
+    t = 3.0 / ax
+    f = 0.00014476
+    f = -0.00072805 + f * t
+    f = 0.00137237 + f * t
+    f = -0.00009512 + f * t
+    f = -0.00552740 + f * t
+    f = -0.00000077 + f * t
+    f = 0.79788456 + f * t
+    th = 0.00013558
+    th = -0.00029333 + th * t
+    th = -0.00054125 + th * t
+    th = 0.00262573 + th * t
+    th = -0.00003954 + th * t
+    th = -0.04166397 + th * t
+    theta = ax - 0.78539816 + th * t
+    return f / tl.math.sqrt(ax) * tl.math.cos(theta)
+
+
+@triton.jit
+def j0(x):
+    ax = tl.math.abs(x)
+    y_small = _j0_small(ax)
+    y_large = _j0_large(ax)
+    return tl.where(ax <= 3.0, y_small, y_large)
+
+
+@triton.jit
+def _j1_small(x):
+    # A&S 9.4.4, j1(x)/x for |x| ≤ 3. x carries the sign.
+    u = (x / 3.0) * (x / 3.0)
+    p = 0.00001109
+    p = -0.00031761 + p * u
+    p = 0.00443319 + p * u
+    p = -0.03954289 + p * u
+    p = 0.21093573 + p * u
+    p = -0.56249985 + p * u
+    p = 0.5 + p * u
+    return x * p
+
+
+@triton.jit
+def _j1_large(ax):
+    # A&S 9.4.6, x ≥ 3. theta = x - 3pi/4 + correction(3/x)
+    t = 3.0 / ax
+    f = -0.00020033
+    f = 0.00113653 + f * t
+    f = -0.00249511 + f * t
+    f = 0.00017105 + f * t
+    f = 0.01659667 + f * t
+    f = 0.00000156 + f * t
+    f = 0.79788456 + f * t
+    th = -0.00029166
+    th = 0.00079824 + th * t
+    th = 0.00074348 + th * t
+    th = -0.00637879 + th * t
+    th = 0.00005650 + th * t
+    th = 0.12499612 + th * t
+    theta = ax - 2.35619449 + th * t
+    return f / tl.math.sqrt(ax) * tl.math.cos(theta)
+
+
+@triton.jit
+def j1(x):
+    ax = tl.math.abs(x)
+    y_small = _j1_small(x)
+    # j1 is odd; _j1_large uses |x|, so flip sign when x < 0.
+    y_large_pos = _j1_large(ax)
+    y_large = tl.where(x >= 0.0, y_large_pos, -y_large_pos)
+    return tl.where(ax <= 3.0, y_small, y_large)
+
+
+@triton.jit
+def _y0_small_positive(x):
+    # A&S 9.4.2, 0 < x ≤ 3. Caller must guarantee x > 0.
+    u = (x / 3.0) * (x / 3.0)
+    p = -0.00024846
+    p = 0.00427916 + p * u
+    p = -0.04261214 + p * u
+    p = 0.25300117 + p * u
+    p = -0.74350384 + p * u
+    p = 0.60559366 + p * u
+    p = 0.36746691 + p * u
+    return 0.6366197723675814 * tl.math.log(x * 0.5) * _j0_small(x) + p
+
+
+@triton.jit
+def _y0_large(ax):
+    # A&S 9.4.3 with sin instead of cos
+    t = 3.0 / ax
+    f = 0.00014476
+    f = -0.00072805 + f * t
+    f = 0.00137237 + f * t
+    f = -0.00009512 + f * t
+    f = -0.00552740 + f * t
+    f = -0.00000077 + f * t
+    f = 0.79788456 + f * t
+    th = 0.00013558
+    th = -0.00029333 + th * t
+    th = -0.00054125 + th * t
+    th = 0.00262573 + th * t
+    th = -0.00003954 + th * t
+    th = -0.04166397 + th * t
+    theta = ax - 0.78539816 + th * t
+    return f / tl.math.sqrt(ax) * tl.math.sin(theta)
+
+
+@triton.jit
+def y0(x):
+    # y0 is defined only for x > 0; return NaN otherwise.
+    # Use |x| in the log to avoid NaN contamination in the unused branch;
+    # the outer tl.where forces NaN on x <= 0.
+    ax = tl.math.abs(x)
+    safe_x = tl.where(x > 0.0, x, 1.0)
+    y_small = _y0_small_positive(safe_x)
+    y_large = _y0_large(ax)
+    result = tl.where(ax <= 3.0, y_small, y_large)
+    return tl.where(x > 0.0, result, float('nan'))
+
+
+@triton.jit
+def _y1_small_positive(x):
+    # A&S 9.4.5, 0 < x ≤ 3. Caller must guarantee x > 0.
+    u = (x / 3.0) * (x / 3.0)
+    p = 0.0027873
+    p = -0.0400976 + p * u
+    p = 0.3123951 + p * u
+    p = -1.3164827 + p * u
+    p = 2.1682709 + p * u
+    p = 0.2212091 + p * u
+    p = -0.6366198 + p * u
+    return (0.6366197723675814 * x * tl.math.log(x * 0.5) * _j1_small(x) + p) / x
+
+
+@triton.jit
+def _y1_large(ax):
+    # A&S 9.4.6 with sin instead of cos
+    t = 3.0 / ax
+    f = -0.00020033
+    f = 0.00113653 + f * t
+    f = -0.00249511 + f * t
+    f = 0.00017105 + f * t
+    f = 0.01659667 + f * t
+    f = 0.00000156 + f * t
+    f = 0.79788456 + f * t
+    th = -0.00029166
+    th = 0.00079824 + th * t
+    th = 0.00074348 + th * t
+    th = -0.00637879 + th * t
+    th = 0.00005650 + th * t
+    th = 0.12499612 + th * t
+    theta = ax - 2.35619449 + th * t
+    return f / tl.math.sqrt(ax) * tl.math.sin(theta)
+
+
+@triton.jit
+def y1(x):
+    ax = tl.math.abs(x)
+    safe_x = tl.where(x > 0.0, x, 1.0)
+    y_small = _y1_small_positive(safe_x)
+    y_large = _y1_large(ax)
+    result = tl.where(ax <= 3.0, y_small, y_large)
+    return tl.where(x > 0.0, result, float('nan'))
+
+
+@triton.jit
+def cyl_bessel_i0(x):
+    # A&S 9.8.1, |x| ≤ 3.75; A&S 9.8.2, |x| > 3.75. i0 is even.
+    ax = tl.math.abs(x)
+    u_small = (ax / 3.75) * (ax / 3.75)
+    p = 0.0045813
+    p = 0.0360768 + p * u_small
+    p = 0.2659732 + p * u_small
+    p = 1.2067492 + p * u_small
+    p = 3.0899424 + p * u_small
+    p = 3.5156229 + p * u_small
+    y_small = 1.0 + p * u_small
+    t = 3.75 / ax
+    q = 0.00392377
+    q = -0.01647633 + q * t
+    q = 0.02635537 + q * t
+    q = -0.02057706 + q * t
+    q = 0.00916281 + q * t
+    q = -0.00157565 + q * t
+    q = 0.00225319 + q * t
+    q = 0.01328592 + q * t
+    q = 0.39894228 + q * t
+    y_large = q * tl.math.exp(ax) / tl.math.sqrt(ax)
+    return tl.where(ax <= 3.75, y_small, y_large)
+
+
+@triton.jit
+def cyl_bessel_i1(x):
+    # A&S 9.8.3, |x| ≤ 3.75; A&S 9.8.4, |x| > 3.75. i1 is odd.
+    ax = tl.math.abs(x)
+    u_small = (ax / 3.75) * (ax / 3.75)
+    p = 0.00032411
+    p = 0.00301532 + p * u_small
+    p = 0.02658733 + p * u_small
+    p = 0.15084934 + p * u_small
+    p = 0.51498869 + p * u_small
+    p = 0.87890594 + p * u_small
+    p = 0.5 + p * u_small
+    y_small = x * p
+    t = 3.75 / ax
+    q = -0.00420059
+    q = 0.01787654 + q * t
+    q = -0.02895312 + q * t
+    q = 0.02282967 + q * t
+    q = -0.01031555 + q * t
+    q = 0.00163801 + q * t
+    q = -0.00362018 + q * t
+    q = -0.03988024 + q * t
+    q = 0.39894228 + q * t
+    y_large_pos = q * tl.math.exp(ax) / tl.math.sqrt(ax)
+    y_large = tl.where(x >= 0.0, y_large_pos, -y_large_pos)
+    return tl.where(ax <= 3.75, y_small, y_large)
+
+
 # Package this module's functions as a module object.
 #
 # Used in two places:

@@ -5562,14 +5562,11 @@ class GenericLowerer:
         true_dtype = self.env_types.get(ssa.operand_ids[1], "fp32")
 
         if ir_dtype and (ir_dtype.startswith("fp") or ir_dtype.startswith("bf")):
-            # Narrow float (fp16/bf16) computes in float; wider uses its own type.
-            if ir_dtype in ("fp16", "bf16"):
-                ty = "float"
-            elif ir_dtype == "fp64":
-                ty = "double"
-            else:
-                ty = "float"
-            dtype = ir_dtype
+            # Metal has no fp64 on Apple Silicon; fp64 downcasts to float32 to
+            # match the rest of the codegen (see msl_emitter.triton_type_to_msl).
+            # Narrow float (fp16/bf16) also computes in float.
+            ty = "float"
+            dtype = "fp32" if ir_dtype == "fp64" else ir_dtype
         elif ir_dtype and ir_dtype.startswith("i"):
             ty = "int"
             dtype = ir_dtype

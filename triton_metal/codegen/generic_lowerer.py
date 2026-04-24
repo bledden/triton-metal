@@ -818,6 +818,17 @@ class GenericLowerer:
             self._prescan_stores()
             return msl
 
+        # Check for tl.sort / tl.topk applied to each row of a 2D tensor.
+        # When total > 1024 threads are needed, the generic reduce path can't
+        # run (threadgroup cap), but each row can be sorted independently in
+        # a single thread with an in-register bitonic sort.
+        sort_info = self._detect_row_wise_sort()
+        if sort_info:
+            msl = self._lower_row_wise_sort_template(sort_info)
+            self.effective_block_size = sort_info["block_size"]
+            # _prescan_stores already ran inside _detect_row_wise_sort
+            return msl
+
         # Check for 3D reduce — switch to prebuilt template
         reduce_3d_info = self._detect_3d_reduce()
         if reduce_3d_info:
@@ -1838,6 +1849,331 @@ class GenericLowerer:
             lines.append(f"        uint _sk = {K - 1}u - _k;")
         lines.append(f"        uint _src = _si * {N * K}u + _sj * {K}u + _sk;")
         lines.append(f"        {z_ptr}[_e] = {x_ptr}[_src];")
+        lines.append(f"    }}")
+        lines.append("}")
+        lines.append("")
+
+        return "\n".join(lines)
+
+    def _detect_row_wise_sort(self):
+        """Detect tl.sort / tl.topk applied to each row of a 2D tensor.
+
+        Pattern (emitted by triton.language.standard.sort_impl):
+          - Single tt.load of a 2D tensor shape (M, N) where N is a power of 2.
+          - tt.reshape from (M, N) to (2,)*log2(M*N) hypercube.
+          - A series of tt.reduce ops with xori combine, where every reduce
+            axis corresponds to a bit within the *within-row* range, i.e.,
+            axis >= log2(M*N) - log2(N). Additionally, topk has a final
+            axis-reduce with a float max/min combine (trimming the extra dims).
+          - A final tt.reshape to (M, N) or (M, k) and a tt.store.
+
+        For this pattern, each row is sorted independently, so we can emit
+        a kernel where thread `lid` handles row `lid` with a local register
+        array. That avoids needing > 1024 threads in a single threadgroup.
+
+        Returns dict with {M, N, k, descending, elem_type, x_ptr, z_ptr,
+        stride_xm, stride_zm, block_size} if detected, None otherwise.
+        """
+        # Only consider kernels with tt.load + tt.store + multiple tt.reduce
+        if any(op in {"scf.for", "scf.while", "scf.if", "tt.get_num_programs"}
+               for op in (s.op for s in self.graph.ops)):
+            return None
+
+        load_ssa = None
+        store_ssa = None
+        reshape_ops = []
+        reduce_ops = []
+        const_ops = []
+        for ssa in self.graph.ops:
+            if ssa.op == "tt.load":
+                if load_ssa is not None:
+                    return None
+                load_ssa = ssa
+            elif ssa.op == "tt.store":
+                if store_ssa is not None:
+                    return None
+                store_ssa = ssa
+            elif ssa.op == "tt.reshape":
+                reshape_ops.append(ssa)
+            elif ssa.op == "tt.reduce":
+                reduce_ops.append(ssa)
+            elif ssa.op == "arith.constant":
+                const_ops.append(ssa)
+        if load_ssa is None or store_ssa is None:
+            return None
+        # Bitonic sort has at least log2(N) xori reduces. Require at least
+        # one xori reduce to distinguish from softmax/max-reduce patterns.
+        xor_reduce_count = 0
+        for red in reduce_ops:
+            if red.region_ops and any("xori" in bop.op for bop in red.region_ops):
+                xor_reduce_count += 1
+        if xor_reduce_count < 1:
+            return None
+
+        # Require a 2D -> hypercube reshape (distinctive to tl.sort).
+        # Input (M, N) reshapes to (2,)*log2(M*N) with ALL dims size 2.
+        has_hypercube_reshape = False
+        for rs in reshape_ops:
+            out_shape = _extract_shape(rs.type_str)
+            if out_shape and len(out_shape) >= 4 and all(d == 2 for d in out_shape):
+                has_hypercube_reshape = True
+                break
+        if not has_hypercube_reshape:
+            return None
+
+        # Load shape must be 2D: tensor<MxNx...>
+        load_shape = _extract_shape(load_ssa.type_str)
+        if not load_shape or len(load_shape) != 2:
+            return None
+        M, N = load_shape
+        # N must be a power of 2
+        if N < 1 or (N & (N - 1)) != 0:
+            return None
+
+        # Identify the final store shape: (M, K) where K in {N, user_k}
+        store_shape = None
+        if store_ssa.operand_ids and len(store_ssa.operand_ids) >= 2:
+            val_id = store_ssa.operand_ids[1]
+            val_type = self._find_op_type_str(val_id)
+            store_shape = _extract_shape(val_type) if val_type else None
+        if not store_shape or len(store_shape) != 2:
+            return None
+        if store_shape[0] != M:
+            return None
+        K_out = store_shape[1]
+        # K_out must be a power of 2 and <= N
+        if K_out < 1 or (K_out & (K_out - 1)) != 0 or K_out > N:
+            return None
+
+        total = M * N
+        n_dims = total.bit_length() - 1  # log2(total)
+        if (1 << n_dims) != total:
+            return None
+        log_n = N.bit_length() - 1  # log2(N)
+
+        # Every reduce must have an axis in the within-row range
+        # (axes n_dims - log_n .. n_dims - 1 — the last log_n axes)
+        min_axis = n_dims - log_n
+        for red in reduce_ops:
+            axis = red.attrs.get("axis", -1)
+            if axis < min_axis or axis >= n_dims:
+                return None
+            # Must have a reduce body — xori for bitonic compare-swap,
+            # or arith.maxf/maximumf/minf/minimumf/cmpf for topk trim.
+            if not red.region_ops:
+                return None
+            body_ops = {bop.op for bop in red.region_ops}
+            is_xor = any("xori" in op for op in body_ops)
+            is_minmax = any(("max" in op or "min" in op or op == "arith.cmpf")
+                            for op in body_ops)
+            if not (is_xor or is_minmax):
+                return None
+
+        # Identify pointer args (X=input, Z=output) and stride scalars
+        ptr_args = [a for a in self.graph.args if a.is_ptr]
+        scalar_args = [a for a in self.graph.args if not a.is_ptr]
+        if len(ptr_args) < 2:
+            return None
+        # Distinguish input vs output via prescan store chain
+        self._store_ptr_ids = set()
+        self._prescan_stores()
+        x_ptr_name = None
+        z_ptr_name = None
+        for a in ptr_args:
+            if a.id in getattr(self, "_output_arg_ids", set()):
+                if z_ptr_name is None:
+                    z_ptr_name = a.name
+            else:
+                if x_ptr_name is None:
+                    x_ptr_name = a.name
+        if x_ptr_name is None or z_ptr_name is None:
+            return None
+        elem_type = ptr_args[0].elem_type
+
+        # Detect descending by the presence of hypercube-sized `arith.constant
+        # dense<1>` tensors at the start of the kernel. triton.language.sort
+        # emits them when flipping the compare direction. Shape is
+        # (1,)*(n_dims-1) x 2 or similar — any constant dense<1> with only
+        # one non-unit dim of size 2, within the within-row range.
+        descending = False
+        for ssa in const_ops:
+            if ssa.attrs.get("value") != 1:
+                continue
+            shape = _extract_shape(ssa.type_str)
+            if not shape:
+                continue
+            # The inversion constants are 1D-like: all dims size 1 except one
+            # axis of size 2. The size-2 axis corresponds to a within-row bit.
+            size2_axes = [i for i, s in enumerate(shape) if s == 2]
+            other_sizes = [s for s in shape if s != 2]
+            if len(size2_axes) == 1 and all(s == 1 for s in other_sizes):
+                descending = True
+                break
+        # Fallback: scan raw IR text for the inversion constants
+        if not descending:
+            # Look for an arith.constant dense<1> : tensor<...x2xi32 shape
+            # at the top (before the first make_range).
+            raw = getattr(self.graph, "text", None)
+            if raw:
+                # Simple heuristic: arith.constant dense<1> : ... occurs
+                # BEFORE any tt.make_range.
+                mr_pos = raw.find("tt.make_range")
+                const_match = re.search(r"arith\.constant\s+dense<1>\s*:\s*tensor<", raw)
+                if const_match and (mr_pos == -1 or const_match.start() < mr_pos):
+                    descending = True
+
+        # Identify stride scalars: they appear in arith.muli with the
+        # make_range offsets. For now, name-based heuristic: first scalar
+        # arg = stride_xm, second scalar arg = stride_zm. This matches
+        # the sort_kernel signature (X, stride_xm, Z, stride_zm).
+        stride_xm_name = None
+        stride_zm_name = None
+        if len(scalar_args) >= 2:
+            stride_xm_name = scalar_args[0].name
+            stride_zm_name = scalar_args[1].name
+        elif len(scalar_args) >= 1:
+            stride_xm_name = stride_zm_name = scalar_args[0].name
+
+        # Require M <= 1024 so each row fits in one thread within the tg
+        if M > 1024:
+            return None
+
+        # Block size: dispatch enough threads to cover all rows.
+        block_size = max(M, self.graph.num_warps * 32)
+        block_size = min(block_size, 1024)
+
+        return {
+            "M": M,
+            "N": N,
+            "K": K_out,
+            "descending": descending,
+            "elem_type": elem_type,
+            "x_ptr": x_ptr_name,
+            "z_ptr": z_ptr_name,
+            "stride_xm": stride_xm_name,
+            "stride_zm": stride_zm_name,
+            "block_size": block_size,
+        }
+
+    def _lower_row_wise_sort_template(self, info) -> str:
+        """Emit a per-row bitonic sort / top-k kernel.
+
+        Thread `lid` owns row `lid` of the (M, N) input. It loads N elements
+        into a local register array, performs an in-register bitonic sort,
+        and stores the first K elements back to row `lid` of the output.
+
+        Bitonic sort for direction `asc`:
+            for stage in 2, 4, ..., N:
+                for step in stage/2, stage/4, ..., 1:
+                    for i in 0 .. N-1:
+                        j = i ^ step
+                        if j > i:
+                            up = ((i & stage) == 0) xor !asc
+                            if ((v[i] > v[j]) == up) swap
+
+        For topk: run the full sort, then store first K elements. For
+        `descending=True`: sort ascending and reverse-store. For
+        `descending=False` + topk: the smallest K elements.
+        """
+        M = info["M"]
+        N = info["N"]
+        K = info["K"]
+        descending = info["descending"]
+        elem_type = info["elem_type"]
+        x_ptr = info["x_ptr"]
+        z_ptr = info["z_ptr"]
+        stride_xm = info["stride_xm"]
+        stride_zm = info["stride_zm"]
+        block_size = info["block_size"]
+
+        msl_type = triton_type_to_msl(elem_type)
+        # Pick a compute type for comparisons (promote fp16/bf16 to float)
+        compute_type = _msl_compute_type(elem_type)
+
+        safe_name = _sanitize_msl_name(self.graph.func_name)
+
+        # Build argument declarations in the original IR arg order
+        arg_decls = []
+        for i, arg in enumerate(self.graph.args):
+            if arg.is_ptr:
+                arg_msl_type = triton_type_to_msl(arg.elem_type)
+                if arg.name == z_ptr:
+                    arg_decls.append(
+                        f"    volatile device {arg_msl_type}* {arg.name} [[buffer({i})]]")
+                else:
+                    arg_decls.append(
+                        f"    device const {arg_msl_type}* {arg.name} [[buffer({i})]]")
+            else:
+                scalar_ty = triton_type_to_msl(arg.elem_type or "i32")
+                arg_decls.append(
+                    f"    constant {scalar_ty}& {arg.name} [[buffer({i})]]")
+
+        # Integer sort? If elem type is integer we just use standard
+        # `<` / `>` over the integer values. For floats, use `<` / `>`.
+        is_int = elem_type.startswith("i") or elem_type.startswith("u")
+
+        lines = []
+        lines.append("#include <metal_stdlib>")
+        lines.append("using namespace metal;")
+        lines.append("")
+        lines.append(f"kernel void {safe_name}(")
+        lines.append(",\n".join(arg_decls) + ",")
+        lines.append("    uint pid [[threadgroup_position_in_grid]],")
+        lines.append("    uint lid [[thread_position_in_threadgroup]],")
+        lines.append("    uint tid [[thread_position_in_grid]]")
+        lines.append(") {")
+
+        lines.append(f"    if (lid < {M}u) {{")
+        # Load N elements for this row
+        lines.append(f"        {compute_type} v[{N}];")
+        lines.append(f"        uint _row_off = lid * (uint){stride_xm};")
+        lines.append(f"        for (uint _i = 0u; _i < {N}u; _i++) {{")
+        lines.append(f"            v[_i] = static_cast<{compute_type}>({x_ptr}[_row_off + _i]);")
+        lines.append(f"        }}")
+        # In-register bitonic sort (ascending). Unroll to avoid the
+        # `step /= 2u` where step=1 lap not exiting the `>=1u` condition
+        # cleanly in MSL (0 >= 1 is false so it DOES exit; but some compilers
+        # warn). We emit the sequence directly from known N.
+        lines.append(f"        // Bitonic sort of {N} elements (ascending order)")
+        stage = 2
+        while stage <= N:
+            step = stage // 2
+            while step >= 1:
+                lines.append(f"        // stage={stage}, step={step}")
+                lines.append(f"        for (uint i = 0u; i < {N}u; i++) {{")
+                lines.append(f"            uint j = i ^ {step}u;")
+                lines.append(f"            if (j > i) {{")
+                lines.append(f"                bool up = ((i & {stage}u) == 0u);")
+                lines.append(f"                bool gt = (v[i] > v[j]);")
+                lines.append(f"                if (gt == up) {{")
+                lines.append(f"                    {compute_type} _t = v[i]; v[i] = v[j]; v[j] = _t;")
+                lines.append(f"                }}")
+                lines.append(f"            }}")
+                lines.append(f"        }}")
+                step //= 2
+            stage *= 2
+        # After ascending sort, v[0..N-1] is ascending.
+        # For sort descending: store reversed.
+        # For topk ascending (not descending): smallest K → v[0..K-1] in ascending order.
+        # For topk descending: largest K → v[N-K..N-1] → store in reverse order.
+        # For sort ascending: v[0..N-1].
+        lines.append(f"        uint _row_off_z = lid * (uint){stride_zm};")
+        if descending:
+            if K < N:
+                # topk largest: take v[N-K..N-1], reverse for descending order
+                lines.append(f"        for (uint _i = 0u; _i < {K}u; _i++) {{")
+                lines.append(f"            {z_ptr}[_row_off_z + _i] = static_cast<{msl_type}>(v[{N}u - 1u - _i]);")
+                lines.append(f"        }}")
+            else:
+                # sort descending: reverse entire ascending output
+                lines.append(f"        for (uint _i = 0u; _i < {N}u; _i++) {{")
+                lines.append(f"            {z_ptr}[_row_off_z + _i] = static_cast<{msl_type}>(v[{N}u - 1u - _i]);")
+                lines.append(f"        }}")
+        else:
+            # ascending sort or topk ascending (smallest K): take v[0..K-1]
+            lines.append(f"        for (uint _i = 0u; _i < {K}u; _i++) {{")
+            lines.append(f"            {z_ptr}[_row_off_z + _i] = static_cast<{msl_type}>(v[_i]);")
+            lines.append(f"        }}")
         lines.append(f"    }}")
         lines.append("}")
         lines.append("")

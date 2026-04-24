@@ -341,27 +341,43 @@ class MetalBackend(BaseBackend):
         # elements. This works for elementwise / reduce kernels where
         # each thread's computation is per-element.
         #
-        # For tt.dot, it breaks: tt.dot lowers to simdgroup_matrix_8x8
-        # ops that read a full M*N tile from threadgroup memory as a
-        # cooperative operation (all threads in a simdgroup participate,
-        # and the tile spans the whole 32x64 = 2048 shared-memory buffer).
-        # On wrap iteration 0 only positions lid < 1024 are populated in
-        # that buffer; the simdgroup load reads all 2048 positions and
-        # gets garbage beyond index 1023. The wrap loop cannot be moved
-        # inside the simdgroup op (it's atomic from our IR's perspective),
-        # and the current populate-then-compute structure has the populate
-        # under the outer wrap loop too, so splitting the wrap into
-        # populate-only and compute-only phases would need per-load inner
-        # stride loops that re-parameterize `%lid` — a non-trivial
-        # restructuring of the wrap injection pass.
+        # For tt.dot, it breaks in multiple ways at 2048-element tiles:
         #
-        # Concretely this bites FlashAttention HEAD_DIM=64 (BLOCK_M=BLOCK_N
-        # =32, HEAD_DIM=64, tile = 32*64 = 2048 > 1024) and any matmul
-        # with M*N > 1024. FA HEAD_DIM=32 (tile = 32*32 = 1024) is fine.
+        # 1) The populate phase (stores scalar per-thread to TG[lid])
+        #    only covers positions 0..1023. The simdgroup_matrix_8x8_load
+        #    that follows reads a full M*N tile (e.g. 2048 floats) from TG
+        #    and gets garbage at positions 1024..2047. Could be fixed with
+        #    a populate-phase-only wrap (each thread does 2 stores), but:
         #
-        # Route to MSL, which has a different code model (threadgroup-wide
-        # tile population without per-thread wrap) and handles large tiles
-        # correctly.
+        # 2) FA's scf.for has per-thread scalar loop-carried state
+        #    (acc, m_i, l_i) as phi nodes. For a 2048-element acc tensor
+        #    with only 1024 threads, each thread would need to carry 2
+        #    scalars across the loop, but the phi is a single scalar.
+        #
+        # 3) The alpha = exp(m_prev - m_new) rescale of acc happens as
+        #    `acc_scalar * alpha_scalar` per thread, writing back to
+        #    TG[lid] (positions 0..1023). Positions 1024..2047 of the acc
+        #    TG buffer are never rescaled, so the next iter's dot_cin
+        #    reads stale data from half the acc buffer.
+        #
+        # 4) The final output store uses the per-thread scalar acc/l_i,
+        #    so only rows 0..15 (of 32) get written to global memory.
+        #
+        # Issues (2), (3), (4) all stem from the per-thread scalar model
+        # in DotOpConversion. Fixing requires keeping acc/m_i/l_i purely
+        # in TG memory and using stride loops for all per-element ops.
+        # That is a substantial refactor of the C++ conversion.
+        #
+        # Route to MSL, which uses a different code model: acc/m_i/l_i
+        # live in threadgroup memory throughout, with stride loops
+        # (`for _sb = lid; _sb < 2048; _sb += 1024`) for populate, apply
+        # alpha, and write-out. No per-thread scalar roundtrip.
+        #
+        # Investigated 2026-04-21: attempted populate-only phase split and
+        # `__tg_dot_cin_` aliasing; aliasing broke FA HEAD_DIM=32 (live
+        # range of dot_cin is not captured correctly by the range-based
+        # pass for this buffer's bracketed store-barrier-simdload pattern).
+        # Phase split would fix (1) but not (2)/(3)/(4).
         if 'tt.dot' in ops_in_kernel:
             # Compute block_size the same way make_llir does: product of
             # max `end` per slice dim for 2D kernels, else max end.

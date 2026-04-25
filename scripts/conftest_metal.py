@@ -136,12 +136,6 @@ UNIMPLEMENTED_FEATURES = {
     # by int (0). Cache clear misses, prior test pollutes cache, hook never fires.
     # Passes in isolation, fails when run after test_passing_nested_tuple_with_constexpr.
     "test_passing_nested_tuple_with_constexpr_and_jit_hook",
-    # Upstream Python 3.14 / PEP 649 issue: inspect.getmembers() now sees
-    # auto-generated __annotate_func__, which @tl.core._aggregate adds to
-    # hash_attrs, then jit.py's record_reference rejects as "Unsupported function".
-    # Fixed upstream in triton-lang/triton#9529 (47f7e923f, Feb 27 2026).
-    # Awaiting full triton upgrade — see project_status memory's deferred-work note.
-    "test_aggregate_with_tuple",
     # "test_math_erf_op",  # Enabled: Abramowitz & Stegun erf approximation (max err ~1.5e-7)
     # "test_transpose",  # Enabled: 2D transpose works for most types
     # "test_cast",  # Enabled: type casts work correctly

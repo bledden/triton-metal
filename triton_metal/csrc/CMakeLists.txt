@@ -1,4 +1,23 @@
 cmake_minimum_required(VERSION 3.20)
+
+# Match the macOS deployment target Triton uses for its build, so that
+# linking against pre-built triton .o files doesn't trigger version
+# mismatch warnings or load failures. Read it from triton's CMakeCache.
+if(NOT DEFINED CMAKE_OSX_DEPLOYMENT_TARGET)
+  set(_triton_cache "$ENV{HOME}/Documents/triton/build/cmake.macosx-15.0-arm64-cpython-3.14/CMakeCache.txt")
+  if(EXISTS "${_triton_cache}")
+    file(STRINGS "${_triton_cache}" _osx_target_line
+         REGEX "^CMAKE_OSX_DEPLOYMENT_TARGET:STRING=.+$")
+    if(_osx_target_line)
+      string(REGEX REPLACE "^CMAKE_OSX_DEPLOYMENT_TARGET:STRING=" "" _osx_target
+             "${_osx_target_line}")
+      set(CMAKE_OSX_DEPLOYMENT_TARGET "${_osx_target}" CACHE STRING
+          "macOS deployment target (inherited from triton's CMakeCache)" FORCE)
+      message(STATUS "Inheriting OSX deployment target from triton: ${CMAKE_OSX_DEPLOYMENT_TARGET}")
+    endif()
+  endif()
+endif()
+
 project(triton_metal_backend CXX C)
 
 set(CMAKE_CXX_STANDARD 17)
@@ -8,7 +27,9 @@ set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 # ---------------------------------------------------------------------------
 # Paths — hardcoded defaults, overridable via -D at configure time
 # ---------------------------------------------------------------------------
-set(LLVM_SYSPATH "$ENV{HOME}/.triton/llvm/llvm-979132a0-macos-arm64"
+# Use the version-agnostic symlink so this tracks the LLVM hash from
+# triton/cmake/llvm-hash.txt without needing edits on every bump.
+set(LLVM_SYSPATH "$ENV{HOME}/.triton/llvm/llvm-macos-arm64"
     CACHE PATH "Path to LLVM/MLIR install")
 set(TRITON_SRCPATH "$ENV{HOME}/Documents/triton"
     CACHE PATH "Path to Triton source tree")
@@ -187,7 +208,7 @@ install(TARGETS triton_metal_backend LIBRARY DESTINATION lib)
 find_package(pybind11 REQUIRED PATHS
     "${CMAKE_CURRENT_SOURCE_DIR}/../../.venv/lib/python3.14/site-packages/pybind11/share/cmake/pybind11")
 
-pybind11_add_module(_triton_metal_cpp
+pybind11_add_module(_triton_metal_cpp NO_EXTRAS SHARED
     python_bindings.cpp
     python_bindings_bridge.cpp
     lib/Conversion/TritonMetalToLLVM.cpp
@@ -197,27 +218,54 @@ pybind11_add_module(_triton_metal_cpp
     lib/Conversion/DotOpToLLVM.cpp
 )
 
+# NO_EXTRAS disables pybind11's automatic -flto/IPO injection. LTO requires
+# all symbols be resolvable at link time, which defeats -undefined
+# dynamic_lookup (the mechanism we use to defer MLIR/LLVM symbol resolution
+# until libtriton.so is loaded into the same Python process).
+#
+# SHARED (not pybind11's default MODULE/-bundle) is required on macOS so
+# the linker accepts undefined references that resolve via libtriton.so at
+# runtime. -bundle's stricter symbol resolution rejects them. Python loads
+# .so files via dlopen regardless of whether they're -bundle or -dynamiclib.
+set_target_properties(_triton_metal_cpp PROPERTIES
+    INTERPROCEDURAL_OPTIMIZATION OFF
+    PREFIX ""
+    SUFFIX ".cpython-314-darwin.so"
+)
+
 # Include our headers for the conversion sources compiled into this module
 target_include_directories(_triton_metal_cpp PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/include
 )
 
-# Link against libtriton.so for ALL MLIR/LLVM symbols — this is the same
-# copy of MLIR that Triton uses, so no duplicate registrations.
+# Link against libtriton.so for ALL MLIR/LLVM symbols. This is the same
+# copy of MLIR that Triton uses, so no duplicate dialect registrations.
+#
+# REQUIRES libtriton built with TRITON_EXT_ENABLED=1 (upstream's flag for
+# plugin/extension builds). Default libtriton hides all symbols except
+# _PyInit_libtriton; with TRITON_EXT_ENABLED visibility is "default" so
+# MLIR/LLVM symbols are exported and our module can dynamic_lookup them
+# at runtime. See triton commits 6cb844590 (introduce flag) and
+# fdfded1d8 (minimize default exports). The runtime guard in
+# lib/Tools/PluginUtils.cpp refuses to load us if libtriton was built
+# without TRITON_EXT_ENABLED, so the failure mode is loud, not silent.
 target_link_libraries(_triton_metal_cpp PRIVATE ${LIBTRITON_PATH})
 
-# Also link the Triton IR dialect object files — these contain non-inline
-# method definitions for Triton ops (GetProgramIdOp, LoadOp, etc.)
-target_sources(_triton_metal_cpp PRIVATE ${TRITON_IR_OBJS})
+# macOS: defer MLIR/LLVM symbol resolution to runtime when libtriton.so is
+# loaded into the same process. Same pattern triton_metal_plugin uses.
+if(APPLE)
+  target_link_options(_triton_metal_cpp PRIVATE
+      "LINKER:-undefined,dynamic_lookup")
+endif()
 
-# TritonGPU dialect object files — enables type-safe matching on TTG ops.
-target_sources(_triton_metal_cpp PRIVATE ${TRITON_GPU_OBJS})
-
-# TritonNvidiaGPU objects — provide TypeID symbols referenced by TTG ops.
-target_sources(_triton_metal_cpp PRIVATE ${TRITON_NVIDIA_GPU_OBJS})
-
-# Triton helper .o files — LinearLayout methods, supportMMA, etc.
-target_sources(_triton_metal_cpp PRIVATE ${TRITON_SUPPORT_OBJS})
+# NOTE: pre-TRITON_EXT_ENABLED, we needed to pull in TritonIR/TritonGPUIR/
+# TritonNvidiaGPUIR/Tools .o files directly because their symbols (TypeID
+# resolvers, getShape, dialect ctors) lived in libtriton as private-local
+# symbols. With TRITON_EXT_ENABLED libtriton exports all of these with
+# default visibility, so dynamic_lookup at runtime resolves them — no need
+# to embed our own copies. Embedding them would also resurrect the
+# duplicate dialect registration crash that was the original reason this
+# build was structured around libtriton.so in the first place.
 
 # Per-file RTTI settings:
 # - python_bindings.cpp needs RTTI for pybind11 (typeid)

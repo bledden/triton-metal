@@ -41,10 +41,18 @@ def _metal_check_type_supported(dtype, device):
 
 
 def pytest_configure(config):
-    """Monkeypatch check_type_supported at import time."""
-    import triton._internal_testing as _testing
+    """Monkeypatch check_type_supported at import time.
 
-    _testing.check_type_supported = _metal_check_type_supported
+    Upstream moved check_type_supported from triton._internal_testing into
+    test_core.py around 2026-04. We try both locations so the monkeypatch
+    works against either version of triton.
+    """
+    try:
+        import triton._internal_testing as _testing
+        if hasattr(_testing, "check_type_supported"):
+            _testing.check_type_supported = _metal_check_type_supported
+    except (ImportError, AttributeError):
+        pass
 
     import sys
     test_mod = sys.modules.get("test_core")

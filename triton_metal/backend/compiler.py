@@ -1688,7 +1688,9 @@ class MetalBackend(BaseBackend):
 
         pm = ir.pass_manager(mod.context)
         passes.common.add_inliner(pm)
-        passes.ttir.add_rewrite_tensor_pointer(pm)
+        # Block pointers are now lowered in the Python frontend (upstream
+        # b939621a0 "Rewrite block pointer to be python-only"); the C++
+        # add_rewrite_tensor_pointer pass was removed in that change.
         # Metal has no TMA — always rewrite tensor descriptors to pointers.
         passes.ttir.add_rewrite_tensor_descriptor_to_pointer(pm)
         passes.common.add_canonicalizer(pm)

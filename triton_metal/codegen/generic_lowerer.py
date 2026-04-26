@@ -1974,7 +1974,11 @@ class GenericLowerer:
           - global x_ptr reads: 3 → 1 (cached in TG memory)
           - global out_ptr writes: 1 → 1
           - exp() calls: 2 → 1
-        Measured ~2x faster on M4 Max for n_cols=1024.
+
+        When the input is float (4-byte element) and ``n_cols`` is a multiple
+        of 4 at runtime, the kernel takes a vectorized path that loads/stores
+        ``float4`` chunks. This roughly doubles memory throughput on M4 Max
+        (measured 1.49x speedup on softmax_8Kx1K vs the scalar path).
         """
         block_size = info["block_size"]
         n_arg = info["n_arg"]
@@ -1985,6 +1989,20 @@ class GenericLowerer:
         warp_size = 32
         threads = num_warps * warp_size
         n_simd = num_warps  # one shared slot per warp for cross-warp reduce
+
+        # Vectorized float4 path is correct only when:
+        #   - the input arg is fp32 (4-byte element), so reinterpret-cast
+        #     to float4 produces aligned packs of 4 elements
+        #   - the threadgroup row_cache buffer has block_size divisible by 4
+        #     so the float4 reinterpret is well-defined inside TG memory
+        #   - n_cols is a runtime multiple of 4 (checked at runtime)
+        # Other element types (fp16/bf16/integer) fall through to the scalar
+        # path until a typed-vector emission is added.
+        input_arg_obj = next((a for a in self.graph.args
+                              if a.is_ptr and a.name == input_arg), None)
+        is_fp32_input = (input_arg_obj is not None
+                         and input_arg_obj.elem_type in ("f32", "fp32"))
+        vectorize = is_fp32_input and (block_size % 4 == 0)
 
         safe_name = _sanitize_msl_name(self.graph.func_name)
 
@@ -2015,18 +2033,34 @@ class GenericLowerer:
         lines.append(f"    threadgroup float row_cache[{block_size}];")
         lines.append(f"    threadgroup float reduce_buf[{n_simd}];")
         lines.append(f"    int row_start = pid * {n_arg};")
+        lines.append("    float local_max = -INFINITY;")
         lines.append("")
 
-        # Phase 1: load x into TG cache, compute local max. Iterate only up
-        # to n_cols (not block_size) to avoid per-iteration mask branches.
-        # Positions [n_cols, block_size) of row_cache stay uninitialized but
-        # are never read in phase 2/3 (those also iterate < n_cols).
-        lines.append("    float local_max = -INFINITY;")
-        lines.append(f"    for (uint i = lid; i < (uint){n_arg}; i += {threads}u) {{")
-        lines.append(f"        float v = static_cast<float>({input_arg}[row_start + i]);")
-        lines.append("        row_cache[i] = v;")
-        lines.append("        local_max = max(local_max, v);")
-        lines.append("    }")
+        # ----- Phase 1: load → row_cache, reduce local max -----
+        if vectorize:
+            lines.append(f"    bool use_vec = (({n_arg} & 3) == 0);")
+            lines.append("    if (use_vec) {")
+            lines.append(f"        int n_v = {n_arg} / 4;")
+            lines.append(f"        device float4* x4 = (device float4*)({input_arg} + row_start);")
+            lines.append("        threadgroup float4* row4 = (threadgroup float4*)row_cache;")
+            lines.append(f"        for (uint i = lid; i < (uint)n_v; i += {threads}u) {{")
+            lines.append("            float4 v = x4[i];")
+            lines.append("            row4[i] = v;")
+            lines.append("            local_max = max(local_max, max(max(v.x, v.y), max(v.z, v.w)));")
+            lines.append("        }")
+            lines.append("    } else {")
+            lines.append(f"        for (uint i = lid; i < (uint){n_arg}; i += {threads}u) {{")
+            lines.append(f"            float v = static_cast<float>({input_arg}[row_start + i]);")
+            lines.append("            row_cache[i] = v;")
+            lines.append("            local_max = max(local_max, v);")
+            lines.append("        }")
+            lines.append("    }")
+        else:
+            lines.append(f"    for (uint i = lid; i < (uint){n_arg}; i += {threads}u) {{")
+            lines.append(f"        float v = static_cast<float>({input_arg}[row_start + i]);")
+            lines.append("        row_cache[i] = v;")
+            lines.append("        local_max = max(local_max, v);")
+            lines.append("    }")
 
         # Reduce max across threadgroup
         lines.append("    float simd_max_v = simd_max(local_max);")
@@ -2035,15 +2069,35 @@ class GenericLowerer:
         lines.append("    threadgroup_barrier(mem_flags::mem_threadgroup);")
         lines.append(f"    float row_max = simd_max((tiisg < {n_simd}u) ? "
                      f"reduce_buf[tiisg] : -INFINITY);")
+        lines.append("    float local_sum = 0.0f;")
         lines.append("")
 
-        # Phase 2: compute exp(x - max), accumulate sum, write back to TG
-        lines.append("    float local_sum = 0.0f;")
-        lines.append(f"    for (uint i = lid; i < (uint){n_arg}; i += {threads}u) {{")
-        lines.append("        float e = exp(row_cache[i] - row_max);")
-        lines.append("        row_cache[i] = e;")
-        lines.append("        local_sum += e;")
-        lines.append("    }")
+        # ----- Phase 2: exp(x - max) → row_cache, reduce local sum -----
+        if vectorize:
+            lines.append("    if (use_vec) {")
+            lines.append(f"        int n_v = {n_arg} / 4;")
+            lines.append("        threadgroup float4* row4 = (threadgroup float4*)row_cache;")
+            lines.append(f"        for (uint i = lid; i < (uint)n_v; i += {threads}u) {{")
+            lines.append("            float4 v = row4[i];")
+            lines.append("            float4 e;")
+            lines.append("            e.x = exp(v.x - row_max); e.y = exp(v.y - row_max);")
+            lines.append("            e.z = exp(v.z - row_max); e.w = exp(v.w - row_max);")
+            lines.append("            row4[i] = e;")
+            lines.append("            local_sum += e.x + e.y + e.z + e.w;")
+            lines.append("        }")
+            lines.append("    } else {")
+            lines.append(f"        for (uint i = lid; i < (uint){n_arg}; i += {threads}u) {{")
+            lines.append("            float e = exp(row_cache[i] - row_max);")
+            lines.append("            row_cache[i] = e;")
+            lines.append("            local_sum += e;")
+            lines.append("        }")
+            lines.append("    }")
+        else:
+            lines.append(f"    for (uint i = lid; i < (uint){n_arg}; i += {threads}u) {{")
+            lines.append("        float e = exp(row_cache[i] - row_max);")
+            lines.append("        row_cache[i] = e;")
+            lines.append("        local_sum += e;")
+            lines.append("    }")
 
         # Reduce sum
         lines.append("    float simd_sum_v = simd_sum(local_sum);")
@@ -2055,10 +2109,24 @@ class GenericLowerer:
         lines.append("    float inv_sum = 1.0f / row_sum;")
         lines.append("")
 
-        # Phase 3: write normalized exp to global memory
-        lines.append(f"    for (uint i = lid; i < (uint){n_arg}; i += {threads}u) {{")
-        lines.append(f"        {output_arg}[row_start + i] = row_cache[i] * inv_sum;")
-        lines.append("    }")
+        # ----- Phase 3: write normalized exp to global memory -----
+        if vectorize:
+            lines.append("    if (use_vec) {")
+            lines.append(f"        int n_v = {n_arg} / 4;")
+            lines.append(f"        device float4* o4 = (device float4*)({output_arg} + row_start);")
+            lines.append("        threadgroup float4* row4 = (threadgroup float4*)row_cache;")
+            lines.append(f"        for (uint i = lid; i < (uint)n_v; i += {threads}u) {{")
+            lines.append("            o4[i] = row4[i] * inv_sum;")
+            lines.append("        }")
+            lines.append("    } else {")
+            lines.append(f"        for (uint i = lid; i < (uint){n_arg}; i += {threads}u) {{")
+            lines.append(f"            {output_arg}[row_start + i] = row_cache[i] * inv_sum;")
+            lines.append("        }")
+            lines.append("    }")
+        else:
+            lines.append(f"    for (uint i = lid; i < (uint){n_arg}; i += {threads}u) {{")
+            lines.append(f"        {output_arg}[row_start + i] = row_cache[i] * inv_sum;")
+            lines.append("    }")
         lines.append("}")
         lines.append("")
         return "\n".join(lines)

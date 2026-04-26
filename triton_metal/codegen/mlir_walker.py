@@ -1190,12 +1190,18 @@ class MLIRWalker:
             attrs["axis"] = axis if axis is not None else 0
 
         elif name == "arith.constant":
-            # Try integer first via binding
-            int_val = op.get_int_attr("value")
+            # `get_constant_value` (added in upstream triton 6cfdc3c37) handles
+            # both scalar IntegerAttr and splat DenseIntElementsAttr — strictly
+            # more than `get_int_attr("value")` which only handles the scalar
+            # case. Try it first to avoid the text-fallback for splat int
+            # constants like `dense<0> : tensor<32xi32>`.
+            int_val = op.get_constant_value() if hasattr(op, "get_constant_value") else None
+            if int_val is None:
+                int_val = op.get_int_attr("value")
             if int_val is not None:
                 attrs["value"] = int_val
             else:
-                # Look up from pre-parsed module text by walk order.
+                # Text fallback for floats and non-splat dense constants.
                 # Use position-based list (not SSA-name dict) to handle
                 # duplicate SSA names across functions (e.g., %cst in
                 # multiple noinline functions).
@@ -1203,7 +1209,6 @@ class MLIRWalker:
                 if idx < len(self._text_index.constants_by_position):
                     attrs["value"] = self._text_index.constants_by_position[idx]
                 elif idx < len(self._constant_names_in_order):
-                    # Fallback to name-based lookup
                     ssa_name = self._constant_names_in_order[idx]
                     if ssa_name in self._text_index.constants:
                         attrs["value"] = self._text_index.constants[ssa_name]

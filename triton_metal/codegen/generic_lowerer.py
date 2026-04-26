@@ -5474,7 +5474,7 @@ class GenericLowerer:
             return
         dst_elem = ssa.elem_type or "f16"
         dst_dtype = _mlir_to_triton_dtype(dst_elem)
-        from triton_metal.codegen.msl_builtins import is_fp8_type, fp8_from_float_func
+        from triton_metal.codegen.msl_builtins import is_fp8_type, fp8_from_float_func, fp8_to_float_func
         if is_fp8_type(dst_dtype):
             # FP32 → FP8: emit conversion call
             src_var = self._lookup(ssa.operand_ids[0])

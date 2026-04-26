@@ -10,10 +10,10 @@ Metal (Apple Silicon) backend for [OpenAI Triton](https://github.com/triton-lang
 
 **Alpha** — actively developed, not yet production-ready.
 
-- **4,279 / 9,334** upstream Triton tests passing (0 failures)
-- **32/32** torch.compile model tests
-- **15/15** MLX backend tests
+- **4,320 / 9,342** upstream Triton tests passing (0 failures), aligned with triton 3.7.0
+- **434/434** project tests, **32/32** torch.compile model tests, **15/15** MLX backend tests
 - Triton tutorials 01-03, 05 passing
+- Built against Triton's `TRITON_EXT_ENABLED=1` plugin architecture (upstream PR #9783)
 
 ## Requirements
 

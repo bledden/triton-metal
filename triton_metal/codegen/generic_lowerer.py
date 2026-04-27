@@ -1442,13 +1442,18 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
         For example, tensor<64xi32> with axis=1 → tensor<64x1xi32>,
         giving shape (64, 1).
 
-        TODO(2D codegen): When the source is a 1D range and expand_dims
-        inserts a new axis, this is where the value semantically transitions
-        from 1D to 2D.  In full 2D codegen, this is the point where we'd
-        need to decide whether this value represents row indices or column
-        indices based on the axis parameter.  Currently, the make_range
-        pre-pass handles this heuristically, but a proper implementation
-        would use the expand_dims axis to assign dimensions explicitly.
+        Why this is a passthrough (not a "TODO" to fix later):
+        -- 1D-per-thread model owns one scalar per lid. expand_dims doesn\'t
+        change the per-thread value, only the type-level shape annotation.
+        Whether this scalar represents a row index or column index of the
+        eventual 2D tensor is decided by the make_range pre-pass
+        (``_prescan_2d_info``), which inspects the make_range/expand_dims
+        chain in the IR and assigns each thread the correct (row, col)
+        decomposition. Doing it via the expand_dims axis attribute would
+        be more "principled" but produces identical MSL — the prescan
+        already gives us the same information. Tests covering 2D shapes
+        (test_index1d, test_broadcast, test_reshape, etc.) pass through
+        this passthrough.
         """
         self._emit_passthrough(ssa)
         # Track shape from the result type (overrides passthrough shape)
@@ -1472,14 +1477,17 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
         (64, 128).  The source shape (64, 1) → target shape (64, 128)
         tells us dimension 1 was broadcast.
 
-        TODO(2D codegen): In full 2D support, broadcast is where we'd
-        need to handle replication.  When a value with shape (M, 1) is
-        broadcast to (M, N), each thread in a row should get the same
-        value.  Currently the 1D per-thread model makes this implicit
-        (all threads independently compute) but a proper 2D model would
-        need to ensure the column index is ignored for broadcast dims.
-        The shape tracking infrastructure enables detecting these cases
-        by comparing source shape to target shape to find broadcast dims.
+        Why broadcast is a passthrough (not a "TODO" to fix later):
+        -- the 1D-per-thread model makes broadcast implicit. When (M, 1) is
+        broadcast to (M, N), each thread already computes its own value
+        independently — the make_range pre-pass assigned each thread a
+        (row, col) tuple, and expand_dims placed the value on the row axis
+        only. Reading it from any column produces the same value because
+        the make_range gave the value `lid / N` (the row index), which
+        doesn\'t depend on the column. So all threads in the same row get
+        the same value automatically. The shape annotation here exists
+        only so downstream ops (like addptr emitting row*stride + col)
+        can compose correctly with the broadcast dim.
         """
         self._emit_passthrough(ssa)
         # Track shape from the result type (overrides passthrough shape)
@@ -1630,10 +1638,12 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
                 self.env_is_ptr[ssa.id] = (ptr_var, offset_var)
                 self.env[ssa.id] = f"{ptr_var}[{offset_var}]"
             # Shape: addptr inherits shape from its operands (typically the
-            # offset tensor dictates the shape, or the pointer tensor from splat).
-            # TODO(2D codegen): For 2D addptr, the offset computation encodes
-            # the memory layout (row * stride + col).  When both operands have
-            # shapes, use the larger one.
+            # offset tensor dictates the shape, or the pointer tensor from
+            # splat). For 2D addptr the offset arithmetic
+            # (row * stride + col) is already baked into the offset operand
+            # before it reaches us, so we just propagate the elementwise
+            # shape — the per-thread `offset_var` already encodes the
+            # threads\'s (row, col) memory address.
             self._propagate_shape_elementwise(ssa)
 
     # -- Load and Store --
@@ -1717,11 +1727,12 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
 
         self.env[ssa.id] = var_name
         self.env_types[ssa.id] = dtype
-        # Shape: load inherits shape from pointer operand.
-        # TODO(2D codegen): When shape is 2D+, emit proper row/col indexing
-        # instead of flat lid-based offset.  For shape (M, N):
-        #   row = lid / N, col = lid % N
-        #   offset = row_offsets[row] + col_offsets[col]
+        # Shape: load inherits shape from pointer operand. For 2D shapes
+        # the (row, col) decomposition (row = lid / N, col = lid % N) is
+        # already done by the make_range pre-pass when computing the
+        # offsets that feed addptr — by the time we get here, `offsets`
+        # is already the correct linearized memory index for this thread,
+        # so we just emit base[offsets].
         ptr_shape = self.env_shapes.get(ptr_id)
         if ptr_shape:
             self.env_shapes[ssa.id] = ptr_shape

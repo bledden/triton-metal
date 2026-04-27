@@ -608,6 +608,148 @@ class _TemplateMixin:
         lines.append("")
         return "\n".join(lines)
 
+    def _lower_layer_norm_template(self, info) -> str:
+        """Emit a TG-cached row-wise layer-norm kernel.
+
+        Mirrors ``_lower_softmax_template``\\'s structure with a row_cache TG
+        buffer; differs only in the math (single-pass ``sum`` and ``sum_sq``
+        in phase 1, instead of ``max`` + delayed ``exp``).
+
+        Memory traffic vs the generic 3-phase lowering:
+          - global x_ptr reads: 3 → 1 (cached in TG memory)
+          - global out_ptr writes: 1 → 1
+        Vectorizes through float4 when the input is fp32 and ``n_cols`` is a
+        runtime multiple of 4 — same eligibility as the softmax template.
+
+        Caveat: this template assumes the canonical layer-norm shape
+            (x - mean) * rsqrt(var + eps)
+        without learnable gamma/beta scaling. Kernels that include gamma/beta
+        load extra pointers and would not match the detector\\'s 2-ptr
+        signature; they fall through to the generic phase lowerer.
+        """
+        block_size = info["block_size"]
+        n_arg = info["n_arg"]
+        input_arg = info["input_arg"]
+        output_arg = info["output_arg"]
+        num_warps = self.options.num_warps if self.options else 4
+        warp_size = 32
+        threads = num_warps * warp_size
+        n_simd = num_warps
+
+        input_arg_obj = next((a for a in self.graph.args
+                              if a.is_ptr and a.name == input_arg), None)
+        is_fp32_input = (input_arg_obj is not None
+                         and input_arg_obj.elem_type in ("f32", "fp32"))
+        vectorize = is_fp32_input and (block_size % 4 == 0)
+
+        safe_name = _sanitize_msl_name(self.graph.func_name)
+
+        arg_decls = []
+        for i, arg in enumerate(self.graph.args):
+            if arg.is_ptr:
+                arg_msl_type = triton_type_to_msl(arg.elem_type)
+                arg_decls.append(
+                    f"    device {arg_msl_type}* {arg.name} [[buffer({i})]]")
+            else:
+                arg_msl_type = triton_type_to_msl(arg.elem_type) if arg.elem_type else "int"
+                arg_decls.append(
+                    f"    constant {arg_msl_type}& {arg.name} [[buffer({i})]]")
+
+        # eps default — matches torch.nn.LayerNorm. Most layer-norm Triton
+        # kernels pass eps as a constexpr, so it doesn\\'t reach codegen as
+        # a runtime arg.
+        eps_literal = "1e-6f"
+
+        lines = []
+        lines.append("#include <metal_stdlib>")
+        lines.append("using namespace metal;")
+        lines.append("")
+        lines.append(f"kernel void {safe_name}(")
+        lines.append(",\n".join(arg_decls) + ",")
+        lines.append("    uint pid [[threadgroup_position_in_grid]],")
+        lines.append("    uint lid [[thread_position_in_threadgroup]],")
+        lines.append("    uint sgitg [[simdgroup_index_in_threadgroup]],")
+        lines.append("    uint tiisg [[thread_index_in_simdgroup]]")
+        lines.append(") {")
+
+        lines.append(f"    threadgroup float row_cache[{block_size}];")
+        lines.append(f"    threadgroup float reduce_buf[{n_simd}];")
+        lines.append(f"    int row_start = pid * {n_arg};")
+        lines.append("    float local_sum = 0.0f;")
+        lines.append("    float local_sumsq = 0.0f;")
+        lines.append("")
+
+        # Phase 1: load → row_cache, single-pass mean + variance
+        if vectorize:
+            lines.append(f"    bool use_vec = (({n_arg} & 3) == 0);")
+            lines.append("    if (use_vec) {")
+            lines.append(f"        int n_v = {n_arg} / 4;")
+            lines.append(f"        device float4* x4 = (device float4*)({input_arg} + row_start);")
+            lines.append("        threadgroup float4* row4 = (threadgroup float4*)row_cache;")
+            lines.append(f"        for (uint i = lid; i < (uint)n_v; i += {threads}u) {{")
+            lines.append("            float4 v = x4[i];")
+            lines.append("            row4[i] = v;")
+            lines.append("            local_sum += v.x + v.y + v.z + v.w;")
+            lines.append("            local_sumsq += v.x*v.x + v.y*v.y + v.z*v.z + v.w*v.w;")
+            lines.append("        }")
+            lines.append("    } else {")
+            lines.append(f"        for (uint i = lid; i < (uint){n_arg}; i += {threads}u) {{")
+            lines.append(f"            float v = static_cast<float>({input_arg}[row_start + i]);")
+            lines.append("            row_cache[i] = v;")
+            lines.append("            local_sum += v;")
+            lines.append("            local_sumsq += v * v;")
+            lines.append("        }")
+            lines.append("    }")
+        else:
+            lines.append(f"    for (uint i = lid; i < (uint){n_arg}; i += {threads}u) {{")
+            lines.append(f"        float v = static_cast<float>({input_arg}[row_start + i]);")
+            lines.append("        row_cache[i] = v;")
+            lines.append("        local_sum += v;")
+            lines.append("        local_sumsq += v * v;")
+            lines.append("    }")
+
+        # Reduce sum and sum-of-squares across threadgroup
+        lines.append("    float simd_sum_v = simd_sum(local_sum);")
+        lines.append("    threadgroup_barrier(mem_flags::mem_threadgroup);")
+        lines.append("    if (tiisg == 0) reduce_buf[sgitg] = simd_sum_v;")
+        lines.append("    threadgroup_barrier(mem_flags::mem_threadgroup);")
+        lines.append(f"    float row_sum = simd_sum((tiisg < {n_simd}u) ? reduce_buf[tiisg] : 0.0f);")
+        lines.append("")
+        lines.append("    float simd_sumsq_v = simd_sum(local_sumsq);")
+        lines.append("    threadgroup_barrier(mem_flags::mem_threadgroup);")
+        lines.append("    if (tiisg == 0) reduce_buf[sgitg] = simd_sumsq_v;")
+        lines.append("    threadgroup_barrier(mem_flags::mem_threadgroup);")
+        lines.append(f"    float row_sumsq = simd_sum((tiisg < {n_simd}u) ? reduce_buf[tiisg] : 0.0f);")
+        lines.append("")
+        lines.append(f"    float inv_n = 1.0f / float({n_arg});")
+        lines.append("    float mean = row_sum * inv_n;")
+        lines.append("    float var = row_sumsq * inv_n - mean * mean;")
+        lines.append(f"    float inv_std = rsqrt(var + {eps_literal});")
+        lines.append("")
+
+        # Phase 2: write (x - mean) * inv_std to global memory
+        if vectorize:
+            lines.append("    if (use_vec) {")
+            lines.append(f"        int n_v = {n_arg} / 4;")
+            lines.append(f"        device float4* o4 = (device float4*)({output_arg} + row_start);")
+            lines.append("        threadgroup float4* row4 = (threadgroup float4*)row_cache;")
+            lines.append(f"        for (uint i = lid; i < (uint)n_v; i += {threads}u) {{")
+            lines.append("            float4 v = row4[i];")
+            lines.append("            float4 m = float4(mean);")
+            lines.append("            o4[i] = (v - m) * inv_std;")
+            lines.append("        }")
+            lines.append("    } else {")
+            lines.append(f"        for (uint i = lid; i < (uint){n_arg}; i += {threads}u) {{")
+            lines.append(f"            {output_arg}[row_start + i] = (row_cache[i] - mean) * inv_std;")
+            lines.append("        }")
+            lines.append("    }")
+        else:
+            lines.append(f"    for (uint i = lid; i < (uint){n_arg}; i += {threads}u) {{")
+            lines.append(f"        {output_arg}[row_start + i] = (row_cache[i] - mean) * inv_std;")
+            lines.append("    }")
+        lines.append("}")
+        lines.append("")
+        return "\n".join(lines)
 
     def _lower_row_wise_sort_template(self, info) -> str:
         """Emit a per-row bitonic sort / top-k kernel.

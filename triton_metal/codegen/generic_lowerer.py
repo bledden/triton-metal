@@ -307,6 +307,18 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
             self._prescan_stores()
             return msl
 
+        # Check for row-wise layer norm (sum + sum_sq + sub + rsqrt). Same
+        # TG-cache + float4 vectorization shape as softmax. Must be tried
+        # AFTER softmax because the patterns share the "two reduces + sub"
+        # signature (softmax: max+sum+exp; layer_norm: sum+sum+rsqrt).
+        layer_norm_info = self._detect_layer_norm()
+        if layer_norm_info:
+            msl = self._lower_layer_norm_template(layer_norm_info)
+            self.effective_block_size = (
+                (self.options.num_warps if self.options else 4) * 32)
+            self._prescan_stores()
+            return msl
+
         # Check for tl.sort / tl.topk applied to each row of a 2D tensor.
         # When total > 1024 threads are needed, the generic reduce path can't
         # run (threadgroup cap), but each row can be sorted independently in

@@ -457,6 +457,107 @@ class _DetectionMixin:
             "block_size": block_size,
         }
 
+    def _detect_layer_norm(self):
+        """Detect a row-wise layer-norm kernel:
+            x = tl.load(x_ptr + row * n + offsets, mask, other=0.0)
+            mean = tl.sum(x, axis=0) / n
+            diff = x - mean
+            var = tl.sum(diff * diff, axis=0) / n
+            inv_std = tl.math.rsqrt(var + eps)
+            tl.store(out_ptr + ..., (x - mean) * inv_std, mask)
+
+        Like softmax: 3 generic wrap-loops over x_ptr, one read per pass.
+        Template caches the row in TG memory, reads once, and uses a
+        Welford-style single-pass mean+M2 to fold both reductions into one
+        read of the cache.
+
+        Returns a dict if matched, None otherwise.
+        """
+        # No control flow allowed (single-row template only)
+        for ssa in self.graph.ops:
+            if ssa.op in ("scf.for", "scf.while", "scf.if",
+                          "tt.get_num_programs"):
+                return None
+
+        load_ssa = None
+        store_ssa = None
+        reduce_ops = []
+        has_rsqrt = False
+        has_subf = False
+        has_mulf = False
+        has_addf = False
+        for ssa in self.graph.ops:
+            op = ssa.op
+            if op == "tt.load":
+                if load_ssa is not None:
+                    return None
+                load_ssa = ssa
+            elif op == "tt.store":
+                if store_ssa is not None:
+                    return None
+                store_ssa = ssa
+            elif op == "tt.reduce":
+                reduce_ops.append(ssa)
+            elif op == "math.rsqrt":
+                has_rsqrt = True
+            elif op == "math.sqrt":
+                # sqrt followed by 1/sqrt is also a valid normalization shape
+                has_rsqrt = True
+            elif op == "arith.subf":
+                has_subf = True
+            elif op == "arith.mulf":
+                has_mulf = True
+            elif op == "arith.addf":
+                has_addf = True
+
+        # Layer norm: 2 sum reduces, normalization math (rsqrt, sub, mul,
+        # add for variance + epsilon). Differs from softmax by lacking exp
+        # and having two sum reduces (vs max + sum).
+        if (load_ssa is None or store_ssa is None
+                or len(reduce_ops) != 2
+                or not (has_rsqrt and has_subf and has_mulf and has_addf)):
+            return None
+        red_ops = [self._get_reduce_combine_info(r)[0] for r in reduce_ops]
+        if red_ops != ["sum", "sum"]:
+            return None
+
+        # Don't fire if softmax pattern matches (max/exp/divf disqualifies
+        # layer norm because softmax's _detect_* would fire instead).
+        for ssa in self.graph.ops:
+            if ssa.op in ("math.exp", "math.exp2"):
+                return None
+
+        input_arg = None
+        output_arg = None
+        for arg in self.graph.args:
+            if not arg.is_ptr:
+                continue
+            if input_arg is None:
+                input_arg = arg.name
+            elif output_arg is None:
+                output_arg = arg.name
+        if input_arg is None or output_arg is None:
+            return None
+
+        n_arg = None
+        for arg in self.graph.args:
+            if not arg.is_ptr:
+                n_arg = arg.name
+                break
+        if n_arg is None:
+            return None
+
+        block_size = self.graph.block_size
+        if block_size > 1024:
+            return None
+
+        return {
+            "input_arg": input_arg,
+            "output_arg": output_arg,
+            "n_arg": n_arg,
+            "block_size": block_size,
+        }
+
 
     def _detect_row_wise_sort(self):
         """Detect tl.sort / tl.topk applied to each row of a 2D tensor.

@@ -816,3 +816,49 @@ def test_kloop_int_matmul_int_epilogue_refuses():
     O = torch.zeros(M, N, dtype=torch.int32, device="mps")
     with pytest.raises(MetalNonRecoverableError):
         _k_kloop_int_bias[(1,)](A, B, Bias, O, M=M, N=N, K=K, BK=BK); torch.mps.synchronize()
+
+
+# --- de-dup wiring 2026-06-28: masked-store refuse moved off the pre-dispatch chokepoint ---
+if _HAS:
+    @triton.jit
+    def _k_fa_masked(Q, K, V, O, N: tl.constexpr, HD: tl.constexpr, sm: tl.constexpr, BOUND: tl.constexpr):
+        om = tl.arange(0, N); on = tl.arange(0, N); od = tl.arange(0, HD)
+        q = tl.load(Q + om[:, None] * HD + od[None, :]) * sm
+        k = tl.load(K + on[:, None] * HD + od[None, :])
+        qk = tl.dot(q, tl.trans(k)); qk = qk - tl.max(qk, 1)[:, None]
+        p = tl.exp(qk); p = p / tl.sum(p, 1)[:, None]
+        o = tl.dot(p.to(tl.float32), tl.load(V + on[:, None] * HD + od[None, :]))
+        tl.store(O + om[:, None] * HD + od[None, :], o, mask=om[:, None] < BOUND)
+
+
+@requires
+def test_masked_fa_generic_honors_not_refused():
+    # The masked-store chokepoint used to refuse ANY non-tile-boundary mask on a dot
+    # kernel, including an FA kernel that routes to the mask-HONORING generic/scalar-tiled
+    # path. The refuse now lives at the mask-DROPPING templates, so a head_dim<=64 FA
+    # masked store COMPUTES and CLIPS instead of over-refusing. (de-dup wiring 2026-06-28)
+    _clear()
+    N, HD, BOUND = 32, 64, 20
+    rng = np.random.RandomState(0)
+    Qn, Kn, Vn = (rng.randn(N, HD).astype(np.float32) for _ in range(3)); sm = 1.0 / np.sqrt(HD)
+    Q = torch.tensor(Qn, device="mps"); K = torch.tensor(Kn, device="mps"); V = torch.tensor(Vn, device="mps")
+    O = torch.full((N, HD), -999.0, device="mps")
+    _k_fa_masked[(1,)](Q, K, V, O, N=N, HD=HD, sm=float(sm), BOUND=BOUND); torch.mps.synchronize()
+    got = O.cpu().numpy()
+    assert (got[BOUND:] == -999.0).all(), "rows>=BOUND clobbered (mask dropped)"
+    qk = (Qn.astype(np.float64) @ Kn.astype(np.float64).T) * sm
+    qk -= qk.max(1, keepdims=True); pp = np.exp(qk); pp /= pp.sum(1, keepdims=True)
+    ref = pp @ Vn.astype(np.float64)
+    assert float(np.abs(got[:BOUND] - ref[:BOUND]).max()) < 1e-4, "kept rows wrong"
+
+
+@requires
+def test_masked_fa_head128_refuses():
+    # The head_dim=128 FA templates DROP a non-tile-boundary output mask, so they must
+    # refuse it (the chokepoint no longer covers FA). (de-dup wiring 2026-06-28)
+    _clear()
+    N, HD, BOUND = 128, 128, 20
+    Q = torch.randn(N, HD, device="mps"); K = torch.randn(N, HD, device="mps"); V = torch.randn(N, HD, device="mps")
+    O = torch.zeros(N, HD, device="mps")
+    with pytest.raises(MetalNonRecoverableError):
+        _k_fa_masked[(1,)](Q, K, V, O, N=N, HD=HD, sm=0.0884, BOUND=BOUND); torch.mps.synchronize()

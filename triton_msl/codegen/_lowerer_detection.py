@@ -553,41 +553,41 @@ class _DetectionMixin:
                     "dimension on the host, or use a separate kernel per batch.",
                     op_name="tt.dot")
 
-    def _refuse_nontrivial_template_output_mask(self):
-        """SYSTEMIC anti-silent-wrong gate (ONE place, mirrors the masked-INPUT-load
-        refusal in _detect_simple_dot): the matmul / FlashAttention TEMPLATES — the
-        simdgroup simple-dot, the K-loop, the strided-scalar, the fused matmul+softmax,
-        and the simdgroup-FA template — ALL drop the user's OUTPUT ``tt.store`` mask.
-        They gate writes only on the hard-coded tile boundary (``gr < M && gc < N`` for
-        matmul, ``qr < N_CTX`` for FA — and, for aligned float, a fully-unmasked
-        simdgroup_store) and never thread the store's mask operand into the emitted
-        kernel.
+    def _template_output_mask_nontrivial(self, is_fa):
+        """True iff a dot-bearing kernel carries an output ``tt.store`` mask that
+        RESTRICTS the output WITHIN the computed tile — a non-tile-boundary mask the
+        matmul / FlashAttention TEMPLATES would SILENTLY DROP. They gate writes only on
+        the hard-coded tile boundary (``gr < M && gc < N`` for matmul, ``qr < N_CTX`` for
+        FA — and, for aligned float, a fully-unmasked simdgroup_store) and never thread
+        the store's mask operand into the emitted kernel.
 
-        Because the templates compute the FULL baked output tile, an output store mask
-        that is TRIVIALLY-TRUE over that tile is HARMLESS to drop:
+        Because the templates compute the FULL baked output tile, a mask that is
+        TRIVIALLY-TRUE over that tile is HARMLESS to drop and returns False here:
           * no mask at all, or
           * the canonical tile-boundary clip ``(rm < M) & (rn < N)`` / ``om < N_CTX``
             (the template's own boundary already enforces exactly this), or
           * a comparison against a compile-time constant >= the tile extent.
-        But a mask that actually RESTRICTS the output WITHIN the tile — a tighter
+        A mask that actually RESTRICTS the output WITHIN the tile — a tighter
         ``make_range`` bound such as ``rm < BOUND`` with ``BOUND < M``, or a value mask
-        like ``acc > 0`` — would be SILENTLY DROPPED, clobbering the masked-off elements
-        with finite values (silent-wrong; latent OOB if C is under-allocated).
+        like ``acc > 0`` — returns True (it would be SILENTLY DROPPED, clobbering the
+        masked-off elements with finite values; latent OOB if C is under-allocated).
 
-        This runs at the SINGLE matmul/FA dispatch chokepoint in ``lower()``, BEFORE any
-        of the five template store sites, so the fix can never be missing from one copy.
-        A non-tile-boundary output mask on a dot-bearing kernel has NO correct lowering
-        on this backend (the generic per-element matmul is itself wrong at 16/32/64), so
-        we REFUSE LOUDLY rather than emit silently-wrong output. The no-mask / provable
-        tile-boundary no-op cases are left untouched (current fast-path behavior).
+        ``is_fa`` selects the boundary-arg names the template's OWN clip references (FA
+        clips output ROWS by N_CTX; matmul clips rows by M and cols by N) — the caller
+        passes the template kind the kernel routes to.
+
+        SINGLE SOURCE OF TRUTH for the triviality classification, shared by the matmul
+        dispatch chokepoint (``_refuse_nontrivial_template_output_mask``) AND the
+        head_dim=128 simdgroup/tiled FA self-refusal (``_lower_flash_attention_template``)
+        so the two cannot diverge.
 
         Structural trivially-true proof (naming mirrors the template's OWN boundary
         clip, which references the kernel arg literally named M / N / N_CTX): the mask
         must be an AND-tree whose every leaf is ``cmpi`` of a ``make_range``-rooted tile
         index against the matching output-extent arg (row index < M / N_CTX, col index
         < N) or a constant >= the tile extent. Anything else (a different/extra arg
-        bound, a value comparison, OR / XOR, an un-modelled expression) is treated as
-        NOT-provably-trivial -> refuse.
+        bound, a value comparison, OR / XOR, an un-modelled expression) is NOT
+        provably-trivial -> returns True.
         """
         def _flatten(ops):
             for s in ops:
@@ -600,26 +600,19 @@ class _DetectionMixin:
         allops = list(_flatten(self.graph.ops))
         dots = [s for s in allops if s.op == "tt.dot"]
         if not dots:
-            return  # not a matmul / FA kernel — the templates that drop masks never fire
+            return False  # not a matmul / FA kernel — the mask-dropping templates never fire
 
         # Only the stores that could route to a template matter, and a template only
-        # fires for a dot kernel. Gate every masked output store in such a kernel.
+        # fires for a dot kernel. Classify every masked output store in such a kernel.
         masked_stores = [s for s in allops
                          if s.op == "tt.store" and len(s.operand_ids or []) >= 3]
         if not masked_stores:
-            return  # no output mask -> nothing dropped
+            return False  # no output mask -> nothing dropped
 
         by_id = {s.id: s for s in allops}
         arg_by_id = {a.id: a for a in self.graph.args}
 
-        # Classify FA vs matmul exactly as lower() routes it: >= 2 dots with both an
-        # exp and a max between them (online-softmax). FA clips output ROWS by N_CTX;
-        # matmul clips rows by M and cols by N.
-        def _is_exp(op):
-            return op in ("math.exp", "math.exp2", "tt.exp")
-        is_fa = (len(dots) >= 2
-                 and any(_is_exp(s.op) for s in allops)
-                 and any("max" in (s.op or "") for s in allops))
+        # FA clips output ROWS by N_CTX; matmul clips rows by M and cols by N.
         ok_row_names = {"N_CTX"} if is_fa else {"M"}
         ok_col_names = set() if is_fa else {"N"}
 
@@ -735,21 +728,68 @@ class _DetectionMixin:
 
         for st in masked_stores:
             if not _mask_is_trivial(st.operand_ids[2]):
-                from triton_msl.errors import MetalNonRecoverableError
-                kind = "FlashAttention" if is_fa else "matmul"
-                extent = "N_CTX" if is_fa else "M/N"
-                raise MetalNonRecoverableError(
-                    f"{kind} with a non-tile-boundary output store mask is not "
-                    "supported: the simdgroup / K-loop / strided / matmul+softmax / FA "
-                    "templates compute the FULL output tile and gate writes only on the "
-                    f"tile boundary ({extent}), silently DROPPING any tighter store mask "
-                    "(e.g. tl.store(c, acc, mask=rm < BOUND) with BOUND < M, or a value "
-                    "mask such as acc > 0) -> the masked-off elements would be clobbered "
-                    "with finite values. Refusing to emit silently-wrong output. Use a "
-                    "full-tile store (the tile-boundary mask (rm < M) & (rn < N) / "
-                    "om < N_CTX is honored automatically by the template boundary), or "
-                    "apply the partial-output mask in a separate elementwise kernel.",
-                    op_name="tt.dot")
+                return True
+        return False
+
+    def _refuse_nontrivial_template_output_mask(self):
+        """SYSTEMIC anti-silent-wrong gate at the SINGLE matmul dispatch chokepoint in
+        ``lower()`` (BEFORE any template store site, so the fix can never be missing from
+        one copy): a MATMUL with a non-tile-boundary output ``tt.store`` mask has NO
+        correct lowering on this backend — the simdgroup simple-dot / K-loop / strided /
+        matmul+softmax templates compute the FULL tile and gate writes only on the tile
+        boundary (silently DROPPING a tighter user mask), AND the generic per-element
+        matmul fallback is itself wrong at 16/32/64 — so we REFUSE LOUDLY rather than emit
+        silently-wrong output.
+
+        FlashAttention is DELIBERATELY EXEMPTED here. An FA kernel routes to a mask-
+        HONORING path: head_dim<=64 lowers through the scalar-tiled / generic
+        ``_lower_store``, which clips the user's output mask correctly. Refusing FA at
+        this chokepoint would OVER-REFUSE a clip the honoring path computes (the
+        regression this method's split repairs). The ONE FA path that DROPS the mask — the
+        head_dim=128 simdgroup/tiled template, which takes no mask operand — refuses the
+        non-tile-boundary mask ITSELF at emission (``_lower_flash_attention_template``),
+        using the SAME shared triviality check (``_template_output_mask_nontrivial``) so
+        the two cannot diverge. The no-mask / provable tile-boundary cases are untouched.
+        """
+        def _flatten(ops):
+            for s in ops:
+                yield s
+                if s.region_ops:
+                    yield from _flatten(s.region_ops)
+                if s.else_ops:
+                    yield from _flatten(s.else_ops)
+
+        allops = list(_flatten(self.graph.ops))
+        dots = [s for s in allops if s.op == "tt.dot"]
+        if not dots:
+            return  # not a matmul / FA kernel — the mask-dropping templates never fire
+
+        # Classify FA vs matmul exactly as lower() routes it: >= 2 dots with both an exp
+        # and a max between them (online-softmax). FA is exempt here (it routes to a
+        # honoring path, or the head_dim=128 template self-refuses at emission).
+        def _is_exp(op):
+            return op in ("math.exp", "math.exp2", "tt.exp")
+        is_fa = (len(dots) >= 2
+                 and any(_is_exp(s.op) for s in allops)
+                 and any("max" in (s.op or "") for s in allops))
+        if is_fa:
+            return
+
+        if self._template_output_mask_nontrivial(is_fa=False):
+            from triton_msl.errors import MetalNonRecoverableError
+            raise MetalNonRecoverableError(
+                "matmul with a non-tile-boundary output store mask is not supported: "
+                "the simdgroup / K-loop / strided / matmul+softmax templates compute the "
+                "FULL output tile and gate writes only on the tile boundary (M/N), "
+                "silently DROPPING any tighter store mask (e.g. tl.store(c, acc, "
+                "mask=rm < BOUND) with BOUND < M, or a value mask such as acc > 0) -> the "
+                "masked-off elements would be clobbered with finite values, and the "
+                "generic per-element matmul fallback is itself wrong at 16/32/64. "
+                "Refusing to emit silently-wrong output. Use a full-tile store (the "
+                "tile-boundary mask (rm < M) & (rn < N) is honored automatically by the "
+                "template boundary), or apply the partial-output mask in a separate "
+                "elementwise kernel.",
+                op_name="tt.dot")
 
     def _detect_simple_dot(self):
         """Detect a simple dot kernel: load→local_alloc→local_load→dot→store.

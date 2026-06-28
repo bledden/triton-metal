@@ -5121,6 +5121,28 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
         block_n = info["block_n"]
         C1 = "c1"
 
+        # COORDINATED REFUSE (the chokepoint's FA exemption lands here). The dispatch
+        # gate ``_refuse_nontrivial_template_output_mask`` deliberately lets FA through —
+        # head_dim<=64 routes to the mask-HONORING scalar/generic ``_lower_store``. But
+        # BOTH head_dim=128 FA templates emitted below (simdgroup AND tiled) take NO mask
+        # operand: they compute the FULL output tile, gate writes only on the N_CTX
+        # boundary, and would SILENTLY DROP a tighter user output ``tt.store`` mask
+        # (rm < BOUND with BOUND < N_CTX, or a value mask), clobbering the masked-off
+        # rows. So the mask-dropping templates refuse such a mask THEMSELVES here, using
+        # the SAME shared triviality check as the chokepoint (so the two cannot diverge).
+        # A trivially-true tile-boundary mask (om < N_CTX) / the no-mask case pass through.
+        if self._template_output_mask_nontrivial(is_fa=True):
+            raise MetalNonRecoverableError(
+                "FlashAttention (head_dim=128) with a non-tile-boundary output store "
+                "mask is not supported: the simdgroup / tiled FA templates compute the "
+                "FULL output tile and gate writes only on the N_CTX boundary, silently "
+                "DROPPING any tighter store mask (e.g. tl.store(o, acc, mask=om < BOUND) "
+                "with BOUND < N_CTX, or a value mask). Refusing to emit silently-wrong "
+                "output. Use a full-tile store (the tile-boundary mask om < N_CTX is "
+                "honored automatically by the template boundary), or apply the partial-"
+                "output mask in a separate elementwise kernel.",
+                op_name="tt.dot")
+
         # The four pointer roles must be the first four args in canonical order
         # (Q,K,V,Out = 0,1,2,3) — the template hard-codes Q/K/V/Out at buffers
         # 0..3. The detector already required four DISTINCT roles; enforce the

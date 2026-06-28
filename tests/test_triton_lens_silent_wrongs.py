@@ -862,3 +862,40 @@ def test_masked_fa_head128_refuses():
     O = torch.zeros(N, HD, device="mps")
     with pytest.raises(MetalNonRecoverableError):
         _k_fa_masked[(1,)](Q, K, V, O, N=N, HD=HD, sm=0.0884, BOUND=BOUND); torch.mps.synchronize()
+
+
+# --- classifier hole 2026-06-28: multi-block constant bound is NOT trivially-true ---
+if _HAS:
+    @triton.jit
+    def _k_mb_fa128(Q, K, V, O, N_CTX, HD: tl.constexpr, BM: tl.constexpr, BN: tl.constexpr,
+                    CONST: tl.constexpr, sm: tl.constexpr):
+        pm = tl.program_id(0); offs_m = pm * BM + tl.arange(0, BM); offs_d = tl.arange(0, HD)
+        q = tl.load(Q + offs_m[:, None] * HD + offs_d[None, :]) * sm
+        m_i = tl.full([BM], -float('inf'), tl.float32); l_i = tl.zeros([BM], tl.float32)
+        acc = tl.zeros([BM, HD], tl.float32)
+        for sn in range(0, N_CTX, BN):
+            offs_n = sn + tl.arange(0, BN)
+            k = tl.load(K + offs_n[:, None] * HD + offs_d[None, :])
+            v = tl.load(V + offs_n[:, None] * HD + offs_d[None, :])
+            qk = tl.dot(q, tl.trans(k)); m_ij = tl.maximum(m_i, tl.max(qk, 1))
+            p = tl.exp(qk - m_ij[:, None]); alpha = tl.exp(m_i - m_ij)
+            l_i = l_i * alpha + tl.sum(p, 1)
+            acc = acc * alpha[:, None] + tl.dot(p.to(tl.float32), v); m_i = m_ij
+        acc = acc / l_i[:, None]
+        tl.store(O + offs_m[:, None] * HD + offs_d[None, :], acc, mask=offs_m[:, None] < CONST)
+
+
+@requires
+def test_multiblock_constant_bound_mask_not_trivial():
+    # A CONSTANT output-mask bound on a MULTI-BLOCK (pid*BLOCK+range) index is NOT
+    # trivially-true: the make_range extent is the per-block span, the index runs to a
+    # runtime total, so a constant between BLOCK and the total clips later blocks. The
+    # classifier used to mis-call it trivial -> the mask-dropping head_dim=128 FA template
+    # would clobber the masked-off rows. Must now refuse. (classifier hole 2026-06-28)
+    _clear()
+    N_CTX, HD, BM, BN, CONST = 64, 128, 32, 32, 40   # CONST between BM=32 and N_CTX=64
+    Q = torch.randn(N_CTX, HD, device="mps"); K = torch.randn(N_CTX, HD, device="mps")
+    V = torch.randn(N_CTX, HD, device="mps"); O = torch.zeros(N_CTX, HD, device="mps")
+    with pytest.raises(MetalNonRecoverableError):
+        _k_mb_fa128[(N_CTX // BM,)](Q, K, V, O, N_CTX, HD=HD, BM=BM, BN=BN, CONST=CONST, sm=0.0884)
+        torch.mps.synchronize()

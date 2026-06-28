@@ -628,6 +628,7 @@ class _DetectionMixin:
             seen = set()
             stack = [start_id]
             has_range = False
+            has_pid = False
             extent = None
             axis = None
             while stack:
@@ -645,6 +646,10 @@ class _DetectionMixin:
                     except (TypeError, ValueError):
                         extent = None
                     continue
+                if o.op in ("tt.get_program_id", "tt.program_id",
+                            "tt.get_num_programs"):
+                    has_pid = True       # multi-block tile offset pid*BLOCK+range
+                    continue
                 if o.op == "tt.expand_dims":
                     try:
                         axis = int(o.attrs.get("axis"))
@@ -658,9 +663,9 @@ class _DetectionMixin:
                 # tt.get_program_id / arith.constant: scalar leaves of pid*BLOCK+range;
                 # ignore (they don't disqualify a reachable make_range). Any other op
                 # leaves has_range as-is.
-            return (extent, axis) if has_range else None
+            return (extent, axis, has_pid) if has_range else None
 
-        def _bound_ok(bound_id, ok_names, idx_extent):
+        def _bound_ok(bound_id, ok_names, idx_extent, has_pid):
             """True iff the comparison's BOUND is the template's output-extent arg for
             this axis (matching name) or a constant >= the tile extent."""
             seen = set()
@@ -681,7 +686,12 @@ class _DetectionMixin:
                     val = int(o.attrs.get("value"))
                 except (TypeError, ValueError):
                     return False
-                return idx_extent is not None and val >= idx_extent
+                # a CONSTANT bound on a MULTI-BLOCK index (pid*BLOCK+range) can't be
+                # proven trivial: the make_range extent is the per-block span, the index
+                # runs to a RUNTIME total -> a const between BLOCK and total clips later
+                # blocks. Only the arg-name case (matching the template's own clip) is
+                # trivial for multi-block. Re-audit 2026-06-28.
+                return (not has_pid) and idx_extent is not None and val >= idx_extent
             return False
 
         def _leaf_is_trivial(cmp_op):
@@ -706,9 +716,9 @@ class _DetectionMixin:
                      or (pred in ("sgt", "ugt", "sge", "uge") and not idx_left))
             if not upper:
                 return False
-            extent, axis = idx_info
+            extent, axis, has_pid = idx_info
             ok_names = ok_col_names if axis == 0 else ok_row_names
-            return _bound_ok(bound_id, ok_names, extent)
+            return _bound_ok(bound_id, ok_names, extent, has_pid)
 
         def _mask_is_trivial(mask_id, depth=0):
             if depth > 64:

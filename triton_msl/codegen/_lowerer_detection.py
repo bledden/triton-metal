@@ -553,6 +553,204 @@ class _DetectionMixin:
                     "dimension on the host, or use a separate kernel per batch.",
                     op_name="tt.dot")
 
+    def _refuse_nontrivial_template_output_mask(self):
+        """SYSTEMIC anti-silent-wrong gate (ONE place, mirrors the masked-INPUT-load
+        refusal in _detect_simple_dot): the matmul / FlashAttention TEMPLATES — the
+        simdgroup simple-dot, the K-loop, the strided-scalar, the fused matmul+softmax,
+        and the simdgroup-FA template — ALL drop the user's OUTPUT ``tt.store`` mask.
+        They gate writes only on the hard-coded tile boundary (``gr < M && gc < N`` for
+        matmul, ``qr < N_CTX`` for FA — and, for aligned float, a fully-unmasked
+        simdgroup_store) and never thread the store's mask operand into the emitted
+        kernel.
+
+        Because the templates compute the FULL baked output tile, an output store mask
+        that is TRIVIALLY-TRUE over that tile is HARMLESS to drop:
+          * no mask at all, or
+          * the canonical tile-boundary clip ``(rm < M) & (rn < N)`` / ``om < N_CTX``
+            (the template's own boundary already enforces exactly this), or
+          * a comparison against a compile-time constant >= the tile extent.
+        But a mask that actually RESTRICTS the output WITHIN the tile — a tighter
+        ``make_range`` bound such as ``rm < BOUND`` with ``BOUND < M``, or a value mask
+        like ``acc > 0`` — would be SILENTLY DROPPED, clobbering the masked-off elements
+        with finite values (silent-wrong; latent OOB if C is under-allocated).
+
+        This runs at the SINGLE matmul/FA dispatch chokepoint in ``lower()``, BEFORE any
+        of the five template store sites, so the fix can never be missing from one copy.
+        A non-tile-boundary output mask on a dot-bearing kernel has NO correct lowering
+        on this backend (the generic per-element matmul is itself wrong at 16/32/64), so
+        we REFUSE LOUDLY rather than emit silently-wrong output. The no-mask / provable
+        tile-boundary no-op cases are left untouched (current fast-path behavior).
+
+        Structural trivially-true proof (naming mirrors the template's OWN boundary
+        clip, which references the kernel arg literally named M / N / N_CTX): the mask
+        must be an AND-tree whose every leaf is ``cmpi`` of a ``make_range``-rooted tile
+        index against the matching output-extent arg (row index < M / N_CTX, col index
+        < N) or a constant >= the tile extent. Anything else (a different/extra arg
+        bound, a value comparison, OR / XOR, an un-modelled expression) is treated as
+        NOT-provably-trivial -> refuse.
+        """
+        def _flatten(ops):
+            for s in ops:
+                yield s
+                if s.region_ops:
+                    yield from _flatten(s.region_ops)
+                if s.else_ops:
+                    yield from _flatten(s.else_ops)
+
+        allops = list(_flatten(self.graph.ops))
+        dots = [s for s in allops if s.op == "tt.dot"]
+        if not dots:
+            return  # not a matmul / FA kernel — the templates that drop masks never fire
+
+        # Only the stores that could route to a template matter, and a template only
+        # fires for a dot kernel. Gate every masked output store in such a kernel.
+        masked_stores = [s for s in allops
+                         if s.op == "tt.store" and len(s.operand_ids or []) >= 3]
+        if not masked_stores:
+            return  # no output mask -> nothing dropped
+
+        by_id = {s.id: s for s in allops}
+        arg_by_id = {a.id: a for a in self.graph.args}
+
+        # Classify FA vs matmul exactly as lower() routes it: >= 2 dots with both an
+        # exp and a max between them (online-softmax). FA clips output ROWS by N_CTX;
+        # matmul clips rows by M and cols by N.
+        def _is_exp(op):
+            return op in ("math.exp", "math.exp2", "tt.exp")
+        is_fa = (len(dots) >= 2
+                 and any(_is_exp(s.op) for s in allops)
+                 and any("max" in (s.op or "") for s in allops))
+        ok_row_names = {"N_CTX"} if is_fa else {"M"}
+        ok_col_names = set() if is_fa else {"N"}
+
+        _IDX_WRAP = ("arith.addi", "arith.subi", "arith.muli", "tt.broadcast",
+                     "ttg.convert_layout", "tt.reshape", "tt.splat", "tt.expand_dims")
+
+        def _index_info(start_id):
+            """Trace an SSA value back toward a ``tt.make_range`` (a tile-position
+            index). Return ``(extent, axis)`` if a make_range is reachable (extent =
+            its end-start span; axis = the ``tt.expand_dims`` axis on the path, 1 for a
+            ``[:, None]`` ROW index / 0 for a ``[None, :]`` COL index / None if 1-D),
+            else ``None`` (this operand is NOT a tile index — e.g. the scalar bound)."""
+            seen = set()
+            stack = [start_id]
+            has_range = False
+            extent = None
+            axis = None
+            while stack:
+                vid = stack.pop()
+                if vid in seen:
+                    continue
+                seen.add(vid)
+                o = by_id.get(vid)
+                if o is None:
+                    continue  # func arg / external — not an index by itself
+                if o.op == "tt.make_range":
+                    has_range = True
+                    try:
+                        extent = int(o.attrs.get("end")) - int(o.attrs.get("start"))
+                    except (TypeError, ValueError):
+                        extent = None
+                    continue
+                if o.op == "tt.expand_dims":
+                    try:
+                        axis = int(o.attrs.get("axis"))
+                    except (TypeError, ValueError):
+                        pass
+                    stack.extend(o.operand_ids or [])
+                    continue
+                if o.op in _IDX_WRAP:
+                    stack.extend(o.operand_ids or [])
+                    continue
+                # tt.get_program_id / arith.constant: scalar leaves of pid*BLOCK+range;
+                # ignore (they don't disqualify a reachable make_range). Any other op
+                # leaves has_range as-is.
+            return (extent, axis) if has_range else None
+
+        def _bound_ok(bound_id, ok_names, idx_extent):
+            """True iff the comparison's BOUND is the template's output-extent arg for
+            this axis (matching name) or a constant >= the tile extent."""
+            seen = set()
+            cur = bound_id
+            o = by_id.get(cur)
+            while (o is not None and o.id not in seen
+                   and o.op in ("tt.splat", "tt.broadcast", "ttg.convert_layout",
+                                "tt.reshape")
+                   and o.operand_ids):
+                seen.add(o.id)
+                cur = o.operand_ids[0]
+                o = by_id.get(cur)
+            arg = arg_by_id.get(cur)
+            if arg is not None:
+                return arg.name in ok_names
+            if o is not None and o.op == "arith.constant":
+                try:
+                    val = int(o.attrs.get("value"))
+                except (TypeError, ValueError):
+                    return False
+                return idx_extent is not None and val >= idx_extent
+            return False
+
+        def _leaf_is_trivial(cmp_op):
+            if cmp_op.op != "arith.cmpi":
+                return False  # cmpf value mask, etc. -> not a tile-boundary clip
+            pred = str(cmp_op.attrs.get("predicate_name", ""))
+            if pred not in ("slt", "ult", "sle", "ule", "sgt", "ugt", "sge", "uge"):
+                return False  # eq/ne -> not an upper-bound tile clip
+            if len(cmp_op.operand_ids or []) < 2:
+                return False
+            op0, op1 = cmp_op.operand_ids[0], cmp_op.operand_ids[1]
+            info0, info1 = _index_info(op0), _index_info(op1)
+            if info0 is not None and info1 is None:
+                idx_info, bound_id, idx_left = info0, op1, True
+            elif info1 is not None and info0 is None:
+                idx_info, bound_id, idx_left = info1, op0, False
+            else:
+                return False  # neither (or both) is a tile index -> can't prove trivial
+            # Must be an UPPER bound on the index (idx < bound):
+            #   slt/ult/sle/ule with idx on the LEFT, or sgt/ugt/sge/uge with idx RIGHT.
+            upper = ((pred in ("slt", "ult", "sle", "ule") and idx_left)
+                     or (pred in ("sgt", "ugt", "sge", "uge") and not idx_left))
+            if not upper:
+                return False
+            extent, axis = idx_info
+            ok_names = ok_col_names if axis == 0 else ok_row_names
+            return _bound_ok(bound_id, ok_names, extent)
+
+        def _mask_is_trivial(mask_id, depth=0):
+            if depth > 64:
+                return False
+            o = by_id.get(mask_id)
+            if o is None:
+                return False
+            if o.op == "arith.andi":
+                ops = o.operand_ids or []
+                return bool(ops) and all(_mask_is_trivial(c, depth + 1) for c in ops)
+            if o.op in ("tt.broadcast", "ttg.convert_layout", "tt.reshape",
+                        "tt.expand_dims"):
+                return bool(o.operand_ids) and _mask_is_trivial(o.operand_ids[0], depth + 1)
+            if o.op == "arith.cmpi":
+                return _leaf_is_trivial(o)
+            return False  # arith.ori/xori, cmpf (value mask), splat(true), unknown -> refuse
+
+        for st in masked_stores:
+            if not _mask_is_trivial(st.operand_ids[2]):
+                from triton_msl.errors import MetalNonRecoverableError
+                kind = "FlashAttention" if is_fa else "matmul"
+                extent = "N_CTX" if is_fa else "M/N"
+                raise MetalNonRecoverableError(
+                    f"{kind} with a non-tile-boundary output store mask is not "
+                    "supported: the simdgroup / K-loop / strided / matmul+softmax / FA "
+                    "templates compute the FULL output tile and gate writes only on the "
+                    f"tile boundary ({extent}), silently DROPPING any tighter store mask "
+                    "(e.g. tl.store(c, acc, mask=rm < BOUND) with BOUND < M, or a value "
+                    "mask such as acc > 0) -> the masked-off elements would be clobbered "
+                    "with finite values. Refusing to emit silently-wrong output. Use a "
+                    "full-tile store (the tile-boundary mask (rm < M) & (rn < N) / "
+                    "om < N_CTX is honored automatically by the template boundary), or "
+                    "apply the partial-output mask in a separate elementwise kernel.",
+                    op_name="tt.dot")
+
     def _detect_simple_dot(self):
         """Detect a simple dot kernel: load→local_alloc→local_load→dot→store.
 

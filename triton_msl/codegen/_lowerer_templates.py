@@ -356,6 +356,13 @@ class _TemplateMixin:
             return self._lower_k_loop_dot_inline(info, decision[1] if (
                 decision is not None and decision[0] == "simdgroup") else None)
 
+        # The non-K-loop simple-dot fast path emits the whole baked M×N output from a
+        # SINGLE threadgroup and never references program_id -- the 4th twin of the
+        # pid-axes integrity guard (the strided/K-loop/softmax siblings have it). A
+        # pid-tiled baked-output launch would leave every block but the first stale.
+        # M/N are baked constexpr here, so has_M=has_N=False. Re-audit 2026-06-27.
+        self._refuse_if_pid_tiles_baked_output(False, False, "simple-dot matmul")
+
         M = info["M"]
         N = info["N"]
         K = info["K"]

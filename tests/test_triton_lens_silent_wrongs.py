@@ -714,3 +714,76 @@ def test_fp16_dot_result_store_over_blocksize_writes_all_rows():
     qk -= qk.max(1, keepdims=True); pp = np.exp(qk); pp /= pp.sum(1, keepdims=True)
     ref = pp @ Vn.astype(np.float64)
     assert float(np.abs(got - ref).max()) < 5e-2, "fp16 FA output mismatch"
+
+
+# --- mask-store/twin hunt 2026-06-27: 3 BLOCKERs (pid simple-dot, size-1 atomic, output mask) ---
+if _HAS:
+    @triton.jit
+    def _k_pid_simpledot(A, B, O, N: tl.constexpr, K: tl.constexpr, BM: tl.constexpr):
+        pid = tl.program_id(0); rm = pid * BM + tl.arange(0, BM)
+        rn = tl.arange(0, N); rk = tl.arange(0, K)
+        a = tl.load(A + rm[:, None] * K + rk[None, :]); b = tl.load(B + rk[:, None] * N + rn[None, :])
+        tl.store(O + rm[:, None] * N + rn[None, :], tl.dot(a, b))
+
+    @triton.jit
+    def _k_size1_atomic(O):
+        tl.atomic_add(O + tl.arange(0, 1), 1.0)
+
+    @triton.jit
+    def _k_mm_boundmask(A, B, O, M: tl.constexpr, N: tl.constexpr, K: tl.constexpr, BOUND: tl.constexpr):
+        rm = tl.arange(0, M); rn = tl.arange(0, N); rk = tl.arange(0, K)
+        a = tl.load(A + rm[:, None] * K + rk[None, :]); b = tl.load(B + rk[:, None] * N + rn[None, :])
+        tl.store(O + rm[:, None] * N + rn[None, :], tl.dot(a, b), mask=rm[:, None] < BOUND)
+
+    @triton.jit
+    def _k_mm_tilemask(A, B, O, M: tl.constexpr, N: tl.constexpr, K: tl.constexpr):
+        rm = tl.arange(0, M); rn = tl.arange(0, N); rk = tl.arange(0, K)
+        a = tl.load(A + rm[:, None] * K + rk[None, :]); b = tl.load(B + rk[:, None] * N + rn[None, :])
+        tl.store(O + rm[:, None] * N + rn[None, :], tl.dot(a, b), mask=(rm[:, None] < M) & (rn[None, :] < N))
+
+
+@requires
+def test_pid_tiled_simpledot_matmul_refuses():
+    # The non-K-loop simple-dot template emits the whole baked output from one threadgroup
+    # and never honors program_id (the 4th pid-guard twin) -> multi-block left rows stale.
+    # Must refuse loudly. (mask-store/twin hunt 2026-06-27)
+    _clear()
+    M, N, K, BM = 64, 32, 16, 32
+    A = torch.randn(M, K, device="mps"); B = torch.randn(K, N, device="mps"); O = torch.zeros(M, N, device="mps")
+    with pytest.raises(MetalNonRecoverableError):
+        _k_pid_simpledot[(M // BM,)](A, B, O, N=N, K=K, BM=BM); torch.mps.synchronize()
+
+
+@requires
+def test_size1_1d_atomic_not_overcounted():
+    # A size-1 1-D non-idempotent atomic was unguarded in 1-D kernels (guard gated on _is_2d)
+    # -> all threads RMW the same address (256x over-count). Must execute on one lane only.
+    _clear()
+    O = torch.zeros(1, device="mps")
+    _k_size1_atomic[(1,)](O); torch.mps.synchronize()
+    assert abs(float(O.cpu().item()) - 1.0) < 1e-6, f"over-count: {O.cpu().item()}"
+
+
+@requires
+def test_matmul_nontileboundary_output_mask_refuses_not_clobber():
+    # The matmul/FA templates compute the full tile and gate writes only on the tile
+    # boundary, silently DROPPING a tighter user output mask -> masked rows clobbered.
+    # A non-tile-boundary mask must refuse loudly. (mask-store/twin hunt 2026-06-27)
+    _clear()
+    M, N, K, BOUND = 64, 64, 64, 40
+    A = torch.randn(M, K, device="mps"); B = torch.randn(K, N, device="mps"); O = torch.zeros(M, N, device="mps")
+    with pytest.raises(MetalNonRecoverableError):
+        _k_mm_boundmask[(1,)](A, B, O, M=M, N=N, K=K, BOUND=BOUND); torch.mps.synchronize()
+
+
+@requires
+def test_matmul_tileboundary_output_mask_still_computes():
+    # The trivially-true tile-boundary mask (rm<M)&(rn<N) must NOT be over-refused (the
+    # template boundary already enforces it). Guards against the gate over-refusing.
+    _clear()
+    M = N = K = 64
+    An = np.random.RandomState(0).randn(M, K).astype(np.float32)
+    Bn = np.random.RandomState(1).randn(K, N).astype(np.float32)
+    A = torch.tensor(An, device="mps"); B = torch.tensor(Bn, device="mps"); O = torch.zeros(M, N, device="mps")
+    _k_mm_tilemask[(1,)](A, B, O, M=M, N=N, K=K); torch.mps.synchronize()
+    assert float(np.abs(O.cpu().numpy() - An.astype(np.float64) @ Bn.astype(np.float64)).max()) < 1e-3

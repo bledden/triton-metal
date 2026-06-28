@@ -817,10 +817,16 @@ class _ControlFlowMixin:
         # is per-program, not per-thread. Guard with lid == 0.
         is_scalar = not ssa.is_tensor
 
-        # In 2D kernels, a 1D atomic tensor (e.g. after 2D→1D reduce) must
-        # only execute on the first N threads, not all M*N threads.
+        # A 1-D atomic tensor smaller than the thread count must only execute on
+        # the first shape[0] threads, NOT all of them. For a constant-offset
+        # (size-1) non-idempotent atomic (atomic_add/fadd) every thread would RMW
+        # the SAME address -> over-count by num_threads (size-1 add returned 256,
+        # expect 1); for size-N>1 the un-guarded lanes lid>=N also write OOB. This
+        # held only for self._is_2d, leaving the 1-D kernel path unguarded (the
+        # missed twin of the 2-D case) — apply it whenever the atomic tensor is 1-D
+        # and under-fills the threadgroup. Re-audit 2026-06-27.
         atomic_1d_guard = None
-        if self._is_2d and ssa.is_tensor:
+        if ssa.is_tensor:
             atom_shape = _extract_shape(ssa.type_str)
             if len(atom_shape) == 1 and atom_shape[0] < self.effective_block_size:
                 atomic_1d_guard = atom_shape[0]

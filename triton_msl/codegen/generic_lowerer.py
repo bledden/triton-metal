@@ -676,6 +676,17 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
         # never computed -> garbage (test_scaled_dot, ~all configs mismatch).
         self._refuse_unsafe_unsupported_ops()
 
+        # SYSTEMIC anti-silent-wrong gate (ONE chokepoint for all five matmul/FA
+        # template store sites): the simdgroup simple-dot, K-loop, strided-scalar,
+        # fused matmul+softmax, and simdgroup-FA templates all DROP a non-tile-boundary
+        # output ``tt.store`` mask (they clip only on the hard-coded tile boundary).
+        # A mask that restricts the output WITHIN the computed tile (rm < BOUND with
+        # BOUND < M, or a value mask) would be silently dropped -> clobbered rows.
+        # Refuse loudly here, before any template dispatch; the trivially-true
+        # tile-boundary mask ((rm < M) & (rn < N) / om < N_CTX) and the no-mask case
+        # are left untouched.
+        self._refuse_nontrivial_template_output_mask()
+
         # Integrity prescan (never silent-wrong): FlashAttention-style kernels
         # (>= 2 tt.dot with a softmax/exp between them) are validated only for
         # head_dim <= 64. Above that the attention lowering SILENTLY mis-computes

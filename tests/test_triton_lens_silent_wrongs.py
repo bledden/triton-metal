@@ -655,3 +655,62 @@ def test_fp8_downcast_round_to_nearest_even(kern, tdt, name):
     Xs = torch.tensor(v, device="mps"); Os = torch.zeros(256, device="mps")
     k[(1,)](Xs, Os, N=256); torch.mps.synchronize()
     np.testing.assert_allclose(Os.cpu().numpy(), torch.tensor(v).cpu().to(tdt).float().numpy(), rtol=0, atol=0)
+
+
+# --- staging-fix re-audit 2026-06-27: multi-block matmul+softmax + fp16 dot-result store ---
+if _HAS:
+    @triton.jit
+    def _k_mb_mmsoft(A, B, O, M: tl.constexpr, N: tl.constexpr, K: tl.constexpr, BM: tl.constexpr):
+        pid = tl.program_id(0)
+        rm = pid * BM + tl.arange(0, BM); rn = tl.arange(0, N); rk = tl.arange(0, K)
+        a = tl.load(A + rm[:, None] * K + rk[None, :]); b = tl.load(B + rk[:, None] * N + rn[None, :])
+        c = tl.dot(a, b); c = c - tl.max(c, 1)[:, None]; p = tl.exp(c); p = p / tl.sum(p, 1)[:, None]
+        tl.store(O + rm[:, None] * N + rn[None, :], p)
+
+    @triton.jit
+    def _k_fa_fp16out(Q, K, V, O, N: tl.constexpr, HD: tl.constexpr, sm: tl.constexpr):
+        om = tl.arange(0, N); on = tl.arange(0, N); od = tl.arange(0, HD)
+        q = tl.load(Q + om[:, None] * HD + od[None, :]) * sm
+        k = tl.load(K + on[:, None] * HD + od[None, :])
+        qk = tl.dot(q, tl.trans(k)); qk = qk - tl.max(qk, 1)[:, None]
+        p = tl.exp(qk); p = p / tl.sum(p, 1)[:, None]
+        v = tl.load(V + on[:, None] * HD + od[None, :])
+        o = tl.dot(p.to(tl.float16), v.to(tl.float16))
+        tl.store(O + om[:, None] * HD + od[None, :], o.to(O.dtype.element_ty))
+
+
+@requires
+def test_multiblock_matmul_softmax_refuses_not_stale_rows():
+    # The fused matmul+softmax template emits the whole baked MxN output from one
+    # threadgroup and never honors program_id; launched multi-block it used to leave
+    # rows past block 0 stale (silent-wrong). Must now REFUSE loudly. (re-audit 2026-06-27)
+    _clear()
+    M, N, K, BM = 64, 32, 32, 32
+    An = np.random.RandomState(0).randn(M, K).astype(np.float32)
+    Bn = np.random.RandomState(1).randn(K, N).astype(np.float32)
+    A = torch.tensor(An, device="mps"); B = torch.tensor(Bn, device="mps"); O = torch.zeros(M, N, device="mps")
+    with pytest.raises(MetalNonRecoverableError):
+        _k_mb_mmsoft[(M // BM,)](A, B, O, M=M, N=N, K=K, BM=BM); torch.mps.synchronize()
+
+
+@requires
+def test_fp16_dot_result_store_over_blocksize_writes_all_rows():
+    # An fp16/bf16 output store of a dot result whose tile exceeds block_size (e.g.
+    # FA head_dim=64 -> 32x64=2048 > 1024) used to collapse to a flat per-thread
+    # write (a .to(O.dtype) cast + convert_layout defeated the strided-store loop),
+    # writing only the first block_size/2 rows. Must now write ALL rows. (re-audit 2026-06-27)
+    _clear()
+    N, HD = 32, 64
+    rng = np.random.RandomState(0)
+    Qn, Kn, Vn = (rng.randn(N, HD).astype(np.float32) for _ in range(3)); sm = 1.0 / np.sqrt(HD)
+    Q = torch.tensor(Qn, device="mps").to(torch.float16)
+    K = torch.tensor(Kn, device="mps").to(torch.float16)
+    V = torch.tensor(Vn, device="mps").to(torch.float16)
+    O = torch.zeros(N, HD, device="mps", dtype=torch.float16)
+    _k_fa_fp16out[(1,)](Q, K, V, O, N=N, HD=HD, sm=float(sm)); torch.mps.synchronize()
+    got = O.float().cpu().numpy()
+    assert int((np.abs(got).sum(1) > 0).sum()) == N, "rows past block_size/2 left unwritten"
+    qk = (Qn.astype(np.float64) @ Kn.astype(np.float64).T) * sm
+    qk -= qk.max(1, keepdims=True); pp = np.exp(qk); pp /= pp.sum(1, keepdims=True)
+    ref = pp @ Vn.astype(np.float64)
+    assert float(np.abs(got - ref).max()) < 5e-2, "fp16 FA output mismatch"

@@ -3046,6 +3046,41 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
         # Check if the value to store is smem-backed with total > block_size
         smem_descs = getattr(self, '_shared_mem_descs', {})
         val_smem = smem_descs.get(val_id)
+        if val_smem is None:
+            # The store value may be a dtype CAST / layout convert of a smem-backed
+            # dot result (e.g. for an fp16/bf16 output: store(convert_layout(
+            # truncf(dot)))). Those ops' results are not themselves smem-backed, so
+            # without following them the cooperative strided-store loop below is
+            # skipped and the store collapses to a flat per-thread write -- silently
+            # dropping every element past block_size (only block_size of a
+            # total>block_size tile get written; the rest stay at their init value).
+            # Walk the passthrough (convert_layout) + dtype-cast chain to a
+            # smem-backed source for the LOOP decision; the loop re-casts smem[_st]
+            # to the output pointer dtype, so the narrowing is preserved. Do NOT
+            # rebind val_id (the total<=block_size flat path needs the cast value).
+            # Re-audit 2026-06-27.
+            _FOLLOW = {"ttg.convert_layout", "arith.truncf", "arith.extf",
+                       "tt.fp_to_fp", "arith.sitofp", "arith.uitofp",
+                       "arith.fptosi", "arith.fptoui", "arith.trunci",
+                       "arith.extsi", "arith.extui"}
+
+            def _flat_ops(ops):
+                for o in ops:
+                    yield o
+                    if o.region_ops:
+                        yield from _flat_ops(o.region_ops)
+                    if o.else_ops:
+                        yield from _flat_ops(o.else_ops)
+            _by_id = {o.id: o for o in _flat_ops(self.graph.ops)}
+            _cur = val_id
+            for _ in range(8):
+                _o = _by_id.get(_cur)
+                if _o is None or _o.op not in _FOLLOW or not _o.operand_ids:
+                    break
+                _cur = _o.operand_ids[0]
+                val_smem = smem_descs.get(_cur)
+                if val_smem is not None:
+                    break
         bs = self.effective_block_size
         if val_smem:
             val_shape = val_smem[1]

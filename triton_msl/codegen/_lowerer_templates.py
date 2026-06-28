@@ -1565,6 +1565,26 @@ class _TemplateMixin:
         if tg_bytes > 32 * 1024:
             return None
 
+        # This template emits the WHOLE baked M×N output from a SINGLE
+        # threadgroup and never references program_id; if the kernel tiles the
+        # output across programs (pid on the M/N axes) every block recomputes and
+        # overwrites the same first rows -> silently wrong (blocks pid>=1 leave
+        # their rows stale). The sibling matmul templates carry this pid guard
+        # (strided-matmul + simdgroup K-loop); this fused-softmax twin was the one
+        # copy missing it. M/N are baked constexpr here (a runtime M/N can't reach
+        # this template — m_block/n_strips need a concrete M), so any program_id
+        # on axis 0/1 is unsafe. Refuse (correct-or-refuse) — re-audit 2026-06-27.
+        pid_axes = {s.attrs.get("axis", 0) for s in self.graph.ops
+                    if s.op == "tt.get_program_id"}
+        if 0 in pid_axes or 1 in pid_axes:
+            from triton_msl.errors import MetalNonRecoverableError
+            raise MetalNonRecoverableError(
+                "fused matmul+softmax tiles the output across programs "
+                f"(program_id axes {sorted(pid_axes)}) but this template emits the "
+                "whole baked M×N output from a single threadgroup and does not honor "
+                "program_id. Refusing rather than recompute the same rows in every "
+                "block.", op_name="tt.dot")
+
         # 128 threads = 4 SIMD groups × 32 threads.
         self.effective_block_size = 128
 

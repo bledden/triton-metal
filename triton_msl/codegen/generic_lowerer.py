@@ -1570,7 +1570,62 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
         _find(self.graph.ops)
         if len(dots) != 1:
             return False
-        return any(ssa.op in _MATMUL_EPILOGUE_COMPUTE_OPS for ssa in self.graph.ops)
+        if any(ssa.op in _MATMUL_EPILOGUE_COMPUTE_OPS for ssa in self.graph.ops):
+            return True
+
+        # The denylist above is FLOAT-only (addresses use integer arith, so a
+        # top-level float-arith op reliably indicates an epilogue). It therefore
+        # MISSES an INTEGER output epilogue — a K-loop int8 matmul + int32 bias on
+        # the dot RESULT silently dropped the bias (re-audit 2026-06-28). Catch it
+        # ADDITIVELY (the float case already returned True above) with a forward-walk
+        # from the matmul OUTPUT: if the dot sits in a top-level region op (the
+        # scf.for K-loop) the loop result carries the accumulator, else the dot
+        # result. A consumer that is neither a value-preserving passthrough nor the
+        # terminal tt.store is an epilogue -> refuse. Crucially this follows ONLY
+        # consumers of the matmul output, never the integer ADDRESS arithmetic that
+        # independently feeds the store pointer, so a plain / cast / reshape matmul
+        # is NOT over-refused.
+        dot = dots[0]
+        _passthrough = {
+            "ttg.convert_layout", "tt.reshape", "tt.trans",
+            "arith.truncf", "arith.extf", "arith.bitcast",
+            "arith.sitofp", "arith.uitofp", "arith.fptosi", "arith.fptoui",
+            "tt.fp_to_fp",
+        }
+
+        def _region_has(ops, target):
+            for o in ops:
+                if o.id == target:
+                    return True
+                if o.region_ops and _region_has(o.region_ops, target):
+                    return True
+                if o.else_ops and _region_has(o.else_ops, target):
+                    return True
+            return False
+
+        output_id = dot.id
+        for top in self.graph.ops:
+            if top.region_ops and _region_has(top.region_ops, dot.id):
+                output_id = top.id    # the scf.for loop result carries the accumulator
+                break
+
+        _seen = set()
+        _frontier = [output_id]
+        while _frontier:
+            _vid = _frontier.pop()
+            if _vid in _seen:
+                continue
+            _seen.add(_vid)
+            for _op in self.graph.ops:
+                if _vid not in (_op.operand_ids or []):
+                    continue
+                if _op.op == "tt.store":
+                    continue                  # terminal — fine
+                if _op.op in _passthrough:
+                    _frontier.append(_op.id)  # follow a representation change
+                else:
+                    return True               # integer (or any) output epilogue
+        return False
 
     def _resolve_constant_int(self, ssa_id):
         """Resolve an SSA ID to its integer constant value, or None."""

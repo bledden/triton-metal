@@ -787,3 +787,32 @@ def test_matmul_tileboundary_output_mask_still_computes():
     A = torch.tensor(An, device="mps"); B = torch.tensor(Bn, device="mps"); O = torch.zeros(M, N, device="mps")
     _k_mm_tilemask[(1,)](A, B, O, M=M, N=N, K=K); torch.mps.synchronize()
     assert float(np.abs(O.cpu().numpy() - An.astype(np.float64) @ Bn.astype(np.float64)).max()) < 1e-3
+
+
+# --- remaining-twins hunt 2026-06-28: K-loop integer output epilogue dropped ---
+if _HAS:
+    @triton.jit
+    def _k_kloop_int_bias(A, B, Bias, O, M: tl.constexpr, N: tl.constexpr, K: tl.constexpr, BK: tl.constexpr):
+        rm = tl.arange(0, M); rn = tl.arange(0, N)
+        acc = tl.zeros((M, N), dtype=tl.int32)
+        for kk in range(0, K, BK):
+            rk = kk + tl.arange(0, BK)
+            acc += tl.dot(tl.load(A + rm[:, None] * K + rk[None, :]), tl.load(B + rk[:, None] * N + rn[None, :]))
+        acc = acc + tl.load(Bias + rn)[None, :]      # INTEGER output epilogue
+        tl.store(O + rm[:, None] * N + rn[None, :], acc)
+
+
+@requires
+def test_kloop_int_matmul_int_epilogue_refuses():
+    # A K-loop integer matmul + trailing INTEGER bias add silently DROPPED the bias
+    # (returned bare A@B): the matmul-epilogue guard was a FLOAT-only denylist, while
+    # the float twin and the simple-dot int twin both refused. Now the int output
+    # epilogue refuses too (additive forward-walk). (remaining-twins hunt 2026-06-28)
+    _clear()
+    M, N, K, BK = 32, 32, 64, 32
+    A = torch.randint(-4, 5, (M, K), dtype=torch.int8, device="mps")
+    B = torch.randint(-4, 5, (K, N), dtype=torch.int8, device="mps")
+    Bias = torch.randint(-100, 100, (N,), dtype=torch.int32, device="mps")
+    O = torch.zeros(M, N, dtype=torch.int32, device="mps")
+    with pytest.raises(MetalNonRecoverableError):
+        _k_kloop_int_bias[(1,)](A, B, Bias, O, M=M, N=N, K=K, BK=BK); torch.mps.synchronize()

@@ -125,6 +125,26 @@ class _TemplateMixin:
             return ("simdgroup", descriptors)
         return ("scalar", descriptors)
 
+    def _refuse_if_pid_tiles_baked_output(self, has_M, has_N, what):
+        """Single-source integrity guard for every matmul template that emits the
+        whole baked output from a single threadgroup. If the kernel tiles the
+        output across programs (program_id on the M/N axes) but M/N are baked
+        constexpr (not runtime args), the true output extent/strides can't be
+        derived here — refuse rather than emit silently-wrong output (each block
+        would recompute/overwrite the same rows, or collapse a real stride to the
+        block size). De-duplicated from three copies after the re-audit
+        (2026-06-27) found the fused matmul+softmax twin was the one copy MISSING
+        this guard -> multi-block silent-wrong."""
+        pid_axes = {s.attrs.get("axis", 0) for s in self.graph.ops
+                    if s.op == "tt.get_program_id"}
+        if (1 in pid_axes and not has_N) or (0 in pid_axes and not has_M):
+            from triton_msl.errors import MetalNonRecoverableError
+            raise MetalNonRecoverableError(
+                f"{what} tiles the output across programs (program_id axes "
+                f"{sorted(pid_axes)}) but M/N are baked as constexpr, not runtime "
+                "args — the true output extent/strides can't be derived here. "
+                "Refusing rather than emit silently-wrong output.", op_name="tt.dot")
+
     def _lower_strided_scalar_matmul(self, info, descriptors):
         """Fully stride-aware scalar matmul for a NON-contiguous-inner operand.
 
@@ -175,20 +195,9 @@ class _TemplateMixin:
         has_M = "M" in scalar_arg_map
         has_N = "N" in scalar_arg_map
         has_K = "K" in scalar_arg_map
-        pid_axes = {s.attrs.get("axis", 0) for s in self.graph.ops
-                    if s.op == "tt.get_program_id"}
-        has_pid = len(pid_axes) > 0
-
-        # Same integrity guard as the simdgroup K-loop: if the kernel tiles the
-        # output across programs but M/N are constexpr (no runtime arg), the true
-        # output extent is unknown here -> refuse rather than guess.
-        if (1 in pid_axes and not has_N) or (0 in pid_axes and not has_M):
-            from triton_msl.errors import MetalNonRecoverableError
-            raise MetalNonRecoverableError(
-                "strided matmul tiles the output across programs "
-                f"(program_id axes {sorted(pid_axes)}) but M/N are baked as "
-                "constexpr, not runtime args — the true output extent can't be "
-                "derived. Refusing.", op_name="tt.dot")
+        has_pid = any(s.op == "tt.get_program_id" for s in self.graph.ops)
+        # Shared integrity guard (see _refuse_if_pid_tiles_baked_output).
+        self._refuse_if_pid_tiles_baked_output(has_M, has_N, "strided matmul")
 
         # 256 threads per threadgroup; each handles a strided subset of the tile.
         block_size = 256
@@ -635,16 +644,8 @@ class _TemplateMixin:
         # (test_dot_mulbroadcasted: grid 2x6 over 256x192, B read with
         # stride 32 instead of 192 -> ~98% mismatch). The full dim is baked
         # in as constexpr and isn't recoverable here, so refuse rather than
-        # emit wrong numbers: an UNSUPPORTED stub makes emit_msl fall back.
-        pid_axes = {s.attrs.get("axis", 0) for s in self.graph.ops
-                    if s.op == "tt.get_program_id"}
-        if (1 in pid_axes and not has_N) or (0 in pid_axes and not has_M):
-            from triton_msl.errors import MetalNonRecoverableError
-            raise MetalNonRecoverableError(
-                "K-loop matmul tiles the output across programs "
-                f"(program_id axes {sorted(pid_axes)}) but M/N are baked as "
-                "constexpr, not runtime args — the true output strides "
-                "can't be derived (e.g. test_dot_mulbroadcasted).")
+        # emit wrong numbers. Shared guard (_refuse_if_pid_tiles_baked_output).
+        self._refuse_if_pid_tiles_baked_output(has_M, has_N, "K-loop matmul")
 
         if has_M:
             lines.append(f"    uint _M = (uint)M;")
@@ -1567,23 +1568,11 @@ class _TemplateMixin:
 
         # This template emits the WHOLE baked M×N output from a SINGLE
         # threadgroup and never references program_id; if the kernel tiles the
-        # output across programs (pid on the M/N axes) every block recomputes and
-        # overwrites the same first rows -> silently wrong (blocks pid>=1 leave
-        # their rows stale). The sibling matmul templates carry this pid guard
-        # (strided-matmul + simdgroup K-loop); this fused-softmax twin was the one
-        # copy missing it. M/N are baked constexpr here (a runtime M/N can't reach
-        # this template — m_block/n_strips need a concrete M), so any program_id
-        # on axis 0/1 is unsafe. Refuse (correct-or-refuse) — re-audit 2026-06-27.
-        pid_axes = {s.attrs.get("axis", 0) for s in self.graph.ops
-                    if s.op == "tt.get_program_id"}
-        if 0 in pid_axes or 1 in pid_axes:
-            from triton_msl.errors import MetalNonRecoverableError
-            raise MetalNonRecoverableError(
-                "fused matmul+softmax tiles the output across programs "
-                f"(program_id axes {sorted(pid_axes)}) but this template emits the "
-                "whole baked M×N output from a single threadgroup and does not honor "
-                "program_id. Refusing rather than recompute the same rows in every "
-                "block.", op_name="tt.dot")
+        # output across programs every block recomputes/overwrites the same rows
+        # -> silently wrong. Shared guard (_refuse_if_pid_tiles_baked_output); M/N
+        # are baked constexpr here (a runtime M/N can't reach this template —
+        # m_block/n_strips need a concrete M), so has_M/has_N are False.
+        self._refuse_if_pid_tiles_baked_output(False, False, "fused matmul+softmax")
 
         # 128 threads = 4 SIMD groups × 32 threads.
         self.effective_block_size = 128

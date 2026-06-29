@@ -91,6 +91,17 @@ add_kernel[(n + 255) // 256,](x, y, out, n, BLOCK=256)
 print(f"Max error: {(out - (x + y)).abs().max():.2e}")
 ```
 
+Run a fuller, runnable version — vector-add, fused-softmax, and a tiled matmul, each
+on a non-multiple shape (so every load/store boundary mask is exercised) and verified
+against a NumPy reference — with [`examples/local_triton_dev.py`](examples/local_triton_dev.py):
+
+```bash
+python examples/local_triton_dev.py
+```
+
+It's the same `@triton.jit` source you'd run on a CUDA GPU — develop and verify locally
+on your Mac, then ship the identical kernels to NVIDIA.
+
 ### torch.compile
 
 ```python

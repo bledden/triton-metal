@@ -75,3 +75,22 @@ target-version = "py310"
 
 [tool.ruff.lint]
 select = ["E", "F", "W"]
+# The codebase has a deliberate compact style (inline semicolons in kernels/tests,
+# math-style index names l/I, f-string MSL template literals). These rules are noise
+# against it; the meaningful checks (F811 redefinition, real F-codes, W) stay on.
+ignore = [
+    "E401",  # multiple imports on one line
+    "E402",  # module-level import not at top (guarded `import triton` blocks)
+    "E501",  # line too long (codegen emits long MSL template lines)
+    "E701",  # multiple statements on one line (colon)
+    "E702",  # multiple statements on one line (semicolon) — compact kernel/test style
+    "E703",  # statement ends with a semicolon
+    "E731",  # lambda assignment
+    "E741",  # ambiguous variable name (l/I/O — index/math convention)
+    "F401",  # imported but unused (re-exports + side-effect registration imports)
+    "F541",  # f-string without placeholders (MSL template literals)
+    "F841",  # local variable assigned but never used (readability intermediates)
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["F811"]  # tests redefine same-named kernels across cases by design

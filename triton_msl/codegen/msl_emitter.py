@@ -527,7 +527,6 @@ def _mept_path_log(tag, detail):
     fallback-integrity audit to measure how load-bearing the (silent-
     capable) legacy fallback is across the test suite.
     """
-    import os
     path = os.environ.get("TRITON_MSL_PATH_LOG")
     if not path:
         return
@@ -630,7 +629,6 @@ def _legacy_fallback(ir_text, metadata, options, reason):
     verified silent-wrongs). By default an unlowerable kernel REFUSES; set
     TRITON_MSL_LEGACY=1 to accept the risk for debugging.
     """
-    import os
     if os.environ.get("TRITON_MSL_LEGACY") != "1":
         from triton_msl.errors import MetalNonRecoverableError
         raise MetalNonRecoverableError(

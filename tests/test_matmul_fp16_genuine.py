@@ -8,6 +8,8 @@ measured fp16==fp32==7.00 TFLOP/s). These tests assert on the GENERATED MSL so
 """
 import re
 
+import pytest
+
 # Import via the public surface (msl_emitter), NOT _msl_templates directly:
 # importing _msl_templates before msl_emitter triggers a pre-existing
 # circular/star-import fragility that breaks `make_matmul_kernel` (tracked

@@ -89,7 +89,6 @@ def _mlir_to_triton_dtype(mlir_type: str) -> str:
     if fp8_result:
         return fp8_result
     # Handle multi-dim type strings like "4xi32" → extract base type
-    import re
     m = re.search(r"([a-z]\w*)$", mlir_type)
     if m:
         base = m.group(1)
@@ -212,7 +211,6 @@ def _alias_shared_memory(msl: str) -> str:
        member), remove duplicate declarations, and adjust the declaration
        size to the group maximum.
     """
-    import re
 
     lines = msl.split('\n')
 

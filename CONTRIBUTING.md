@@ -64,15 +64,15 @@ python benchmarks/mlx_vs_pyobjc.py         # MLX vs PyObjC comparison
 
 ## Code Style
 
-We use [ruff](https://docs.astral.sh/ruff/). `ruff check` is the CI gate — the
-`[tool.ruff.lint]` config in `pyproject.toml` codifies the project's deliberate compact
-style (inline semicolons, math-style index names, MSL-template f-strings). `ruff format`
-is available but **not yet enforced** in CI — the codebase predates a repo-wide format
-pass, so a format gate would require reformatting most files first.
+We use [ruff](https://docs.astral.sh/ruff/) for both linting and formatting, and **both
+are CI gates**. `ruff check` enforces the lint rules (the `[tool.ruff.lint]` config in
+`pyproject.toml` relaxes a few the codebase uses by convention — math-style index names,
+template f-strings); `ruff format` enforces formatting. Run both before pushing:
 
 ```bash
-ruff check triton_msl/ tests/    # the CI gate — must pass
-ruff format triton_msl/ tests/   # optional; would reformat most files (not run in CI)
+ruff check triton_msl/ tests/           # lint gate — must pass
+ruff format triton_msl/ tests/          # apply formatting, then commit the result
+ruff format --check triton_msl/ tests/  # what CI checks — must pass
 ```
 
 ## Architecture

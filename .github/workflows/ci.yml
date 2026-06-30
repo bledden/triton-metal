@@ -29,3 +29,6 @@ jobs:
 
       - name: Lint
         run: ruff check triton_msl/ tests/
+
+      - name: Format check
+        run: ruff format --check triton_msl/ tests/

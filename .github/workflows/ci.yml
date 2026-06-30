@@ -50,7 +50,10 @@ jobs:
 
       - name: Resolve Triton's current main commit
         id: triton
-        run: echo "sha=$(git ls-remote https://github.com/triton-lang/triton.git HEAD | cut -f1)" >> "$GITHUB_OUTPUT"
+        run: |
+          sha="$(git ls-remote https://github.com/triton-lang/triton.git HEAD | head -n1 | cut -f1)"
+          echo "Triton main commit: $sha"
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
 
       # Cache the BUILT wheel, keyed on Triton's current main commit + py + os.
       # This is the piece that was broken before: `cache: pip` kept failing to

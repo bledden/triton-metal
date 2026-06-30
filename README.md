@@ -6,6 +6,12 @@ Metal (Apple Silicon) backend for [OpenAI Triton](https://github.com/triton-lang
 @triton.jit → Triton TTIR → TTGIR → MSL → metallib → Apple GPU
 ```
 
+**The same `@triton.jit` source runs on NVIDIA.** triton-msl is a Triton *backend*, not a
+dialect — only the final stage (→ MSL) is Apple-specific, so the kernel you develop and
+correctness-debug on your Mac is the identical code that runs on a CUDA GPU. The fp32 paths
+are **verified bit-identical on a real NVIDIA A40** ([`PORTABILITY.md`](PORTABILITY.md)):
+develop kernel *logic* on the laptop you own, rent a GPU only for the performance pass.
+
 ## Status
 
 **Alpha** — actively developed, not yet production-ready.
@@ -19,12 +25,12 @@ Metal (Apple Silicon) backend for [OpenAI Triton](https://github.com/triton-lang
   backend compiles and runs the kernels on the GPU, since upstream `test_core`
   otherwise assumes CUDA). Re-run it to reproduce; counts in this file and
   `CHANGELOG.md` are regenerated from it, not hand-maintained.
-- **877 passed / 0 failed** in the project suite (codegen, GPU correctness,
+- **1,968 passed / 0 failed** in the project suite (codegen, GPU correctness,
   integration, FlashAttention, MLX backend, fast-matmul / compile_shader
   zero-copy, `torch.compile`, and training). FlashAttention: causal + non-causal
   at **HEAD_DIM 32 / 64 / 128** (head_dim 128 fp32 + fp16 via the simdgroup-MMA
   template; see [\[4\]](REFERENCES.md) for the algorithm); **15 / 15** MLX backend
-  tests; the project suite grew from 434 → 603 → 716 → ~877 since `0.1.0-alpha`.
+  tests; the project suite grew from 434 → 603 → 716 → 877 → 1,968 since `0.1.0-alpha`.
   (A further ~20 C++-MLIR-backend tests skip unless that optional extension is
   built.)
 - **`torch.compile` routes through triton-msl** on Python 3.10–3.14 (PyTorch
@@ -44,6 +50,27 @@ Metal (Apple Silicon) backend for [OpenAI Triton](https://github.com/triton-lang
 See [`REFERENCES.md`](REFERENCES.md) for citations and
 [`docs/superpowers/specs/2026-05-30-triton-msl-roadmap.md`](docs/superpowers/specs/2026-05-30-triton-msl-roadmap.md)
 for the active pre-1.0 roadmap.
+
+## Portability — develop on Apple Silicon, run on NVIDIA
+
+triton-msl is a **backend** for Triton, so your `@triton.jit` source is standard Triton —
+the same code runs on NVIDIA (only the final codegen stage differs). The three example
+kernels, unmodified, were run on an Apple M4 Max **and** a rented NVIDIA A40, each checked
+against the same NumPy reference:
+
+| kernel | Mac vs NumPy | NVIDIA vs NumPy | **Mac ↔ NVIDIA Δ** |
+|---|---|---|---|
+| `vector_add` | 0 | 0 | **0 — bit-identical** |
+| `fused_softmax` | 7.45e-9 | 5.59e-9 | 7.45e-9 |
+| `matmul` (fp32 / `ieee`) | 4.58e-5 | 4.58e-5 | **0 — bit-identical** |
+| `matmul` (`tf32`) | refused (no tf32 on Metal) | 6.07e-2 | — |
+
+**Correctness/logic is portable** — two of three kernels were bit-identical across vendors,
+and it crossed Triton 3.0.0 ↔ 3.7.0. **Performance is not** (block sizes and fast-path
+routing are hardware-specific). So the workflow is: develop and debug kernel *logic* on the
+Mac you own, then rent a GPU for minutes for the performance pass. The one numerical caveat
+is NVIDIA's **tf32** default for `tl.dot` (pass `input_precision="ieee"` to match). Full
+receipt + a reproduce harness: [`PORTABILITY.md`](PORTABILITY.md).
 
 ## Requirements
 

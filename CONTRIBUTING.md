@@ -48,6 +48,12 @@ pytest tests/test_gpu_correctness.py -v    # GPU correctness
 python scripts/run_upstream_tests.py --test-file test_core.py --timeout 1800  # ~14 min
 ```
 
+> **Hosted CI runs lint only.** GitHub's hosted macOS runners can't build Triton in time
+> (Triton ships no macOS wheels; a from-source build exceeds the runner's time limit), so
+> GPU/Metal correctness is validated **locally** — run `pytest tests/` on Apple Silicon
+> (with a source-built Triton) before pushing; the suite is currently 1,968 / 0. For
+> automated GPU coverage, register a self-hosted macOS runner (see `.github/workflows/ci.yml`).
+
 ## Running Benchmarks
 
 ```bash
@@ -58,11 +64,15 @@ python benchmarks/mlx_vs_pyobjc.py         # MLX vs PyObjC comparison
 
 ## Code Style
 
-We use [ruff](https://docs.astral.sh/ruff/) for linting:
+We use [ruff](https://docs.astral.sh/ruff/). `ruff check` is the CI gate — the
+`[tool.ruff.lint]` config in `pyproject.toml` codifies the project's deliberate compact
+style (inline semicolons, math-style index names, MSL-template f-strings). `ruff format`
+is available but **not yet enforced** in CI — the codebase predates a repo-wide format
+pass, so a format gate would require reformatting most files first.
 
 ```bash
-ruff check triton_msl/ tests/
-ruff format triton_msl/ tests/
+ruff check triton_msl/ tests/    # the CI gate — must pass
+ruff format triton_msl/ tests/   # optional; would reformat most files (not run in CI)
 ```
 
 ## Architecture

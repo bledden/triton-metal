@@ -1,6 +1,7 @@
 """fp16/bf16 atomic RMW via word-CAS (Phase 3 feature 1). These refused before
 (Metal has no 16-bit device atomic); a neighbor-preserving 32-bit word-CAS makes
 them correct. Serial GPU."""
+
 import pytest
 
 try:
@@ -8,6 +9,7 @@ try:
     import triton
     import triton.language as tl
     import Metal
+
     HAS = Metal.MTLCreateSystemDefaultDevice() is not None
 except Exception:
     HAS = False
@@ -15,12 +17,13 @@ except Exception:
 requires_metal = pytest.mark.skipif(not HAS, reason="Metal/torch/triton needed")
 
 if HAS:
+
     @triton.jit
     def _atomic_add_kernel(X, OUT, N, BLOCK: tl.constexpr):
         offs = tl.arange(0, BLOCK)
         mask = offs < N
         x = tl.load(X + offs, mask=mask)
-        tl.atomic_add(OUT + (offs % 4), x, mask=mask)   # many threads -> 4 slots
+        tl.atomic_add(OUT + (offs % 4), x, mask=mask)  # many threads -> 4 slots
 
     @triton.jit
     def _atomic_neighbor_kernel(X, OUT, N, BLOCK: tl.constexpr):
@@ -41,8 +44,7 @@ def test_fp16_atomic_add_accumulates():
     want = torch.zeros(4, dtype=torch.float32)
     for i in range(N):
         want[i % 4] += X[i].float()
-    assert torch.allclose(OUT.float(), want, atol=1e-1, rtol=1e-2), (
-        f"got {OUT.float()} want {want}")
+    assert torch.allclose(OUT.float(), want, atol=1e-1, rtol=1e-2), f"got {OUT.float()} want {want}"
 
 
 @requires_metal
@@ -54,7 +56,8 @@ def test_fp16_atomic_neighbor_preservation():
     OUT = torch.zeros(N, dtype=torch.float16)
     _atomic_neighbor_kernel[(1,)](X, OUT, N, BLOCK=256)
     assert torch.allclose(OUT.float(), X.float(), atol=1e-2), (
-        f"neighbor corruption: got {OUT.float()[:8]} want {X.float()[:8]}")
+        f"neighbor corruption: got {OUT.float()[:8]} want {X.float()[:8]}"
+    )
 
 
 @requires_metal
@@ -101,5 +104,4 @@ def test_bf16_atomic_add_accumulates():
     for i in range(N):
         want[i % 4] += X[i].float()
     # bf16 has an 8-bit mantissa — looser tolerance.
-    assert torch.allclose(OUT.float(), want, atol=1.0, rtol=5e-2), (
-        f"got {OUT.float()} want {want}")
+    assert torch.allclose(OUT.float(), want, atol=1.0, rtol=5e-2), f"got {OUT.float()} want {want}"

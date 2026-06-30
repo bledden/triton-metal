@@ -13,12 +13,14 @@ try:
     import triton
     import triton.language as tl
     from triton._C.libtriton import ir
+
     HAS_TRITON = True
 except ImportError:
     HAS_TRITON = False
 
 try:
     import Metal
+
     HAS_METAL = Metal.MTLCreateSystemDefaultDevice() is not None
 except ImportError:
     HAS_METAL = False
@@ -70,9 +72,10 @@ def _validate_msl_compiles(msl_src: str):
     air_path = metal_path.replace(".metal", ".air")
     try:
         result = subprocess.run(
-            ["xcrun", "-sdk", "macosx", "metal", "-c", metal_path,
-             "-o", air_path, "-std=metal3.2", "-O0"],
-            capture_output=True, text=True, timeout=30,
+            ["xcrun", "-sdk", "macosx", "metal", "-c", metal_path, "-o", air_path, "-std=metal3.2", "-O0"],
+            capture_output=True,
+            text=True,
+            timeout=30,
         )
         if result.returncode != 0:
             print(f"MSL compilation FAILED:\n{result.stderr}")
@@ -90,6 +93,7 @@ def _validate_msl_compiles(msl_src: str):
 # Tests
 # ---------------------------------------------------------------------------
 
+
 @requires_triton
 def test_dot_scaled_refuses_not_silently_wrong():
     """Integrity (PR1): microscaling matmul (tt.dot_scaled) has no Apple
@@ -104,8 +108,7 @@ def test_dot_scaled_refuses_not_silently_wrong():
     from triton_msl.errors import MetalNonRecoverableError
 
     @triton.jit
-    def k(a_base, b_base, out, BM: tl.constexpr, BN: tl.constexpr,
-          BK: tl.constexpr):
+    def k(a_base, b_base, out, BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr):
         a_ptr = a_base + tl.arange(0, BM)[:, None] * BK + tl.arange(0, BK)[None, :]
         b_ptr = b_base + tl.arange(0, BK)[:, None] * BN + tl.arange(0, BN)[None, :]
         a = tl.load(a_ptr)
@@ -117,13 +120,12 @@ def test_dot_scaled_refuses_not_silently_wrong():
     target = GPUTarget("metal", "apple-m4", 32)
     backend = MetalBackend(target)
     options = backend.parse_options({})
-    src = ASTSource(fn=k, signature={"a_base": "*fp8e5", "b_base": "*fp8e5",
-                                     "out": "*fp32"},
-                    constexprs=dict(BM=32, BN=32, BK=32))
+    src = ASTSource(
+        fn=k, signature={"a_base": "*fp8e5", "b_base": "*fp8e5", "out": "*fp32"}, constexprs=dict(BM=32, BN=32, BK=32)
+    )
     ctx = ir.context()
     ir.load_dialects(ctx)
-    mod = src.make_ir(target, options, backend.get_codegen_implementation(options),
-                      backend.get_module_map(), ctx)
+    mod = src.make_ir(target, options, backend.get_codegen_implementation(options), backend.get_module_map(), ctx)
     meta = {}
     mod = backend.make_ttir(mod, meta, options)
     mod = backend.make_ttgir(mod, meta, options)
@@ -149,8 +151,9 @@ def test_constexpr_dim_matmul_refuses_not_silently_wrong():
     from triton_msl.errors import MetalNonRecoverableError
 
     @triton.jit
-    def kernel(Z, X, Y, M: tl.constexpr, N: tl.constexpr, K: tl.constexpr,
-               BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr):
+    def kernel(
+        Z, X, Y, M: tl.constexpr, N: tl.constexpr, K: tl.constexpr, BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr
+    ):
         pidn = tl.program_id(1)
         pidm = tl.program_id(0)
         offm = tl.arange(0, BM)[:, None]
@@ -175,8 +178,7 @@ def test_constexpr_dim_matmul_refuses_not_silently_wrong():
     src = ASTSource(fn=kernel, signature=sig, constexprs=ce)
     ctx = ir.context()
     ir.load_dialects(ctx)
-    mod = src.make_ir(target, options, backend.get_codegen_implementation(options),
-                      backend.get_module_map(), ctx)
+    mod = src.make_ir(target, options, backend.get_codegen_implementation(options), backend.get_module_map(), ctx)
     meta = {}
     mod = backend.make_ttir(mod, meta, options)
     mod = backend.make_ttgir(mod, meta, options)
@@ -211,9 +213,7 @@ def test_unstructured_cf_refuses_not_silently_wrong():
         src = ASTSource(fn=fn, signature=sig, constexprs={})
         ctx = ir.context()
         ir.load_dialects(ctx)
-        mod = src.make_ir(target, options,
-                          backend.get_codegen_implementation(options),
-                          backend.get_module_map(), ctx)
+        mod = src.make_ir(target, options, backend.get_codegen_implementation(options), backend.get_module_map(), ctx)
         meta = {}
         mod = backend.make_ttir(mod, meta, options)
         mod = backend.make_ttgir(mod, meta, options)
@@ -235,8 +235,7 @@ def test_unstructured_cf_refuses_not_silently_wrong():
                 val = tl.load(Val3)
         tl.store(Out, val)
 
-    sig = {k: "*i32" for k in
-           ("Cond1", "Cond2", "Cond3", "Val1", "Val2", "Val3", "Out")}
+    sig = {k: "*i32" for k in ("Cond1", "Cond2", "Cond3", "Val1", "Val2", "Val3", "Out")}
     with pytest.raises(MetalNonRecoverableError, match="control flow"):
         _emit(nested, sig)
 
@@ -264,22 +263,36 @@ def test_unstructured_cf_refuses_not_silently_wrong():
 
 @requires_triton
 @requires_metal
-@pytest.mark.parametrize("in_shape,perm,red_dims", [
-    ((4, 32, 32, 4, 2), [2, 1, 0, 3, 4], [3, 1, 0]),
-    ((8, 2, 32, 4, 16), [4, 0, 1, 3, 2], [0, 2, 0]),
-])
+@pytest.mark.parametrize(
+    "in_shape,perm,red_dims",
+    [
+        ((4, 32, 32, 4, 2), [2, 1, 0, 3, 4], [3, 1, 0]),
+        ((8, 2, 32, 4, 16), [4, 0, 1, 3, 2], [0, 2, 0]),
+    ],
+)
 def test_permute_chained_reduce_matches_torch(in_shape, perm, red_dims):
     """Fused permute + chained sum-reduce (test_chained_reductions shape)
     produces exact integer results via the cooperative scatter-reduce."""
     import torch
 
     @triton.jit
-    def kernel(In, Out, dim_0: tl.constexpr, dim_1: tl.constexpr,
-               dim_2: tl.constexpr, dim_3: tl.constexpr, dim_4: tl.constexpr,
-               perm_0: tl.constexpr, perm_1: tl.constexpr, perm_2: tl.constexpr,
-               perm_3: tl.constexpr, perm_4: tl.constexpr,
-               red_dim_0: tl.constexpr, red_dim_1: tl.constexpr,
-               red_dim_2: tl.constexpr):
+    def kernel(
+        In,
+        Out,
+        dim_0: tl.constexpr,
+        dim_1: tl.constexpr,
+        dim_2: tl.constexpr,
+        dim_3: tl.constexpr,
+        dim_4: tl.constexpr,
+        perm_0: tl.constexpr,
+        perm_1: tl.constexpr,
+        perm_2: tl.constexpr,
+        perm_3: tl.constexpr,
+        perm_4: tl.constexpr,
+        red_dim_0: tl.constexpr,
+        red_dim_1: tl.constexpr,
+        red_dim_2: tl.constexpr,
+    ):
         idx = tl.arange(0, dim_0 * dim_1 * dim_2 * dim_3 * dim_4)
         idx = idx.reshape(dim_0, dim_1, dim_2, dim_3, dim_4)
         vals = tl.load(In + idx)
@@ -290,8 +303,7 @@ def test_permute_chained_reduce_matches_torch(in_shape, perm, red_dims):
 
     inp = torch.randint(0, 1000, in_shape, dtype=torch.int32, device="cpu")
     temp = torch.permute(inp, perm).contiguous()
-    ref = torch.sum(torch.sum(torch.sum(temp, red_dims[0]), red_dims[1]),
-                    red_dims[2])
+    ref = torch.sum(torch.sum(torch.sum(temp, red_dims[0]), red_dims[1]), red_dims[2])
     out = torch.empty_like(ref)
     kernel[(1,)](inp, out, *in_shape, *perm, *red_dims)
     assert torch.all(ref == out), f"mismatch: ref={ref}\nout={out}"
@@ -301,6 +313,7 @@ def test_permute_chained_reduce_matches_torch(in_shape, perm, red_dims):
 @requires_metal
 def test_lower_vector_add():
     """Generic lowerer produces valid MSL for vector_add."""
+
     @triton.jit
     def vector_add(a_ptr, b_ptr, out_ptr, n, BLOCK_SIZE: tl.constexpr):
         pid = tl.program_id(0)
@@ -311,9 +324,7 @@ def test_lower_vector_add():
         tl.store(out_ptr + offsets, a + b, mask=mask)
 
     sig = {"a_ptr": "*fp32", "b_ptr": "*fp32", "out_ptr": "*fp32", "n": "i32"}
-    mod, metadata, options = _compile_to_ttgir(
-        vector_add, sig, constexprs={"BLOCK_SIZE": 256}
-    )
+    mod, metadata, options = _compile_to_ttgir(vector_add, sig, constexprs={"BLOCK_SIZE": 256})
 
     msl, graph = _lower_to_msl(mod, metadata, options)
 
@@ -338,6 +349,7 @@ def test_lower_vector_add():
 @requires_metal
 def test_lower_scalar_mul():
     """Generic lowerer produces valid MSL for scalar multiply."""
+
     @triton.jit
     def scalar_mul(x_ptr, out_ptr, n, scale, BLOCK_SIZE: tl.constexpr):
         pid = tl.program_id(0)
@@ -347,9 +359,7 @@ def test_lower_scalar_mul():
         tl.store(out_ptr + offsets, x * scale, mask=mask)
 
     sig = {"x_ptr": "*fp32", "out_ptr": "*fp32", "n": "i32", "scale": "fp32"}
-    mod, metadata, options = _compile_to_ttgir(
-        scalar_mul, sig, constexprs={"BLOCK_SIZE": 256}
-    )
+    mod, metadata, options = _compile_to_ttgir(scalar_mul, sig, constexprs={"BLOCK_SIZE": 256})
 
     msl, graph = _lower_to_msl(mod, metadata, options)
 
@@ -366,6 +376,7 @@ def test_lower_scalar_mul():
 @requires_metal
 def test_lower_fp16_cast():
     """Generic lowerer handles FP16 loads/stores."""
+
     @triton.jit
     def cast_kernel(x_ptr, y_ptr, out_ptr, n, BLOCK_SIZE: tl.constexpr):
         pid = tl.program_id(0)
@@ -377,9 +388,7 @@ def test_lower_fp16_cast():
         tl.store(out_ptr + offsets, result.to(tl.float16), mask=mask)
 
     sig = {"x_ptr": "*fp16", "y_ptr": "*fp16", "out_ptr": "*fp16", "n": "i32"}
-    mod, metadata, options = _compile_to_ttgir(
-        cast_kernel, sig, constexprs={"BLOCK_SIZE": 256}
-    )
+    mod, metadata, options = _compile_to_ttgir(cast_kernel, sig, constexprs={"BLOCK_SIZE": 256})
 
     msl, graph = _lower_to_msl(mod, metadata, options)
 
@@ -395,6 +404,7 @@ def test_lower_fp16_cast():
 @requires_metal
 def test_lower_constant_mul():
     """Generic lowerer handles float constants."""
+
     @triton.jit
     def const_kernel(x_ptr, out_ptr, n, BLOCK_SIZE: tl.constexpr):
         pid = tl.program_id(0)
@@ -405,9 +415,7 @@ def test_lower_constant_mul():
         tl.store(out_ptr + offsets, result, mask=mask)
 
     sig = {"x_ptr": "*fp32", "out_ptr": "*fp32", "n": "i32"}
-    mod, metadata, options = _compile_to_ttgir(
-        const_kernel, sig, constexprs={"BLOCK_SIZE": 256}
-    )
+    mod, metadata, options = _compile_to_ttgir(const_kernel, sig, constexprs={"BLOCK_SIZE": 256})
 
     msl, graph = _lower_to_msl(mod, metadata, options)
 
@@ -422,9 +430,9 @@ def test_lower_constant_mul():
 @requires_metal
 def test_lower_sum_reduction():
     """Generic lowerer handles tt.reduce (sum)."""
+
     @triton.jit
-    def sum_kernel(input_ptr, output_ptr, n_elements,
-                   BLOCK_SIZE: tl.constexpr):
+    def sum_kernel(input_ptr, output_ptr, n_elements, BLOCK_SIZE: tl.constexpr):
         pid = tl.program_id(0)
         offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
         mask = offsets < n_elements
@@ -433,9 +441,7 @@ def test_lower_sum_reduction():
         tl.store(output_ptr + pid, result)
 
     sig = {"input_ptr": "*fp32", "output_ptr": "*fp32", "n_elements": "i32"}
-    mod, metadata, options = _compile_to_ttgir(
-        sum_kernel, sig, constexprs={"BLOCK_SIZE": 256}
-    )
+    mod, metadata, options = _compile_to_ttgir(sum_kernel, sig, constexprs={"BLOCK_SIZE": 256})
 
     msl, graph = _lower_to_msl(mod, metadata, options)
 
@@ -452,10 +458,12 @@ def test_lower_sum_reduction():
 # Adversarial tests — novel op combinations the pattern matchers can't handle
 # ---------------------------------------------------------------------------
 
+
 @requires_triton
 @requires_metal
 def test_lower_negation():
     """Generic lowerer handles arith.negf."""
+
     @triton.jit
     def negate_kernel(x_ptr, out_ptr, n, BLOCK_SIZE: tl.constexpr):
         pid = tl.program_id(0)
@@ -465,9 +473,7 @@ def test_lower_negation():
         tl.store(out_ptr + offsets, -x, mask=mask)
 
     sig = {"x_ptr": "*fp32", "out_ptr": "*fp32", "n": "i32"}
-    mod, metadata, options = _compile_to_ttgir(
-        negate_kernel, sig, constexprs={"BLOCK_SIZE": 256}
-    )
+    mod, metadata, options = _compile_to_ttgir(negate_kernel, sig, constexprs={"BLOCK_SIZE": 256})
 
     msl, graph = _lower_to_msl(mod, metadata, options)
     print(f"\n=== Generated MSL for negate ===")
@@ -481,6 +487,7 @@ def test_lower_negation():
 @requires_metal
 def test_lower_math_exp():
     """Generic lowerer handles math.exp (exponential)."""
+
     @triton.jit
     def exp_kernel(x_ptr, out_ptr, n, BLOCK_SIZE: tl.constexpr):
         pid = tl.program_id(0)
@@ -490,9 +497,7 @@ def test_lower_math_exp():
         tl.store(out_ptr + offsets, tl.exp(x), mask=mask)
 
     sig = {"x_ptr": "*fp32", "out_ptr": "*fp32", "n": "i32"}
-    mod, metadata, options = _compile_to_ttgir(
-        exp_kernel, sig, constexprs={"BLOCK_SIZE": 256}
-    )
+    mod, metadata, options = _compile_to_ttgir(exp_kernel, sig, constexprs={"BLOCK_SIZE": 256})
 
     msl, graph = _lower_to_msl(mod, metadata, options)
     print(f"\n=== Generated MSL for exp ===")
@@ -506,6 +511,7 @@ def test_lower_math_exp():
 @requires_metal
 def test_lower_fused_silu():
     """Adversarial: SiLU (x * sigmoid(x)) — not a named pattern."""
+
     @triton.jit
     def silu_kernel(x_ptr, out_ptr, n, BLOCK_SIZE: tl.constexpr):
         pid = tl.program_id(0)
@@ -517,9 +523,7 @@ def test_lower_fused_silu():
         tl.store(out_ptr + offsets, result, mask=mask)
 
     sig = {"x_ptr": "*fp32", "out_ptr": "*fp32", "n": "i32"}
-    mod, metadata, options = _compile_to_ttgir(
-        silu_kernel, sig, constexprs={"BLOCK_SIZE": 256}
-    )
+    mod, metadata, options = _compile_to_ttgir(silu_kernel, sig, constexprs={"BLOCK_SIZE": 256})
 
     msl, graph = _lower_to_msl(mod, metadata, options)
     print(f"\n=== Generated MSL for fused_silu ===")
@@ -533,9 +537,9 @@ def test_lower_fused_silu():
 @requires_metal
 def test_lower_multi_op_chain():
     """Adversarial: long chain of mixed ops — no single pattern covers this."""
+
     @triton.jit
-    def chain_kernel(a_ptr, b_ptr, out_ptr, n, alpha,
-                     BLOCK_SIZE: tl.constexpr):
+    def chain_kernel(a_ptr, b_ptr, out_ptr, n, alpha, BLOCK_SIZE: tl.constexpr):
         pid = tl.program_id(0)
         offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
         mask = offsets < n
@@ -545,11 +549,8 @@ def test_lower_multi_op_chain():
         result = (a * alpha + b) * (a - b)
         tl.store(out_ptr + offsets, result, mask=mask)
 
-    sig = {"a_ptr": "*fp32", "b_ptr": "*fp32", "out_ptr": "*fp32",
-           "n": "i32", "alpha": "fp32"}
-    mod, metadata, options = _compile_to_ttgir(
-        chain_kernel, sig, constexprs={"BLOCK_SIZE": 256}
-    )
+    sig = {"a_ptr": "*fp32", "b_ptr": "*fp32", "out_ptr": "*fp32", "n": "i32", "alpha": "fp32"}
+    mod, metadata, options = _compile_to_ttgir(chain_kernel, sig, constexprs={"BLOCK_SIZE": 256})
 
     msl, graph = _lower_to_msl(mod, metadata, options)
     print(f"\n=== Generated MSL for multi_op_chain ===")
@@ -564,9 +565,9 @@ def test_lower_multi_op_chain():
 @requires_metal
 def test_lower_reduce_mul_add():
     """Adversarial: reduce(x * y + z) — reduction of a fused expression."""
+
     @triton.jit
-    def reduce_expr_kernel(x_ptr, y_ptr, z_ptr, out_ptr, n,
-                           BLOCK_SIZE: tl.constexpr):
+    def reduce_expr_kernel(x_ptr, y_ptr, z_ptr, out_ptr, n, BLOCK_SIZE: tl.constexpr):
         pid = tl.program_id(0)
         offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
         mask = offsets < n
@@ -577,11 +578,8 @@ def test_lower_reduce_mul_add():
         result = tl.sum(expr, axis=0)
         tl.store(out_ptr + pid, result)
 
-    sig = {"x_ptr": "*fp32", "y_ptr": "*fp32", "z_ptr": "*fp32",
-           "out_ptr": "*fp32", "n": "i32"}
-    mod, metadata, options = _compile_to_ttgir(
-        reduce_expr_kernel, sig, constexprs={"BLOCK_SIZE": 256}
-    )
+    sig = {"x_ptr": "*fp32", "y_ptr": "*fp32", "z_ptr": "*fp32", "out_ptr": "*fp32", "n": "i32"}
+    mod, metadata, options = _compile_to_ttgir(reduce_expr_kernel, sig, constexprs={"BLOCK_SIZE": 256})
 
     msl, graph = _lower_to_msl(mod, metadata, options)
     print(f"\n=== Generated MSL for reduce_mul_add ===")
@@ -596,19 +594,18 @@ def test_lower_reduce_mul_add():
 @requires_metal
 def test_lower_max_reduction():
     """Generic lowerer handles tt.reduce with maxf combine."""
+
     @triton.jit
     def max_kernel(x_ptr, out_ptr, n, BLOCK_SIZE: tl.constexpr):
         pid = tl.program_id(0)
         offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
         mask = offsets < n
-        x = tl.load(x_ptr + offsets, mask=mask, other=float('-inf'))
+        x = tl.load(x_ptr + offsets, mask=mask, other=float("-inf"))
         result = tl.max(x, axis=0)
         tl.store(out_ptr + pid, result)
 
     sig = {"x_ptr": "*fp32", "out_ptr": "*fp32", "n": "i32"}
-    mod, metadata, options = _compile_to_ttgir(
-        max_kernel, sig, constexprs={"BLOCK_SIZE": 256}
-    )
+    mod, metadata, options = _compile_to_ttgir(max_kernel, sig, constexprs={"BLOCK_SIZE": 256})
 
     msl, graph = _lower_to_msl(mod, metadata, options)
     print(f"\n=== Generated MSL for max_reduction ===")
@@ -623,6 +620,7 @@ def test_lower_max_reduction():
 @requires_metal
 def test_lower_where_clamp():
     """Adversarial: tl.where (arith.select) for clamping."""
+
     @triton.jit
     def clamp_kernel(x_ptr, out_ptr, n, BLOCK_SIZE: tl.constexpr):
         pid = tl.program_id(0)
@@ -635,9 +633,7 @@ def test_lower_where_clamp():
         tl.store(out_ptr + offsets, clamped, mask=mask)
 
     sig = {"x_ptr": "*fp32", "out_ptr": "*fp32", "n": "i32"}
-    mod, metadata, options = _compile_to_ttgir(
-        clamp_kernel, sig, constexprs={"BLOCK_SIZE": 256}
-    )
+    mod, metadata, options = _compile_to_ttgir(clamp_kernel, sig, constexprs={"BLOCK_SIZE": 256})
 
     msl, graph = _lower_to_msl(mod, metadata, options)
     print(f"\n=== Generated MSL for where_clamp ===")
@@ -652,6 +648,7 @@ def test_lower_where_clamp():
 @requires_metal
 def test_lower_int_to_float():
     """Generic lowerer handles sitofp (integer to float conversion)."""
+
     @triton.jit
     def itof_kernel(idx_ptr, out_ptr, n, BLOCK_SIZE: tl.constexpr):
         pid = tl.program_id(0)
@@ -663,9 +660,7 @@ def test_lower_int_to_float():
         tl.store(out_ptr + offsets, result, mask=mask)
 
     sig = {"idx_ptr": "*i32", "out_ptr": "*fp32", "n": "i32"}
-    mod, metadata, options = _compile_to_ttgir(
-        itof_kernel, sig, constexprs={"BLOCK_SIZE": 256}
-    )
+    mod, metadata, options = _compile_to_ttgir(itof_kernel, sig, constexprs={"BLOCK_SIZE": 256})
 
     msl, graph = _lower_to_msl(mod, metadata, options)
     print(f"\n=== Generated MSL for int_to_float ===")
@@ -679,6 +674,7 @@ def test_lower_int_to_float():
 # ---------------------------------------------------------------------------
 # Pipeline integration tests — verify emit_msl uses new codegen
 # ---------------------------------------------------------------------------
+
 
 @requires_triton
 @requires_metal
@@ -696,9 +692,7 @@ def test_emit_msl_uses_new_codegen_for_elementwise():
         tl.store(out_ptr + offsets, a + b, mask=mask)
 
     sig = {"a_ptr": "*fp32", "b_ptr": "*fp32", "out_ptr": "*fp32", "n": "i32"}
-    mod, metadata, options = _compile_to_ttgir(
-        add_kernel, sig, constexprs={"BLOCK_SIZE": 256}
-    )
+    mod, metadata, options = _compile_to_ttgir(add_kernel, sig, constexprs={"BLOCK_SIZE": 256})
 
     # Call through the full pipeline — same path as compiler.make_msl
     msl = emit_msl(mod, metadata, options)
@@ -721,12 +715,21 @@ def test_emit_msl_handles_matmul_via_new_pipeline():
 
     @triton.jit
     def matmul_kernel(
-        a_ptr, b_ptr, c_ptr,
-        M, N, K,
-        stride_am, stride_ak,
-        stride_bk, stride_bn,
-        stride_cm, stride_cn,
-        BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+        a_ptr,
+        b_ptr,
+        c_ptr,
+        M,
+        N,
+        K,
+        stride_am,
+        stride_ak,
+        stride_bk,
+        stride_bn,
+        stride_cm,
+        stride_cn,
+        BLOCK_M: tl.constexpr,
+        BLOCK_N: tl.constexpr,
+        BLOCK_K: tl.constexpr,
     ):
         pid_m = tl.program_id(0)
         pid_n = tl.program_id(1)
@@ -746,25 +749,31 @@ def test_emit_msl_handles_matmul_via_new_pipeline():
         tl.store(c_ptrs, acc)
 
     sig = {
-        "a_ptr": "*fp32", "b_ptr": "*fp32", "c_ptr": "*fp32",
-        "M": "i32", "N": "i32", "K": "i32",
-        "stride_am": "i32", "stride_ak": "i32",
-        "stride_bk": "i32", "stride_bn": "i32",
-        "stride_cm": "i32", "stride_cn": "i32",
+        "a_ptr": "*fp32",
+        "b_ptr": "*fp32",
+        "c_ptr": "*fp32",
+        "M": "i32",
+        "N": "i32",
+        "K": "i32",
+        "stride_am": "i32",
+        "stride_ak": "i32",
+        "stride_bk": "i32",
+        "stride_bn": "i32",
+        "stride_cm": "i32",
+        "stride_cn": "i32",
     }
     mod, metadata, options = _compile_to_ttgir(
-        matmul_kernel, sig,
-        constexprs={"BLOCK_M": 32, "BLOCK_N": 32, "BLOCK_K": 32}
+        matmul_kernel, sig, constexprs={"BLOCK_M": 32, "BLOCK_N": 32, "BLOCK_K": 32}
     )
 
     import warnings
+
     with warnings.catch_warnings(record=True) as w:
         warnings.simplefilter("always")
         msl = emit_msl(mod, metadata, options)
         # Should NOT trigger a legacy fallback deprecation warning
         legacy_warnings = [x for x in w if "legacy" in str(x.message).lower()]
-        assert len(legacy_warnings) == 0, \
-            f"Matmul should use new pipeline, got legacy warning: {legacy_warnings}"
+        assert len(legacy_warnings) == 0, f"Matmul should use new pipeline, got legacy warning: {legacy_warnings}"
 
     print(f"\n=== emit_msl pipeline output for matmul_kernel ===")
     print(f"(first 500 chars): {msl[:500]}")
@@ -835,10 +844,8 @@ def test_no_legacy_fallback_for_standard_kernels():
             warnings.simplefilter("always")
             msl = emit_msl(mod, metadata, options)
             legacy_warnings = [x for x in w if "legacy" in str(x.message).lower()]
-            assert len(legacy_warnings) == 0, \
-                f"Kernel '{name}' fell back to legacy parser!"
-            assert "UNSUPPORTED" not in msl, \
-                f"Kernel '{name}' has unsupported ops in output"
+            assert len(legacy_warnings) == 0, f"Kernel '{name}' fell back to legacy parser!"
+            assert "UNSUPPORTED" not in msl, f"Kernel '{name}' has unsupported ops in output"
         print(f"  {name}: OK (new pipeline)")
 
 
@@ -846,16 +853,18 @@ def test_no_legacy_fallback_for_standard_kernels():
 # Adversarial end-to-end tests — novel combinations through full pipeline
 # ---------------------------------------------------------------------------
 
+
 @requires_triton
 @requires_metal
 def test_lower_softmax_fused():
     """Adversarial: row-wise softmax — max + sub + exp + sum + div."""
+
     @triton.jit
     def softmax_kernel(x_ptr, out_ptr, n, BLOCK_SIZE: tl.constexpr):
         pid = tl.program_id(0)
         offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
         mask = offsets < n
-        x = tl.load(x_ptr + offsets, mask=mask, other=float('-inf'))
+        x = tl.load(x_ptr + offsets, mask=mask, other=float("-inf"))
         x_max = tl.max(x, axis=0)
         x_shifted = x - x_max
         numerator = tl.exp(x_shifted)
@@ -864,9 +873,7 @@ def test_lower_softmax_fused():
         tl.store(out_ptr + offsets, result, mask=mask)
 
     sig = {"x_ptr": "*fp32", "out_ptr": "*fp32", "n": "i32"}
-    mod, metadata, options = _compile_to_ttgir(
-        softmax_kernel, sig, constexprs={"BLOCK_SIZE": 256}
-    )
+    mod, metadata, options = _compile_to_ttgir(softmax_kernel, sig, constexprs={"BLOCK_SIZE": 256})
 
     msl, graph = _lower_to_msl(mod, metadata, options)
     print(f"\n=== Generated MSL for softmax_fused ===")
@@ -883,6 +890,7 @@ def test_lower_softmax_fused():
 @requires_metal
 def test_lower_gelu_sigmoid():
     """Adversarial: GELU sigmoid approximation — x * sigmoid(1.702 * x)."""
+
     @triton.jit
     def gelu_kernel(x_ptr, out_ptr, n, BLOCK_SIZE: tl.constexpr):
         pid = tl.program_id(0)
@@ -894,9 +902,7 @@ def test_lower_gelu_sigmoid():
         tl.store(out_ptr + offsets, result, mask=mask)
 
     sig = {"x_ptr": "*fp32", "out_ptr": "*fp32", "n": "i32"}
-    mod, metadata, options = _compile_to_ttgir(
-        gelu_kernel, sig, constexprs={"BLOCK_SIZE": 256}
-    )
+    mod, metadata, options = _compile_to_ttgir(gelu_kernel, sig, constexprs={"BLOCK_SIZE": 256})
 
     msl, graph = _lower_to_msl(mod, metadata, options)
     print(f"\n=== Generated MSL for gelu_sigmoid ===")
@@ -910,6 +916,7 @@ def test_lower_gelu_sigmoid():
 # ---------------------------------------------------------------------------
 # sizePerThread tests — wrapping loop when Triton expects fewer threads
 # ---------------------------------------------------------------------------
+
 
 @requires_triton
 @requires_metal
@@ -970,12 +977,13 @@ def test_size_per_thread_no_wrapping_when_fits():
     shared memory. The multi-pass optimization only activates when sizePerThread > 1
     or block_size > 1024.
     """
+
     @triton.jit
     def softmax_kernel(x_ptr, out_ptr, n, BLOCK_SIZE: tl.constexpr):
         pid = tl.program_id(0)
         offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
         mask = offsets < n
-        x = tl.load(x_ptr + offsets, mask=mask, other=float('-inf'))
+        x = tl.load(x_ptr + offsets, mask=mask, other=float("-inf"))
         x_max = tl.max(x, axis=0)
         x_shifted = x - x_max
         numerator = tl.exp(x_shifted)
@@ -984,18 +992,14 @@ def test_size_per_thread_no_wrapping_when_fits():
         tl.store(out_ptr + offsets, result, mask=mask)
 
     sig = {"x_ptr": "*fp32", "out_ptr": "*fp32", "n": "i32"}
-    mod, metadata, options = _compile_to_ttgir(
-        softmax_kernel, sig, constexprs={"BLOCK_SIZE": 1024}
-    )
+    mod, metadata, options = _compile_to_ttgir(softmax_kernel, sig, constexprs={"BLOCK_SIZE": 1024})
 
     msl, graph = _lower_to_msl(mod, metadata, options)
     print(f"\n=== Generated MSL for softmax (no wrapping, sizePerThread=1) ===")
     print(msl)
 
     # With sizePerThread=1 and block_size=1024, no wrapping needed
-    assert "_loop_e" not in msl, (
-        "No wrapping loop when sizePerThread=1 and block_size fits in 1024 threads"
-    )
+    assert "_loop_e" not in msl, "No wrapping loop when sizePerThread=1 and block_size fits in 1024 threads"
     assert "kernel void" in msl
     assert "UNSUPPORTED" not in msl
     assert _validate_msl_compiles(msl), "MSL failed to compile"
@@ -1038,6 +1042,7 @@ def test_multipass_reduction_softmax():
     reductions, the codegen should emit a multi-pass kernel:
     per-element loops separated by reductions, with local accumulators.
     """
+
     @triton.jit
     def softmax_kernel(x_ptr, out_ptr, n, BLOCK_SIZE: tl.constexpr):
         pid = tl.program_id(0)
@@ -1052,9 +1057,7 @@ def test_multipass_reduction_softmax():
         tl.store(out_ptr + pid * n + offsets, result, mask=mask)
 
     sig = {"x_ptr": "*fp32", "out_ptr": "*fp32", "n": "i32"}
-    mod, metadata, options = _compile_to_ttgir(
-        softmax_kernel, sig, constexprs={"BLOCK_SIZE": 2048}
-    )
+    mod, metadata, options = _compile_to_ttgir(softmax_kernel, sig, constexprs={"BLOCK_SIZE": 2048})
 
     msl, graph = _lower_to_msl(mod, metadata, options)
     print(f"\n=== Generated MSL for multipass softmax (BLOCK=2048) ===")
@@ -1136,22 +1139,15 @@ def test_parse_blocked_field_extracts_lists():
         "threadsPerWarp = [32], warpsPerCTA = [4], order = [0]}>\n"
     )
 
-    assert GenericLowerer._parse_blocked_field(mod_text, "bar",
-                                                "sizePerThread") == [1, 4]
-    assert GenericLowerer._parse_blocked_field(mod_text, "bar",
-                                                "threadsPerWarp") == [2, 16]
-    assert GenericLowerer._parse_blocked_field(mod_text, "bar",
-                                                "warpsPerCTA") == [4, 1]
-    assert GenericLowerer._parse_blocked_field(mod_text, "bar",
-                                                "order") == [1, 0]
-    assert GenericLowerer._parse_blocked_field(mod_text, "foo",
-                                                "sizePerThread") == [8]
+    assert GenericLowerer._parse_blocked_field(mod_text, "bar", "sizePerThread") == [1, 4]
+    assert GenericLowerer._parse_blocked_field(mod_text, "bar", "threadsPerWarp") == [2, 16]
+    assert GenericLowerer._parse_blocked_field(mod_text, "bar", "warpsPerCTA") == [4, 1]
+    assert GenericLowerer._parse_blocked_field(mod_text, "bar", "order") == [1, 0]
+    assert GenericLowerer._parse_blocked_field(mod_text, "foo", "sizePerThread") == [8]
     # Missing alias returns None.
-    assert GenericLowerer._parse_blocked_field(mod_text, "baz",
-                                                "sizePerThread") is None
+    assert GenericLowerer._parse_blocked_field(mod_text, "baz", "sizePerThread") is None
     # Missing field returns None.
-    assert GenericLowerer._parse_blocked_field(mod_text, "bar",
-                                                "nonexistent") is None
+    assert GenericLowerer._parse_blocked_field(mod_text, "bar", "nonexistent") is None
 
 
 def test_track_n_elems_blocked_layout():
@@ -1161,10 +1157,7 @@ def test_track_n_elems_blocked_layout():
 
     # sizePerThread=[4], threadsPerWarp=[32], warpsPerCTA=[4] →
     # 4 warps * 32 lanes = 128 threads, 4 elems/thread → 512 total.
-    mod_text = (
-        "#blk = #ttg.blocked<{sizePerThread = [4], "
-        "threadsPerWarp = [32], warpsPerCTA = [4], order = [0]}>"
-    )
+    mod_text = "#blk = #ttg.blocked<{sizePerThread = [4], threadsPerWarp = [32], warpsPerCTA = [4], order = [0]}>"
 
     class _Options:
         num_warps = 4
@@ -1176,9 +1169,7 @@ def test_track_n_elems_blocked_layout():
     lowerer.env_n_elems = {}
 
     lowerer._track_n_elems(42, "tensor<512xf32, #blk>", (512,))
-    assert lowerer.env_n_elems[42] == 4, (
-        f"expected 4 elems/thread for blocked[4], got "
-        f"{lowerer.env_n_elems[42]}")
+    assert lowerer.env_n_elems[42] == 4, f"expected 4 elems/thread for blocked[4], got {lowerer.env_n_elems[42]}"
 
 
 def test_track_n_elems_linear_layout():
@@ -1204,8 +1195,8 @@ def test_track_n_elems_linear_layout():
 
     lowerer._track_n_elems(7, "tensor<512xf32, #lin>", (512,))
     assert lowerer.env_n_elems[7] == 4, (
-        f"expected 4 elems/thread for linear with 2 register bases, got "
-        f"{lowerer.env_n_elems[7]}")
+        f"expected 4 elems/thread for linear with 2 register bases, got {lowerer.env_n_elems[7]}"
+    )
 
 
 def test_track_n_elems_scalar_defaults_to_one():
@@ -1392,9 +1383,16 @@ def test_emit_passthrough_propagates_env_array():
     lowerer.env[100] = "v_scalar"
     lowerer.env_array[100] = ("v_arr", 4, "float")
 
-    dst = SSAValue(id=200, name="v200", op="tt.bitcast",
-                   operand_ids=[100], attrs={}, type_str="tensor<512xf32>",
-                   elem_type="f32", is_tensor=True)
+    dst = SSAValue(
+        id=200,
+        name="v200",
+        op="tt.bitcast",
+        operand_ids=[100],
+        attrs={},
+        type_str="tensor<512xf32>",
+        elem_type="f32",
+        is_tensor=True,
+    )
     lowerer._emit_passthrough(dst)
 
     # Both forms propagate.
@@ -1422,10 +1420,16 @@ def test_emit_cast_emits_array_when_mept_on_and_src_is_array():
         lowerer.env[100] = "v_src"
         lowerer.env_array[100] = ("v_src", 4, "half")
 
-        dst = SSAValue(id=200, name="v200", op="arith.extf",
-                       operand_ids=[100], attrs={},
-                       type_str="tensor<512xf32>", elem_type="f32",
-                       is_tensor=True)
+        dst = SSAValue(
+            id=200,
+            name="v200",
+            op="arith.extf",
+            operand_ids=[100],
+            attrs={},
+            type_str="tensor<512xf32>",
+            elem_type="f32",
+            is_tensor=True,
+        )
         lowerer._emit_cast(dst, "float", dtype="fp32")
 
         # Result should be an array with per-element casts.
@@ -1463,10 +1467,16 @@ def test_emit_unary_emits_array_when_mept_on_and_src_is_array():
         lowerer.env[100] = "v_src"
         lowerer.env_array[100] = ("v_src", 3, "float")
 
-        dst = SSAValue(id=200, name="v200", op="arith.negf",
-                       operand_ids=[100], attrs={},
-                       type_str="tensor<384xf32>", elem_type="f32",
-                       is_tensor=True)
+        dst = SSAValue(
+            id=200,
+            name="v200",
+            op="arith.negf",
+            operand_ids=[100],
+            attrs={},
+            type_str="tensor<384xf32>",
+            elem_type="f32",
+            is_tensor=True,
+        )
         lowerer._emit_unary(dst, "-")
 
         name, n, ty = lowerer.env_array[200]
@@ -1505,10 +1515,16 @@ def test_emit_binary_emits_array_when_both_operands_are_arrays():
         lowerer.env_array[101] = ("b", 4, "float")
         lowerer.effective_block_size = 256
 
-        dst = SSAValue(id=200, name="v200", op="arith.addf",
-                       operand_ids=[100, 101], attrs={},
-                       type_str="tensor<512xf32>", elem_type="f32",
-                       is_tensor=True)
+        dst = SSAValue(
+            id=200,
+            name="v200",
+            op="arith.addf",
+            operand_ids=[100, 101],
+            attrs={},
+            type_str="tensor<512xf32>",
+            elem_type="f32",
+            is_tensor=True,
+        )
         lowerer._emit_binary(dst, "+")
 
         name, n, ty = lowerer.env_array[200]
@@ -1547,10 +1563,16 @@ def test_emit_binary_emits_scalar_when_mept_off():
         lowerer.env_array[101] = ("b", 4, "float")
         lowerer.effective_block_size = 256
 
-        dst = SSAValue(id=200, name="v200", op="arith.addf",
-                       operand_ids=[100, 101], attrs={},
-                       type_str="tensor<512xf32>", elem_type="f32",
-                       is_tensor=True)
+        dst = SSAValue(
+            id=200,
+            name="v200",
+            op="arith.addf",
+            operand_ids=[100, 101],
+            attrs={},
+            type_str="tensor<512xf32>",
+            elem_type="f32",
+            is_tensor=True,
+        )
         lowerer._emit_binary(dst, "+")
 
         assert 200 not in lowerer.env_array
@@ -1585,10 +1607,16 @@ def test_emit_binary_broadcasts_scalar_against_array():
         lowerer.env_array[100] = ("a", 4, "float")
         # No env_array for 101 — scalar.
 
-        dst = SSAValue(id=200, name="v200", op="arith.addf",
-                       operand_ids=[100, 101], attrs={},
-                       type_str="tensor<512xf32>", elem_type="f32",
-                       is_tensor=True)
+        dst = SSAValue(
+            id=200,
+            name="v200",
+            op="arith.addf",
+            operand_ids=[100, 101],
+            attrs={},
+            type_str="tensor<512xf32>",
+            elem_type="f32",
+            is_tensor=True,
+        )
         lowerer._emit_binary(dst, "+")
 
         name, n, ty = lowerer.env_array[200]
@@ -1625,10 +1653,16 @@ def test_emit_binary_broadcasts_scalar_against_array_b_side():
         lowerer.env_array[101] = ("b", 3, "float")
         # No env_array for 100 — scalar.
 
-        dst = SSAValue(id=200, name="v200", op="arith.mulf",
-                       operand_ids=[100, 101], attrs={},
-                       type_str="tensor<384xf32>", elem_type="f32",
-                       is_tensor=True)
+        dst = SSAValue(
+            id=200,
+            name="v200",
+            op="arith.mulf",
+            operand_ids=[100, 101],
+            attrs={},
+            type_str="tensor<384xf32>",
+            elem_type="f32",
+            is_tensor=True,
+        )
         lowerer._emit_binary(dst, "*")
 
         name, n, ty = lowerer.env_array[200]
@@ -1665,10 +1699,16 @@ def test_emit_builtin_binary_array_path():
         lowerer.env_array[100] = ("a", 3, "float")
         lowerer.env_array[101] = ("b", 3, "float")
 
-        dst = SSAValue(id=200, name="v200", op="math.exp2",
-                       operand_ids=[100, 101], attrs={},
-                       type_str="tensor<384xf32>", elem_type="f32",
-                       is_tensor=True)
+        dst = SSAValue(
+            id=200,
+            name="v200",
+            op="math.exp2",
+            operand_ids=[100, 101],
+            attrs={},
+            type_str="tensor<384xf32>",
+            elem_type="f32",
+            is_tensor=True,
+        )
         lowerer._emit_builtin_binary(dst, "pow")
 
         name, n, ty = lowerer.env_array[200]
@@ -1705,10 +1745,16 @@ def test_emit_builtin_binary_scalar_path_unchanged():
         lowerer.env_array[100] = ("a", 3, "float")
         lowerer.env_array[101] = ("b", 3, "float")
 
-        dst = SSAValue(id=200, name="v200", op="math.exp2",
-                       operand_ids=[100, 101], attrs={},
-                       type_str="tensor<384xf32>", elem_type="f32",
-                       is_tensor=True)
+        dst = SSAValue(
+            id=200,
+            name="v200",
+            op="math.exp2",
+            operand_ids=[100, 101],
+            attrs={},
+            type_str="tensor<384xf32>",
+            elem_type="f32",
+            is_tensor=True,
+        )
         lowerer._emit_builtin_binary(dst, "pow")
 
         assert 200 not in lowerer.env_array
@@ -1743,20 +1789,23 @@ def test_emit_nan_propagating_minmax_array_path():
         lowerer.env_array[100] = ("a", 2, "float")
         lowerer.env_array[101] = ("b", 2, "float")
 
-        dst = SSAValue(id=200, name="v200", op="arith.maxnumf",
-                       operand_ids=[100, 101], attrs={},
-                       type_str="tensor<256xf32>", elem_type="f32",
-                       is_tensor=True)
+        dst = SSAValue(
+            id=200,
+            name="v200",
+            op="arith.maxnumf",
+            operand_ids=[100, 101],
+            attrs={},
+            type_str="tensor<256xf32>",
+            elem_type="f32",
+            is_tensor=True,
+        )
         lowerer._emit_nan_propagating_minmax(dst, "fmax")
 
         name, n, ty = lowerer.env_array[200]
         assert n == 2
         body = "\n".join(lowerer.kb._body_lines)
         for i in range(2):
-            expected = (
-                f"{name}[{i}] = (isnan(a[{i}]) || isnan(b[{i}])) ? "
-                f"NAN : fmax(a[{i}], b[{i}]);"
-            )
+            expected = f"{name}[{i}] = (isnan(a[{i}]) || isnan(b[{i}])) ? NAN : fmax(a[{i}], b[{i}]);"
             assert expected in body
     finally:
         if saved is None:
@@ -1787,20 +1836,23 @@ def test_emit_uitofp_array_path():
         # Signed source -> casts through unsigned first.
         lowerer.env_types[100] = "i32"
 
-        dst = SSAValue(id=200, name="v200", op="arith.uitofp",
-                       operand_ids=[100], attrs={},
-                       type_str="tensor<512xf32>", elem_type="f32",
-                       is_tensor=True)
+        dst = SSAValue(
+            id=200,
+            name="v200",
+            op="arith.uitofp",
+            operand_ids=[100],
+            attrs={},
+            type_str="tensor<512xf32>",
+            elem_type="f32",
+            is_tensor=True,
+        )
         lowerer._emit_uitofp(dst)
 
         name, n, ty = lowerer.env_array[200]
         assert n == 4
         body = "\n".join(lowerer.kb._body_lines)
         for i in range(4):
-            assert (
-                f"{name}[{i}] = static_cast<float>(static_cast<uint>"
-                f"(v_src[{i}]));" in body
-            )
+            assert f"{name}[{i}] = static_cast<float>(static_cast<uint>(v_src[{i}]));" in body
     finally:
         if saved is None:
             os.environ.pop("TRITON_MSL_MEPT", None)
@@ -1829,10 +1881,16 @@ def test_emit_int_cast_array_path():
         lowerer.env_array[100] = ("v_src", 3, "char")
         lowerer.env_types[100] = "i8"
 
-        dst = SSAValue(id=200, name="v200", op="arith.extsi",
-                       operand_ids=[100], attrs={},
-                       type_str="tensor<384xi32>", elem_type="i32",
-                       is_tensor=True)
+        dst = SSAValue(
+            id=200,
+            name="v200",
+            op="arith.extsi",
+            operand_ids=[100],
+            attrs={},
+            type_str="tensor<384xi32>",
+            elem_type="i32",
+            is_tensor=True,
+        )
         lowerer._emit_int_cast(dst, unsigned=False)
 
         name, n, ty = lowerer.env_array[200]
@@ -1867,10 +1925,16 @@ def test_lower_math_unary_array_path():
         lowerer.env[100] = "v_src"
         lowerer.env_array[100] = ("v_src", 3, "float")
 
-        dst = SSAValue(id=200, name="v200", op="math.exp",
-                       operand_ids=[100], attrs={},
-                       type_str="tensor<384xf32>", elem_type="f32",
-                       is_tensor=True)
+        dst = SSAValue(
+            id=200,
+            name="v200",
+            op="math.exp",
+            operand_ids=[100],
+            attrs={},
+            type_str="tensor<384xf32>",
+            elem_type="f32",
+            is_tensor=True,
+        )
         lowerer._lower_math(dst)
 
         name, n, ty = lowerer.env_array[200]
@@ -1909,19 +1973,23 @@ def test_lower_math_fma_array_path():
         lowerer.env_array[101] = ("b", 2, "float")
         # c is a scalar — broadcast it.
 
-        dst = SSAValue(id=200, name="v200", op="math.fma",
-                       operand_ids=[100, 101, 102], attrs={},
-                       type_str="tensor<256xf32>", elem_type="f32",
-                       is_tensor=True)
+        dst = SSAValue(
+            id=200,
+            name="v200",
+            op="math.fma",
+            operand_ids=[100, 101, 102],
+            attrs={},
+            type_str="tensor<256xf32>",
+            elem_type="f32",
+            is_tensor=True,
+        )
         lowerer._lower_math(dst)
 
         name, n, ty = lowerer.env_array[200]
         assert n == 2
         body = "\n".join(lowerer.kb._body_lines)
         for i in range(2):
-            assert (
-                f"{name}[{i}] = fma(a[{i}], b[{i}], c_scalar);" in body
-            )
+            assert f"{name}[{i}] = fma(a[{i}], b[{i}], c_scalar);" in body
     finally:
         if saved is None:
             os.environ.pop("TRITON_MSL_MEPT", None)
@@ -1939,8 +2007,7 @@ def test_lower_make_range_emits_array_when_mept_and_n_elems():
     class _Options:
         num_warps = 4
 
-    graph = IRGraph(func_name="t", args=[], ops=[],
-                    block_size=512, num_warps=4)
+    graph = IRGraph(func_name="t", args=[], ops=[], block_size=512, num_warps=4)
     saved = os.environ.get("TRITON_MSL_MEPT")
     os.environ["TRITON_MSL_MEPT"] = "1"
     try:
@@ -1953,11 +2020,16 @@ def test_lower_make_range_emits_array_when_mept_and_n_elems():
 
         # Hand-inject n_elems = 4 (would normally come from layout
         # tracking once the producer layout includes sizePerThread=4).
-        range_ssa = SSAValue(id=42, name="r42", op="tt.make_range",
-                             operand_ids=[],
-                             attrs={"start": 0, "end": 512},
-                             type_str="tensor<512xi32>", elem_type="i32",
-                             is_tensor=True)
+        range_ssa = SSAValue(
+            id=42,
+            name="r42",
+            op="tt.make_range",
+            operand_ids=[],
+            attrs={"start": 0, "end": 512},
+            type_str="tensor<512xi32>",
+            elem_type="i32",
+            is_tensor=True,
+        )
         lowerer.env_n_elems[42] = 4
         # Prescan normally sets this; we drive make_range directly.
         lowerer._mept_single_pass = True
@@ -1991,8 +2063,7 @@ def test_lower_make_range_scalar_when_single_pass_inactive():
     class _Options:
         num_warps = 4
 
-    graph = IRGraph(func_name="t", args=[], ops=[],
-                    block_size=512, num_warps=4)
+    graph = IRGraph(func_name="t", args=[], ops=[], block_size=512, num_warps=4)
     saved = os.environ.get("TRITON_MSL_MEPT")
     os.environ["TRITON_MSL_MEPT"] = "0"
     try:
@@ -2002,11 +2073,16 @@ def test_lower_make_range_scalar_when_single_pass_inactive():
         # _lid_expr is a property returning "lid" by default.
         lowerer.effective_block_size = 128
 
-        range_ssa = SSAValue(id=42, name="r42", op="tt.make_range",
-                             operand_ids=[],
-                             attrs={"start": 0, "end": 512},
-                             type_str="tensor<512xi32>", elem_type="i32",
-                             is_tensor=True)
+        range_ssa = SSAValue(
+            id=42,
+            name="r42",
+            op="tt.make_range",
+            operand_ids=[],
+            attrs={"start": 0, "end": 512},
+            type_str="tensor<512xi32>",
+            elem_type="i32",
+            is_tensor=True,
+        )
         # Even with an n_elems hint, make_range stays scalar unless
         # _mept_single_pass was set by the eligibility prescan.
         lowerer.env_n_elems[42] = 4
@@ -2046,10 +2122,14 @@ def test_lower_addptr_emits_ptr_array_when_offset_is_array():
         lowerer.env_array[101] = ("off", 4, "uint")
 
         addptr_ssa = SSAValue(
-            id=200, name="r200", op="tt.addptr",
-            operand_ids=[100, 101], attrs={},
+            id=200,
+            name="r200",
+            op="tt.addptr",
+            operand_ids=[100, 101],
+            attrs={},
             type_str="tensor<512x!tt.ptr<f32>>",
-            elem_type="f32", is_tensor=True,
+            elem_type="f32",
+            is_tensor=True,
         )
         lowerer._lower_addptr(addptr_ssa)
 
@@ -2091,10 +2171,14 @@ def test_lower_addptr_combines_scalar_parent_with_array_offset():
         lowerer.env_array[101] = ("off", 3, "uint")
 
         addptr_ssa = SSAValue(
-            id=200, name="r200", op="tt.addptr",
-            operand_ids=[100, 101], attrs={},
+            id=200,
+            name="r200",
+            op="tt.addptr",
+            operand_ids=[100, 101],
+            attrs={},
             type_str="tensor<384x!tt.ptr<f32>>",
-            elem_type="f32", is_tensor=True,
+            elem_type="f32",
+            is_tensor=True,
         )
         lowerer._lower_addptr(addptr_ssa)
 
@@ -2133,9 +2217,13 @@ def test_lower_load_array_path_via_env_ptr_array():
         lowerer.env_ptr_array[100] = ("x_ptr", "off", 4)
 
         load_ssa = SSAValue(
-            id=200, name="r200", op="tt.load",
-            operand_ids=[100], attrs={},
-            type_str="tensor<512xf32>", elem_type="f32",
+            id=200,
+            name="r200",
+            op="tt.load",
+            operand_ids=[100],
+            attrs={},
+            type_str="tensor<512xf32>",
+            elem_type="f32",
             is_tensor=True,
         )
         lowerer._lower_load(load_ssa)
@@ -2144,10 +2232,7 @@ def test_lower_load_array_path_via_env_ptr_array():
         assert n == 4
         body = "\n".join(lowerer.kb._body_lines)
         for i in range(4):
-            assert (
-                f"{name}[{i}] = static_cast<float>"
-                f"(x_ptr[off[{i}]]);" in body
-            )
+            assert f"{name}[{i}] = static_cast<float>(x_ptr[off[{i}]]);" in body
     finally:
         if saved is None:
             os.environ.pop("TRITON_MSL_MEPT", None)
@@ -2182,9 +2267,13 @@ def test_lower_load_array_with_array_mask_and_other():
         lowerer.env_array[102] = ("deflt", 3, "float")
 
         load_ssa = SSAValue(
-            id=200, name="r200", op="tt.load",
-            operand_ids=[100, 101, 102], attrs={},
-            type_str="tensor<384xf32>", elem_type="f32",
+            id=200,
+            name="r200",
+            op="tt.load",
+            operand_ids=[100, 101, 102],
+            attrs={},
+            type_str="tensor<384xf32>",
+            elem_type="f32",
             is_tensor=True,
         )
         lowerer._lower_load(load_ssa)
@@ -2194,9 +2283,7 @@ def test_lower_load_array_with_array_mask_and_other():
         body = "\n".join(lowerer.kb._body_lines)
         for i in range(3):
             assert (
-                f"{name}[{i}] = msk[{i}] ? "
-                f"static_cast<float>(x_ptr[off[{i}]]) : "
-                f"static_cast<float>(deflt[{i}]);"
+                f"{name}[{i}] = msk[{i}] ? static_cast<float>(x_ptr[off[{i}]]) : static_cast<float>(deflt[{i}]);"
             ) in body
     finally:
         if saved is None:
@@ -2230,9 +2317,13 @@ def test_lower_load_array_with_scalar_mask_and_scalar_other():
         lowerer.env[102] = "0.0f"
 
         load_ssa = SSAValue(
-            id=200, name="r200", op="tt.load",
-            operand_ids=[100, 101, 102], attrs={},
-            type_str="tensor<256xf32>", elem_type="f32",
+            id=200,
+            name="r200",
+            op="tt.load",
+            operand_ids=[100, 101, 102],
+            attrs={},
+            type_str="tensor<256xf32>",
+            elem_type="f32",
             is_tensor=True,
         )
         lowerer._lower_load(load_ssa)
@@ -2242,9 +2333,7 @@ def test_lower_load_array_with_scalar_mask_and_scalar_other():
         body = "\n".join(lowerer.kb._body_lines)
         for i in range(2):
             assert (
-                f"{name}[{i}] = mask_scalar ? "
-                f"static_cast<float>(x_ptr[off[{i}]]) : "
-                f"static_cast<float>(0.0f);"
+                f"{name}[{i}] = mask_scalar ? static_cast<float>(x_ptr[off[{i}]]) : static_cast<float>(0.0f);"
             ) in body
     finally:
         if saved is None:
@@ -2273,8 +2362,11 @@ def test_lower_load_array_fp8_unmasked():
         lowerer.env_ptr_array[100] = ("x_ptr", "off", 3)
 
         load_ssa = SSAValue(
-            id=200, name="r200", op="tt.load",
-            operand_ids=[100], attrs={},
+            id=200,
+            name="r200",
+            op="tt.load",
+            operand_ids=[100],
+            attrs={},
             type_str="tensor<384xf8E4M3FN>",
             elem_type="f8E4M3FN",
             is_tensor=True,
@@ -2324,8 +2416,11 @@ def test_lower_load_array_fp8_with_array_mask_and_other():
         lowerer.env_array[102] = ("deflt", 2, "float")
 
         load_ssa = SSAValue(
-            id=200, name="r200", op="tt.load",
-            operand_ids=[100, 101, 102], attrs={},
+            id=200,
+            name="r200",
+            op="tt.load",
+            operand_ids=[100, 101, 102],
+            attrs={},
             type_str="tensor<256xf8E5M2>",
             elem_type="f8E5M2",
             is_tensor=True,
@@ -2338,15 +2433,10 @@ def test_lower_load_array_fp8_with_array_mask_and_other():
         body = "\n".join(lowerer.kb._body_lines)
         # Masked uchar gather.
         for i in range(2):
-            assert (
-                f"msk[{i}] ? x_ptr[off[{i}]] : uchar(0)" in body
-            )
+            assert f"msk[{i}] ? x_ptr[off[{i}]] : uchar(0)" in body
         # Converted float (masked) with 'other' fallback.
         for i in range(2):
-            assert (
-                f"msk[{i}] ? " in body
-                and f"static_cast<float>(deflt[{i}])" in body
-            )
+            assert f"msk[{i}] ? " in body and f"static_cast<float>(deflt[{i}])" in body
     finally:
         if saved is None:
             os.environ.pop("TRITON_MSL_MEPT", None)
@@ -2377,9 +2467,14 @@ def test_lower_store_array_path_scatters_to_env_ptr_array():
         lowerer.env_array[101] = ("vals", 3, "float")
 
         store_ssa = SSAValue(
-            id=200, name="r200", op="tt.store",
-            operand_ids=[100, 101], attrs={},
-            type_str="", elem_type="f32", is_tensor=False,
+            id=200,
+            name="r200",
+            op="tt.store",
+            operand_ids=[100, 101],
+            attrs={},
+            type_str="",
+            elem_type="f32",
+            is_tensor=False,
         )
         lowerer._lower_store(store_ssa)
 
@@ -2404,8 +2499,7 @@ def test_mept_round_trip_load_op_store():
     class _Options:
         num_warps = 4
 
-    graph = IRGraph(func_name="t", args=[], ops=[], block_size=512,
-                    num_warps=4)
+    graph = IRGraph(func_name="t", args=[], ops=[], block_size=512, num_warps=4)
     saved = os.environ.get("TRITON_MSL_MEPT")
     os.environ["TRITON_MSL_MEPT"] = "1"
     try:
@@ -2421,53 +2515,90 @@ def test_mept_round_trip_load_op_store():
         lowerer._mept_single_pass = True
 
         # 1) make_range → idx[4]
-        rng = SSAValue(id=10, name="r10", op="tt.make_range",
-                       operand_ids=[], attrs={"start": 0, "end": 512},
-                       type_str="tensor<512xi32>", elem_type="i32",
-                       is_tensor=True)
+        rng = SSAValue(
+            id=10,
+            name="r10",
+            op="tt.make_range",
+            operand_ids=[],
+            attrs={"start": 0, "end": 512},
+            type_str="tensor<512xi32>",
+            elem_type="i32",
+            is_tensor=True,
+        )
         lowerer.env_n_elems[10] = 4
         lowerer._lower_make_range(rng)
         assert 10 in lowerer.env_array
         idx_name, _, _ = lowerer.env_array[10]
 
         # 2) tt.addptr(x_ptr, idx) → env_ptr_array
-        in_ptr = SSAValue(id=11, name="r11", op="tt.addptr",
-                          operand_ids=[1, 10], attrs={},
-                          type_str="tensor<512x!tt.ptr<f32>>",
-                          elem_type="f32", is_tensor=True)
+        in_ptr = SSAValue(
+            id=11,
+            name="r11",
+            op="tt.addptr",
+            operand_ids=[1, 10],
+            attrs={},
+            type_str="tensor<512x!tt.ptr<f32>>",
+            elem_type="f32",
+            is_tensor=True,
+        )
         lowerer._lower_addptr(in_ptr)
         assert 11 in lowerer.env_ptr_array
 
         # 3) tt.load(in_ptr) → val[4]
-        load = SSAValue(id=12, name="r12", op="tt.load",
-                        operand_ids=[11], attrs={},
-                        type_str="tensor<512xf32>", elem_type="f32",
-                        is_tensor=True)
+        load = SSAValue(
+            id=12,
+            name="r12",
+            op="tt.load",
+            operand_ids=[11],
+            attrs={},
+            type_str="tensor<512xf32>",
+            elem_type="f32",
+            is_tensor=True,
+        )
         lowerer._lower_load(load)
         assert 12 in lowerer.env_array
         val_name = lowerer.env_array[12][0]
 
         # 4) Unary negate via _emit_unary → r[4]
-        neg = SSAValue(id=13, name="r13", op="arith.negf",
-                       operand_ids=[12], attrs={},
-                       type_str="tensor<512xf32>", elem_type="f32",
-                       is_tensor=True)
+        neg = SSAValue(
+            id=13,
+            name="r13",
+            op="arith.negf",
+            operand_ids=[12],
+            attrs={},
+            type_str="tensor<512xf32>",
+            elem_type="f32",
+            is_tensor=True,
+        )
         lowerer._emit_unary(neg, "-")
         assert 13 in lowerer.env_array
         neg_name = lowerer.env_array[13][0]
 
         # 5) tt.addptr(out_ptr, idx) → env_ptr_array for output
-        out_ptr = SSAValue(id=14, name="r14", op="tt.addptr",
-                           operand_ids=[2, 10], attrs={},
-                           type_str="tensor<512x!tt.ptr<f32>>",
-                           elem_type="f32", is_tensor=True)
+        out_ptr = SSAValue(
+            id=14,
+            name="r14",
+            op="tt.addptr",
+            operand_ids=[2, 10],
+            attrs={},
+            type_str="tensor<512x!tt.ptr<f32>>",
+            elem_type="f32",
+            is_tensor=True,
+        )
         lowerer._lower_addptr(out_ptr)
         assert 14 in lowerer.env_ptr_array
 
         # 6) tt.store(out_ptr, neg) → per-position writes
-        store = SSAValue(id=15, name="r15", op="tt.store",
-                         operand_ids=[14, 13], attrs={},
-                         type_str="", elem_type="f32", is_tensor=False)
+        store = SSAValue(
+            id=15,
+            name="r15",
+            op="tt.store",
+            operand_ids=[14, 13],
+            attrs={},
+            type_str="",
+            elem_type="f32",
+            is_tensor=False,
+        )
         lowerer._lower_store(store)
 
         body = "\n".join(lowerer.kb._body_lines)
@@ -2479,10 +2610,7 @@ def test_mept_round_trip_load_op_store():
             # Load reads x_ptr[idx[i]]
             assert f"x_ptr[{idx_name}[{i}]]" in body
             # Final store writes out_ptr[idx[i]] = -val[i]
-            assert (
-                f"out_ptr[{idx_name}[{i}]] = {neg_name}[{i}];"
-                in body
-            )
+            assert f"out_ptr[{idx_name}[{i}]] = {neg_name}[{i}];" in body
     finally:
         if saved is None:
             os.environ.pop("TRITON_MSL_MEPT", None)
@@ -2515,9 +2643,14 @@ def test_lower_store_array_path_with_array_mask():
         lowerer.env_is_mask[102] = True
 
         store = SSAValue(
-            id=200, name="r200", op="tt.store",
-            operand_ids=[100, 101, 102], attrs={},
-            type_str="", elem_type="f32", is_tensor=False,
+            id=200,
+            name="r200",
+            op="tt.store",
+            operand_ids=[100, 101, 102],
+            attrs={},
+            type_str="",
+            elem_type="f32",
+            is_tensor=False,
         )
         lowerer._lower_store(store)
 
@@ -2556,9 +2689,14 @@ def test_lower_store_array_path_with_scalar_mask():
         lowerer.env_is_mask[102] = True
 
         store = SSAValue(
-            id=200, name="r200", op="tt.store",
-            operand_ids=[100, 101, 102], attrs={},
-            type_str="", elem_type="f32", is_tensor=False,
+            id=200,
+            name="r200",
+            op="tt.store",
+            operand_ids=[100, 101, 102],
+            attrs={},
+            type_str="",
+            elem_type="f32",
+            is_tensor=False,
         )
         lowerer._lower_store(store)
 
@@ -2584,8 +2722,7 @@ def test_lower_make_range_uses_linear_layout_position_when_available():
     class _Options:
         num_warps = 4
 
-    graph = IRGraph(func_name="t", args=[], ops=[], block_size=512,
-                    num_warps=4)
+    graph = IRGraph(func_name="t", args=[], ops=[], block_size=512, num_warps=4)
     saved = os.environ.get("TRITON_MSL_MEPT")
     os.environ["TRITON_MSL_MEPT"] = "1"
     try:
@@ -2604,10 +2741,16 @@ def test_lower_make_range_uses_linear_layout_position_when_available():
             block_basis=[],
         )
 
-        rng = SSAValue(id=42, name="r42", op="tt.make_range",
-                       operand_ids=[], attrs={"start": 0, "end": 512},
-                       type_str="tensor<512xi32>", elem_type="i32",
-                       is_tensor=True)
+        rng = SSAValue(
+            id=42,
+            name="r42",
+            op="tt.make_range",
+            operand_ids=[],
+            attrs={"start": 0, "end": 512},
+            type_str="tensor<512xi32>",
+            elem_type="i32",
+            is_tensor=True,
+        )
         lowerer.env_n_elems[42] = 4
         lowerer.env_layout[42] = ll
         # Prescan normally sets this; we drive make_range directly.
@@ -2648,8 +2791,7 @@ def test_lower_make_range_scalar_when_n_elems_is_one():
     class _Options:
         num_warps = 4
 
-    graph = IRGraph(func_name="t", args=[], ops=[],
-                    block_size=128, num_warps=4)
+    graph = IRGraph(func_name="t", args=[], ops=[], block_size=128, num_warps=4)
     saved = os.environ.get("TRITON_MSL_MEPT")
     os.environ["TRITON_MSL_MEPT"] = "1"
     try:
@@ -2659,11 +2801,16 @@ def test_lower_make_range_scalar_when_n_elems_is_one():
         # _lid_expr is a property returning "lid" by default.
         lowerer.effective_block_size = 128
 
-        range_ssa = SSAValue(id=42, name="r42", op="tt.make_range",
-                             operand_ids=[],
-                             attrs={"start": 0, "end": 128},
-                             type_str="tensor<128xi32>", elem_type="i32",
-                             is_tensor=True)
+        range_ssa = SSAValue(
+            id=42,
+            name="r42",
+            op="tt.make_range",
+            operand_ids=[],
+            attrs={"start": 0, "end": 128},
+            type_str="tensor<128xi32>",
+            elem_type="i32",
+            is_tensor=True,
+        )
         lowerer.env_n_elems[42] = 1
 
         lowerer._lower_make_range(range_ssa)
@@ -2699,10 +2846,16 @@ def test_lower_math_binary_array_path():
         lowerer.env_array[100] = ("a", 2, "float")
         lowerer.env_array[101] = ("b", 2, "float")
 
-        dst = SSAValue(id=200, name="v200", op="math.powf",
-                       operand_ids=[100, 101], attrs={},
-                       type_str="tensor<256xf32>", elem_type="f32",
-                       is_tensor=True)
+        dst = SSAValue(
+            id=200,
+            name="v200",
+            op="math.powf",
+            operand_ids=[100, 101],
+            attrs={},
+            type_str="tensor<256xf32>",
+            elem_type="f32",
+            is_tensor=True,
+        )
         lowerer._lower_math(dst)
 
         name, n, ty = lowerer.env_array[200]
@@ -2737,10 +2890,16 @@ def test_lower_math_roundeven_array_path():
         lowerer.env[100] = "v_src"
         lowerer.env_array[100] = ("v_src", 3, "float")
 
-        dst = SSAValue(id=200, name="v200", op="math.roundeven",
-                       operand_ids=[100], attrs={},
-                       type_str="tensor<384xf32>", elem_type="f32",
-                       is_tensor=True)
+        dst = SSAValue(
+            id=200,
+            name="v200",
+            op="math.roundeven",
+            operand_ids=[100],
+            attrs={},
+            type_str="tensor<384xf32>",
+            elem_type="f32",
+            is_tensor=True,
+        )
         lowerer._lower_math(dst)
 
         name, n, ty = lowerer.env_array[200]
@@ -2778,10 +2937,16 @@ def test_emit_binary_mismatched_array_lengths_falls_through():
         lowerer.env_array[101] = ("b", 2, "float")  # different length
         lowerer.effective_block_size = 256
 
-        dst = SSAValue(id=200, name="v200", op="arith.addf",
-                       operand_ids=[100, 101], attrs={},
-                       type_str="tensor<512xf32>", elem_type="f32",
-                       is_tensor=True)
+        dst = SSAValue(
+            id=200,
+            name="v200",
+            op="arith.addf",
+            operand_ids=[100, 101],
+            attrs={},
+            type_str="tensor<512xf32>",
+            elem_type="f32",
+            is_tensor=True,
+        )
         lowerer._emit_binary(dst, "+")
 
         # Falls through to scalar emission (legacy path).
@@ -2813,10 +2978,16 @@ def test_emit_unary_emits_scalar_when_mept_off():
         lowerer.env[100] = "v_src"
         lowerer.env_array[100] = ("v_src", 3, "float")
 
-        dst = SSAValue(id=200, name="v200", op="arith.negf",
-                       operand_ids=[100], attrs={},
-                       type_str="tensor<384xf32>", elem_type="f32",
-                       is_tensor=True)
+        dst = SSAValue(
+            id=200,
+            name="v200",
+            op="arith.negf",
+            operand_ids=[100],
+            attrs={},
+            type_str="tensor<384xf32>",
+            elem_type="f32",
+            is_tensor=True,
+        )
         lowerer._emit_unary(dst, "-")
 
         assert 200 not in lowerer.env_array
@@ -2851,10 +3022,16 @@ def test_emit_cast_emits_scalar_when_mept_off():
         # Even if env_array has an entry, flag-off ignores it.
         lowerer.env_array[100] = ("v_src", 4, "half")
 
-        dst = SSAValue(id=200, name="v200", op="arith.extf",
-                       operand_ids=[100], attrs={},
-                       type_str="tensor<512xf32>", elem_type="f32",
-                       is_tensor=True)
+        dst = SSAValue(
+            id=200,
+            name="v200",
+            op="arith.extf",
+            operand_ids=[100],
+            attrs={},
+            type_str="tensor<512xf32>",
+            elem_type="f32",
+            is_tensor=True,
+        )
         lowerer._emit_cast(dst, "float", dtype="fp32")
 
         assert 200 not in lowerer.env_array  # stayed scalar
@@ -2884,9 +3061,16 @@ def test_emit_passthrough_no_env_array_when_src_has_none():
     lowerer.env[100] = "v_scalar"
     # Deliberately no env_array entry on src.
 
-    dst = SSAValue(id=200, name="v200", op="tt.bitcast",
-                   operand_ids=[100], attrs={}, type_str="tensor<512xf32>",
-                   elem_type="f32", is_tensor=True)
+    dst = SSAValue(
+        id=200,
+        name="v200",
+        op="tt.bitcast",
+        operand_ids=[100],
+        attrs={},
+        type_str="tensor<512xf32>",
+        elem_type="f32",
+        is_tensor=True,
+    )
     lowerer._emit_passthrough(dst)
 
     assert lowerer.env[200] == "v_scalar"
@@ -2948,13 +3132,9 @@ def test_mept_flag_actually_changes_output_when_layout_supports_it():
             target = GPUTarget("metal", "apple-m4", 32)
             backend = MetalBackend(target)
             options = backend.parse_options({})
-            sig = {"a_ptr": "*fp32", "b_ptr": "*fp32",
-                   "out_ptr": "*fp32", "n": "i32"}
-            attrs = {(0,): [("tt.divisibility", 16)],
-                     (1,): [("tt.divisibility", 16)],
-                     (2,): [("tt.divisibility", 16)]}
-            src = ASTSource(fn=vector_add, signature=sig,
-                            constexprs={"BLOCK_SIZE": 512}, attrs=attrs)
+            sig = {"a_ptr": "*fp32", "b_ptr": "*fp32", "out_ptr": "*fp32", "n": "i32"}
+            attrs = {(0,): [("tt.divisibility", 16)], (1,): [("tt.divisibility", 16)], (2,): [("tt.divisibility", 16)]}
+            src = ASTSource(fn=vector_add, signature=sig, constexprs={"BLOCK_SIZE": 512}, attrs=attrs)
             context = ir.context()
             ir.load_dialects(context)
             cg = backend.get_codegen_implementation(options)
@@ -2976,9 +3156,7 @@ def test_mept_flag_actually_changes_output_when_layout_supports_it():
     # Flag-off: scalar form, no per-position array declarations.
     assert "[4];" not in off, f"flag-off should be scalar, got:\n{off}"
     # Flag-on: single-pass array form must appear.
-    assert "[4];" in on, (
-        f"Expected per-position array decl in MEPT-on MSL, got:\n{on}"
-    )
+    assert "[4];" in on, f"Expected per-position array decl in MEPT-on MSL, got:\n{on}"
     # And no wrap-loop double-count.
     assert "_loop_e * 4" not in on
     # Both paths must compile.
@@ -3000,12 +3178,8 @@ def test_mept_convert_layout_shuffle_emits_position_redistribution():
     # Two 1-D linear layouts over 512 elements, 4 regs/thread (128 threads).
     # src: contiguous within thread (reg basis [1,2]); dst: a different
     # register assignment (reg basis [256, 1]) — a genuine redistribution.
-    src_ll = LinearLayout(register_basis=[1, 2],
-                          lane_basis=[4, 8, 16, 32, 64],
-                          warp_basis=[128, 256], block_basis=[])
-    dst_ll = LinearLayout(register_basis=[256, 1],
-                          lane_basis=[2, 4, 8, 16, 32],
-                          warp_basis=[64, 128], block_basis=[])
+    src_ll = LinearLayout(register_basis=[1, 2], lane_basis=[4, 8, 16, 32, 64], warp_basis=[128, 256], block_basis=[])
+    dst_ll = LinearLayout(register_basis=[256, 1], lane_basis=[2, 4, 8, 16, 32], warp_basis=[64, 128], block_basis=[])
     assert src_ll.total_elements == 512 == dst_ll.total_elements
 
     mod_text = (
@@ -3027,14 +3201,27 @@ def test_mept_convert_layout_shuffle_emits_position_redistribution():
     lowerer.env_layout[100] = src_ll
     lowerer.env_types[100] = "fp32"
 
-    cvt = SSAValue(id=200, name="r200", op="ttg.convert_layout",
-                   operand_ids=[100], attrs={},
-                   type_str="tensor<512xf32, #dst>", elem_type="f32",
-                   is_tensor=True)
+    cvt = SSAValue(
+        id=200,
+        name="r200",
+        op="ttg.convert_layout",
+        operand_ids=[100],
+        attrs={},
+        type_str="tensor<512xf32, #dst>",
+        elem_type="f32",
+        is_tensor=True,
+    )
     # Source op so _find_op_type_str / src_type resolution works.
-    src_op = SSAValue(id=100, name="v", op="tt.load", operand_ids=[],
-                      attrs={}, type_str="tensor<512xf32, #src>",
-                      elem_type="f32", is_tensor=True)
+    src_op = SSAValue(
+        id=100,
+        name="v",
+        op="tt.load",
+        operand_ids=[],
+        attrs={},
+        type_str="tensor<512xf32, #src>",
+        elem_type="f32",
+        is_tensor=True,
+    )
     graph.ops = [src_op, cvt]
 
     lowerer._lower_convert_layout(cvt)
@@ -3117,13 +3304,27 @@ def test_mept_reduce_uses_fold_when_operand_is_array():
 
         # tt.reduce with a sum body: the combine returns addf(a, b) of the two block args
         # (60, 61) — the structural classifier matches the yielded op against block_arg_ids.
-        add_body = SSAValue(id=51, name="b51", op="arith.addf",
-                            operand_ids=[60, 61], attrs={}, type_str="f32",
-                            elem_type="f32", is_tensor=False)
-        red = SSAValue(id=52, name="r52", op="tt.reduce",
-                       operand_ids=[50], attrs={"axis": 0, "block_arg_ids": [60, 61]},
-                       type_str="f32", elem_type="f32", is_tensor=False,
-                       region_ops=[add_body])
+        add_body = SSAValue(
+            id=51,
+            name="b51",
+            op="arith.addf",
+            operand_ids=[60, 61],
+            attrs={},
+            type_str="f32",
+            elem_type="f32",
+            is_tensor=False,
+        )
+        red = SSAValue(
+            id=52,
+            name="r52",
+            op="tt.reduce",
+            operand_ids=[50],
+            attrs={"axis": 0, "block_arg_ids": [60, 61]},
+            type_str="f32",
+            elem_type="f32",
+            is_tensor=False,
+            region_ops=[add_body],
+        )
         lowerer._lower_reduce(red)
 
         body = "\n".join(lowerer.kb._body_lines)
@@ -3172,10 +3373,8 @@ def test_mept_bf16_store_casts_to_buffer_dtype():
         backend = MetalBackend(target)
         options = backend.parse_options({})
         sig = {"x_ptr": "*bf16", "o_ptr": "*bf16"}
-        attrs = {(0,): [("tt.divisibility", 16)],
-                 (1,): [("tt.divisibility", 16)]}
-        src = ASTSource(fn=add1_bf16, signature=sig,
-                        constexprs={"BLOCK": 512}, attrs=attrs)
+        attrs = {(0,): [("tt.divisibility", 16)], (1,): [("tt.divisibility", 16)]}
+        src = ASTSource(fn=add1_bf16, signature=sig, constexprs={"BLOCK": 512}, attrs=attrs)
         context = ir.context()
         ir.load_dialects(context)
         cg = backend.get_codegen_implementation(options)
@@ -3194,9 +3393,7 @@ def test_mept_bf16_store_casts_to_buffer_dtype():
 
     # MEPT active (array form), store casts to bfloat, and it compiles.
     assert "[4];" in msl, f"expected MEPT array form, got:\n{msl}"
-    assert "static_cast<bfloat>" in msl, (
-        f"bf16 store must cast float->bfloat, got:\n{msl}"
-    )
+    assert "static_cast<bfloat>" in msl, f"bf16 store must cast float->bfloat, got:\n{msl}"
     assert _validate_msl_compiles(msl), "bf16 MEPT MSL failed to compile"
 
 
@@ -3227,7 +3424,7 @@ def test_mept_no_double_count_with_wrap_loop():
     @triton.jit
     def copy_unmasked(x_ptr, o_ptr, BLOCK: tl.constexpr):
         off = tl.arange(0, BLOCK)
-        x = tl.load(x_ptr + off)        # NO mask -> OOB would actually run
+        x = tl.load(x_ptr + off)  # NO mask -> OOB would actually run
         tl.store(o_ptr + off, x + 1.0)  # NO mask
 
     def lower_with_mept():
@@ -3237,10 +3434,8 @@ def test_mept_no_double_count_with_wrap_loop():
         sig = {"x_ptr": "*fp32", "o_ptr": "*fp32"}
         # Divisibility hints (what the JIT runtime adds) -> coalesce emits
         # sizePerThread=[4] on default Apple configs.
-        attrs = {(0,): [("tt.divisibility", 16)],
-                 (1,): [("tt.divisibility", 16)]}
-        src = ASTSource(fn=copy_unmasked, signature=sig,
-                        constexprs={"BLOCK": 512}, attrs=attrs)
+        attrs = {(0,): [("tt.divisibility", 16)], (1,): [("tt.divisibility", 16)]}
+        src = ASTSource(fn=copy_unmasked, signature=sig, constexprs={"BLOCK": 512}, attrs=attrs)
         context = ir.context()
         ir.load_dialects(context)
         cg = backend.get_codegen_implementation(options)
@@ -3266,13 +3461,9 @@ def test_mept_no_double_count_with_wrap_loop():
     # MEPT must be active (sizePerThread=4 -> array form present).
     assert "[4]" in msl, f"expected MEPT array form, got:\n{msl}"
     # The double-count signature must be ABSENT.
-    assert "_loop_e * 4" not in msl, (
-        f"double-count: make_range multiplies the wrap-loop variable:\n{msl}"
-    )
+    assert "_loop_e * 4" not in msl, f"double-count: make_range multiplies the wrap-loop variable:\n{msl}"
     # No wrap-loop at all — MEPT covers the tile in one pass.
-    assert "for (uint _loop_e" not in msl, (
-        f"wrap-loop must be suppressed when MEPT covers the tile:\n{msl}"
-    )
+    assert "for (uint _loop_e" not in msl, f"wrap-loop must be suppressed when MEPT covers the tile:\n{msl}"
     # Correct single-pass index uses the raw thread id.
     assert "lid * 4u" in msl, f"expected lid*4 single-pass index:\n{msl}"
     # And it must compile.
@@ -3289,6 +3480,7 @@ def test_track_n_elems_against_real_kernel_layouts():
     components — ``_parse_blocked_field`` + ``_track_n_elems`` — produce
     a sensible result for every tensor SSA in a representative kernel.
     """
+
     @triton.jit
     def vector_add(a_ptr, b_ptr, out_ptr, n, BLOCK_SIZE: tl.constexpr):
         offsets = tl.arange(0, BLOCK_SIZE)
@@ -3298,29 +3490,25 @@ def test_track_n_elems_against_real_kernel_layouts():
         tl.store(out_ptr + offsets, a + b, mask=mask)
 
     sig = {"a_ptr": "*fp32", "b_ptr": "*fp32", "out_ptr": "*fp32", "n": "i32"}
-    mod, metadata, options = _compile_to_ttgir(
-        vector_add, sig, constexprs={"BLOCK_SIZE": 256}
-    )
+    mod, metadata, options = _compile_to_ttgir(vector_add, sig, constexprs={"BLOCK_SIZE": 256})
 
     from triton_msl.codegen.mlir_walker import walk_ttgir
     from triton_msl.codegen.generic_lowerer import (
-        GenericLowerer, _extract_shape,
+        GenericLowerer,
+        _extract_shape,
     )
 
     graph = walk_ttgir(mod, options)
     lowerer = GenericLowerer(graph, options)
 
-    tensor_ssa = [op for op in graph.ops
-                  if op.type_str and "tensor<" in op.type_str]
+    tensor_ssa = [op for op in graph.ops if op.type_str and "tensor<" in op.type_str]
     assert tensor_ssa, "expected at least one tensor SSA value"
 
     for op in tensor_ssa:
         shape = _extract_shape(op.type_str)
         lowerer._track_n_elems(op.id, op.type_str, shape)
         n = lowerer.env_n_elems.get(op.id)
-        assert n is not None and n >= 1, (
-            f"_track_n_elems failed for ssa id={op.id} "
-            f"type={op.type_str!r} (got {n!r})")
+        assert n is not None and n >= 1, f"_track_n_elems failed for ssa id={op.id} type={op.type_str!r} (got {n!r})"
 
 
 def test_find_op_type_str_recurses_nested_regions():
@@ -3328,14 +3516,12 @@ def test_find_op_type_str_recurses_nested_regions():
     from triton_msl.codegen.generic_lowerer import GenericLowerer
 
     def _op(id, type_str="", region_ops=None, else_ops=None):
-        return SimpleNamespace(id=id, type_str=type_str,
-                               region_ops=region_ops or [],
-                               else_ops=else_ops or [])
+        return SimpleNamespace(id=id, type_str=type_str, region_ops=region_ops or [], else_ops=else_ops or [])
 
     gl = GenericLowerer.__new__(GenericLowerer)
-    inner = _op(99, "tensor<256xf32>")          # depth-2: inside a nested loop
-    mid = _op(50, "", region_ops=[inner])        # depth-1: nested scf.for body
-    outer = _op(10, "", region_ops=[mid])        # top-level scf.for
+    inner = _op(99, "tensor<256xf32>")  # depth-2: inside a nested loop
+    mid = _op(50, "", region_ops=[inner])  # depth-1: nested scf.for body
+    outer = _op(10, "", region_ops=[mid])  # top-level scf.for
     gl.graph = SimpleNamespace(ops=[outer], args=[])
 
     assert gl._find_op_type_str(99) == "tensor<256xf32>"

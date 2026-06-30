@@ -14,6 +14,7 @@ import triton.language as tl
 
 # --- Direct tl.math wrappers (generate MLIR math ops) ---
 
+
 @triton.jit
 def exp(x):
     return tl.math.exp(x)
@@ -80,6 +81,7 @@ def fma(x, y, z):
 
 
 # --- Composite implementations ---
+
 
 @triton.jit
 def tanh(x):
@@ -246,9 +248,7 @@ def erfinv(x):
     # Based on J.M. Blair approximation
     a = tl.math.abs(x)
     w = -tl.math.log((1.0 - a) * (1.0 + a))
-    p = tl.where(w < 5.0,
-                 _erfinv_small(w),
-                 _erfinv_large(w))
+    p = tl.where(w < 5.0, _erfinv_small(w), _erfinv_large(w))
     return tl.where(x < 0.0, -p, p)
 
 
@@ -291,39 +291,64 @@ from triton.language import core as _core
 # generic_lowerer maps these __nv_* symbols to MSL's native isinf/isnan/isfinite
 # built-ins, which are NOT affected by fast-math.
 
+
 @_core.extern
 def isinf(arg0, _semantic=None):
     return _core.extern_elementwise(
-        "", "", [arg0], {
-            (_core.dtype("fp32"), ): ("__nv_isinff", _core.dtype("int32")),
-            (_core.dtype("fp64"), ): ("__nv_isinfd", _core.dtype("int32")),
-        }, is_pure=True, _semantic=_semantic).to(_core.int1, _semantic=_semantic)
+        "",
+        "",
+        [arg0],
+        {
+            (_core.dtype("fp32"),): ("__nv_isinff", _core.dtype("int32")),
+            (_core.dtype("fp64"),): ("__nv_isinfd", _core.dtype("int32")),
+        },
+        is_pure=True,
+        _semantic=_semantic,
+    ).to(_core.int1, _semantic=_semantic)
 
 
 @_core.extern
 def isnan(arg0, _semantic=None):
     return _core.extern_elementwise(
-        "", "", [arg0], {
-            (_core.dtype("fp32"), ): ("__nv_isnanf", _core.dtype("int32")),
-            (_core.dtype("fp64"), ): ("__nv_isnand", _core.dtype("int32")),
-        }, is_pure=True, _semantic=_semantic).to(_core.int1, _semantic=_semantic)
+        "",
+        "",
+        [arg0],
+        {
+            (_core.dtype("fp32"),): ("__nv_isnanf", _core.dtype("int32")),
+            (_core.dtype("fp64"),): ("__nv_isnand", _core.dtype("int32")),
+        },
+        is_pure=True,
+        _semantic=_semantic,
+    ).to(_core.int1, _semantic=_semantic)
 
 
 @_core.extern
 def finitef(arg0, _semantic=None):
     return _core.extern_elementwise(
-        "", "", [arg0], {
-            (_core.dtype("fp32"), ): ("__nv_finitef", _core.dtype("int32")),
-        }, is_pure=True, _semantic=_semantic).to(_core.int1, _semantic=_semantic)
+        "",
+        "",
+        [arg0],
+        {
+            (_core.dtype("fp32"),): ("__nv_finitef", _core.dtype("int32")),
+        },
+        is_pure=True,
+        _semantic=_semantic,
+    ).to(_core.int1, _semantic=_semantic)
 
 
 @_core.extern
 def isfinited(arg0, _semantic=None):
     return _core.extern_elementwise(
-        "", "", [arg0], {
-            (_core.dtype("fp32"), ): ("__nv_isfinited", _core.dtype("int32")),
-            (_core.dtype("fp64"), ): ("__nv_isfinited", _core.dtype("int32")),
-        }, is_pure=True, _semantic=_semantic).to(_core.int1, _semantic=_semantic)
+        "",
+        "",
+        [arg0],
+        {
+            (_core.dtype("fp32"),): ("__nv_isfinited", _core.dtype("int32")),
+            (_core.dtype("fp64"),): ("__nv_isfinited", _core.dtype("int32")),
+        },
+        is_pure=True,
+        _semantic=_semantic,
+    ).to(_core.int1, _semantic=_semantic)
 
 
 @triton.jit
@@ -520,7 +545,7 @@ def y0(x):
     y_small = _y0_small_positive(safe_x)
     y_large = _y0_large(ax)
     result = tl.where(ax <= 3.0, y_small, y_large)
-    return tl.where(x > 0.0, result, float('nan'))
+    return tl.where(x > 0.0, result, float("nan"))
 
 
 @triton.jit
@@ -565,7 +590,7 @@ def y1(x):
     y_small = _y1_small_positive(safe_x)
     y_large = _y1_large(ax)
     result = tl.where(ax <= 3.0, y_small, y_large)
-    return tl.where(x > 0.0, result, float('nan'))
+    return tl.where(x > 0.0, result, float("nan"))
 
 
 @triton.jit
@@ -645,6 +670,7 @@ metal_libdevice = types.ModuleType("metal_libdevice")
 # = libdevice.fast_dividef` at test-module scope) don't break unrelated kernels.
 try:
     from triton.language.extra import libdevice as _upstream_stub
+
     for _name in dir(_upstream_stub):
         if _name.startswith("_"):
             continue
@@ -656,12 +682,17 @@ except ImportError:
 # Include both @triton.jit functions (hasattr 'fn') and @core.extern builtins
 # (hasattr 'signature' + marked with TRITON_BUILTIN).
 from triton.language.core import TRITON_BUILTIN as _TRITON_BUILTIN
-metal_libdevice.__dict__.update({
-    name: obj for name, obj in globals().items()
-    if not name.startswith("_") and name != "metal_libdevice"
-    and callable(obj)
-    and (hasattr(obj, "fn") or getattr(obj, _TRITON_BUILTIN, False))
-})
+
+metal_libdevice.__dict__.update(
+    {
+        name: obj
+        for name, obj in globals().items()
+        if not name.startswith("_")
+        and name != "metal_libdevice"
+        and callable(obj)
+        and (hasattr(obj, "fn") or getattr(obj, _TRITON_BUILTIN, False))
+    }
+)
 # Also add non-jit module references
 metal_libdevice.tl = tl
 metal_libdevice.triton = triton

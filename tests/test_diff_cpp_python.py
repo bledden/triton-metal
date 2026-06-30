@@ -4,6 +4,7 @@ Each path runs in its own subprocess (fresh cache dir, fresh process state)
 and saves the kernel output buffer; the parent byte-compares the two .npy
 files. Skips entirely when the C++ pass library isn't built.
 """
+
 import os
 import subprocess
 import sys
@@ -16,7 +17,7 @@ from triton_msl.backend.compiler import MetalBackend
 
 pytestmark = pytest.mark.skipif(not MetalBackend._has_cpp_passes(), reason="cpp not built")
 
-KERNEL = '''import os, sys
+KERNEL = """import os, sys
 os.environ.setdefault("TRITON_DEFAULT_BACKEND", "metal")
 import numpy as np, torch, triton, triton.language as tl
 @triton.jit
@@ -25,15 +26,16 @@ def k(X, O, N: tl.constexpr):
     tl.store(O + i, (x * 2.0 + 1.0).to(tl.float16))
 torch.manual_seed(0)
 x = torch.randn(256); o = torch.zeros(256, dtype=torch.float16)
-k[(1,)](x, o, N=256); np.save(sys.argv[1], o.numpy())'''
+k[(1,)](x, o, N=256); np.save(sys.argv[1], o.numpy())"""
+
 
 def _run(out, force_python):
     # Fresh TRITON_CACHE_DIR per run: TRITON_MSL_FORCE_PYTHON is not in
     # Triton's cache key, so a shared ~/.triton/cache would replay the first
     # run's binary in the second run and make the differential vacuous.
-    env = dict(os.environ, PYTHONPATH=os.getcwd(),
-               TRITON_MSL_CACHE_DIR=tempfile.mkdtemp(),
-               TRITON_CACHE_DIR=tempfile.mkdtemp())
+    env = dict(
+        os.environ, PYTHONPATH=os.getcwd(), TRITON_MSL_CACHE_DIR=tempfile.mkdtemp(), TRITON_CACHE_DIR=tempfile.mkdtemp()
+    )
     # C++ is opt-in (default-on flip reverted): the C++ side must request it
     # explicitly, else both sides route Python and the differential is vacuous.
     if force_python:
@@ -43,6 +45,7 @@ def _run(out, force_python):
         env.pop("TRITON_MSL_FORCE_PYTHON", None)
         env["TRITON_MSL_USE_CPP"] = "1"
     subprocess.run([sys.executable, "-c", KERNEL, out], check=True, env=env, timeout=180)
+
 
 def test_elementwise_matches():
     with tempfile.TemporaryDirectory() as d:

@@ -5,16 +5,19 @@ be imported and its passes registered alongside Triton's libtriton.so in the
 same process. The pybind11 module links against libtriton.so for shared MLIR
 symbols, eliminating the previous duplicate-dialect-registration crash.
 """
+
 import pytest
 
 try:
     import triton_msl._triton_msl_cpp as cpp
+
     _HAS_CPP = True
 except ImportError:
     _HAS_CPP = False
 
 try:
     import Metal
+
     _HAS_METAL = Metal.MTLCreateSystemDefaultDevice() is not None
 except ImportError:
     _HAS_METAL = False
@@ -22,6 +25,7 @@ except ImportError:
 try:
     import triton
     import triton.language as tl
+
     _HAS_TRITON = True
 except ImportError:
     _HAS_TRITON = False
@@ -34,6 +38,7 @@ requires_metal = pytest.mark.skipif(not _HAS_METAL, reason="Metal not available"
 def test_cpp_module_importable():
     """C++ MLIR module can be imported."""
     import triton_msl._triton_msl_cpp as mod
+
     assert hasattr(mod, "register_metal_passes")
 
 
@@ -139,6 +144,7 @@ def test_scf_for_accumulation():
 
     os.environ["TRITON_MSL_USE_CPP"] = "1"
     try:
+
         @triton.jit
         def accum_kernel(x_ptr, out_ptr, K: tl.constexpr, BLOCK: tl.constexpr):
             pid = tl.program_id(0)
@@ -179,6 +185,7 @@ def test_scf_if_conditional():
 
     os.environ["TRITON_MSL_USE_CPP"] = "1"
     try:
+
         @triton.jit
         def clamp_kernel(x_ptr, out_ptr, lo, hi, n, BLOCK: tl.constexpr):
             pid = tl.program_id(0)
@@ -211,6 +218,7 @@ def test_wrapping_loop_large_block():
 
     os.environ["TRITON_MSL_USE_CPP"] = "1"
     try:
+
         @triton.jit
         def scale_kernel(x_ptr, out_ptr, n, BLOCK: tl.constexpr):
             pid = tl.program_id(0)
@@ -248,6 +256,7 @@ def test_local_alloc_basic():
 
     os.environ["TRITON_MSL_USE_CPP"] = "1"
     try:
+
         @triton.jit
         def shmem_kernel(x_ptr, out_ptr, BLOCK: tl.constexpr):
             offs = tl.arange(0, BLOCK)
@@ -283,9 +292,9 @@ def test_async_copy_sync_loop():
 
     os.environ["TRITON_MSL_USE_CPP"] = "1"
     try:
+
         @triton.jit
-        def pipelined_kernel(x_ptr, out_ptr, K: tl.constexpr,
-                             BLOCK: tl.constexpr):
+        def pipelined_kernel(x_ptr, out_ptr, K: tl.constexpr, BLOCK: tl.constexpr):
             offs = tl.arange(0, BLOCK)
             acc = tl.zeros([BLOCK], dtype=tl.float32)
             for k in tl.range(K, num_stages=2):
@@ -352,6 +361,7 @@ def test_cpp_tiled_reduction():
 
     os.environ["TRITON_MSL_USE_CPP"] = "1"
     try:
+
         @triton.jit
         def sum_kernel(x_ptr, out_ptr, N: tl.constexpr, BLOCK: tl.constexpr):
             offs = tl.arange(0, BLOCK)
@@ -382,6 +392,7 @@ def test_cpp_cumsum():
 
     os.environ["TRITON_MSL_USE_CPP"] = "1"
     try:
+
         @triton.jit
         def cumsum_kernel(x_ptr, out_ptr, BLOCK: tl.constexpr):
             offs = tl.arange(0, BLOCK)
@@ -412,26 +423,32 @@ def test_cpp_dot_32x32():
 
     os.environ["TRITON_MSL_USE_CPP"] = "1"
     try:
+
         @triton.jit
-        def matmul_kernel(a_ptr, b_ptr, c_ptr,
-                           M: tl.constexpr, N: tl.constexpr, K: tl.constexpr,
-                           BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr,
-                           BLOCK_K: tl.constexpr):
+        def matmul_kernel(
+            a_ptr,
+            b_ptr,
+            c_ptr,
+            M: tl.constexpr,
+            N: tl.constexpr,
+            K: tl.constexpr,
+            BLOCK_M: tl.constexpr,
+            BLOCK_N: tl.constexpr,
+            BLOCK_K: tl.constexpr,
+        ):
             off_m = tl.arange(0, BLOCK_M)
             off_n = tl.arange(0, BLOCK_N)
             off_k = tl.arange(0, BLOCK_K)
             a = tl.load(a_ptr + off_m[:, None] * K + off_k[None, :])
             b = tl.load(b_ptr + off_k[:, None] * N + off_n[None, :])
-            c = tl.dot(a.to(tl.float16), b.to(tl.float16),
-                        acc=tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32))
+            c = tl.dot(a.to(tl.float16), b.to(tl.float16), acc=tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32))
             tl.store(c_ptr + off_m[:, None] * N + off_n[None, :], c)
 
         M = N = K = 32
         a = torch.randn(M, K)
         b = torch.randn(K, N)
         c = torch.zeros(M, N)
-        matmul_kernel[(1,)](a, b, c, M=M, N=N, K=K,
-                             BLOCK_M=M, BLOCK_N=N, BLOCK_K=K)
+        matmul_kernel[(1,)](a, b, c, M=M, N=N, K=K, BLOCK_M=M, BLOCK_N=N, BLOCK_K=K)
 
         expected = a @ b
         max_err = (c - expected).abs().max().item()
@@ -452,9 +469,9 @@ def test_cpp_layer_norm():
 
     os.environ["TRITON_MSL_USE_CPP"] = "1"
     try:
+
         @triton.jit
-        def layer_norm_kernel(x_ptr, out_ptr, N: tl.constexpr,
-                               eps: tl.constexpr, BLOCK: tl.constexpr):
+        def layer_norm_kernel(x_ptr, out_ptr, N: tl.constexpr, eps: tl.constexpr, BLOCK: tl.constexpr):
             offs = tl.arange(0, BLOCK)
             mask = offs < N
             x = tl.load(x_ptr + offs, mask=mask, other=0.0)
@@ -493,11 +510,19 @@ def test_cpp_dot_k_loop():
 
     os.environ["TRITON_MSL_USE_CPP"] = "1"
     try:
+
         @triton.jit
-        def matmul_k_loop(a_ptr, b_ptr, c_ptr,
-                           M: tl.constexpr, N: tl.constexpr, K: tl.constexpr,
-                           BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr,
-                           BLOCK_K: tl.constexpr):
+        def matmul_k_loop(
+            a_ptr,
+            b_ptr,
+            c_ptr,
+            M: tl.constexpr,
+            N: tl.constexpr,
+            K: tl.constexpr,
+            BLOCK_M: tl.constexpr,
+            BLOCK_N: tl.constexpr,
+            BLOCK_K: tl.constexpr,
+        ):
             off_m = tl.arange(0, BLOCK_M)
             off_n = tl.arange(0, BLOCK_N)
             acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
@@ -513,8 +538,7 @@ def test_cpp_dot_k_loop():
         a = torch.randn(M, K)
         b = torch.randn(K, N)
         c = torch.zeros(M, N)
-        matmul_k_loop[(1,)](a, b, c, M=M, N=N, K=K,
-                             BLOCK_M=M, BLOCK_N=N, BLOCK_K=16)
+        matmul_k_loop[(1,)](a, b, c, M=M, N=N, K=K, BLOCK_M=M, BLOCK_N=N, BLOCK_K=16)
 
         expected = a @ b
         max_err = (c - expected).abs().max().item()
@@ -540,6 +564,7 @@ def test_aliasing_non_overlapping_allocs():
 
     os.environ["TRITON_MSL_USE_CPP"] = "1"
     try:
+
         @triton.jit
         def two_phase_kernel(x_ptr, out_ptr, BLOCK: tl.constexpr):
             offs = tl.arange(0, BLOCK)
@@ -565,16 +590,26 @@ def test_aliasing_non_overlapping_allocs():
 
 
 if _HAS_TRITON:
+
     @triton.jit
     def _fa_fwd_strided_kernel(
-        Q, K, V, Out,
-        stride_qm, stride_qk,
-        stride_kn, stride_kk,
-        stride_vn, stride_vk,
-        stride_om, stride_ok,
+        Q,
+        K,
+        V,
+        Out,
+        stride_qm,
+        stride_qk,
+        stride_kn,
+        stride_kk,
+        stride_vn,
+        stride_vk,
+        stride_om,
+        stride_ok,
         sm_scale,
-        N_CTX, HEAD_DIM: tl.constexpr,
-        BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr,
+        N_CTX,
+        HEAD_DIM: tl.constexpr,
+        BLOCK_M: tl.constexpr,
+        BLOCK_N: tl.constexpr,
     ):
         """FlashAttention v2 forward with explicit strides.
 
@@ -626,7 +661,7 @@ def _run_fa_cpp(N_CTX, HEAD_DIM):
     import triton
 
     BLOCK_M = BLOCK_N = 32
-    sm_scale = 1.0 / (HEAD_DIM ** 0.5)
+    sm_scale = 1.0 / (HEAD_DIM**0.5)
 
     torch.manual_seed(42)
     q = torch.randn(N_CTX, HEAD_DIM)
@@ -638,13 +673,23 @@ def _run_fa_cpp(N_CTX, HEAD_DIM):
     try:
         grid = (triton.cdiv(N_CTX, BLOCK_M),)
         _fa_fwd_strided_kernel[grid](
-            q, k, v, out,
-            q.stride(0), q.stride(1),
-            k.stride(0), k.stride(1),
-            v.stride(0), v.stride(1),
-            out.stride(0), out.stride(1),
+            q,
+            k,
+            v,
+            out,
+            q.stride(0),
+            q.stride(1),
+            k.stride(0),
+            k.stride(1),
+            v.stride(0),
+            v.stride(1),
+            out.stride(0),
+            out.stride(1),
             sm_scale,
-            N_CTX, HEAD_DIM, BLOCK_M, BLOCK_N,
+            N_CTX,
+            HEAD_DIM,
+            BLOCK_M,
+            BLOCK_N,
         )
     finally:
         os.environ.pop("TRITON_MSL_USE_CPP", None)
@@ -709,10 +754,12 @@ def test_cpp_compile_shader_mept_block_size():
 
     if not (hasattr(torch.backends, "mps") and torch.backends.mps.is_available()):
         import pytest
+
         pytest.skip("MPS not available")
 
     os.environ["TRITON_MSL_USE_CPP"] = "1"
     try:
+
         @triton.jit
         def gather_k(a_ptr, o_ptr, n, BLOCK: tl.constexpr):
             i = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)

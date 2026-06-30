@@ -12,6 +12,7 @@ never silent-wrong (computed-but-wrong) and never a cryptic crash (any other exc
 
 Run deep:  TRITON_MSL_FALLBACK=error python tests/test_fuzz_reduce.py 3
 """
+
 import os
 import shutil
 import sys
@@ -28,8 +29,7 @@ requires = pytest.mark.skipif(not HAS, reason="MPS + compile_shader needed")
 
 
 def _clear_cache():
-    for d in (os.path.expanduser("~/.cache/triton_msl"),
-              os.path.expanduser("~/.triton/cache")):
+    for d in (os.path.expanduser("~/.cache/triton_msl"), os.path.expanduser("~/.triton/cache")):
         shutil.rmtree(d, ignore_errors=True)
 
 
@@ -67,32 +67,37 @@ def _r1d_inloop_sum(a, o, N: tl.constexpr, T: tl.constexpr):
 
 @triton.jit
 def _r2d_sum_ax1(a, o, M: tl.constexpr, N: tl.constexpr):
-    i = tl.arange(0, M); j = tl.arange(0, N)
+    i = tl.arange(0, M)
+    j = tl.arange(0, N)
     tl.store(o + i, tl.sum(tl.load(a + i[:, None] * N + j[None, :]), 1))
 
 
 @triton.jit
 def _r2d_max_ax1(a, o, M: tl.constexpr, N: tl.constexpr):
-    i = tl.arange(0, M); j = tl.arange(0, N)
+    i = tl.arange(0, M)
+    j = tl.arange(0, N)
     tl.store(o + i, tl.max(tl.load(a + i[:, None] * N + j[None, :]), 1))
 
 
 @triton.jit
 def _r2d_argmax_ax1(a, o, M: tl.constexpr, N: tl.constexpr):
-    i = tl.arange(0, M); j = tl.arange(0, N)
+    i = tl.arange(0, M)
+    j = tl.arange(0, N)
     _v, idx = tl.max(tl.load(a + i[:, None] * N + j[None, :]), 1, return_indices=True)
     tl.store(o + i, idx)
 
 
 @triton.jit
 def _r2d_sum_ax0(a, o, M: tl.constexpr, N: tl.constexpr):
-    i = tl.arange(0, M); j = tl.arange(0, N)
+    i = tl.arange(0, M)
+    j = tl.arange(0, N)
     tl.store(o + j, tl.sum(tl.load(a + i[:, None] * N + j[None, :]), 0))
 
 
 @triton.jit
 def _r2d_inloop_sum_ax1(a, o, M: tl.constexpr, N: tl.constexpr, T: tl.constexpr):
-    i = tl.arange(0, M); acc = tl.zeros((M,), tl.float32)
+    i = tl.arange(0, M)
+    acc = tl.zeros((M,), tl.float32)
     for t in range(0, T):
         j = tl.arange(0, N)
         acc += tl.sum(tl.load(a + t * M * N + i[:, None] * N + j[None, :]), 1)
@@ -101,14 +106,18 @@ def _r2d_inloop_sum_ax1(a, o, M: tl.constexpr, N: tl.constexpr, T: tl.constexpr)
 
 @triton.jit
 def _r3d_sum_ax2(a, o, B: tl.constexpr, R: tl.constexpr, C: tl.constexpr):
-    b = tl.arange(0, B); r = tl.arange(0, R); c = tl.arange(0, C)
+    b = tl.arange(0, B)
+    r = tl.arange(0, R)
+    c = tl.arange(0, C)
     x = tl.load(a + b[:, None, None] * R * C + r[None, :, None] * C + c[None, None, :])
     tl.store(o + b[:, None] * R + r[None, :], tl.sum(x, 2))
 
 
 @triton.jit
 def _r3d_sum_ax0(a, o, B: tl.constexpr, R: tl.constexpr, C: tl.constexpr):
-    b = tl.arange(0, B); r = tl.arange(0, R); c = tl.arange(0, C)
+    b = tl.arange(0, B)
+    r = tl.arange(0, R)
+    c = tl.arange(0, C)
     x = tl.load(a + b[:, None, None] * R * C + r[None, :, None] * C + c[None, None, :])
     tl.store(o + r[:, None] * C + c[None, :], tl.sum(x, 0))
 
@@ -153,24 +162,37 @@ def _run_cell(form, dims, dtype, seed):
     try:
         if form in ("1d_sum", "1d_max", "1d_argmax"):
             (N,) = dims
-            A = (torch.randn(N, device="mps") if _is_float(dtype)
-                 else torch.randint(-50, 50, (N,), device="mps", dtype=dtype))
+            A = (
+                torch.randn(N, device="mps")
+                if _is_float(dtype)
+                else torch.randint(-50, 50, (N,), device="mps", dtype=dtype)
+            )
             o = torch.empty(1, device="mps", dtype=odt)
             {"1d_sum": _r1d_sum, "1d_max": _r1d_max, "1d_argmax": _r1d_argmax}[form][(1,)](A, o, N=N)
         elif form == "1d_inloop_sum":
             N, T = dims
-            A = torch.randn(T, N, device="mps", dtype=dtype) if _is_float(dtype) else \
-                torch.randint(-20, 20, (T, N), device="mps", dtype=dtype)
+            A = (
+                torch.randn(T, N, device="mps", dtype=dtype)
+                if _is_float(dtype)
+                else torch.randint(-20, 20, (T, N), device="mps", dtype=dtype)
+            )
             o = torch.empty(1, device="mps", dtype=odt)
             _r1d_inloop_sum[(1,)](A, o, N=N, T=T)
         elif form in ("2d_sum_ax1", "2d_max_ax1", "2d_argmax_ax1", "2d_sum_ax0"):
             M, N = dims
-            A = torch.randn(M, N, device="mps") if _is_float(dtype) else \
-                torch.randint(-50, 50, (M, N), device="mps", dtype=dtype)
+            A = (
+                torch.randn(M, N, device="mps")
+                if _is_float(dtype)
+                else torch.randint(-50, 50, (M, N), device="mps", dtype=dtype)
+            )
             osz = N if form == "2d_sum_ax0" else M
             o = torch.empty(osz, device="mps", dtype=odt)
-            {"2d_sum_ax1": _r2d_sum_ax1, "2d_max_ax1": _r2d_max_ax1,
-             "2d_argmax_ax1": _r2d_argmax_ax1, "2d_sum_ax0": _r2d_sum_ax0}[form][(1,)](A, o, M=M, N=N)
+            {
+                "2d_sum_ax1": _r2d_sum_ax1,
+                "2d_max_ax1": _r2d_max_ax1,
+                "2d_argmax_ax1": _r2d_argmax_ax1,
+                "2d_sum_ax0": _r2d_sum_ax0,
+            }[form][(1,)](A, o, M=M, N=N)
         elif form == "2d_inloop_sum_ax1":
             M, N, T = dims
             A = torch.randn(T, M, N, device="mps", dtype=dtype)
@@ -178,8 +200,11 @@ def _run_cell(form, dims, dtype, seed):
             _r2d_inloop_sum_ax1[(1,)](A, o, M=M, N=N, T=T)
         elif form in ("3d_sum_ax2", "3d_sum_ax0"):
             B, R, C = dims
-            A = torch.randn(B, R, C, device="mps") if _is_float(dtype) else \
-                torch.randint(-30, 30, (B, R, C), device="mps", dtype=dtype)
+            A = (
+                torch.randn(B, R, C, device="mps")
+                if _is_float(dtype)
+                else torch.randint(-30, 30, (B, R, C), device="mps", dtype=dtype)
+            )
             osz = (R, C) if form == "3d_sum_ax0" else (B, R)
             o = torch.empty(osz, device="mps", dtype=odt)
             {"3d_sum_ax2": _r3d_sum_ax2, "3d_sum_ax0": _r3d_sum_ax0}[form][(1,)](A, o, B=B, R=R, C=C)
@@ -195,20 +220,21 @@ def _run_cell(form, dims, dtype, seed):
             return _run_cell(form, dims, dtype, seed + 100000)
         except MetalNonRecoverableError:
             return ("refused", None)
-        except Exception as e:                             # noqa: BLE001
+        except Exception as e:  # noqa: BLE001
             return (f"crash:{type(e).__name__}", str(e)[:80])
-    except Exception as e:                                 # noqa: BLE001
+    except Exception as e:  # noqa: BLE001
         return (f"crash:{type(e).__name__}", str(e)[:80])
     ref = _ref(form, A)
     got = o.reshape(ref.shape) if hasattr(ref, "shape") and ref.dim() > 0 else o[0]
     if is_arg:
         ok = bool((got.long().cpu() == ref.long().cpu()).all())
         return ("correct" if ok else "wrong:idx", None)
-    g = got.float().cpu(); e = ref.float().cpu()
+    g = got.float().cpu()
+    e = ref.float().cpu()
     err = (g - e).abs().max().item()
     scale = max(e.abs().max().item(), 1e-6)
     t = _tol(dtype)
-    return ("correct" if err <= t["atol"] + t["rtol"] * scale else f"wrong:{err/scale:.2e}", err / scale)
+    return ("correct" if err <= t["atol"] + t["rtol"] * scale else f"wrong:{err / scale:.2e}", err / scale)
 
 
 _FLOAT = [torch.float32, torch.float16, torch.bfloat16]
@@ -225,15 +251,15 @@ def _cells():
             cells.append(("1d_argmax", (N,), dt))
     for dt in _FLOAT + _INT:
         cells.append(("1d_inloop_sum", (64, 4), dt))
-    for (M, N) in [(8, 16), (8, 32), (16, 16), (16, 32), (32, 32), (8, 64), (16, 64)]:
+    for M, N in [(8, 16), (8, 32), (16, 16), (16, 32), (32, 32), (8, 64), (16, 64)]:
         for dt in _FLOAT:
             for form in ("2d_sum_ax1", "2d_max_ax1", "2d_argmax_ax1", "2d_sum_ax0"):
                 cells.append((form, (M, N), dt))
         cells.append(("2d_sum_ax1", (M, N), torch.int32))
-    for (M, N) in [(8, 16), (8, 64), (16, 32)]:
+    for M, N in [(8, 16), (8, 64), (16, 32)]:
         for dt in _FLOAT:
             cells.append(("2d_inloop_sum_ax1", (M, N, 3), dt))
-    for (B, R, C) in [(2, 4, 4), (2, 8, 8), (4, 4, 8)]:
+    for B, R, C in [(2, 4, 4), (2, 8, 8), (4, 4, 8)]:
         for dt in _FLOAT + _INT:
             cells.append(("3d_sum_ax2", (B, R, C), dt))
             cells.append(("3d_sum_ax0", (B, R, C), dt))
@@ -245,10 +271,8 @@ def _cells():
 @pytest.mark.parametrize("form,dims,dtype", _cells())
 def test_reduce_correct_or_refuse(form, dims, dtype):
     status, detail = _run_cell(form, dims, dtype, seed=0)
-    assert not status.startswith("wrong"), \
-        f"SILENT-WRONG {form} {dims} {dtype}: {status} ({detail})"
-    assert not status.startswith("crash"), \
-        f"CRYPTIC-CRASH {form} {dims} {dtype}: {status} {detail}"
+    assert not status.startswith("wrong"), f"SILENT-WRONG {form} {dims} {dtype}: {status} ({detail})"
+    assert not status.startswith("crash"), f"CRYPTIC-CRASH {form} {dims} {dtype}: {status} {detail}"
 
 
 def _deep(n_seeds):
@@ -256,7 +280,7 @@ def _deep(n_seeds):
     tally = {}
     bad = []
     for seed in range(n_seeds):
-        for (form, dims, dt) in cells:
+        for form, dims, dt in cells:
             status, detail = _run_cell(form, dims, dt, seed=seed)
             kind = status.split(":")[0]
             tally[kind] = tally.get(kind, 0) + 1
@@ -275,7 +299,8 @@ if __name__ == "__main__":
 # --- combined 2-D reduce form (reduce-probe #7 blind spot) -------------------------
 @triton.jit
 def _k_combined_2d(a, o, M: tl.constexpr, N: tl.constexpr):
-    i = tl.arange(0, M); j = tl.arange(0, N)
+    i = tl.arange(0, M)
+    j = tl.arange(0, N)
     x = tl.load(a + i[:, None] * N + j[None, :])
     tl.store(o + i, tl.sum(x, 1) + tl.max(x, 1))
 
@@ -288,15 +313,16 @@ def test_combined_2d_reduce_correct_or_refuse(M, N):
     # fuzzer sweep above does not exercise this interaction).
     _clear_cache()
     torch.manual_seed(0)
-    a = torch.randn(M, N, device="mps"); o = torch.empty(M, device="mps")
+    a = torch.randn(M, N, device="mps")
+    o = torch.empty(M, device="mps")
     try:
-        _k_combined_2d[(1,)](a, o, M=M, N=N); torch.mps.synchronize()
+        _k_combined_2d[(1,)](a, o, M=M, N=N)
+        torch.mps.synchronize()
     except MetalNonRecoverableError:
         return  # loud refusal is acceptable
     exp = a.cpu().sum(1) + a.cpu().max(1).values
     err = (o.cpu() - exp).abs().max().item()
-    assert err <= 3e-3 + 3e-3 * max(exp.abs().max().item(), 1e-6), \
-        f"SILENT-WRONG combined 2D reduce {M}x{N}: err {err}"
+    assert err <= 3e-3 + 3e-3 * max(exp.abs().max().item(), 1e-6), f"SILENT-WRONG combined 2D reduce {M}x{N}: err {err}"
 
 
 # --- atomic-of-reduce form (BLOCKER 3) --------------------------------------------
@@ -308,13 +334,15 @@ def test_combined_2d_reduce_correct_or_refuse(M, N):
 # (correct) or refuse loudly — never over-count.
 @triton.jit
 def _k_atomic_add_sum(x, out, n, BLOCK: tl.constexpr):
-    i = tl.arange(0, BLOCK); m = i < n
+    i = tl.arange(0, BLOCK)
+    m = i < n
     tl.atomic_add(out, tl.sum(tl.load(x + i, mask=m, other=0.0), axis=0))
 
 
 @triton.jit
 def _k_atomic_xor_sum(x, out, n, BLOCK: tl.constexpr):
-    i = tl.arange(0, BLOCK); m = i < n
+    i = tl.arange(0, BLOCK)
+    m = i < n
     tl.atomic_xor(out, tl.sum(tl.load(x + i, mask=m, other=0), axis=0))
 
 
@@ -329,20 +357,22 @@ def test_atomic_of_reduce_correct_or_refuse(BLOCK, op):
         out = torch.zeros(1, device="mps", dtype=torch.float32)
         want = float(x.sum().item())
         try:
-            _k_atomic_add_sum[(1,)](x, out, BLOCK, BLOCK=BLOCK); torch.mps.synchronize()
+            _k_atomic_add_sum[(1,)](x, out, BLOCK, BLOCK=BLOCK)
+            torch.mps.synchronize()
         except MetalNonRecoverableError:
             return  # loud refusal is acceptable
         got = out.item()
-        assert abs(got - want) <= 1e-2 * max(want, 1.0), \
+        assert abs(got - want) <= 1e-2 * max(want, 1.0), (
             f"SILENT-WRONG atomic_add(sum) BLOCK={BLOCK}: got {got} want {want}"
+        )
     else:
         x = torch.arange(1, BLOCK + 1, device="mps", dtype=torch.int32)
         out = torch.zeros(1, device="mps", dtype=torch.int32)
-        want = int(x.sum().item())   # a single xor of the scalar reduce result
+        want = int(x.sum().item())  # a single xor of the scalar reduce result
         try:
-            _k_atomic_xor_sum[(1,)](x, out, BLOCK, BLOCK=BLOCK); torch.mps.synchronize()
+            _k_atomic_xor_sum[(1,)](x, out, BLOCK, BLOCK=BLOCK)
+            torch.mps.synchronize()
         except MetalNonRecoverableError:
             return
         got = int(out.item())
-        assert got == want, \
-            f"SILENT-WRONG atomic_xor(sum) BLOCK={BLOCK}: got {got} want {want}"
+        assert got == want, f"SILENT-WRONG atomic_xor(sum) BLOCK={BLOCK}: got {got} want {want}"

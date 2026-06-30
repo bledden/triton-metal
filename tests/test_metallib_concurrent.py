@@ -10,6 +10,7 @@ Fix: per-call tempfile.mkdtemp() under the cache dir so every call has unique
 intermediates; the final os.replace onto the content-addressed .metallib is
 still atomic and idempotent (last-writer-wins with identical content).
 """
+
 import os
 import platform
 import subprocess
@@ -85,7 +86,6 @@ def test_make_metallib_concurrent_no_race(tmp_path, monkeypatch):
     for t in threads:
         t.join()
 
-    assert errors == [], (
-        f"{len(errors)} thread(s) raised exceptions during concurrent make_metallib:\n"
-        + "\n".join(f"  {type(e).__name__}: {e}" for e in errors[:5])
+    assert errors == [], f"{len(errors)} thread(s) raised exceptions during concurrent make_metallib:\n" + "\n".join(
+        f"  {type(e).__name__}: {e}" for e in errors[:5]
     )

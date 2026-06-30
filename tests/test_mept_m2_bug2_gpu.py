@@ -2,6 +2,7 @@
 correctly at BLOCK>=256 under flag-ON (previously refused with
 MetalNonRecoverableError). Run with TRITON_MSL_MEPT=1. Serial only.
 """
+
 import os
 
 import pytest
@@ -11,16 +12,18 @@ try:
     import triton
     import triton.language as tl
     import Metal
+
     HAS = Metal.MTLCreateSystemDefaultDevice() is not None
 except Exception:
     HAS = False
 
 requires_metal = pytest.mark.skipif(not HAS, reason="Metal/torch/triton needed")
 requires_mept = pytest.mark.skipif(
-    os.environ.get("TRITON_MSL_MEPT") != "1",
-    reason="requires TRITON_MSL_MEPT=1 (M2 register-array form)")
+    os.environ.get("TRITON_MSL_MEPT") != "1", reason="requires TRITON_MSL_MEPT=1 (M2 register-array form)"
+)
 
 if HAS:
+
     @triton.jit
     def _sum_in_loop(X, OUT, N, n_tiles, BLOCK: tl.constexpr):
         offs = tl.arange(0, BLOCK)
@@ -41,5 +44,4 @@ def test_sum_in_loop_computes_flag_on(BLOCK):
     OUT = torch.zeros(1)
     n_tiles = (N + BLOCK - 1) // BLOCK
     _sum_in_loop[(1,)](X, OUT, N, n_tiles, BLOCK=BLOCK)
-    assert abs(float(OUT[0]) - X.sum().item()) < 1e-1, (
-        f"BLOCK={BLOCK}: got {float(OUT[0])}, want {X.sum().item()}")
+    assert abs(float(OUT[0]) - X.sum().item()) < 1e-1, f"BLOCK={BLOCK}: got {float(OUT[0])}, want {X.sum().item()}"

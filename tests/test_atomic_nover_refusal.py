@@ -18,6 +18,7 @@ tl.reshape defeats the MEPT spine) AND a BLOCK-wide atomic sits in a
 control-flow region. `_undercover_atomic` reproduces exactly that structure —
 mirroring tests/test_nover_store_refusal.py. Serial GPU.
 """
+
 import pytest
 
 try:
@@ -26,6 +27,7 @@ try:
     import triton.language as tl
     import Metal
     from triton_msl.errors import MetalNonRecoverableError
+
     HAS = Metal.MTLCreateSystemDefaultDevice() is not None
 except Exception:
     HAS = False
@@ -33,19 +35,21 @@ except Exception:
 requires_metal = pytest.mark.skipif(not HAS, reason="Metal/torch/triton needed")
 
 if HAS:
+
     @triton.jit
     def _undercover_atomic(X, OUT, OUT2, K, BLOCK: tl.constexpr, H: tl.constexpr):
         o = tl.arange(0, BLOCK)
         v = tl.load(X + o)
-        s = tl.sum(v)                            # 1-D full reduce -> multipass,
+        s = tl.sum(v)  # 1-D full reduce -> multipass,
         #                                          block_size collapses to num_threads
-        w = tl.reshape(v + s, (H, BLOCK // H))   # rank-changing reshape defeats
+        w = tl.reshape(v + s, (H, BLOCK // H))  # rank-changing reshape defeats
         #                                          the MEPT register-array spine
         rm = tl.arange(0, H)[:, None]
         rn = tl.arange(0, BLOCK // H)[None, :]
         tl.store(OUT2 + rm * (BLOCK // H) + rn, w)
-        for k in range(0, K):                    # BLOCK-wide atomic in a control-
-            tl.atomic_add(OUT + o, v + s + k)    # flow region -> base path scatter
+        for k in range(0, K):  # BLOCK-wide atomic in a control-
+            tl.atomic_add(OUT + o, v + s + k)  # flow region -> base path scatter
+
 
 # All @triton.jit kernels defined in this file.  The autouse fixture below
 # clears their in-process JIT caches before each test.

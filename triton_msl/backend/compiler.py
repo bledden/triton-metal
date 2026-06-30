@@ -65,6 +65,7 @@ def _stash_msl(msl_src, key, block_size=None):
     # kernel — never stale, never a collision.
     try:
         import json
+
         path = os.path.join(_get_cache_dir(), f"{key}.mslstash")
         if not os.path.exists(path):
             tmp = f"{path}.{os.getpid()}.tmp"
@@ -93,6 +94,7 @@ def _load_stashed_msl(key):
         return hit
     try:
         import json
+
         path = os.path.join(_get_cache_dir(), f"{key}.mslstash")
         if os.path.exists(path):
             with open(path) as f:
@@ -130,12 +132,11 @@ def _msl_cache_key(mod_text, options_hash):
     silently replay stale compiled kernels (Phase 0, audit debt #1/#2).
     """
     from triton_msl import CODEGEN_VERSION
+
     # Effective MEPT flag (default ON as of M5): no-env and "1" share a key;
     # "0" (escape hatch) is distinct. Must match generic_lowerer's default.
     mept = "0" if os.environ.get("TRITON_MSL_MEPT") == "0" else "1"
-    return hashlib.sha256(
-        (mod_text + options_hash + CODEGEN_VERSION + mept).encode("utf-8")
-    ).hexdigest()[:16]
+    return hashlib.sha256((mod_text + options_hash + CODEGEN_VERSION + mept).encode("utf-8")).hexdigest()[:16]
 
 
 # Number of attempts for the metal→air→metallib pipeline.
@@ -161,14 +162,19 @@ def _warn_inert_num_stages(n):
     _NUM_STAGES_WARNED = True
     try:
         from triton_msl.debug import _debug_level
+
         if _debug_level() < 1:
             return
         import sys
-        print(f"[triton-msl] num_stages={n} requested but is a no-op on Metal: the "
-              f"backend's fast paths (direct-load + register-blocked matmul, "
-              f"prefetch+MLP FlashAttention) already saturate load/compute overlap; "
-              f"CUDA-style multi-stage pipelining measured no benefit. Result is "
-              f"correct, just not pipelined.", file=sys.stderr)
+
+        print(
+            f"[triton-msl] num_stages={n} requested but is a no-op on Metal: the "
+            f"backend's fast paths (direct-load + register-blocked matmul, "
+            f"prefetch+MLP FlashAttention) already saturate load/compute overlap; "
+            f"CUDA-style multi-stage pipelining measured no benefit. Result is "
+            f"correct, just not pipelined.",
+            file=sys.stderr,
+        )
     except Exception:
         pass
 
@@ -227,9 +233,7 @@ class MetalOptions:
         # ``tuple(option_val.items())``; storing a dict here breaks
         # that contract (test_launch_with_options[options2]).
         if isinstance(self.extern_libs, dict):
-            object.__setattr__(
-                self, "extern_libs", tuple(sorted(self.extern_libs.items()))
-            )
+            object.__setattr__(self, "extern_libs", tuple(sorted(self.extern_libs.items())))
 
     @staticmethod
     def _make_hashable(value):
@@ -239,15 +243,11 @@ class MetalOptions:
 
     def hash(self):
         hash_dict = dict(self.__dict__)
-        key = "_".join(
-            f"{name}-{self._make_hashable(val)}"
-            for name, val in sorted(hash_dict.items())
-        )
+        key = "_".join(f"{name}-{self._make_hashable(val)}" for name, val in sorted(hash_dict.items()))
         return hashlib.sha256(key.encode("utf-8")).hexdigest()
 
 
 class MetalBackend(BaseBackend):
-
     @staticmethod
     def supports_target(target: GPUTarget):
         return target.backend in ("metal", "mps")
@@ -268,8 +268,7 @@ class MetalBackend(BaseBackend):
 
         # Validate num_warps is a power of 2
         num_warps = result.get("num_warps", 4)
-        assert num_warps > 0 and (num_warps & (num_warps - 1)) == 0, \
-            f"num_warps ({num_warps}) must be a power of 2"
+        assert num_warps > 0 and (num_warps & (num_warps - 1)) == 0, f"num_warps ({num_warps}) must be a power of 2"
 
         # Validate: no FP64 on Metal.
         arch = result.get("arch", "apple-m4")
@@ -318,6 +317,7 @@ class MetalBackend(BaseBackend):
         # our Metal-compatible implementation. Mirrors NVIDIA's pattern of
         # pointing at triton.language.extra.cuda.libdevice.
         from triton_msl.inductor.metal_libdevice import metal_libdevice
+
         return {"triton.language.extra.libdevice": metal_libdevice}
 
     def load_dialects(self, ctx):
@@ -347,9 +347,9 @@ class MetalBackend(BaseBackend):
         # slower; one differential kernel (T2) was insufficient to flip a family.
         # The diff harness + family table + dtype gate stay as the foundation for
         # a corpus-validated re-flip. FORCE_PYTHON kept as an explicit override.
-        use_cpp = (os.environ.get("TRITON_MSL_FORCE_PYTHON") != "1"
-                   and os.environ.get("TRITON_MSL_USE_CPP", "") == "1")
+        use_cpp = os.environ.get("TRITON_MSL_FORCE_PYTHON") != "1" and os.environ.get("TRITON_MSL_USE_CPP", "") == "1"
         if use_cpp and self._has_cpp_passes():
+
             def _metallib_via_cpp(src, metadata):
                 """Compile metallib from C++ LLVM IR when possible, MSL otherwise.
 
@@ -375,8 +375,7 @@ class MetalBackend(BaseBackend):
                         # C++ path's block_size to shared metadata. This
                         # keeps MSL fallback's metadata pristine if
                         # compilation fails.
-                        result = MetalBackend.make_metallib_from_llir(
-                            llir, cpp_meta, options)
+                        result = MetalBackend.make_metallib_from_llir(llir, cpp_meta, options)
                         metadata["block_size"] = cpp_meta["block_size"]
                         return result
                     except Exception as _e:
@@ -384,15 +383,18 @@ class MetalBackend(BaseBackend):
                         # TRITON_MSL_CPP_TRACE=1 is set.
                         if os.environ.get("TRITON_MSL_CPP_TRACE"):
                             import traceback
-                            print(f"[triton-msl] C++ path failed for "
-                                  f"{metadata.get('name', 'kernel')}: {_e}",
-                                  file=sys.stderr)
+
+                            print(
+                                f"[triton-msl] C++ path failed for {metadata.get('name', 'kernel')}: {_e}",
+                                file=sys.stderr,
+                            )
                             traceback.print_exc(file=sys.stderr)
                 # Complex kernels or C++ failure: use MSL metallib
                 return MetalBackend.make_metallib(src, metadata, options)
 
             # Override the msl stage to ALSO generate LLVM IR
             orig_make_msl = stages["msl"]
+
             def _msl_with_cpp(src, metadata):
                 """Generate MSL and save TTGIR for C++ metallib compilation."""
                 # Save TTGIR text before MSL generation mutates the module
@@ -418,8 +420,10 @@ class MetalBackend(BaseBackend):
         # The per-family op table lives in cpp_families.py (Phase 1 spec).
         import re
         from triton_msl.backend.cpp_families import enabled_ops
+
         allowed_ops = enabled_ops()
         from triton_msl.backend.cpp_families import cpp_safe_text
+
         if not cpp_safe_text(ttgir_text):
             return True  # unsafe dtype for C++ AIR path -> Python route
         # The C++ run_to_llvm pass aborts (assertion) on a SCALAR (0-D) load —
@@ -427,7 +431,7 @@ class MetalBackend(BaseBackend):
         # pointers `tensor<Nx!tt.ptr<T>>` (e.g. batchnorm's i64
         # num_batches_tracked increment: `tt.load %in : !tt.ptr<i64>`). The MSL
         # path handles these; route them there rather than crash the process.
-        if re.search(r'tt\.load\b[^\n]*:\s*!tt\.ptr<', ttgir_text):
+        if re.search(r"tt\.load\b[^\n]*:\s*!tt\.ptr<", ttgir_text):
             return True
         # Extract actual MLIR operations from the TTGIR text.
         # Operations appear as either:
@@ -443,13 +447,13 @@ class MetalBackend(BaseBackend):
         ops_in_kernel = set()
         for line in ttgir_text.splitlines():
             stripped = line.strip()
-            if not stripped or stripped.startswith('//') or stripped.startswith('#'):
+            if not stripped or stripped.startswith("//") or stripped.startswith("#"):
                 continue
             # Match "= <op>" pattern (result-producing ops)
-            for m in re.finditer(r'=\s+((?:tt|arith|math|scf|ttg)\.\w+)', stripped):
+            for m in re.finditer(r"=\s+((?:tt|arith|math|scf|ttg)\.\w+)", stripped):
                 ops_in_kernel.add(m.group(1))
             # Match ops at line start (side-effecting ops like tt.store, tt.return, tt.func)
-            m = re.match(r'((?:tt|arith|math|scf|ttg)\.\w+)', stripped)
+            m = re.match(r"((?:tt|arith|math|scf|ttg)\.\w+)", stripped)
             if m:
                 ops_in_kernel.add(m.group(1))
         # If any op is NOT in the allowlist, use MSL
@@ -531,14 +535,14 @@ class MetalBackend(BaseBackend):
         # range of dot_cin is not captured correctly by the range-based
         # pass for this buffer's bracketed store-barrier-simdload pattern).
         # Phase split would fix (1) but not (2)/(3)/(4).
-        if 'tt.dot' in ops_in_kernel:
+        if "tt.dot" in ops_in_kernel:
             # Compute block_size the same way make_llir does: product of
             # max `end` per slice dim for 2D kernels, else max end.
             dim_to_end = {}
             max_end_any = 0
             for mr in re.finditer(
-                r'tt\.make_range\s*\{[^}]*end\s*=\s*(\d+)[^}]*\}\s*:\s*'
-                r'tensor<\d+xi32(?:,\s*#ttg\.slice<\{dim\s*=\s*(\d+))?',
+                r"tt\.make_range\s*\{[^}]*end\s*=\s*(\d+)[^}]*\}\s*:\s*"
+                r"tensor<\d+xi32(?:,\s*#ttg\.slice<\{dim\s*=\s*(\d+))?",
                 ttgir_text,
             ):
                 end = int(mr.group(1))
@@ -565,8 +569,15 @@ class MetalBackend(BaseBackend):
         # MSL, which has its own shared-memory aliasing pass.
         # Element byte sizes keyed by MLIR type suffix.
         elem_bytes = {
-            'i1': 1, 'i8': 1, 'i16': 2, 'i32': 4, 'i64': 8,
-            'f16': 2, 'bf16': 2, 'f32': 4, 'f64': 8,
+            "i1": 1,
+            "i8": 1,
+            "i16": 2,
+            "i32": 4,
+            "i64": 8,
+            "f16": 2,
+            "bf16": 2,
+            "f32": 4,
+            "f64": 8,
         }
         # Find any tt.reduce and check the input tensor type. The signature
         # line follows the op body on a later line, so scan multi-line.
@@ -577,7 +588,7 @@ class MetalBackend(BaseBackend):
         ):
             dims_str, elem_ty = m.group(1), m.group(2)
             try:
-                dims = [int(d) for d in dims_str.split('x') if d]
+                dims = [int(d) for d in dims_str.split("x") if d]
             except ValueError:
                 continue
             n = 1
@@ -598,6 +609,7 @@ class MetalBackend(BaseBackend):
         """Check if the C++ MLIR pass library is available."""
         try:
             import triton_msl._triton_msl_cpp
+
             return True
         except ImportError:
             return False
@@ -635,7 +647,7 @@ class MetalBackend(BaseBackend):
         # Use a line-aware check to avoid matching attribute references.
         has_dot = False
         for _line in ttgir_text.splitlines():
-            if re.search(r'(?:^|=\s|\s)tt\.dot\b', _line):
+            if re.search(r"(?:^|=\s|\s)tt\.dot\b", _line):
                 has_dot = True
                 break
 
@@ -647,12 +659,12 @@ class MetalBackend(BaseBackend):
         # can decompose the linear thread ID:
         #   dim=1 → row index:  lid / BLOCK_COL
         #   dim=0 → col index:  lid % BLOCK_COL
-        lines = ttgir_text.split('\n')
+        lines = ttgir_text.split("\n")
         make_range_dims = {}  # %name -> (dim, block_size)
         for line in lines:
             mr_m = re.search(
-                r'(%\S+)\s*=\s*tt\.make_range\s*\{[^}]*end\s*=\s*(\d+)[^}]*\}\s*:\s*tensor<\d+xi32,\s*#ttg\.slice<\{dim\s*=\s*(\d+)',
-                line
+                r"(%\S+)\s*=\s*tt\.make_range\s*\{[^}]*end\s*=\s*(\d+)[^}]*\}\s*:\s*tensor<\d+xi32,\s*#ttg\.slice<\{dim\s*=\s*(\d+)",
+                line,
             )
             if mr_m:
                 name = mr_m.group(1)
@@ -675,21 +687,17 @@ class MetalBackend(BaseBackend):
         # This is done before stripping so the dim info is preserved.
         annotated_lines = []
         for line in lines:
-            if has_2d_block and 'tt.make_range' in line:
+            if has_2d_block and "tt.make_range" in line:
                 # Find the make_range attribute dict and slice dim
-                mr_m = re.search(
-                    r'(tt\.make_range\s*\{)([^}]*)(}\s*:)',
-                    line
-                )
-                slice_m = re.search(
-                    r'#ttg\.slice<\{dim\s*=\s*(\d+)',
-                    line
-                )
+                mr_m = re.search(r"(tt\.make_range\s*\{)([^}]*)(}\s*:)", line)
+                slice_m = re.search(r"#ttg\.slice<\{dim\s*=\s*(\d+)", line)
                 if mr_m and slice_m:
                     dim_val = int(slice_m.group(1))
                     # Inject metal.dim and metal.col_block_size attributes
-                    new_attrs = f'{mr_m.group(2)}, metal.dim = {dim_val} : i32, metal.col_block_size = {col_block_size} : i32'
-                    line = line[:mr_m.start(1)] + mr_m.group(1) + new_attrs + mr_m.group(3) + line[mr_m.end():]
+                    new_attrs = (
+                        f"{mr_m.group(2)}, metal.dim = {dim_val} : i32, metal.col_block_size = {col_block_size} : i32"
+                    )
+                    line = line[: mr_m.start(1)] + mr_m.group(1) + new_attrs + mr_m.group(3) + line[mr_m.end() :]
             annotated_lines.append(line)
 
         # Phase 1: Strip encoding attributes and loc annotations.
@@ -704,13 +712,13 @@ class MetalBackend(BaseBackend):
             stripped = line.rstrip()
 
             # Handle #name = #ttg.X<...> alias definitions
-            if re.match(r'^#\w+ = #ttg\.', stripped):
+            if re.match(r"^#\w+ = #ttg\.", stripped):
                 if has_dot:
                     phase1_lines.append(stripped)
                 continue
 
             # Skip #locN = loc(...) alias definitions
-            if re.match(r'^#loc\d*\s*=\s*loc\(', stripped):
+            if re.match(r"^#loc\d*\s*=\s*loc\(", stripped):
                 continue
 
             if not has_dot:
@@ -719,7 +727,7 @@ class MetalBackend(BaseBackend):
                 # #smem>`) since re.sub only replaces non-overlapping matches
                 # in one pass.
                 while True:
-                    new_stripped = re.sub(r',\s*#\w+>', '>', stripped)
+                    new_stripped = re.sub(r",\s*#\w+>", ">", stripped)
                     if new_stripped == stripped:
                         break
                     stripped = new_stripped
@@ -729,29 +737,25 @@ class MetalBackend(BaseBackend):
                 #   , #ttg.dot_op<{opIdx = 0, parent = #blocked}>
                 #   , #ttg.swizzled_shared<{...}>
                 # These appear inside tensor<...> types. Match , #ttg.X<{...}>
-                stripped = re.sub(
-                    r',\s*#ttg\.\w+<\{[^}]*\}>', '', stripped
-                )
+                stripped = re.sub(r",\s*#ttg\.\w+<\{[^}]*\}>", "", stripped)
 
             # Remove ttg.* module attributes — but preserve ttg.num-warps,
             # ttg.num-ctas, ttg.threads-per-warp, ttg.target when tt.dot is
             # present. TTG layout verifiers require these to compute warp
             # layout for MMA operands.
             if not has_dot:
-                stripped = re.sub(r'"ttg\.[^"]*"\s*=\s*[^,}]+[,]?\s*', '', stripped)
-                stripped = re.sub(r'ttg\.\w+\s*=\s*"[^"]*"[,]?\s*', '', stripped)
+                stripped = re.sub(r'"ttg\.[^"]*"\s*=\s*[^,}]+[,]?\s*', "", stripped)
+                stripped = re.sub(r'ttg\.\w+\s*=\s*"[^"]*"[,]?\s*', "", stripped)
 
             # Remove loc(...) annotations — handle nested parens.
-            while 'loc(' in stripped:
+            while "loc(" in stripped:
                 prev = stripped
-                stripped = re.sub(
-                    r'\s*loc\((?:[^()]*|\([^()]*\))*\)', '', stripped
-                )
+                stripped = re.sub(r"\s*loc\((?:[^()]*|\([^()]*\))*\)", "", stripped)
                 if stripped == prev:
                     break
 
             # Clean up empty module attributes
-            stripped = re.sub(r'module attributes \{\s*\}', 'module', stripped)
+            stripped = re.sub(r"module attributes \{\s*\}", "module", stripped)
 
             # Skip now-empty lines
             if stripped.strip():
@@ -768,21 +772,21 @@ class MetalBackend(BaseBackend):
         # rewrites (this keeps the existing elementwise/reduce path
         # intact).
         if has_dot:
-            return '\n'.join(phase1_lines) + '\n'
+            return "\n".join(phase1_lines) + "\n"
 
-        alloc_map = {}    # ttg.local_alloc result -> input operand
+        alloc_map = {}  # ttg.local_alloc result -> input operand
         replace_map = {}  # value to replace -> replacement value
 
         # First pass: scan for TTG op mappings
         for line in phase1_lines:
             # ttg.local_alloc %x : (...) -> !ttg.memdesc<...>
-            m = re.match(r'\s*(%\S+)\s*=\s*ttg\.local_alloc\s+(%\S+)', line)
+            m = re.match(r"\s*(%\S+)\s*=\s*ttg\.local_alloc\s+(%\S+)", line)
             if m:
                 alloc_map[m.group(1)] = m.group(2)
                 continue
 
             # ttg.local_load %x : !ttg.memdesc<...> -> tensor<...>
-            m = re.match(r'\s*(%\S+)\s*=\s*ttg\.local_load\s+(%\S+)', line)
+            m = re.match(r"\s*(%\S+)\s*=\s*ttg\.local_load\s+(%\S+)", line)
             if m:
                 alloc_result = m.group(2)
                 original = alloc_map.get(alloc_result, alloc_result)
@@ -790,19 +794,19 @@ class MetalBackend(BaseBackend):
                 continue
 
             # ttg.convert_layout %x : tensor<...> -> tensor<...>
-            m = re.match(r'\s*(%\S+)\s*=\s*ttg\.convert_layout\s+(%\S+)', line)
+            m = re.match(r"\s*(%\S+)\s*=\s*ttg\.convert_layout\s+(%\S+)", line)
             if m:
                 replace_map[m.group(1)] = m.group(2)
                 continue
 
             # ttg.memdesc_trans %x {order = ...} : ...
-            m = re.match(r'\s*(%\S+)\s*=\s*ttg\.memdesc_trans\s+(%\S+)', line)
+            m = re.match(r"\s*(%\S+)\s*=\s*ttg\.memdesc_trans\s+(%\S+)", line)
             if m:
                 alloc_map[m.group(1)] = alloc_map.get(m.group(2), m.group(2))
                 continue
 
             # tt.trans %x : tensor<...> -> tensor<...>
-            m = re.match(r'\s*(%\S+)\s*=\s*tt\.trans\s+(%\S+)', line)
+            m = re.match(r"\s*(%\S+)\s*=\s*tt\.trans\s+(%\S+)", line)
             if m:
                 replace_map[m.group(1)] = m.group(2)
                 continue
@@ -812,44 +816,43 @@ class MetalBackend(BaseBackend):
         # _detect_simple_dot path.
         out_lines = []
         # Sort replacements longest-first to avoid partial matches
-        sorted_replacements = sorted(replace_map.items(),
-                                     key=lambda x: len(x[0]), reverse=True)
+        sorted_replacements = sorted(replace_map.items(), key=lambda x: len(x[0]), reverse=True)
 
         for line in phase1_lines:
             # Skip ttg.* op lines entirely
-            if re.match(r'\s*%\S+\s*=\s*ttg\.\w+', line):
+            if re.match(r"\s*%\S+\s*=\s*ttg\.\w+", line):
                 continue
 
             # Skip tt.trans lines (already mapped as passthrough)
-            if re.match(r'\s*%\S+\s*=\s*tt\.trans\s+', line):
+            if re.match(r"\s*%\S+\s*=\s*tt\.trans\s+", line):
                 continue
 
             # Apply replacements
             for old, new in sorted_replacements:
                 # Use word-boundary-aware replacement to avoid partial matches
-                line = re.sub(re.escape(old) + r'(?=[\s,):}\]]|$)', new, line)
+                line = re.sub(re.escape(old) + r"(?=[\s,):}\]]|$)", new, line)
 
             # tt.dot is preserved — handled by C++ DotOpToLLVM pattern or MSL
             # _detect_simple_dot path.
 
             # Remove residual TTG type annotations that slipped through
             # e.g. !ttg.memdesc<...> in type positions
-            line = re.sub(r'!ttg\.memdesc<[^>]*>', 'tensor<1xf32>', line)
+            line = re.sub(r"!ttg\.memdesc<[^>]*>", "tensor<1xf32>", line)
 
             if line.strip():
                 out_lines.append(line)
 
-        return '\n'.join(out_lines) + '\n'
+        return "\n".join(out_lines) + "\n"
 
     # Map LLVM IR element types to their byte size and AIR metadata name.
     _ELEM_TYPE_INFO = {
-        'half':  (2, 2, 'half'),
-        'float': (4, 4, 'float'),
-        'i8':    (1, 1, 'char'),
-        'i16':   (2, 2, 'short'),
-        'i32':   (4, 4, 'int'),
-        'i64':   (8, 8, 'long'),
-        'bfloat':(2, 2, 'bfloat'),
+        "half": (2, 2, "half"),
+        "float": (4, 4, "float"),
+        "i8": (1, 1, "char"),
+        "i16": (2, 2, "short"),
+        "i32": (4, 4, "int"),
+        "i64": (8, 8, "long"),
+        "bfloat": (2, 2, "bfloat"),
     }
 
     @staticmethod
@@ -866,7 +869,7 @@ class MetalBackend(BaseBackend):
         """
         import re
 
-        lines = llir_text.split('\n')
+        lines = llir_text.split("\n")
 
         # Pass -1: Collect addrspace(3) global declarations so we can rewrite
         # opaque-pointer references to them (including in !air.threadgroup_buffers
@@ -874,10 +877,7 @@ class MetalBackend(BaseBackend):
         # E.g. @__reduce_shared_0 = internal addrspace(3) global [32 x float] undef
         tg_global_types = {}  # "@__reduce_shared_0" -> "[32 x float]"
         for line in lines:
-            m = re.match(
-                r'\s*(@[\w.]+)\s*=\s*[^=]*addrspace\(3\)\s+global\s+(\[[^\]]+\]|\S+)',
-                line
-            )
+            m = re.match(r"\s*(@[\w.]+)\s*=\s*[^=]*addrspace\(3\)\s+global\s+(\[[^\]]+\]|\S+)", line)
             if m:
                 tg_global_types[m.group(1)] = m.group(2)
 
@@ -886,10 +886,7 @@ class MetalBackend(BaseBackend):
         #   -> cast_map["%.generic"] = ("%0", "1")
         cast_map = {}
         for line in lines:
-            m = re.match(
-                r'\s*(%\S+)\s*=\s*addrspacecast\s+ptr\s+addrspace\((\d+)\)\s+(%\S+)\s+to\s+ptr',
-                line
-            )
+            m = re.match(r"\s*(%\S+)\s*=\s*addrspacecast\s+ptr\s+addrspace\((\d+)\)\s+(%\S+)\s+to\s+ptr", line)
             if m:
                 cast_map[m.group(1)] = (m.group(3), m.group(2))
 
@@ -900,10 +897,7 @@ class MetalBackend(BaseBackend):
         param_types = {}  # param_name -> element_type (e.g. "%0" -> "half")
         for line in lines:
             # GEP: getelementptr <type>, ptr %name
-            m = re.match(
-                r'\s*%\S+\s*=\s*getelementptr\s+(\w+),\s*ptr\s+(%([\w.]+))',
-                line
-            )
+            m = re.match(r"\s*%\S+\s*=\s*getelementptr\s+(\w+),\s*ptr\s+(%([\w.]+))", line)
             if m:
                 elem_type = m.group(1)
                 ptr_name = m.group(2)
@@ -911,10 +905,7 @@ class MetalBackend(BaseBackend):
                 if actual_ptr not in param_types:
                     param_types[actual_ptr] = elem_type
             # Load from constant buffer: load <type>, ptr addrspace(2) %name
-            m = re.match(
-                r'\s*(%\S+)\s*=\s*load\s+(\w+),\s*ptr\s+addrspace\(2\)\s+(%([\w.]+))',
-                line
-            )
+            m = re.match(r"\s*(%\S+)\s*=\s*load\s+(\w+),\s*ptr\s+addrspace\(2\)\s+(%([\w.]+))", line)
             if m:
                 elem_type = m.group(2)
                 ptr_name = m.group(3)  # e.g. "%4"
@@ -926,20 +917,17 @@ class MetalBackend(BaseBackend):
         sig_param_names = []  # ordered list of param names from define line
         sig_param_addrspaces = {}  # param_name -> addrspace string or None
         for line in lines:
-            m = re.match(
-                r'\s*define\s+void\s+@\w+\((.*)\)',
-                line
-            )
+            m = re.match(r"\s*define\s+void\s+@\w+\((.*)\)", line)
             if m:
-                for param in m.group(1).split(','):
+                for param in m.group(1).split(","):
                     param = param.strip()
                     # Extract param name (last %word in the param)
-                    name_m = re.search(r'(%\S+)\s*$', param)
+                    name_m = re.search(r"(%\S+)\s*$", param)
                     if name_m:
                         pname = name_m.group(1)
                         sig_param_names.append(pname)
                         # Check if it has an addrspace
-                        as_m = re.search(r'addrspace\((\d+)\)', param)
+                        as_m = re.search(r"addrspace\((\d+)\)", param)
                         if as_m:
                             sig_param_addrspaces[pname] = as_m.group(1)
                 break
@@ -948,22 +936,22 @@ class MetalBackend(BaseBackend):
         # If we found a GEP that uses the param, use that type; else default to float.
         def _get_device_ptr_type(param_name):
             """Return the element type for a device buffer parameter."""
-            return param_types.get(param_name, 'float')
+            return param_types.get(param_name, "float")
 
         # Build maps: param_index -> element_type for device and constant buffers
         param_elem_types = {}  # index -> elem_type string (device buffers)
         const_elem_types = {}  # index -> elem_type string (constant buffers)
         for i, pname in enumerate(sig_param_names):
-            if sig_param_addrspaces.get(pname) == '1':
+            if sig_param_addrspaces.get(pname) == "1":
                 param_elem_types[i] = _get_device_ptr_type(pname)
-            elif sig_param_addrspaces.get(pname) == '2':
-                const_elem_types[i] = param_types.get(pname, 'i32')
+            elif sig_param_addrspaces.get(pname) == "2":
+                const_elem_types[i] = param_types.get(pname, "i32")
 
         # Build per-param constant buffer type lookup by name (for non-sig lines)
         const_param_type_by_name = {}
         for i, pname in enumerate(sig_param_names):
-            if sig_param_addrspaces.get(pname) == '2':
-                const_param_type_by_name[pname] = const_elem_types.get(i, 'i32')
+            if sig_param_addrspaces.get(pname) == "2":
+                const_param_type_by_name[pname] = const_elem_types.get(i, "i32")
 
         # Pass 0.75: Rewrite AIR intrinsic declarations (and their call-site
         # pointer-operand types) from opaque `ptr addrspace(N)` to typed
@@ -972,29 +960,29 @@ class MetalBackend(BaseBackend):
         # rejects opaque pointers in `declare` lines with:
         #   "ptr type is only supported in -opaque-pointers mode".
         _PTR_SUFFIX_MAP = {
-            'p0f32': ('float*', '0', 'float'),
-            'p1f32': ('float addrspace(1)*', '1', 'float'),
-            'p2f32': ('float addrspace(2)*', '2', 'float'),
-            'p3f32': ('float addrspace(3)*', '3', 'float'),
-            'p0f16': ('half*', '0', 'half'),
-            'p1f16': ('half addrspace(1)*', '1', 'half'),
-            'p2f16': ('half addrspace(2)*', '2', 'half'),
-            'p3f16': ('half addrspace(3)*', '3', 'half'),
-            'p0i32': ('i32*', '0', 'i32'),
-            'p1i32': ('i32 addrspace(1)*', '1', 'i32'),
-            'p2i32': ('i32 addrspace(2)*', '2', 'i32'),
-            'p3i32': ('i32 addrspace(3)*', '3', 'i32'),
+            "p0f32": ("float*", "0", "float"),
+            "p1f32": ("float addrspace(1)*", "1", "float"),
+            "p2f32": ("float addrspace(2)*", "2", "float"),
+            "p3f32": ("float addrspace(3)*", "3", "float"),
+            "p0f16": ("half*", "0", "half"),
+            "p1f16": ("half addrspace(1)*", "1", "half"),
+            "p2f16": ("half addrspace(2)*", "2", "half"),
+            "p3f16": ("half addrspace(3)*", "3", "half"),
+            "p0i32": ("i32*", "0", "i32"),
+            "p1i32": ("i32 addrspace(1)*", "1", "i32"),
+            "p2i32": ("i32 addrspace(2)*", "2", "i32"),
+            "p3i32": ("i32 addrspace(3)*", "3", "i32"),
         }
         # Map intrinsic-name -> typed-pointer string (for the pointer operand).
         air_intrinsic_ptr_types = {}
         for line in lines:
-            m = re.match(r'\s*declare\s+.*@(air\.[\w.]+)\(', line)
+            m = re.match(r"\s*declare\s+.*@(air\.[\w.]+)\(", line)
             if not m:
                 continue
             iname = m.group(1)
             # Find the FIRST pN<type> suffix; AIR names may stack suffixes
             # like `.v64f32.p3f32` so we want the *pointer* one.
-            psuf = re.search(r'\.(p[0-3][a-z0-9]+)', iname)
+            psuf = re.search(r"\.(p[0-3][a-z0-9]+)", iname)
             if not psuf:
                 continue
             entry = _PTR_SUFFIX_MAP.get(psuf.group(1))
@@ -1006,12 +994,11 @@ class MetalBackend(BaseBackend):
         if air_intrinsic_ptr_types:
             new_lines = []
             for line in lines:
-                for iname, (typed_ptr, addr, _elem) in (
-                        air_intrinsic_ptr_types.items()):
-                    if f'@{iname}' not in line:
+                for iname, (typed_ptr, addr, _elem) in air_intrinsic_ptr_types.items():
+                    if f"@{iname}" not in line:
                         continue
                     line = re.sub(
-                        rf'ptr\s+addrspace\({addr}\)',
+                        rf"ptr\s+addrspace\({addr}\)",
                         typed_ptr,
                         line,
                     )
@@ -1025,15 +1012,15 @@ class MetalBackend(BaseBackend):
 
         for line in lines:
             # Skip addrspacecast lines
-            if re.match(r'\s*%\S+\s*=\s*addrspacecast\s+.*to\s+ptr', line):
+            if re.match(r"\s*%\S+\s*=\s*addrspacecast\s+.*to\s+ptr", line):
                 continue
 
             # Strip `nuw` / `nsw` flags from getelementptr (both instruction
             # and constant-expression forms). Metal's older LLVM parser
             # rejects these flags with "expected '(' in constantexpr".
             line = re.sub(
-                r'getelementptr\s+((?:inbounds\s+)?)(?:nuw|nsw)\s+',
-                r'getelementptr \1',
+                r"getelementptr\s+((?:inbounds\s+)?)(?:nuw|nsw)\s+",
+                r"getelementptr \1",
                 line,
             )
 
@@ -1042,29 +1029,32 @@ class MetalBackend(BaseBackend):
             # `GEP(i8, half addrspace(3)* p, i64 16)` — in typed-pointer
             # mode this is rejected ("i8 vs half"). Convert back to
             # `GEP(half, half addrspace(3)* p, i64 8)`.
-            _ELEM_BYTES = {'half': 2, 'float': 4, 'bfloat': 2,
-                           'i8': 1, 'i16': 2, 'i32': 4, 'i64': 8}
+            _ELEM_BYTES = {"half": 2, "float": 4, "bfloat": 2, "i8": 1, "i16": 2, "i32": 4, "i64": 8}
+
             def _fix_byte_gep(m):
-                prefix = m.group(1)        # `inbounds ` or ''
-                elem_ptr_ty = m.group(2)   # `half` or `float` etc.
-                addr_space = m.group(3)    # '1', '2', '3'
-                ptr_expr = m.group(4)      # `@name` or `%name` or nested GEP
+                prefix = m.group(1)  # `inbounds ` or ''
+                elem_ptr_ty = m.group(2)  # `half` or `float` etc.
+                addr_space = m.group(3)  # '1', '2', '3'
+                ptr_expr = m.group(4)  # `@name` or `%name` or nested GEP
                 byte_off = int(m.group(5))
                 size = _ELEM_BYTES.get(elem_ptr_ty)
                 if size is None or byte_off % size != 0:
                     return m.group(0)
                 elem_off = byte_off // size
-                return (f'getelementptr {prefix}({elem_ptr_ty}, '
-                        f'{elem_ptr_ty} addrspace({addr_space})* {ptr_expr}'
-                        f', i64 {elem_off})')
+                return (
+                    f"getelementptr {prefix}({elem_ptr_ty}, "
+                    f"{elem_ptr_ty} addrspace({addr_space})* {ptr_expr}"
+                    f", i64 {elem_off})"
+                )
+
             # This handles `getelementptr [inbounds] (i8, <T> addrspace(N)* <P>,
             # i64 <N>)` where <P> may itself be a constant expression without
             # parens in it. We match non-greedily up to the matching `)` by
             # disallowing any other comma after the second arg.
             line = re.sub(
-                r'getelementptr\s+((?:inbounds\s+)?)'
-                r'\(i8,\s*(\w+)\s+addrspace\((\d+)\)\*\s+'
-                r'(@[\w.]+|getelementptr\([^)]*\))\s*,\s*i64\s+(\d+)\)',
+                r"getelementptr\s+((?:inbounds\s+)?)"
+                r"\(i8,\s*(\w+)\s+addrspace\((\d+)\)\*\s+"
+                r"(@[\w.]+|getelementptr\([^)]*\))\s*,\s*i64\s+(\d+)\)",
                 _fix_byte_gep,
                 line,
             )
@@ -1073,58 +1063,44 @@ class MetalBackend(BaseBackend):
             for name in sorted(cast_map.keys(), key=len, reverse=True):
                 src, addrspace = cast_map[name]
                 # Word-boundary replacement
-                line = re.sub(re.escape(name) + r'(?=[\s,)\]]|$)', src, line)
+                line = re.sub(re.escape(name) + r"(?=[\s,)\]]|$)", src, line)
 
             # Convert function signature with per-param types
-            def_m = re.match(
-                r'(\s*define\s+void\s+@\w+\()(.*?)(\)\s*\{.*)$',
-                line
-            )
+            def_m = re.match(r"(\s*define\s+void\s+@\w+\()(.*?)(\)\s*\{.*)$", line)
             if def_m:
                 prefix, params_str, suffix = def_m.group(1), def_m.group(2), def_m.group(3)
                 new_params = []
-                for i, param in enumerate(params_str.split(',')):
+                for i, param in enumerate(params_str.split(",")):
                     param = param.strip()
-                    if 'ptr addrspace(1)' in param:
-                        ety = param_elem_types.get(i, 'float')
-                        param = param.replace('ptr addrspace(1)', f'{ety} addrspace(1)*')
-                    elif 'ptr addrspace(2)' in param:
-                        ety = const_elem_types.get(i, 'i32')
-                        param = param.replace('ptr addrspace(2)', f'{ety} addrspace(2)*')
+                    if "ptr addrspace(1)" in param:
+                        ety = param_elem_types.get(i, "float")
+                        param = param.replace("ptr addrspace(1)", f"{ety} addrspace(1)*")
+                    elif "ptr addrspace(2)" in param:
+                        ety = const_elem_types.get(i, "i32")
+                        param = param.replace("ptr addrspace(2)", f"{ety} addrspace(2)*")
                     new_params.append(param)
-                line = prefix + ', '.join(new_params) + suffix
+                line = prefix + ", ".join(new_params) + suffix
             else:
                 # Non-signature lines: convert ptr addrspace(2) with correct type.
                 # Match "ptr addrspace(2) %name" and use the inferred type.
                 def _replace_const_ptr(m):
                     pname = m.group(1)
-                    ety = const_param_type_by_name.get(pname, 'i32')
-                    return f'{ety} addrspace(2)* {pname}'
-                line = re.sub(
-                    r'ptr\s+addrspace\(2\)\s+(%([\w.]+))',
-                    _replace_const_ptr,
-                    line
-                )
+                    ety = const_param_type_by_name.get(pname, "i32")
+                    return f"{ety} addrspace(2)* {pname}"
+
+                line = re.sub(r"ptr\s+addrspace\(2\)\s+(%([\w.]+))", _replace_const_ptr, line)
                 # Do NOT blindly replace ptr addrspace(1) here; GEP/load/store
                 # handlers below will use the correct element type.
 
             # GEP: getelementptr <type>, ptr %X → getelementptr <type>, <type> addrspace(1)* %X
-            line = re.sub(
-                r'getelementptr\s+(\w+),\s*ptr\s+(%\S+)',
-                r'getelementptr \1, \1 addrspace(1)* \2',
-                line
-            )
+            line = re.sub(r"getelementptr\s+(\w+),\s*ptr\s+(%\S+)", r"getelementptr \1, \1 addrspace(1)* \2", line)
 
             # Load from GEP result (device buffer, addrspace 1):
             # load <type>, ptr %X -> load <type>, <type> addrspace(1)* %X
             # By this point, constant buffer loads (addrspace 2) already have
             # their ptr replaced with i32 addrspace(2)*, so any remaining
             # "load <type>, ptr %X" refers to a device buffer GEP result.
-            line = re.sub(
-                r'load\s+(\w+),\s*ptr\s+(%\S+)',
-                r'load \1, \1 addrspace(1)* \2',
-                line
-            )
+            line = re.sub(r"load\s+(\w+),\s*ptr\s+(%\S+)", r"load \1, \1 addrspace(1)* \2", line)
 
             # Store: store <type> %v, ptr %X → store <type> %v, <type> addrspace(1)* %X
             # Handle any scalar type. The stored value may be an SSA register
@@ -1132,11 +1108,7 @@ class MetalBackend(BaseBackend):
             # zero-init); match both, otherwise the pointer is left opaque and
             # Metal rejects the IR ("ptr type is only supported in
             # -opaque-pointers mode") — which then AGX-rejects the metallib.
-            line = re.sub(
-                r'store\s+(\w+)\s+(\S+),\s*ptr\s+(%\S+)',
-                r'store \1 \2, \1 addrspace(1)* \3',
-                line
-            )
+            line = re.sub(r"store\s+(\w+)\s+(\S+),\s*ptr\s+(%\S+)", r"store \1 \2, \1 addrspace(1)* \3", line)
 
             # PHI nodes with ptr type: phi ptr [ %a, %bb1 ], [ %b, %bb2 ]
             # These come from scf.for loop iter_args that carry pointers.
@@ -1144,11 +1116,7 @@ class MetalBackend(BaseBackend):
             # The element type is inferred from uses (GEP/load/store).
             # For simplicity, default to float addrspace(1)* since that's
             # the most common case for device buffer pointers in loops.
-            line = re.sub(
-                r'phi\s+ptr\s+\[',
-                r'phi float addrspace(1)* [',
-                line
-            )
+            line = re.sub(r"phi\s+ptr\s+\[", r"phi float addrspace(1)* [", line)
 
             # ---- Threadgroup shared memory (addrspace 3) patterns ----
             # These are generated by the reduce op lowering.
@@ -1157,9 +1125,9 @@ class MetalBackend(BaseBackend):
             # -> getelementptr [N x <elem>], [N x <elem>] addrspace(3)* @name, ...
             # Generalized over element types (float, half, i32, ...).
             line = re.sub(
-                r'getelementptr\s+(\[\d+ x \w+\]),\s*ptr addrspace\(3\)\s+([%@]\S+)',
-                r'getelementptr \1, \1 addrspace(3)* \2',
-                line
+                r"getelementptr\s+(\[\d+ x \w+\]),\s*ptr addrspace\(3\)\s+([%@]\S+)",
+                r"getelementptr \1, \1 addrspace(3)* \2",
+                line,
             )
 
             # When an AIR intrinsic (or other typed-pointer call) receives a
@@ -1178,13 +1146,13 @@ class MetalBackend(BaseBackend):
                     return m.group(0)
                 # Only wrap when the stored global is an array of the same
                 # element type (i.e. `[N x <elem>]`), otherwise leave alone.
-                arr_m = re.match(r'\[(\d+) x (\w+)\]', gty)
+                arr_m = re.match(r"\[(\d+) x (\w+)\]", gty)
                 if not arr_m or arr_m.group(2) != elem:
                     return m.group(0)
-                return (f'{elem} addrspace(3)* getelementptr({gty}, {gty}'
-                        f' addrspace(3)* {gname}, i32 0, i32 0)')
+                return f"{elem} addrspace(3)* getelementptr({gty}, {gty} addrspace(3)* {gname}, i32 0, i32 0)"
+
             line = re.sub(
-                r'(\w+)\s+addrspace\(3\)\*\s+(@[\w.]+)',
+                r"(\w+)\s+addrspace\(3\)\*\s+(@[\w.]+)",
                 _wrap_tg_global,
                 line,
             )
@@ -1196,82 +1164,77 @@ class MetalBackend(BaseBackend):
             # when it coalesces reduce globals with non-overlapping live
             # ranges; they keep the `[32 x float]` type.
             m_tg_store = re.match(
-                r'(\s*store\s+float\s+\S+),\s*ptr addrspace\(3\)\s+'
-                r'(@(?:__reduce_shared_|__tg_merged_)\d+)(.*)',
-                line
+                r"(\s*store\s+float\s+\S+),\s*ptr addrspace\(3\)\s+"
+                r"(@(?:__reduce_shared_|__tg_merged_)\d+)(.*)",
+                line,
             )
             if m_tg_store:
-                line = (f'{m_tg_store.group(1)}, float addrspace(3)* '
-                        f'getelementptr([32 x float], [32 x float] addrspace(3)* '
-                        f'{m_tg_store.group(2)}, i32 0, i32 0){m_tg_store.group(3)}')
+                line = (
+                    f"{m_tg_store.group(1)}, float addrspace(3)* "
+                    f"getelementptr([32 x float], [32 x float] addrspace(3)* "
+                    f"{m_tg_store.group(2)}, i32 0, i32 0){m_tg_store.group(3)}"
+                )
             else:
                 # Generalized scalar store: any scalar element type.
                 line = re.sub(
-                    r'store\s+(\w+)\s+(%\S+),\s*ptr addrspace\(3\)\s+([%@]\S+)',
-                    r'store \1 \2, \1 addrspace(3)* \3',
-                    line
+                    r"store\s+(\w+)\s+(%\S+),\s*ptr addrspace\(3\)\s+([%@]\S+)",
+                    r"store \1 \2, \1 addrspace(3)* \3",
+                    line,
                 )
 
             # Load from threadgroup: load <elem>, ptr addrspace(3) %slot or @global
             m_tg_load = re.match(
-                r'(\s*%\S+\s*=\s*load\s+float),\s*ptr addrspace\(3\)\s+'
-                r'(@(?:__reduce_shared_|__tg_merged_)\d+)(.*)',
-                line
+                r"(\s*%\S+\s*=\s*load\s+float),\s*ptr addrspace\(3\)\s+"
+                r"(@(?:__reduce_shared_|__tg_merged_)\d+)(.*)",
+                line,
             )
             if m_tg_load:
-                line = (f'{m_tg_load.group(1)}, float addrspace(3)* '
-                        f'getelementptr([32 x float], [32 x float] addrspace(3)* '
-                        f'{m_tg_load.group(2)}, i32 0, i32 0){m_tg_load.group(3)}')
-            else:
-                line = re.sub(
-                    r'load\s+(\w+),\s*ptr addrspace\(3\)\s+([%@]\S+)',
-                    r'load \1, \1 addrspace(3)* \2',
-                    line
+                line = (
+                    f"{m_tg_load.group(1)}, float addrspace(3)* "
+                    f"getelementptr([32 x float], [32 x float] addrspace(3)* "
+                    f"{m_tg_load.group(2)}, i32 0, i32 0){m_tg_load.group(3)}"
                 )
+            else:
+                line = re.sub(r"load\s+(\w+),\s*ptr addrspace\(3\)\s+([%@]\S+)", r"load \1, \1 addrspace(3)* \2", line)
 
             # Capture function name and param types for metadata
-            m = re.match(
-                r'\s*define\s+void\s+@(\w+)\(((?:[^()]*|\([^()]*\))*)\)',
-                line
-            )
+            m = re.match(r"\s*define\s+void\s+@(\w+)\(((?:[^()]*|\([^()]*\))*)\)", line)
             if m:
                 fn_name = m.group(1)
-                for param in m.group(2).split(','):
+                for param in m.group(2).split(","):
                     param = param.strip()
-                    idx = param.rfind('%')
+                    idx = param.rfind("%")
                     if idx > 0:
                         fn_param_types.append(param[:idx].rstrip())
                     else:
                         fn_param_types.append(param)
 
             # Metadata: ptr @fn -> typed function pointer
-            if fn_name and line.strip().startswith('!') and f'ptr @{fn_name}' in line:
-                typed_sig = ', '.join(fn_param_types)
-                fn_ptr_type = f'void ({typed_sig})*'
-                line = line.replace(f'ptr @{fn_name}', f'{fn_ptr_type} @{fn_name}')
+            if fn_name and line.strip().startswith("!") and f"ptr @{fn_name}" in line:
+                typed_sig = ", ".join(fn_param_types)
+                fn_ptr_type = f"void ({typed_sig})*"
+                line = line.replace(f"ptr @{fn_name}", f"{fn_ptr_type} @{fn_name}")
 
             # Metadata: ptr addrspace(3) @global -> typed pointer to the global.
             # Emitted by the C++ bridge for !air.threadgroup_buffers entries.
             # Metal rejects opaque `ptr` in metadata operands.
-            if line.strip().startswith('!') and 'ptr addrspace(3)' in line:
+            if line.strip().startswith("!") and "ptr addrspace(3)" in line:
+
                 def _rewrite_tg_global(m):
                     gname = m.group(1)
                     gty = tg_global_types.get(gname)
                     if gty is None:
                         return m.group(0)
-                    return f'{gty} addrspace(3)* {gname}'
-                line = re.sub(
-                    r'ptr\s+addrspace\(3\)\s+(@[\w.]+)',
-                    _rewrite_tg_global,
-                    line
-                )
+                    return f"{gty} addrspace(3)* {gname}"
+
+                line = re.sub(r"ptr\s+addrspace\(3\)\s+(@[\w.]+)", _rewrite_tg_global, line)
 
             # Fix metadata arg_type_name and arg_type_size for non-float device buffers.
             # The C++ pass hardcodes "float" / size 4 for all device buffers.
             # Replace with the correct type based on GEP-inferred element types.
-            if line.strip().startswith('!') and '!"air.buffer"' in line and '!"air.address_space", i32 1' in line:
+            if line.strip().startswith("!") and '!"air.buffer"' in line and '!"air.address_space", i32 1' in line:
                 # This is a device buffer metadata entry. Extract the arg index.
-                arg_idx_m = re.match(r'(\s*!\d+\s*=\s*!\{i32\s+)(\d+)', line)
+                arg_idx_m = re.match(r"(\s*!\d+\s*=\s*!\{i32\s+)(\d+)", line)
                 if arg_idx_m:
                     arg_idx = int(arg_idx_m.group(2))
                     if arg_idx in param_elem_types:
@@ -1280,27 +1243,15 @@ class MetalBackend(BaseBackend):
                         if type_info:
                             byte_size, align_size, air_name = type_info
                             # Replace arg_type_size
-                            line = re.sub(
-                                r'(!"air\.arg_type_size",\s*i32\s+)\d+',
-                                rf'\g<1>{byte_size}',
-                                line
-                            )
+                            line = re.sub(r'(!"air\.arg_type_size",\s*i32\s+)\d+', rf"\g<1>{byte_size}", line)
                             # Replace arg_type_align_size
-                            line = re.sub(
-                                r'(!"air\.arg_type_align_size",\s*i32\s+)\d+',
-                                rf'\g<1>{align_size}',
-                                line
-                            )
+                            line = re.sub(r'(!"air\.arg_type_align_size",\s*i32\s+)\d+', rf"\g<1>{align_size}", line)
                             # Replace arg_type_name
-                            line = re.sub(
-                                r'(!"air\.arg_type_name",\s*!")(\w+)(")',
-                                rf'\g<1>{air_name}\3',
-                                line
-                            )
+                            line = re.sub(r'(!"air\.arg_type_name",\s*!")(\w+)(")', rf"\g<1>{air_name}\3", line)
 
             out_lines.append(line)
 
-        return '\n'.join(out_lines)
+        return "\n".join(out_lines)
 
     @staticmethod
     def _strip_unsupported_llvm_attrs(llir_text):
@@ -1313,17 +1264,17 @@ class MetalBackend(BaseBackend):
         """
         import re
 
-        lines = llir_text.split('\n')
+        lines = llir_text.split("\n")
         out_lines = []
         for line in lines:
             # Remove "attributes #N = { ... }" lines entirely
-            if re.match(r'\s*attributes\s+#\d+\s*=\s*\{', line):
+            if re.match(r"\s*attributes\s+#\d+\s*=\s*\{", line):
                 continue
             # Remove #N references from declare/define lines
-            line = re.sub(r'\s+#\d+\b', '', line)
+            line = re.sub(r"\s+#\d+\b", "", line)
             out_lines.append(line)
 
-        return '\n'.join(out_lines)
+        return "\n".join(out_lines)
 
     @staticmethod
     def _rename_llvm_kernel(llir_text, new_name):
@@ -1335,12 +1286,13 @@ class MetalBackend(BaseBackend):
         AIR metadata nodes like !air.kernel).
         """
         import re
+
         if not new_name or new_name == "kernel":
             return llir_text
         # Rewrite define line and all @kernel references (as a whole word)
         # so substrings like @kernel_fn aren't accidentally matched.
-        pattern = re.compile(r'@kernel\b')
-        return pattern.sub(f'@{new_name}', llir_text)
+        pattern = re.compile(r"@kernel\b")
+        return pattern.sub(f"@{new_name}", llir_text)
 
     # Mapping from LLVM intrinsics to AIR intrinsics for math functions
     # that Metal's runtime doesn't resolve as standard LLVM intrinsics.
@@ -1414,14 +1366,15 @@ class MetalBackend(BaseBackend):
 
         # -- Compute block_size early (needed for wrapping loop decision) ----
         import re
+
         block_size = options.num_warps * 32  # default
         # Collect (end, slice_dim) pairs, one per tt.make_range occurrence,
         # so we can compute block_size = prod(end for each distinct slice dim)
         # for 2D kernels (e.g. 32x32 matmul = 1024 threads), not prod(set()).
         mr_entries = []  # list of (end, slice_dim or None)
         for mr_match in re.finditer(
-            r'tt\.make_range\s*\{[^}]*end\s*=\s*(\d+)[^}]*\}\s*:\s*tensor<'
-            r'\d+xi32(?:,\s*#ttg\.slice<\{dim\s*=\s*(\d+))?',
+            r"tt\.make_range\s*\{[^}]*end\s*=\s*(\d+)[^}]*\}\s*:\s*tensor<"
+            r"\d+xi32(?:,\s*#ttg\.slice<\{dim\s*=\s*(\d+))?",
             ttgir_text,
         ):
             end = int(mr_match.group(1))
@@ -1462,7 +1415,9 @@ class MetalBackend(BaseBackend):
                 with open(os.path.join(debug_dir, f"{kernel_name}.pre_wrap.ll"), "w") as f:
                     f.write(air_llvm_ir_opaque)
             air_llvm_ir_opaque = MetalBackend._inject_wrapping_loop(
-                air_llvm_ir_opaque, block_size, cap,
+                air_llvm_ir_opaque,
+                block_size,
+                cap,
             )
             if level >= 1:
                 with open(os.path.join(debug_dir, f"{kernel_name}.wrapped.ll"), "w") as f:
@@ -1491,14 +1446,14 @@ class MetalBackend(BaseBackend):
 
         # Extract kernel name from the LLVM IR (sanity check — should match
         # the name we just renamed to above).
-        m = re.search(r'define\s+void\s+@(\w+)\s*\(', air_llvm_ir)
+        m = re.search(r"define\s+void\s+@(\w+)\s*\(", air_llvm_ir)
         if m:
             metadata["name"] = m.group(1)
 
         metadata.setdefault("block_size", min(block_size, 1024))
 
         # Detect 2D grid usage from program_id axes in the TTGIR.
-        needs_2d = bool(re.search(r'tt\.get_program_id\s+y\b', ttgir_text))
+        needs_2d = bool(re.search(r"tt\.get_program_id\s+y\b", ttgir_text))
         metadata.setdefault("needs_2d_grid", needs_2d)
 
         return air_llvm_ir
@@ -1519,31 +1474,32 @@ class MetalBackend(BaseBackend):
         # The argument list contains nested parens (e.g. addrspace(1)),
         # so we match the define line ending with ') {' then the body.
         fn_match = re.search(
-            r'(define void @\w+\(.*?\) \{)\n(.*?)\n(\})',
-            ir_text, re.DOTALL,
+            r"(define void @\w+\(.*?\) \{)\n(.*?)\n(\})",
+            ir_text,
+            re.DOTALL,
         )
         if not fn_match:
             raise RuntimeError("_inject_wrapping_loop: cannot find function body")
 
-        fn_header = fn_match.group(1)   # define void @name(...) {
+        fn_header = fn_match.group(1)  # define void @name(...) {
         body = fn_match.group(2)
-        fn_close = fn_match.group(3)    # }
+        fn_close = fn_match.group(3)  # }
 
         # ---- determine entry block implicit label ---------------------------
         # The entry block label = next unused SSA number after unnamed args.
         # Named args (%pid, %lid) don't consume SSA numbers.
         # Extract args from fn_header by stripping 'define void @name(' ... ') {'
-        args_match = re.search(r'@\w+\((.*)\)\s*\{', fn_header, re.DOTALL)
+        args_match = re.search(r"@\w+\((.*)\)\s*\{", fn_header, re.DOTALL)
         unnamed_count = 0
         if args_match:
-            for arg in args_match.group(1).split(','):
+            for arg in args_match.group(1).split(","):
                 arg = arg.strip()
-                if arg and re.search(r'%\d+\s*$', arg):
+                if arg and re.search(r"%\d+\s*$", arg):
                     unnamed_count += 1
         entry_label = str(unnamed_count)
 
         # ---- split body into lines and identify blocks ----------------------
-        lines = body.split('\n')
+        lines = body.split("\n")
 
         # Separate setup lines (addrspacecasts + addrspace(2) loads) from
         # compute lines in the entry block.
@@ -1556,14 +1512,12 @@ class MetalBackend(BaseBackend):
         for line in lines:
             stripped = line.strip()
             # Detect start of a new basic block (numeric or named label)
-            if re.match(r'^\d+:', stripped) or re.match(r'^[a-zA-Z_]\w*:', stripped):
+            if re.match(r"^\d+:", stripped) or re.match(r"^[a-zA-Z_]\w*:", stripped):
                 in_entry = False
 
             if in_entry:
                 if not past_setup and (
-                    'addrspacecast' in stripped
-                    or ('load' in stripped and 'addrspace(2)' in stripped)
-                    or stripped == ''
+                    "addrspacecast" in stripped or ("load" in stripped and "addrspace(2)" in stripped) or stripped == ""
                 ):
                     setup_lines.append(line)
                 else:
@@ -1575,10 +1529,10 @@ class MetalBackend(BaseBackend):
         # ---- replace %lid with %_wlid in compute + other blocks ------------
         def replace_lid(text):
             # Replace %lid as a whole word (not inside other identifiers)
-            return re.sub(r'%lid\b', '%_wlid', text)
+            return re.sub(r"%lid\b", "%_wlid", text)
 
-        compute_text = replace_lid('\n'.join(compute_lines))
-        other_text = replace_lid('\n'.join(other_blocks))
+        compute_text = replace_lid("\n".join(compute_lines))
+        other_text = replace_lid("\n".join(other_blocks))
 
         # ---- rewrite phi incoming labels from %<entry> to %_wl_header -------
         # After wrapping, the entry block ends with `br label %_wl_header`
@@ -1594,14 +1548,15 @@ class MetalBackend(BaseBackend):
             # `%_wl_header`. We scan line-by-line to avoid touching lines
             # like `br label %N` where %N is a branch target, not a phi pred.
             out_lines = []
-            for ln in text.split('\n'):
-                if ' = phi ' in ln:
+            for ln in text.split("\n"):
+                if " = phi " in ln:
                     ln = re.sub(
-                        r'(\[\s*[^,\]]+,\s*)%' + re.escape(entry_label) + r'(\s*\])',
-                        r'\g<1>%_wl_header\g<2>', ln,
+                        r"(\[\s*[^,\]]+,\s*)%" + re.escape(entry_label) + r"(\s*\])",
+                        r"\g<1>%_wl_header\g<2>",
+                        ln,
                     )
                 out_lines.append(ln)
-            return '\n'.join(out_lines)
+            return "\n".join(out_lines)
 
         compute_text = rewrite_phi_preds(compute_text)
         other_text = rewrite_phi_preds(other_text)
@@ -1613,41 +1568,41 @@ class MetalBackend(BaseBackend):
 
         # Find the merge block label (block containing ret void)
         merge_label = None
-        for m in re.finditer(r'^(\d+):\s*;.*$', other_text, re.MULTILINE):
+        for m in re.finditer(r"^(\d+):\s*;.*$", other_text, re.MULTILINE):
             # Check if this block contains ret void
             block_start = m.end()
-            next_block = re.search(r'^\d+:', other_text[block_start:], re.MULTILINE)
+            next_block = re.search(r"^\d+:", other_text[block_start:], re.MULTILINE)
             block_end = block_start + next_block.start() if next_block else len(other_text)
             block_body = other_text[block_start:block_end]
-            if 'ret void' in block_body:
+            if "ret void" in block_body:
                 merge_label = m.group(1)
                 break
 
         # Also check if ret void is directly in compute_text (no conditional store)
-        ret_in_compute = 'ret void' in compute_text and merge_label is None
+        ret_in_compute = "ret void" in compute_text and merge_label is None
 
         if ret_in_compute:
             # Simple case: no conditional branch, ret void directly in compute.
             # The compute block has a direct store + ret void.
             # Replace ret void with branch to latch.
-            compute_text = compute_text.replace('ret void', 'br label %_wl_latch')
+            compute_text = compute_text.replace("ret void", "br label %_wl_latch")
 
             new_body_parts = [
-                '\n'.join(setup_lines),
-                f'  br label %_wl_header',
-                '',
-                f'_wl_header:',
-                f'  %_wlid = phi i32 [ %lid, %{entry_label} ], [ %_wlid_next, %_wl_latch ]',
+                "\n".join(setup_lines),
+                f"  br label %_wl_header",
+                "",
+                f"_wl_header:",
+                f"  %_wlid = phi i32 [ %lid, %{entry_label} ], [ %_wlid_next, %_wl_latch ]",
                 compute_text,
                 other_text,
-                '',
-                f'_wl_latch:',
-                f'  %_wlid_next = add i32 %_wlid, {cap}',
-                f'  %_wl_cmp = icmp slt i32 %_wlid_next, {total_elems}',
-                f'  br i1 %_wl_cmp, label %_wl_header, label %_wl_exit',
-                '',
-                f'_wl_exit:',
-                f'  ret void',
+                "",
+                f"_wl_latch:",
+                f"  %_wlid_next = add i32 %_wlid, {cap}",
+                f"  %_wl_cmp = icmp slt i32 %_wlid_next, {total_elems}",
+                f"  br i1 %_wl_cmp, label %_wl_header, label %_wl_exit",
+                "",
+                f"_wl_exit:",
+                f"  ret void",
             ]
         else:
             # Common case: conditional store with merge block.
@@ -1656,31 +1611,29 @@ class MetalBackend(BaseBackend):
             if merge_label is None:
                 # ret void might be at the end of other_text without a labeled block
                 # (shouldn't happen with our IR, but handle gracefully)
-                raise RuntimeError(
-                    "_inject_wrapping_loop: cannot find merge block with ret void"
-                )
+                raise RuntimeError("_inject_wrapping_loop: cannot find merge block with ret void")
 
             # Replace 'ret void' in the merge block with branch to latch
-            other_text = other_text.replace('ret void', 'br label %_wl_latch')
+            other_text = other_text.replace("ret void", "br label %_wl_latch")
 
             # In compute_text, redirect branches to merge label to go to latch.
             # e.g., "br i1 %6, label %11, label %12" where %12 is the merge.
             # The false branch (mask=false, skip store) should go to latch.
             compute_text = re.sub(
-                r'br label %' + merge_label + r'\b',
-                'br label %_wl_latch',
+                r"br label %" + merge_label + r"\b",
+                "br label %_wl_latch",
                 compute_text,
             )
             compute_text = re.sub(
-                r'(br i1 [^,]+, label %\d+), label %' + merge_label + r'\b',
-                r'\1, label %_wl_latch',
+                r"(br i1 [^,]+, label %\d+), label %" + merge_label + r"\b",
+                r"\1, label %_wl_latch",
                 compute_text,
             )
 
             # In other_text, redirect branches to merge to go to latch
             other_text = re.sub(
-                r'br label %' + merge_label + r'\b',
-                'br label %_wl_latch',
+                r"br label %" + merge_label + r"\b",
+                "br label %_wl_latch",
                 other_text,
             )
 
@@ -1688,28 +1641,28 @@ class MetalBackend(BaseBackend):
             # (cosmetic, not functionally required)
 
             new_body_parts = [
-                '\n'.join(setup_lines),
-                f'  br label %_wl_header',
-                '',
-                f'_wl_header:',
-                f'  %_wlid = phi i32 [ %lid, %{entry_label} ], [ %_wlid_next, %_wl_latch ]',
+                "\n".join(setup_lines),
+                f"  br label %_wl_header",
+                "",
+                f"_wl_header:",
+                f"  %_wlid = phi i32 [ %lid, %{entry_label} ], [ %_wlid_next, %_wl_latch ]",
                 compute_text,
                 other_text,
-                '',
-                f'_wl_latch:',
-                f'  %_wlid_next = add i32 %_wlid, {cap}',
-                f'  %_wl_cmp = icmp slt i32 %_wlid_next, {total_elems}',
-                f'  br i1 %_wl_cmp, label %_wl_header, label %_wl_exit',
-                '',
-                f'_wl_exit:',
-                f'  ret void',
+                "",
+                f"_wl_latch:",
+                f"  %_wlid_next = add i32 %_wlid, {cap}",
+                f"  %_wl_cmp = icmp slt i32 %_wlid_next, {total_elems}",
+                f"  br i1 %_wl_cmp, label %_wl_header, label %_wl_exit",
+                "",
+                f"_wl_exit:",
+                f"  ret void",
             ]
 
-        new_body = '\n'.join(new_body_parts)
-        new_fn = f'{fn_header}\n{new_body}\n{fn_close}'
+        new_body = "\n".join(new_body_parts)
+        new_fn = f"{fn_header}\n{new_body}\n{fn_close}"
 
         # Replace the old function in the full IR text
-        return ir_text[:fn_match.start()] + new_fn + ir_text[fn_match.end():]
+        return ir_text[: fn_match.start()] + new_fn + ir_text[fn_match.end() :]
 
     @staticmethod
     def make_metallib_from_llir(src, metadata, options):
@@ -1782,16 +1735,23 @@ class MetalBackend(BaseBackend):
                     try:
                         subprocess.run(
                             [
-                                "xcrun", "-sdk", "macosx", "metal",
-                                "-c", "-x", "ir",
+                                "xcrun",
+                                "-sdk",
+                                "macosx",
+                                "metal",
+                                "-c",
+                                "-x",
+                                "ir",
                                 ll_path,
-                                "-o", air_path,
+                                "-o",
+                                air_path,
                             ],
                             capture_output=True,
                             check=True,
                         )
                     except subprocess.CalledProcessError as e:
                         from triton_msl.errors import MetalCompilationError
+
                         stderr = e.stderr.decode("utf-8", errors="replace") if e.stderr else ""
                         raise MetalCompilationError(
                             f"Metal IR compilation failed (exit {e.returncode})",
@@ -1809,6 +1769,7 @@ class MetalBackend(BaseBackend):
                             time.sleep(0.05 * (_attempt + 1))
                             continue
                         from triton_msl.errors import MetalCompilationError
+
                         raise MetalCompilationError(
                             f"Metal IR compilation produced no .air (transient; all {_METALLIB_COMPILE_ATTEMPTS} attempts failed)",
                             msl_source=ll_path,
@@ -1821,22 +1782,25 @@ class MetalBackend(BaseBackend):
                     try:
                         subprocess.run(
                             [
-                                "xcrun", "-sdk", "macosx", "metallib",
+                                "xcrun",
+                                "-sdk",
+                                "macosx",
+                                "metallib",
                                 air_path,
-                                "-o", tmp_metallib_path,
+                                "-o",
+                                tmp_metallib_path,
                             ],
                             capture_output=True,
                             check=True,
                         )
                     except subprocess.CalledProcessError as e:
                         stderr = e.stderr.decode("utf-8", errors="replace") if e.stderr else ""
-                        _last_transient_exc = subprocess.CalledProcessError(
-                            e.returncode, e.cmd, e.output, e.stderr
-                        )
+                        _last_transient_exc = subprocess.CalledProcessError(e.returncode, e.cmd, e.output, e.stderr)
                         if _attempt < _METALLIB_COMPILE_ATTEMPTS - 1:
                             time.sleep(0.05 * (_attempt + 1))
                             continue
                         from triton_msl.errors import MetalCompilationError
+
                         raise MetalCompilationError(
                             f"Metal library linking failed (exit {e.returncode})",
                             msl_source=air_path,
@@ -1851,6 +1815,7 @@ class MetalBackend(BaseBackend):
                             time.sleep(0.05 * (_attempt + 1))
                             continue
                         from triton_msl.errors import MetalCompilationError
+
                         raise MetalCompilationError(
                             f"Metal library linking failed (os.replace error: {e})",
                             msl_source=air_path,
@@ -1871,6 +1836,7 @@ class MetalBackend(BaseBackend):
                             time.sleep(0.05 * (_attempt + 1))
                             continue
                         from triton_msl.errors import MetalCompilationError
+
                         raise MetalCompilationError(
                             f"Metal library read failed (metallib vanished after replace: {e})",
                             msl_source=air_path,
@@ -1961,9 +1927,7 @@ class MetalBackend(BaseBackend):
 
         pm = ir.pass_manager(mod.context)
         target_str = f"metal:{options.arch}"
-        passes.ttir.add_convert_to_ttgpuir(
-            pm, target_str, options.num_warps, 32, options.num_ctas
-        )
+        passes.ttir.add_convert_to_ttgpuir(pm, target_str, options.num_warps, 32, options.num_ctas)
 
         passes.ttgpuir.add_coalesce(pm)
         passes.ttgpuir.add_remove_layout_conversions(pm)
@@ -2031,7 +1995,8 @@ class MetalBackend(BaseBackend):
             # Populate metadata that emit_msl would normally set.
             # Extract kernel name from MSL: "kernel void NAME("
             import re as _re
-            m = _re.search(r'kernel\s+void\s+(\w+)\s*\(', msl_src)
+
+            m = _re.search(r"kernel\s+void\s+(\w+)\s*\(", msl_src)
             if m:
                 metadata["name"] = m.group(1)
             else:
@@ -2044,6 +2009,7 @@ class MetalBackend(BaseBackend):
             meta_cache_path = msl_cache_path.replace(".msl", ".meta.json")
             if os.path.exists(meta_cache_path):
                 import json
+
                 with open(meta_cache_path, "r") as f:
                     cached_meta = json.load(f)
                 metadata.update(cached_meta)
@@ -2072,9 +2038,7 @@ class MetalBackend(BaseBackend):
             mode = _fallback_mode()
             if mode == "warn":
                 warnings.warn(
-                    f"triton-msl: MSL codegen failed for kernel "
-                    f"'{kernel_name}': {e}. "
-                    f"Kernel will fall back to CPU.",
+                    f"triton-msl: MSL codegen failed for kernel '{kernel_name}': {e}. Kernel will fall back to CPU.",
                     stacklevel=2,
                 )
             elif mode == "error":
@@ -2092,23 +2056,19 @@ class MetalBackend(BaseBackend):
             )
 
         # Cache the generated MSL and metadata atomically.
-        tmp_fd, tmp_path = tempfile.mkstemp(
-            dir=cache_dir, suffix=".msl.tmp"
-        )
+        tmp_fd, tmp_path = tempfile.mkstemp(dir=cache_dir, suffix=".msl.tmp")
         try:
             with os.fdopen(tmp_fd, "w") as f:
                 f.write(msl_src)
             os.replace(tmp_path, msl_cache_path)
             # Cache metadata (name, block_size, etc.) alongside the MSL.
             import json
+
             meta_cache_path = msl_cache_path.replace(".msl", ".meta.json")
             cacheable = {
-                k: v for k, v in metadata.items()
-                if isinstance(v, (str, int, float, bool, type(None), list, tuple))
+                k: v for k, v in metadata.items() if isinstance(v, (str, int, float, bool, type(None), list, tuple))
             }
-            tmp_meta_fd, tmp_meta_path = tempfile.mkstemp(
-                dir=cache_dir, suffix=".meta.tmp"
-            )
+            tmp_meta_fd, tmp_meta_path = tempfile.mkstemp(dir=cache_dir, suffix=".meta.tmp")
             with os.fdopen(tmp_meta_fd, "w") as f:
                 json.dump(cacheable, f)
             os.replace(tmp_meta_path, meta_cache_path)
@@ -2177,6 +2137,7 @@ class MetalBackend(BaseBackend):
             # the retry loop — it's deterministic and has no side-effects).
             if options.target_metal_version == "auto":
                 from triton_msl.backend.device_detect import get_device_info
+
                 metal_std_flag = get_device_info().metal_std_flag
             else:
                 metal_std_flag = f"-std=metal{options.target_metal_version}"
@@ -2215,9 +2176,14 @@ class MetalBackend(BaseBackend):
                     try:
                         subprocess.run(
                             [
-                                "xcrun", "-sdk", "macosx", "metal",
-                                "-c", metal_path,
-                                "-o", air_path,
+                                "xcrun",
+                                "-sdk",
+                                "macosx",
+                                "metal",
+                                "-c",
+                                metal_path,
+                                "-o",
+                                air_path,
                                 metal_std_flag,
                                 "-mmacosx-version-min=15.0",
                                 "-O2",
@@ -2229,6 +2195,7 @@ class MetalBackend(BaseBackend):
                     except subprocess.CalledProcessError as e:
                         import re
                         from triton_msl.errors import MetalCompilationError
+
                         stderr = e.stderr.decode("utf-8", errors="replace") if e.stderr else ""
                         # Distinguish a REAL deterministic MSL error from a
                         # TRANSIENT toolchain flake. A genuine compile error
@@ -2267,6 +2234,7 @@ class MetalBackend(BaseBackend):
                             time.sleep(0.05 * (_attempt + 1))
                             continue
                         from triton_msl.errors import MetalCompilationError
+
                         raise MetalCompilationError(
                             f"Metal shader compilation produced no .air (transient; all {_METALLIB_COMPILE_ATTEMPTS} attempts failed)",
                             msl_source=metal_path,
@@ -2279,22 +2247,25 @@ class MetalBackend(BaseBackend):
                     try:
                         subprocess.run(
                             [
-                                "xcrun", "-sdk", "macosx", "metallib",
+                                "xcrun",
+                                "-sdk",
+                                "macosx",
+                                "metallib",
                                 air_path,
-                                "-o", tmp_metallib_path,
+                                "-o",
+                                tmp_metallib_path,
                             ],
                             capture_output=True,
                             check=True,
                         )
                     except subprocess.CalledProcessError as e:
                         stderr = e.stderr.decode("utf-8", errors="replace") if e.stderr else ""
-                        _last_transient_exc = subprocess.CalledProcessError(
-                            e.returncode, e.cmd, e.output, e.stderr
-                        )
+                        _last_transient_exc = subprocess.CalledProcessError(e.returncode, e.cmd, e.output, e.stderr)
                         if _attempt < _METALLIB_COMPILE_ATTEMPTS - 1:
                             time.sleep(0.05 * (_attempt + 1))
                             continue
                         from triton_msl.errors import MetalCompilationError
+
                         raise MetalCompilationError(
                             f"Metal library linking failed (exit {e.returncode})",
                             msl_source=air_path,
@@ -2309,6 +2280,7 @@ class MetalBackend(BaseBackend):
                             time.sleep(0.05 * (_attempt + 1))
                             continue
                         from triton_msl.errors import MetalCompilationError
+
                         raise MetalCompilationError(
                             f"Metal library linking failed (os.replace error: {e})",
                             msl_source=air_path,
@@ -2329,6 +2301,7 @@ class MetalBackend(BaseBackend):
                             time.sleep(0.05 * (_attempt + 1))
                             continue
                         from triton_msl.errors import MetalCompilationError
+
                         raise MetalCompilationError(
                             f"Metal library read failed (metallib vanished after replace: {e})",
                             msl_source=air_path,
@@ -2369,14 +2342,19 @@ class MetalBackend(BaseBackend):
     @functools.lru_cache()
     def hash(self):
         try:
-            sdk_version = subprocess.check_output(
-                ["xcrun", "--show-sdk-version"],
-                stderr=subprocess.DEVNULL,
-            ).decode().strip()
+            sdk_version = (
+                subprocess.check_output(
+                    ["xcrun", "--show-sdk-version"],
+                    stderr=subprocess.DEVNULL,
+                )
+                .decode()
+                .strip()
+            )
         except (subprocess.CalledProcessError, FileNotFoundError):
             sdk_version = "unknown"
         # Include CODEGEN_VERSION so a codegen change invalidates the Triton-level
         # compile cache too, not only the MSL-text cache (_msl_cache_key). Closes the
         # dev-time in-place-edit replay window (re-audit #13 hardening).
         from triton_msl import CODEGEN_VERSION
+
         return f"metal-{sdk_version}-{self.target.arch}-{CODEGEN_VERSION}"

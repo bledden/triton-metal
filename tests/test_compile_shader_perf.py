@@ -43,6 +43,7 @@ MIN_GBPS = 250.0
 # Kernel under test
 # ---------------------------------------------------------------------------
 
+
 @triton.jit
 def _vadd_perf(A, B, OUT, N, BLOCK: tl.constexpr):
     o = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
@@ -53,6 +54,7 @@ def _vadd_perf(A, B, OUT, N, BLOCK: tl.constexpr):
 # ---------------------------------------------------------------------------
 # Perf gate test
 # ---------------------------------------------------------------------------
+
 
 @requires_fast_path
 def test_vector_add_fast_path_throughput():
@@ -85,10 +87,7 @@ def test_vector_add_fast_path_throughput():
 
     pct_peak = gbps / PEAK_BW * 100
 
-    print(
-        f"\n  vector_add@16M fast-path: {ms:.3f} ms → {gbps:.1f} GB/s "
-        f"({pct_peak:.1f}% of {PEAK_BW} GB/s peak)"
-    )
+    print(f"\n  vector_add@16M fast-path: {ms:.3f} ms → {gbps:.1f} GB/s ({pct_peak:.1f}% of {PEAK_BW} GB/s peak)")
 
     assert gbps >= MIN_GBPS, (
         f"compile_shader fast-path throughput {gbps:.1f} GB/s < {MIN_GBPS} GB/s gate. "

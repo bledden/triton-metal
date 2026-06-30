@@ -3,6 +3,7 @@ iter-arg (per-element accumulator) computes the column-sum correctly under
 flag-ON. Previously the array iter-arg was emitted as a scalar -> invalid
 MSL / refusal. Run with TRITON_MSL_MEPT=1. Serial only.
 """
+
 import os
 import pytest
 
@@ -11,20 +12,22 @@ try:
     import triton
     import triton.language as tl
     import Metal
+
     HAS = Metal.MTLCreateSystemDefaultDevice() is not None
 except Exception:
     HAS = False
 
 requires_metal = pytest.mark.skipif(not HAS, reason="Metal/torch/triton needed")
 requires_mept = pytest.mark.skipif(
-    os.environ.get("TRITON_MSL_MEPT") != "1",
-    reason="requires TRITON_MSL_MEPT=1 (M3 register-array iter-arg)")
+    os.environ.get("TRITON_MSL_MEPT") != "1", reason="requires TRITON_MSL_MEPT=1 (M3 register-array iter-arg)"
+)
 
 if HAS:
+
     @triton.jit
     def _vec_accumulate(X, OUT, n_tiles, BLOCK: tl.constexpr):
         offs = tl.arange(0, BLOCK)
-        acc = tl.zeros((BLOCK,), dtype=tl.float32)   # per-element array iter-arg
+        acc = tl.zeros((BLOCK,), dtype=tl.float32)  # per-element array iter-arg
         for i in range(n_tiles):
             acc = acc + tl.load(X + i * BLOCK + offs)
         tl.store(OUT + offs, acc)
@@ -39,5 +42,4 @@ def test_vec_accumulate_column_sum(BLOCK):
     OUT = torch.zeros(BLOCK)
     _vec_accumulate[(1,)](X, OUT, n_tiles, BLOCK=BLOCK)
     want = X.view(n_tiles, BLOCK).sum(0)
-    assert torch.allclose(OUT, want, atol=1e-2), (
-        f"BLOCK={BLOCK}: max|diff|={float((OUT-want).abs().max()):.4g}")
+    assert torch.allclose(OUT, want, atol=1e-2), f"BLOCK={BLOCK}: max|diff|={float((OUT - want).abs().max()):.4g}"

@@ -13,6 +13,7 @@ Signature:
     On any error the function returns False (no exception escapes); the caller
     falls through to the generic Metal/CPU path.
 """
+
 import math as _math
 
 # Variant MSL strings cached by (msl_dtype, msl_out, rr, rc) — avoids rebuilding
@@ -24,8 +25,8 @@ _VARIANT_MSL_CACHE = {}
 # Public entry point
 # ---------------------------------------------------------------------------
 
-def dispatch_fast_matmul(rt, descriptor, kargs, *, launch_exit_hook=None,
-                         launch_metadata=None):
+
+def dispatch_fast_matmul(rt, descriptor, kargs, *, launch_exit_hook=None, launch_metadata=None):
     """Attempt to dispatch via the simdgroup fast-matmul template.
 
     Parameters
@@ -55,7 +56,7 @@ def dispatch_fast_matmul(rt, descriptor, kargs, *, launch_exit_hook=None,
         m_idx, n_idx, k_idx = descriptor[1], descriptor[2], descriptor[3]
         tile_m, tile_n = descriptor[4], descriptor[5]
         msl_dtype = descriptor[6] if len(descriptor) > 6 else None
-        msl_out   = descriptor[7] if len(descriptor) > 7 else None
+        msl_out = descriptor[7] if len(descriptor) > 7 else None
         stride_checks = descriptor[8] if len(descriptor) > 8 else ()
     except (TypeError, ValueError, IndexError):
         return False  # malformed descriptor -> skip
@@ -92,8 +93,8 @@ def dispatch_fast_matmul(rt, descriptor, kargs, *, launch_exit_hook=None,
         if msl_dtype is not None and msl_out is not None:
             try:
                 from triton_msl.autotuning.matmul_tuner import best_rrrc
-                from triton_msl.codegen._msl_templates import (
-                    make_simdgroup_matmul_kernel_fast)
+                from triton_msl.codegen._msl_templates import make_simdgroup_matmul_kernel_fast
+
                 rrrc = best_rrrc(msl_dtype, msl_out, M, N, K, rt)
                 if rrrc is not None and rrrc != (4, 4):
                     rr, rc = rrrc
@@ -132,8 +133,7 @@ def dispatch_fast_matmul(rt, descriptor, kargs, *, launch_exit_hook=None,
         #     M/N/K binding via the K-loop bound, so a non-canonical signature can't reach
         #     here with mis-bound dims.]
         sel_strip = sel_tn // 4
-        if not (M > 0 and N > 0 and K > 0
-                and M % sel_tm == 0 and N % sel_strip == 0 and K % 8 == 0):
+        if not (M > 0 and N > 0 and K > 0 and M % sel_tm == 0 and N % sel_strip == 0 and K % 8 == 0):
             return False
 
         n_groups = _math.ceil(M / sel_tm) * _math.ceil(N / sel_tn)
@@ -141,8 +141,7 @@ def dispatch_fast_matmul(rt, descriptor, kargs, *, launch_exit_hook=None,
         # The fast template declares exactly 6 buffers (A,B,C,M,N,K = kargs[:6]);
         # pass only those so we don't rely on compile_shader silently ignoring
         # trailing stride args.
-        rt.dispatch(lib, "simdgroup_matmul_fast", kargs[:6],
-                    threads=n_groups * 128, group_size=128)
+        rt.dispatch(lib, "simdgroup_matmul_fast", kargs[:6], threads=n_groups * 128, group_size=128)
         if launch_exit_hook:
             launch_exit_hook(launch_metadata)
         return True

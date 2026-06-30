@@ -12,6 +12,7 @@ the integrity-prescan catalog REFUSE loudly rather than emit (possibly-wrong) ou
 A passing test is not the same as a correct kernel — so for these we require a loud
 failure, not a quiet success. Serial GPU.
 """
+
 import pytest
 
 try:
@@ -20,6 +21,7 @@ try:
     import triton.language as tl
     import Metal
     from triton_msl.errors import MetalNonRecoverableError
+
     HAS = Metal.MTLCreateSystemDefaultDevice() is not None
 except Exception:
     HAS = False
@@ -27,9 +29,9 @@ except Exception:
 requires_metal = pytest.mark.skipif(not HAS, reason="Metal/torch/triton needed")
 
 if HAS:
+
     @triton.jit
-    def _kloop_constexpr_mn_matmul(A, B, C, K, BM: tl.constexpr, BN: tl.constexpr,
-                                   BK: tl.constexpr):
+    def _kloop_constexpr_mn_matmul(A, B, C, K, BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr):
         """A K-loop matmul that tiles its output across programs (program_id on
         axes 0 AND 1) but bakes M/N as constexpr — there is no runtime scalar arg
         named M/N, so the K-loop matmul template cannot recover the true output
@@ -44,7 +46,7 @@ if HAS:
         a_ptrs = A + offm[:, None] * K + offk[None, :]
         b_ptrs = B + offk[:, None] * BN + offn[None, :]
         acc = tl.zeros((BM, BN), dtype=tl.float32)
-        for _k in range(0, K, BK):     # runtime K -> scf.for -> K-loop matmul path
+        for _k in range(0, K, BK):  # runtime K -> scf.for -> K-loop matmul path
             acc += tl.dot(tl.load(a_ptrs), tl.load(b_ptrs))
             a_ptrs += BK
             b_ptrs += BK * BN
@@ -71,9 +73,9 @@ def test_kloop_constexpr_mn_matmul_refuses():
     (`test_dot_mulbroadcasted`). Backs the integrity guard at
     `_lower_k_loop_dot_inline` (`_lowerer_templates.py`)."""
     BM = BN = BK = 32
-    M = BM * 2          # 2x2 program grid -> the constexpr stride guess collapses
+    M = BM * 2  # 2x2 program grid -> the constexpr stride guess collapses
     N = BN * 2
-    K = BK * 2          # runtime K -> the dot sits in a real scf.for (K-loop path)
+    K = BK * 2  # runtime K -> the dot sits in a real scf.for (K-loop path)
     torch.manual_seed(0)
     A = torch.randn(M, K, device="mps", dtype=torch.float32)
     B = torch.randn(K, N, device="mps", dtype=torch.float32)

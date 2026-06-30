@@ -58,8 +58,7 @@ def _compile_msl(msl_src, kernel_name):
         f.write(msl_src)
 
     subprocess.check_call(
-        ["xcrun", "-sdk", "macosx", "metal", "-c", metal_path, "-o", air_path,
-         "-std=metal3.2", "-O2"],
+        ["xcrun", "-sdk", "macosx", "metal", "-c", metal_path, "-o", air_path, "-std=metal3.2", "-O2"],
         stderr=subprocess.PIPE,
     )
     subprocess.check_call(
@@ -72,6 +71,7 @@ def _compile_msl(msl_src, kernel_name):
 # ---------------------------------------------------------------------------
 # Tests
 # ---------------------------------------------------------------------------
+
 
 @pytest.mark.skipif(not _has_metal(), reason="No Metal GPU")
 def test_metal_device():
@@ -121,9 +121,7 @@ kernel void noop(uint tid [[thread_position_in_grid]]) {}
     function = library.newFunctionWithName_("noop")
     assert function is not None
 
-    pipeline, error = device.newComputePipelineStateWithFunction_error_(
-        function, None
-    )
+    pipeline, error = device.newComputePipelineStateWithFunction_error_(function, None)
     assert error is None
 
     queue = device.newCommandQueue()
@@ -172,21 +170,13 @@ kernel void add_one(
     assert error is None
 
     function = library.newFunctionWithName_("add_one")
-    pipeline, error = device.newComputePipelineStateWithFunction_error_(
-        function, None
-    )
+    pipeline, error = device.newComputePipelineStateWithFunction_error_(function, None)
     assert error is None
 
     n = 1024
-    input_buf = device.newBufferWithLength_options_(
-        n * 4, Metal.MTLResourceStorageModeShared
-    )
-    output_buf = device.newBufferWithLength_options_(
-        n * 4, Metal.MTLResourceStorageModeShared
-    )
-    n_buf = device.newBufferWithLength_options_(
-        4, Metal.MTLResourceStorageModeShared
-    )
+    input_buf = device.newBufferWithLength_options_(n * 4, Metal.MTLResourceStorageModeShared)
+    output_buf = device.newBufferWithLength_options_(n * 4, Metal.MTLResourceStorageModeShared)
+    n_buf = device.newBufferWithLength_options_(4, Metal.MTLResourceStorageModeShared)
 
     # Fill input
     input_view = input_buf.contents().as_buffer(n * 4)
@@ -218,9 +208,7 @@ kernel void add_one(
     for i in range(n):
         result = struct.unpack_from("f", output_view, i * 4)[0]
         expected = float(i) + 1.0
-        assert abs(result - expected) < 1e-6, (
-            f"[{i}] got {result}, expected {expected}"
-        )
+        assert abs(result - expected) < 1e-6, f"[{i}] got {result}, expected {expected}"
 
 
 @pytest.mark.skipif(not _has_metal(), reason="No Metal GPU")
@@ -254,24 +242,14 @@ kernel void vector_add(
     assert error is None
 
     function = library.newFunctionWithName_("vector_add")
-    pipeline, error = device.newComputePipelineStateWithFunction_error_(
-        function, None
-    )
+    pipeline, error = device.newComputePipelineStateWithFunction_error_(function, None)
     assert error is None
 
     n = 2048
-    a_buf = device.newBufferWithLength_options_(
-        n * 4, Metal.MTLResourceStorageModeShared
-    )
-    b_buf = device.newBufferWithLength_options_(
-        n * 4, Metal.MTLResourceStorageModeShared
-    )
-    out_buf = device.newBufferWithLength_options_(
-        n * 4, Metal.MTLResourceStorageModeShared
-    )
-    n_buf = device.newBufferWithLength_options_(
-        4, Metal.MTLResourceStorageModeShared
-    )
+    a_buf = device.newBufferWithLength_options_(n * 4, Metal.MTLResourceStorageModeShared)
+    b_buf = device.newBufferWithLength_options_(n * 4, Metal.MTLResourceStorageModeShared)
+    out_buf = device.newBufferWithLength_options_(n * 4, Metal.MTLResourceStorageModeShared)
+    n_buf = device.newBufferWithLength_options_(4, Metal.MTLResourceStorageModeShared)
 
     a_view = a_buf.contents().as_buffer(n * 4)
     b_view = b_buf.contents().as_buffer(n * 4)
@@ -303,6 +281,4 @@ kernel void vector_add(
     for i in range(n):
         result = struct.unpack_from("f", out_view, i * 4)[0]
         expected = float(i) + float(i) * 2.0
-        assert abs(result - expected) < 1e-4, (
-            f"[{i}] got {result}, expected {expected}"
-        )
+        assert abs(result - expected) < 1e-4, f"[{i}] got {result}, expected {expected}"

@@ -78,6 +78,7 @@ def register_metal_triton_backend():
     # regardless of import ordering. See docs/superpowers/plans/
     # 2026-06-18-inductor-backend-port.md.
     import torch._inductor.config as _ind_config
+
     _ind_config.compile_threads = 1
     if hasattr(_ind_config, "autotune_in_subproc"):
         _ind_config.autotune_in_subproc = False
@@ -127,6 +128,7 @@ def register_metal_triton_backend():
     # Force the native init to run FIRST (it sets a one-shot flag so it never
     # re-runs), THEN register ours last so it wins and is never clobbered.
     from torch._inductor.codegen.common import _initialize_device_op_overrides
+
     _initialize_device_op_overrides()
     register_device_op_overrides("mps", MetalTritonDeviceOpOverrides())
 
@@ -157,20 +159,18 @@ def _patch_mps_device_interface():
     """Add missing DeviceInterface methods to MpsInterface for Triton compatibility."""
     from torch._dynamo.device_interface import MpsInterface
 
-    if not hasattr(MpsInterface, "exchange_device") or \
-       MpsInterface.exchange_device is not MpsInterface.__mro__[0].__dict__.get("exchange_device"):
+    if not hasattr(MpsInterface, "exchange_device") or MpsInterface.exchange_device is not MpsInterface.__mro__[
+        0
+    ].__dict__.get("exchange_device"):
         MpsInterface.exchange_device = staticmethod(lambda device: 0)
 
-    if not hasattr(MpsInterface, "maybe_exchange_device") or \
-       "maybe_exchange_device" not in MpsInterface.__dict__:
+    if not hasattr(MpsInterface, "maybe_exchange_device") or "maybe_exchange_device" not in MpsInterface.__dict__:
         MpsInterface.maybe_exchange_device = staticmethod(lambda device: 0)
 
-    if not hasattr(MpsInterface, "set_device") or \
-       "set_device" not in MpsInterface.__dict__:
+    if not hasattr(MpsInterface, "set_device") or "set_device" not in MpsInterface.__dict__:
         MpsInterface.set_device = staticmethod(lambda device: None)
 
-    if not hasattr(MpsInterface, "get_raw_stream") or \
-       "get_raw_stream" not in MpsInterface.__dict__:
+    if not hasattr(MpsInterface, "get_raw_stream") or "get_raw_stream" not in MpsInterface.__dict__:
         MpsInterface.get_raw_stream = staticmethod(lambda device_idx: 0)
 
 
@@ -198,10 +198,12 @@ def _filter_metal_persistent_configs(configs, rnumel):
     if filtered:
         return filtered
     from triton_msl.errors import MetalNonRecoverableError
+
     raise MetalNonRecoverableError(
         f"No Metal-safe persistent-reduction config for rnumel={rnumel}: every candidate "
         f"exceeds Metal's 1024 threads/threadgroup limit (XBLOCK*rnumel > 1024). Refusing "
-        f"rather than emit a config Metal cannot launch.")
+        f"rather than emit a config Metal cannot launch."
+    )
 
 
 def _patch_persistent_reduction_configs():
@@ -215,9 +217,7 @@ def _patch_persistent_reduction_configs():
 
     orig_fn = th._persistent_reduction_configs
 
-    def _metal_persistent_reduction_configs(
-        size_hints, reduction_hint=False, inductor_meta=None, triton_meta=None
-    ):
+    def _metal_persistent_reduction_configs(size_hints, reduction_hint=False, inductor_meta=None, triton_meta=None):
         # Check if targeting MPS device
         device_props = triton_meta.get("device") if triton_meta else None
         is_mps = device_props and getattr(device_props, "type", "") == "mps"
@@ -265,6 +265,7 @@ def _patch_reduction_configs():
             return configs
 
         import copy
+
         result = []
         for c in configs:
             r0_block = c.kwargs.get("R0_BLOCK", 1)
@@ -296,10 +297,12 @@ def _patch_libdevice_for_metal():
     """
     from triton_msl.inductor.metal_libdevice import metal_libdevice
     import torch._inductor.runtime.triton_compat as tc
+
     tc.libdevice = metal_libdevice
 
     try:
         import torch._inductor.runtime.triton_helpers as th
+
         th.libdevice = metal_libdevice
     except (ImportError, AttributeError):
         pass

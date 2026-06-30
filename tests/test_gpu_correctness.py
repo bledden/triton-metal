@@ -12,12 +12,14 @@ import torch
 try:
     import triton
     import triton.language as tl
+
     HAS_TRITON = True
 except ImportError:
     HAS_TRITON = False
 
 try:
     import Metal
+
     HAS_METAL = Metal.MTLCreateSystemDefaultDevice() is not None
 except ImportError:
     HAS_METAL = False
@@ -30,10 +32,12 @@ requires_metal = pytest.mark.skipif(not HAS_METAL, reason="Metal not available")
 # GPU correctness tests — kernels that only had compile-only validation
 # ---------------------------------------------------------------------------
 
+
 @requires_triton
 @requires_metal
 def test_gpu_constant_mul():
     """x * 0.5 — validates arith.constant dense float lowering."""
+
     @triton.jit
     def const_kernel(x_ptr, out_ptr, n, BLOCK_SIZE: tl.constexpr):
         pid = tl.program_id(0)
@@ -51,14 +55,14 @@ def test_gpu_constant_mul():
     const_kernel[grid](x, out, n, BLOCK_SIZE=256)
 
     expected = x * 0.5
-    assert torch.allclose(out, expected, atol=1e-5), \
-        f"Max diff: {(out - expected).abs().max()}"
+    assert torch.allclose(out, expected, atol=1e-5), f"Max diff: {(out - expected).abs().max()}"
 
 
 @requires_triton
 @requires_metal
 def test_gpu_exp():
     """tl.exp(x) — validates math.exp lowering."""
+
     @triton.jit
     def exp_kernel(x_ptr, out_ptr, n, BLOCK_SIZE: tl.constexpr):
         pid = tl.program_id(0)
@@ -76,17 +80,16 @@ def test_gpu_exp():
     exp_kernel[grid](x, out, n, BLOCK_SIZE=256)
 
     expected = torch.exp(x)
-    assert torch.allclose(out, expected, atol=1e-4), \
-        f"Max diff: {(out - expected).abs().max()}"
+    assert torch.allclose(out, expected, atol=1e-4), f"Max diff: {(out - expected).abs().max()}"
 
 
 @requires_triton
 @requires_metal
 def test_gpu_multi_op_chain():
     """(a * alpha + b) * (a - b) — validates long expression chains."""
+
     @triton.jit
-    def chain_kernel(a_ptr, b_ptr, out_ptr, n, alpha,
-                     BLOCK_SIZE: tl.constexpr):
+    def chain_kernel(a_ptr, b_ptr, out_ptr, n, alpha, BLOCK_SIZE: tl.constexpr):
         pid = tl.program_id(0)
         offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
         mask = offsets < n
@@ -105,17 +108,16 @@ def test_gpu_multi_op_chain():
     chain_kernel[grid](a, b, out, n, alpha, BLOCK_SIZE=256)
 
     expected = (a * alpha + b) * (a - b)
-    assert torch.allclose(out, expected, atol=1e-4), \
-        f"Max diff: {(out - expected).abs().max()}"
+    assert torch.allclose(out, expected, atol=1e-4), f"Max diff: {(out - expected).abs().max()}"
 
 
 @requires_triton
 @requires_metal
 def test_gpu_reduce_expr():
     """tl.sum(x * y + z) — validates reduction of fused expression."""
+
     @triton.jit
-    def reduce_expr_kernel(x_ptr, y_ptr, z_ptr, out_ptr, n,
-                           BLOCK_SIZE: tl.constexpr):
+    def reduce_expr_kernel(x_ptr, y_ptr, z_ptr, out_ptr, n, BLOCK_SIZE: tl.constexpr):
         pid = tl.program_id(0)
         offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
         mask = offsets < n
@@ -135,14 +137,16 @@ def test_gpu_reduce_expr():
     reduce_expr_kernel[(1,)](x, y, z, out, n, BLOCK_SIZE=256)
 
     expected = (x * y + z).sum()
-    assert torch.allclose(out, expected.unsqueeze(0), atol=1e-3), \
+    assert torch.allclose(out, expected.unsqueeze(0), atol=1e-3), (
         f"Reduce expr: got {out.item()}, expected {expected.item()}"
+    )
 
 
 @requires_triton
 @requires_metal
 def test_gpu_int_to_float():
     """idx.to(float32) * 0.1 — validates arith.sitofp lowering."""
+
     @triton.jit
     def itof_kernel(idx_ptr, out_ptr, n, BLOCK_SIZE: tl.constexpr):
         pid = tl.program_id(0)
@@ -159,14 +163,14 @@ def test_gpu_int_to_float():
     itof_kernel[(1,)](idx, out, n, BLOCK_SIZE=256)
 
     expected = idx.float() * 0.1
-    assert torch.allclose(out, expected, atol=1e-5), \
-        f"Max diff: {(out - expected).abs().max()}"
+    assert torch.allclose(out, expected, atol=1e-5), f"Max diff: {(out - expected).abs().max()}"
 
 
 @requires_triton
 @requires_metal
 def test_gpu_gelu_sigmoid():
     """x * sigmoid(1.702 * x) — validates sigmoid GELU approximation."""
+
     @triton.jit
     def gelu_kernel(x_ptr, out_ptr, n, BLOCK_SIZE: tl.constexpr):
         pid = tl.program_id(0)
@@ -184,5 +188,4 @@ def test_gpu_gelu_sigmoid():
     gelu_kernel[grid](x, out, n, BLOCK_SIZE=256)
 
     expected = x * torch.sigmoid(1.702 * x)
-    assert torch.allclose(out, expected, atol=1e-4), \
-        f"Max diff: {(out - expected).abs().max()}"
+    assert torch.allclose(out, expected, atol=1e-4), f"Max diff: {(out - expected).abs().max()}"

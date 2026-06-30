@@ -19,12 +19,12 @@ class MSLExtraction:
     """Components extracted from full MSL for metal_kernel dispatch."""
 
     kernel_name: str
-    body: str               # Kernel body (between { })
-    header: str             # Device functions, non-standard includes
+    body: str  # Kernel body (between { })
+    header: str  # Device functions, non-standard includes
     input_names: List[str]  # Read-only pointer arg names
-    output_names: List[str] # Written-to pointer arg names
-    scalar_names: List[str] # Non-pointer buffer arg names (xnumel, etc.)
-    scalar_types: List[str] # MSL types for scalar args (int, float, etc.)
+    output_names: List[str]  # Written-to pointer arg names
+    scalar_names: List[str]  # Non-pointer buffer arg names (xnumel, etc.)
+    scalar_types: List[str]  # MSL types for scalar args (int, float, etc.)
     output_ptr_indices: set = None  # Indices within ptr_args that are outputs
     uses_simd: bool = False
     uses_2d: bool = False
@@ -47,30 +47,30 @@ def extract_msl_for_mlx(
         MSLExtraction with body, header, and arg mappings.
     """
     # Split into pre-kernel (includes, device functions) and kernel
-    kernel_match = re.search(r'^kernel\s+void\s+(\w+)\s*\(', msl_source, re.MULTILINE)
+    kernel_match = re.search(r"^kernel\s+void\s+(\w+)\s*\(", msl_source, re.MULTILINE)
     if not kernel_match:
         raise ValueError("No kernel function found in MSL source")
 
     kernel_name = kernel_match.group(1)
-    pre_kernel = msl_source[:kernel_match.start()].strip()
+    pre_kernel = msl_source[: kernel_match.start()].strip()
 
     # Find kernel signature end (closing paren before opening brace)
     sig_start = kernel_match.start()
-    brace_match = re.search(r'\)\s*\{', msl_source[sig_start:])
+    brace_match = re.search(r"\)\s*\{", msl_source[sig_start:])
     if not brace_match:
         raise ValueError("Could not find kernel body opening brace")
 
     body_start = sig_start + brace_match.end()
 
     # Find matching closing brace (last `}` in source)
-    body_end = msl_source.rstrip().rfind('}')
+    body_end = msl_source.rstrip().rfind("}")
     if body_end < body_start:
         raise ValueError("Could not find kernel body closing brace")
 
     raw_body = msl_source[body_start:body_end]
 
     # Parse signature to extract args
-    sig_text = msl_source[sig_start:sig_start + brace_match.start() + 1]
+    sig_text = msl_source[sig_start : sig_start + brace_match.start() + 1]
     ptr_args, scalar_args, thread_vars = _parse_signature(sig_text)
 
     # Classify pointer args as input vs output
@@ -89,19 +89,19 @@ def extract_msl_for_mlx(
     scalar_types = [ty for _name, ty in scalar_args]
 
     # Detect features
-    uses_simd = 'sgitg' in thread_vars or 'tiisg' in thread_vars
-    uses_2d = 'pid3' in sig_text or 'pid_y' in raw_body
-    uses_tpg = 'tpg' in thread_vars or 'tpg3' in thread_vars
+    uses_simd = "sgitg" in thread_vars or "tiisg" in thread_vars
+    uses_2d = "pid3" in sig_text or "pid_y" in raw_body
+    uses_tpg = "tpg" in thread_vars or "tpg3" in thread_vars
 
     # Detect which tpg axes are needed (from body references and signature)
     tpg_axes: Set[int] = set()
     if uses_tpg:
         tpg_axes.add(0)  # tpg (axis 0) always present when uses_tpg
     # Check for multi-axis tpg in the body (emitted as tpg_y, tpg_z)
-    if re.search(r'\btpg_y\b', raw_body):
+    if re.search(r"\btpg_y\b", raw_body):
         tpg_axes.add(1)
         uses_tpg = True
-    if re.search(r'\btpg_z\b', raw_body):
+    if re.search(r"\btpg_z\b", raw_body):
         tpg_axes.add(2)
         uses_tpg = True
 
@@ -115,17 +115,17 @@ def extract_msl_for_mlx(
 
     # Build header (device functions only — MLX provides metal_stdlib)
     header_parts = []
-    for line in pre_kernel.split('\n'):
+    for line in pre_kernel.split("\n"):
         line_s = line.strip()
-        if line_s.startswith('#include') and 'metal_stdlib' not in line_s:
+        if line_s.startswith("#include") and "metal_stdlib" not in line_s:
             header_parts.append(line_s)
 
     device_funcs = _extract_device_functions(pre_kernel)
     if device_funcs:
-        header_parts.append('')
+        header_parts.append("")
         header_parts.append(device_funcs)
 
-    header = '\n'.join(header_parts)
+    header = "\n".join(header_parts)
 
     # Build body preamble: local variable declarations that reference
     # thread_position_in_grid / threads_per_threadgroup.
@@ -134,32 +134,32 @@ def extract_msl_for_mlx(
 
     if uses_2d:
         # 2D: compute pid/lid per axis from injected thread variables
-        preamble_lines.append('    // MLX thread variable mapping')
-        preamble_lines.append('    uint __pid_x = thread_position_in_grid.x / threads_per_threadgroup.x;')
-        preamble_lines.append('    uint __pid_y = thread_position_in_grid.y / threads_per_threadgroup.y;')
-        preamble_lines.append('    uint __pid_z = thread_position_in_grid.z / threads_per_threadgroup.z;')
-        preamble_lines.append('    uint __lid_x = thread_position_in_grid.x % threads_per_threadgroup.x;')
-        preamble_lines.append('    uint __lid_y = thread_position_in_grid.y % threads_per_threadgroup.y;')
-        preamble_lines.append('    uint __lid_z = thread_position_in_grid.z % threads_per_threadgroup.z;')
-        preamble_lines.append('    uint __tid_x = thread_position_in_grid.x;')
+        preamble_lines.append("    // MLX thread variable mapping")
+        preamble_lines.append("    uint __pid_x = thread_position_in_grid.x / threads_per_threadgroup.x;")
+        preamble_lines.append("    uint __pid_y = thread_position_in_grid.y / threads_per_threadgroup.y;")
+        preamble_lines.append("    uint __pid_z = thread_position_in_grid.z / threads_per_threadgroup.z;")
+        preamble_lines.append("    uint __lid_x = thread_position_in_grid.x % threads_per_threadgroup.x;")
+        preamble_lines.append("    uint __lid_y = thread_position_in_grid.y % threads_per_threadgroup.y;")
+        preamble_lines.append("    uint __lid_z = thread_position_in_grid.z % threads_per_threadgroup.z;")
+        preamble_lines.append("    uint __tid_x = thread_position_in_grid.x;")
 
         # Replace the body's decomposition lines with our computed values
-        raw_body = re.sub(r'uint\s+pid\s*=\s*pid3\.x\s*;', 'uint pid = __pid_x;', raw_body)
-        raw_body = re.sub(r'uint\s+lid\s*=\s*lid3\.x\s*;', 'uint lid = __lid_x;', raw_body)
-        raw_body = re.sub(r'uint\s+tid\s*=\s*tid3\.x\s*;', 'uint tid = __tid_x;', raw_body)
-        raw_body = re.sub(r'uint\s+pid_y\s*=\s*pid3\.y\s*;', 'uint pid_y = __pid_y;', raw_body)
-        raw_body = re.sub(r'uint\s+pid_z\s*=\s*pid3\.z\s*;', 'uint pid_z = __pid_z;', raw_body)
+        raw_body = re.sub(r"uint\s+pid\s*=\s*pid3\.x\s*;", "uint pid = __pid_x;", raw_body)
+        raw_body = re.sub(r"uint\s+lid\s*=\s*lid3\.x\s*;", "uint lid = __lid_x;", raw_body)
+        raw_body = re.sub(r"uint\s+tid\s*=\s*tid3\.x\s*;", "uint tid = __tid_x;", raw_body)
+        raw_body = re.sub(r"uint\s+pid_y\s*=\s*pid3\.y\s*;", "uint pid_y = __pid_y;", raw_body)
+        raw_body = re.sub(r"uint\s+pid_z\s*=\s*pid3\.z\s*;", "uint pid_z = __pid_z;", raw_body)
     else:
         # 1D: pid/lid/tid were kernel params in original MSL — declare as locals
-        preamble_lines.append('    // MLX thread variable mapping')
-        preamble_lines.append('    uint pid = thread_position_in_grid.x / threads_per_threadgroup.x;')
-        preamble_lines.append('    uint lid = thread_position_in_grid.x % threads_per_threadgroup.x;')
-        preamble_lines.append('    uint tid = thread_position_in_grid.x;')
+        preamble_lines.append("    // MLX thread variable mapping")
+        preamble_lines.append("    uint pid = thread_position_in_grid.x / threads_per_threadgroup.x;")
+        preamble_lines.append("    uint lid = thread_position_in_grid.x % threads_per_threadgroup.x;")
+        preamble_lines.append("    uint tid = thread_position_in_grid.x;")
 
     if uses_simd:
         # MLX injects simdgroup_index_in_threadgroup when referenced in source
-        preamble_lines.append('    uint sgitg = simdgroup_index_in_threadgroup;')
-        preamble_lines.append('    uint tiisg = thread_index_in_simdgroup;')
+        preamble_lines.append("    uint sgitg = simdgroup_index_in_threadgroup;")
+        preamble_lines.append("    uint tiisg = thread_index_in_simdgroup;")
 
     if uses_tpg:
         # tpg (threadgroups_per_grid) isn't auto-injected by MLX.
@@ -167,19 +167,19 @@ def extract_msl_for_mlx(
         # MLX's metal_kernel API, so we pass the grid dimensions as scalar
         # arguments injected by the launcher at dispatch time.
         if 0 in tpg_axes:
-            preamble_lines.append('    uint tpg = __tpg_dim0;')
+            preamble_lines.append("    uint tpg = __tpg_dim0;")
         if 1 in tpg_axes:
-            preamble_lines.append('    uint tpg_y = __tpg_dim1;')
+            preamble_lines.append("    uint tpg_y = __tpg_dim1;")
         if 2 in tpg_axes:
-            preamble_lines.append('    uint tpg_z = __tpg_dim2;')
+            preamble_lines.append("    uint tpg_z = __tpg_dim2;")
 
         # Strip the original tpg decomposition lines from the body
         # (emitted by msl_emitter for the 2D case: uint tpg = tpg3.x; etc.)
-        raw_body = re.sub(r'\s*uint\s+tpg\s*=\s*tpg3\.x\s*;\n?', '\n', raw_body)
-        raw_body = re.sub(r'\s*uint\s+tpg_y\s*=\s*tpg3\.y\s*;\n?', '\n', raw_body)
-        raw_body = re.sub(r'\s*uint\s+tpg_z\s*=\s*tpg3\.z\s*;\n?', '\n', raw_body)
+        raw_body = re.sub(r"\s*uint\s+tpg\s*=\s*tpg3\.x\s*;\n?", "\n", raw_body)
+        raw_body = re.sub(r"\s*uint\s+tpg_y\s*=\s*tpg3\.y\s*;\n?", "\n", raw_body)
+        raw_body = re.sub(r"\s*uint\s+tpg_z\s*=\s*tpg3\.z\s*;\n?", "\n", raw_body)
 
-    body = '\n'.join(preamble_lines) + '\n' + raw_body
+    body = "\n".join(preamble_lines) + "\n" + raw_body
 
     return MSLExtraction(
         kernel_name=kernel_name,
@@ -208,20 +208,20 @@ def _parse_signature(sig_text: str):
     thread_vars = set()
 
     for m in re.finditer(
-        r'(?:volatile\s+)?device\s+(?:const\s+)?(\w+)\*\s+(\w+)\s+\[\[buffer\(\d+\)\]\]',
+        r"(?:volatile\s+)?device\s+(?:const\s+)?(\w+)\*\s+(\w+)\s+\[\[buffer\(\d+\)\]\]",
         sig_text,
     ):
         dtype, name = m.group(1), m.group(2)
         ptr_args.append((name, dtype))
 
     for m in re.finditer(
-        r'constant\s+(\w+)&\s+(\w+)\s+\[\[buffer\(\d+\)\]\]',
+        r"constant\s+(\w+)&\s+(\w+)\s+\[\[buffer\(\d+\)\]\]",
         sig_text,
     ):
         dtype, name = m.group(1), m.group(2)
         scalar_args.append((name, dtype))
 
-    for m in re.finditer(r'uint3?\s+(\w+)\s+\[\[', sig_text):
+    for m in re.finditer(r"uint3?\s+(\w+)\s+\[\[", sig_text):
         thread_vars.add(m.group(1))
 
     return ptr_args, scalar_args, thread_vars
@@ -229,22 +229,21 @@ def _parse_signature(sig_text: str):
 
 def _extract_device_functions(pre_kernel: str) -> str:
     """Extract device functions from code before the kernel."""
-    lines = pre_kernel.split('\n')
+    lines = pre_kernel.split("\n")
     func_lines = []
     in_func = False
 
     for line in lines:
         stripped = line.strip()
-        if stripped.startswith('#include') or stripped.startswith('using '):
+        if stripped.startswith("#include") or stripped.startswith("using "):
             continue
         if not stripped:
             if in_func:
                 func_lines.append(line)
             continue
-        if ('void ' in stripped or 'float ' in stripped or 'int ' in stripped) and \
-           not stripped.startswith('kernel '):
+        if ("void " in stripped or "float " in stripped or "int " in stripped) and not stripped.startswith("kernel "):
             in_func = True
         if in_func:
             func_lines.append(line)
 
-    return '\n'.join(func_lines).strip()
+    return "\n".join(func_lines).strip()

@@ -1,5 +1,6 @@
 # tests/test_fa_simdgroup_template.py
 """Standalone parity tests for the simdgroup-MMA FA template vs a torch reference."""
+
 import math
 import pytest
 import torch
@@ -25,10 +26,9 @@ def _ref(q, k, v, causal=False):
 
 def _launch(lib, name, q, k, v, out):
     Z, H, N_CTX, _ = q.shape
-    n_q_blocks = (N_CTX + 31) // 32          # ceil(N_CTX / BLOCK_M=32)
+    n_q_blocks = (N_CTX + 31) // 32  # ceil(N_CTX / BLOCK_M=32)
     s = [*q.stride(), *k.stride(), *v.stride(), *out.stride()]
-    getattr(lib, name)(q, k, v, out, *s, Z, H, N_CTX,
-                       threads=(n_q_blocks * 256, Z * H), group_size=(256, 1))
+    getattr(lib, name)(q, k, v, out, *s, Z, H, N_CTX, threads=(n_q_blocks * 256, Z * H), group_size=(256, 1))
 
 
 @requires_mps
@@ -64,7 +64,7 @@ def test_simd_fa_fp16_noncausal(Z, H, N_CTX):
 
 
 @requires_mps
-@pytest.mark.parametrize("N_CTX", [96, 100, 192, 200])   # not multiples of 64
+@pytest.mark.parametrize("N_CTX", [96, 100, 192, 200])  # not multiples of 64
 def test_simd_fa_fp32_unaligned(N_CTX):
     HEAD_DIM, Z, H = 128, 1, 2
     torch.manual_seed(1)

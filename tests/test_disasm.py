@@ -4,6 +4,7 @@ Split into two groups:
   - pure / graceful-degradation tests (no GPU needed) — always run;
   - end-to-end tests that need a real Metal device — gated on requires_metal.
 """
+
 import os
 import struct
 
@@ -15,12 +16,12 @@ try:
     from tests.conftest import requires_metal
 except Exception:  # pragma: no cover - fallback if conftest layout differs
     import Metal  # noqa
-    requires_metal = pytest.mark.skipif(
-        Metal.MTLCreateSystemDefaultDevice() is None,
-        reason="no Metal device")
+
+    requires_metal = pytest.mark.skipif(Metal.MTLCreateSystemDefaultDevice() is None, reason="no Metal device")
 
 
 # ── graceful degradation (no GPU) ───────────────────────────────────────────
+
 
 def test_disasm_missing_file_is_graceful():
     r = disasm.disassemble_archive("/nonexistent/path.archive")
@@ -40,8 +41,7 @@ def test_extract_agx_slice_accepts_cbfebabe_magic(tmp_path):
     payload = b"\xde\xad\xbe\xef" * 4
     slice_off = 8 + 20  # header(8) + one fat_arch(20)
     header = struct.pack(">II", 0xCBFEBABE, 1)
-    fat_arch = struct.pack(">iIIII", disasm._AGX_CPUTYPE, 0,
-                           slice_off, len(payload), 4)
+    fat_arch = struct.pack(">iIIII", disasm._AGX_CPUTYPE, 0, slice_off, len(payload), 4)
     blob = header + fat_arch + payload
     p = tmp_path / "fat.bin"
     p.write_bytes(blob)
@@ -66,6 +66,7 @@ def test_disasm_result_serializes():
 
 # ── end-to-end (needs a Metal device + a cached metallib) ────────────────────
 
+
 @requires_metal
 def test_reflection_and_disasm_end_to_end(tmp_path):
     import glob
@@ -87,8 +88,7 @@ def test_reflection_and_disasm_end_to_end(tmp_path):
     assert refl.thread_execution_width == 32  # Apple SIMD width
     assert refl.occupancy_hint
 
-    arch = disasm.serialize_native_archive(
-        dev, fn, str(tmp_path / "a.archive"))
+    arch = disasm.serialize_native_archive(dev, fn, str(tmp_path / "a.archive"))
     assert arch and os.path.exists(arch)
     r = disasm.disassemble_archive(arch)
     # Best-effort: must succeed structurally and report HONEST coverage in

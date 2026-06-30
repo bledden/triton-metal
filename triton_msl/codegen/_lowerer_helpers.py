@@ -21,42 +21,57 @@ import re
 
 # MLIR integer comparison predicates (arith.cmpi)
 CMPI_PREDICATES = {
-    0: "==",   # eq
-    1: "!=",   # ne
-    2: "<",    # slt
-    3: "<=",   # sle
-    4: ">",    # sgt
-    5: ">=",   # sge
-    6: "<",    # ult (unsigned, same op in MSL)
-    7: "<=",   # ule
-    8: ">",    # ugt
-    9: ">=",   # uge
+    0: "==",  # eq
+    1: "!=",  # ne
+    2: "<",  # slt
+    3: "<=",  # sle
+    4: ">",  # sgt
+    5: ">=",  # sge
+    6: "<",  # ult (unsigned, same op in MSL)
+    7: "<=",  # ule
+    8: ">",  # ugt
+    9: ">=",  # uge
 }
 
 # Named predicate map
 CMPI_NAMED = {
-    "eq": "==", "ne": "!=",
-    "slt": "<", "sle": "<=", "sgt": ">", "sge": ">=",
-    "ult": "<", "ule": "<=", "ugt": ">", "uge": ">=",
+    "eq": "==",
+    "ne": "!=",
+    "slt": "<",
+    "sle": "<=",
+    "sgt": ">",
+    "sge": ">=",
+    "ult": "<",
+    "ule": "<=",
+    "ugt": ">",
+    "uge": ">=",
 }
 
 # MLIR float comparison predicates (arith.cmpf)
 CMPF_PREDICATES = {
     0: "false",  # false (always false)
-    1: "==",     # oeq
-    2: ">",      # ogt
-    3: ">=",     # oge
-    4: "<",      # olt
-    5: "<=",     # ole
-    6: "!=",     # one
+    1: "==",  # oeq
+    2: ">",  # ogt
+    3: ">=",  # oge
+    4: "<",  # olt
+    5: "<=",  # ole
+    6: "!=",  # one
     # 7-15: unordered variants
 }
 
 CMPF_NAMED = {
-    "oeq": "==", "ogt": ">", "oge": ">=",
-    "olt": "<", "ole": "<=", "one": "!=",
-    "ueq": "==", "ugt": ">", "uge": ">=",
-    "ult": "<", "ule": "<=", "une": "!=",
+    "oeq": "==",
+    "ogt": ">",
+    "oge": ">=",
+    "olt": "<",
+    "ole": "<=",
+    "one": "!=",
+    "ueq": "==",
+    "ugt": ">",
+    "uge": ">=",
+    "ult": "<",
+    "ule": "<=",
+    "une": "!=",
 }
 
 
@@ -64,11 +79,19 @@ CMPF_NAMED = {
 # MLIR type → Triton dtype mapping
 # ---------------------------------------------------------------------------
 
+
 def _mlir_to_triton_dtype(mlir_type: str) -> str:
     """Map MLIR element type to Triton dtype string."""
     _map = {
-        "f32": "fp32", "f16": "fp16", "bf16": "bf16", "f64": "fp64",
-        "i1": "i1", "i8": "i8", "i16": "i16", "i32": "i32", "i64": "i64",
+        "f32": "fp32",
+        "f16": "fp16",
+        "bf16": "bf16",
+        "f64": "fp64",
+        "i1": "i1",
+        "i8": "i8",
+        "i16": "i16",
+        "i32": "i32",
+        "i64": "i64",
         # ui64 → u64 so the reshape-drops-type fallback (which can surface a
         # bare "ui64" base type) doesn't misclassify uint64 as fp32.
         "ui64": "u64",
@@ -183,13 +206,14 @@ def _extract_layout_signature(type_str):
         i += 1
     if depth != 0 or comma_pos < 0:
         return None
-    layout = type_str[comma_pos + 1:i].strip()
+    layout = type_str[comma_pos + 1 : i].strip()
     return layout if layout else None
 
 
 # ---------------------------------------------------------------------------
 # Shared memory aliasing post-pass
 # ---------------------------------------------------------------------------
+
 
 def _alias_shared_memory(msl: str) -> str:
     """Rewrite threadgroup array declarations to reuse memory.
@@ -212,13 +236,11 @@ def _alias_shared_memory(msl: str) -> str:
        size to the group maximum.
     """
 
-    lines = msl.split('\n')
+    lines = msl.split("\n")
 
     # 1. Parse declarations: name -> (size, decl_line_idx, dtype)
     # Handle common threadgroup types: float, int, uint, half, etc.
-    decl_re = re.compile(
-        r'^\s*threadgroup\s+(float|int|uint|half|short|ushort|char|uchar|bool)\s+(\w+)\[(\d+)\];'
-    )
+    decl_re = re.compile(r"^\s*threadgroup\s+(float|int|uint|half|short|ushort|char|uchar|bool)\s+(\w+)\[(\d+)\];")
     decls = {}  # name -> (size, line_idx, dtype)
     for i, line in enumerate(lines):
         m = decl_re.match(line)
@@ -234,13 +256,13 @@ def _alias_shared_memory(msl: str) -> str:
     # the entire loop, because all iterations share the same memory.
     loop_ranges = []  # list of (loop_start_line, loop_end_line)
     brace_stack = []
-    for_line_re = re.compile(r'^\s*for\s*\(')
+    for_line_re = re.compile(r"^\s*for\s*\(")
     for i, line in enumerate(lines):
         if for_line_re.match(line):
             brace_stack.append(i)
         # Track braces — simplistic but works for generated MSL
-        opens = line.count('{')
-        closes = line.count('}')
+        opens = line.count("{")
+        closes = line.count("}")
         for _ in range(opens):
             if not brace_stack or brace_stack[-1] != i:
                 brace_stack.append(i)
@@ -257,7 +279,7 @@ def _alias_shared_memory(msl: str) -> str:
         decl_line = decls[name][1]
         first_use = None
         last_use = None
-        pattern = re.compile(r'\b' + re.escape(name) + r'\b')
+        pattern = re.compile(r"\b" + re.escape(name) + r"\b")
         for i, line in enumerate(lines):
             if i == decl_line:
                 continue
@@ -377,13 +399,12 @@ def _alias_shared_memory(msl: str) -> str:
             # Update size and dtype to the slot's
             max_size = slot_max_size.get(phys_name, int(_size))
             phys_dtype = slot_dtype.get(phys_name, dtype)
-            new_lines.append(
-                f"    threadgroup {phys_dtype} {phys_name}[{max_size}];")
+            new_lines.append(f"    threadgroup {phys_dtype} {phys_name}[{max_size}];")
         else:
             new_line = line
             for old, new in renames.items():
                 if old in new_line:
-                    new_line = re.sub(r'\b' + re.escape(old) + r'\b', new, new_line)
+                    new_line = re.sub(r"\b" + re.escape(old) + r"\b", new, new_line)
             new_lines.append(new_line)
 
-    return '\n'.join(new_lines)
+    return "\n".join(new_lines)

@@ -29,6 +29,7 @@ Everything here degrades gracefully: a failure at any step returns a record
 with ``available=False`` and a reason, never an exception that aborts the
 harness.
 """
+
 from __future__ import annotations
 
 import contextlib
@@ -50,8 +51,8 @@ _MH_CIGAM_64 = 0xCFFAEDFE
 
 # Path to the vendored applegpu decoder.
 _APPLEGPU_DIR = os.path.join(
-    os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
-    "third_party", "applegpu")
+    os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), "third_party", "applegpu"
+)
 
 
 @dataclass
@@ -78,9 +79,9 @@ class DisasmResult:
     instruction_count: int = 0
     decoded_count: int = 0
     failed_count: int = 0
-    decode_coverage: float = 0.0          # decoded / total (0..1)
-    has_mma: bool = False                  # simdgroup-matrix / matmul op seen
-    has_async_load: bool = False           # threadgroup async copy seen
+    decode_coverage: float = 0.0  # decoded / total (0..1)
+    has_mma: bool = False  # simdgroup-matrix / matmul op seen
+    has_async_load: bool = False  # threadgroup async copy seen
     opcode_histogram: dict = field(default_factory=dict)
     sample: List[str] = field(default_factory=list)  # first decoded lines
 
@@ -96,8 +97,7 @@ def reflect_pipeline(pipeline) -> ReflectionMetrics:
     if tg_mem > 0:
         # 32 KB per-core threadgroup memory roof.
         concurrent = max(1, 32 * 1024 // max(tg_mem, 1))
-        hint = (f"TG-memory-bound: ~{concurrent} threadgroups/core "
-                f"({tg_mem} B each vs 32 KB)")
+        hint = f"TG-memory-bound: ~{concurrent} threadgroups/core ({tg_mem} B each vs 32 KB)"
     else:
         hint = "not TG-memory-bound (no static threadgroup memory)"
     return ReflectionMetrics(max_threads, width, tg_mem, hint)
@@ -112,14 +112,14 @@ def serialize_native_archive(device, function, out_path: str) -> Optional[str]:
     try:
         import Metal
         from Foundation import NSURL
+
         desc = Metal.MTLBinaryArchiveDescriptor.alloc().init()
         archive, err = device.newBinaryArchiveWithDescriptor_error_(desc, None)
         if archive is None:
             return None
         cpd = Metal.MTLComputePipelineDescriptor.alloc().init()
         cpd.setComputeFunction_(function)
-        ok, err = archive.addComputePipelineFunctionsWithDescriptor_error_(
-            cpd, None)
+        ok, err = archive.addComputePipelineFunctionsWithDescriptor_error_(cpd, None)
         if not ok:
             return None
         url = NSURL.fileURLWithPath_(out_path)
@@ -148,17 +148,15 @@ def _extract_agx_slice(archive_path: str) -> Optional[bytes]:
             base = 8 + i * 20  # fat_arch: cputype,cpusubtype,offset,size,align
             if base + 20 > len(data):
                 break
-            cputype, _sub, off, size, _align = struct.unpack(
-                ">iIIII", data[base:base + 20])
+            cputype, _sub, off, size, _align = struct.unpack(">iIIII", data[base : base + 20])
             if cputype == _AGX_CPUTYPE:
                 slice_off, slice_size = off, size
                 break
         if slice_off is None:
             return None
-        thin = data[slice_off:slice_off + slice_size]
+        thin = data[slice_off : slice_off + slice_size]
         # The slice may be a thin Mach-O (extract __text) or raw AGX code.
-        if len(thin) >= 4 and struct.unpack("<I", thin[:4])[0] in (
-                _MH_MAGIC_64, _MH_CIGAM_64):
+        if len(thin) >= 4 and struct.unpack("<I", thin[:4])[0] in (_MH_MAGIC_64, _MH_CIGAM_64):
             text = _macho_text_section(thin)
             return text if text else thin
         return thin
@@ -181,21 +179,20 @@ def _macho_text_section(thin: bytes) -> Optional[bytes]:
         for _ in range(ncmds):
             if off + 8 > len(thin):
                 break
-            cmd, cmdsize = struct.unpack(end + "II", thin[off:off + 8])
+            cmd, cmdsize = struct.unpack(end + "II", thin[off : off + 8])
             if cmd == 0x19:  # LC_SEGMENT_64
-                segname = thin[off + 8:off + 24].split(b"\0")[0]
-                nsects = struct.unpack(
-                    end + "I", thin[off + 64:off + 68])[0]
+                segname = thin[off + 8 : off + 24].split(b"\0")[0]
+                nsects = struct.unpack(end + "I", thin[off + 64 : off + 68])[0]
                 soff = off + 72  # first section_64
                 for _s in range(nsects):
-                    sect = thin[soff:soff + 80]
+                    sect = thin[soff : soff + 80]
                     sectname = sect[:16].split(b"\0")[0]
                     if sectname == b"__text":
                         addr_off = struct.unpack(end + "Q", sect[40:48])[0]
                         size = struct.unpack(end + "Q", sect[40:48])[0]
                         s_offset = struct.unpack(end + "I", sect[48:52])[0]
                         s_size = struct.unpack(end + "Q", sect[40:48])[0]
-                        return thin[s_offset:s_offset + s_size]
+                        return thin[s_offset : s_offset + s_size]
                     soff += 80
             off += cmdsize
         return None
@@ -210,19 +207,16 @@ def disassemble_archive(archive_path: str, *, max_sample: int = 40) -> DisasmRes
     ``available=False`` with a reason.
     """
     if not os.path.isdir(_APPLEGPU_DIR):
-        return DisasmResult(False, reason=f"applegpu not vendored at {_APPLEGPU_DIR}",
-                            archive_path=archive_path)
+        return DisasmResult(False, reason=f"applegpu not vendored at {_APPLEGPU_DIR}", archive_path=archive_path)
     agx = _extract_agx_slice(archive_path)
     if not agx:
-        return DisasmResult(False, reason="could not extract native AGX slice",
-                            archive_path=archive_path)
+        return DisasmResult(False, reason="could not extract native AGX slice", archive_path=archive_path)
     if _APPLEGPU_DIR not in sys.path:
         sys.path.insert(0, _APPLEGPU_DIR)
     try:
         import applegpu  # vendored decoder
     except Exception as e:  # pragma: no cover - import guard
-        return DisasmResult(False, reason=f"applegpu import failed: {e}",
-                            archive_path=archive_path)
+        return DisasmResult(False, reason=f"applegpu import failed: {e}", archive_path=archive_path)
 
     decoded, failed = 0, 0
     histogram: dict = {}
@@ -265,8 +259,7 @@ def disassemble_archive(archive_path: str, *, max_sample: int = 40) -> DisasmRes
                 except Exception:
                     asm = None
                     continue
-            ok = (asm is not None and length >= 2 and length % 2 == 0
-                  and "TODO" not in asm and "failed" not in asm)
+            ok = asm is not None and length >= 2 and length % 2 == 0 and "TODO" not in asm and "failed" not in asm
             if ok:
                 decoded += 1
                 histogram[mnem] = histogram.get(mnem, 0) + 1
@@ -290,8 +283,9 @@ def disassemble_archive(archive_path: str, *, max_sample: int = 40) -> DisasmRes
     coverage = (decoded / total) if total else 0.0
     return DisasmResult(
         available=True,
-        reason=("partial: applegpu is M1-era; the M4 is AGX2 so some "
-                "instructions do not decode" if coverage < 0.95 else ""),
+        reason=(
+            "partial: applegpu is M1-era; the M4 is AGX2 so some instructions do not decode" if coverage < 0.95 else ""
+        ),
         archive_path=archive_path,
         instruction_count=total,
         decoded_count=decoded,
@@ -299,7 +293,6 @@ def disassemble_archive(archive_path: str, *, max_sample: int = 40) -> DisasmRes
         decode_coverage=coverage,
         has_mma=has_mma,
         has_async_load=has_async,
-        opcode_histogram=dict(sorted(
-            histogram.items(), key=lambda kv: -kv[1])[:20]),
+        opcode_histogram=dict(sorted(histogram.items(), key=lambda kv: -kv[1])[:20]),
         sample=sample,
     )

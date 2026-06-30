@@ -11,12 +11,14 @@ try:
     import triton
     import triton.language as tl
     from triton._C.libtriton import ir
+
     HAS_TRITON = True
 except ImportError:
     HAS_TRITON = False
 
 try:
     import Metal
+
     HAS_METAL = Metal.MTLCreateSystemDefaultDevice() is not None
 except ImportError:
     HAS_METAL = False
@@ -60,6 +62,7 @@ def _compile_to_ttgir(kernel_fn, sig, constexprs=None):
 # Walker tests
 # ---------------------------------------------------------------------------
 
+
 @requires_triton
 @requires_metal
 def test_walker_vector_add():
@@ -76,9 +79,7 @@ def test_walker_vector_add():
         tl.store(out_ptr + offsets, a + b, mask=mask)
 
     sig = {"a_ptr": "*fp32", "b_ptr": "*fp32", "out_ptr": "*fp32", "n": "i32"}
-    mod, metadata, options = _compile_to_ttgir(
-        vector_add, sig, constexprs={"BLOCK_SIZE": 256}
-    )
+    mod, metadata, options = _compile_to_ttgir(vector_add, sig, constexprs={"BLOCK_SIZE": 256})
 
     graph = walk_ttgir(mod, options)
 
@@ -122,9 +123,7 @@ def test_walker_scalar_mul():
         tl.store(out_ptr + offsets, x * scale, mask=mask)
 
     sig = {"x_ptr": "*fp32", "out_ptr": "*fp32", "n": "i32", "scale": "fp32"}
-    mod, metadata, options = _compile_to_ttgir(
-        scalar_mul, sig, constexprs={"BLOCK_SIZE": 256}
-    )
+    mod, metadata, options = _compile_to_ttgir(scalar_mul, sig, constexprs={"BLOCK_SIZE": 256})
 
     graph = walk_ttgir(mod, options)
 
@@ -145,8 +144,7 @@ def test_walker_sum_reduction():
     from triton_msl.codegen.mlir_walker import walk_ttgir
 
     @triton.jit
-    def sum_kernel(input_ptr, output_ptr, n_elements,
-                   BLOCK_SIZE: tl.constexpr):
+    def sum_kernel(input_ptr, output_ptr, n_elements, BLOCK_SIZE: tl.constexpr):
         pid = tl.program_id(0)
         offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
         mask = offsets < n_elements
@@ -155,9 +153,7 @@ def test_walker_sum_reduction():
         tl.store(output_ptr + pid, result)
 
     sig = {"input_ptr": "*fp32", "output_ptr": "*fp32", "n_elements": "i32"}
-    mod, metadata, options = _compile_to_ttgir(
-        sum_kernel, sig, constexprs={"BLOCK_SIZE": 256}
-    )
+    mod, metadata, options = _compile_to_ttgir(sum_kernel, sig, constexprs={"BLOCK_SIZE": 256})
 
     graph = walk_ttgir(mod, options)
 
@@ -174,8 +170,7 @@ def test_walker_sum_reduction():
         body_op_names = [b.op for b in reduce_op.region_ops]
         print(f"Reduce body ops: {body_op_names}")
         # Body should contain arith.addf (sum combine)
-        assert any("addf" in n for n in body_op_names), \
-            f"Expected arith.addf in reduce body, got: {body_op_names}"
+        assert any("addf" in n for n in body_op_names), f"Expected arith.addf in reduce body, got: {body_op_names}"
     else:
         print("WARNING: reduce body ops not captured (may need region walking)")
 
@@ -199,9 +194,7 @@ def test_walker_fp16_cast():
         tl.store(out_ptr + offsets, result.to(tl.float16), mask=mask)
 
     sig = {"x_ptr": "*fp16", "y_ptr": "*fp16", "out_ptr": "*fp16", "n": "i32"}
-    mod, metadata, options = _compile_to_ttgir(
-        cast_kernel, sig, constexprs={"BLOCK_SIZE": 256}
-    )
+    mod, metadata, options = _compile_to_ttgir(cast_kernel, sig, constexprs={"BLOCK_SIZE": 256})
 
     graph = walk_ttgir(mod, options)
 
@@ -236,9 +229,7 @@ def test_walker_constants():
         tl.store(out_ptr + offsets, result, mask=mask)
 
     sig = {"x_ptr": "*fp32", "out_ptr": "*fp32", "n": "i32"}
-    mod, metadata, options = _compile_to_ttgir(
-        const_kernel, sig, constexprs={"BLOCK_SIZE": 256}
-    )
+    mod, metadata, options = _compile_to_ttgir(const_kernel, sig, constexprs={"BLOCK_SIZE": 256})
 
     graph = walk_ttgir(mod, options)
 
@@ -250,8 +241,9 @@ def test_walker_constants():
 
     # Should have the 0.5 constant
     float_consts = [c for c in const_ops if isinstance(c.attrs.get("value"), float)]
-    assert any(abs(c.attrs["value"] - 0.5) < 1e-6 for c in float_consts), \
+    assert any(abs(c.attrs["value"] - 0.5) < 1e-6 for c in float_consts), (
         f"Expected 0.5 constant, got: {[c.attrs.get('value') for c in const_ops]}"
+    )
 
 
 @requires_triton
@@ -270,9 +262,7 @@ def test_walker_ssa_connectivity():
         tl.store(out_ptr + offsets, a + b, mask=mask)
 
     sig = {"a_ptr": "*fp32", "b_ptr": "*fp32", "out_ptr": "*fp32", "n": "i32"}
-    mod, metadata, options = _compile_to_ttgir(
-        simple_add, sig, constexprs={"BLOCK_SIZE": 256}
-    )
+    mod, metadata, options = _compile_to_ttgir(simple_add, sig, constexprs={"BLOCK_SIZE": 256})
 
     graph = walk_ttgir(mod, options)
 
@@ -299,8 +289,7 @@ def test_walker_ssa_connectivity():
         print("All SSA operand references resolved correctly!")
 
     # Allow some unresolved (block args in nested regions), but flag many
-    assert len(unresolved) < len(graph.ops), \
-        f"Too many unresolved references: {len(unresolved)}/{len(graph.ops)}"
+    assert len(unresolved) < len(graph.ops), f"Too many unresolved references: {len(unresolved)}/{len(graph.ops)}"
 
 
 @requires_triton
@@ -318,9 +307,7 @@ def test_walker_comparison():
         tl.store(out_ptr + offsets, x, mask=mask)
 
     sig = {"x_ptr": "*fp32", "out_ptr": "*fp32", "n": "i32"}
-    mod, metadata, options = _compile_to_ttgir(
-        cmp_kernel, sig, constexprs={"BLOCK_SIZE": 256}
-    )
+    mod, metadata, options = _compile_to_ttgir(cmp_kernel, sig, constexprs={"BLOCK_SIZE": 256})
 
     graph = walk_ttgir(mod, options)
 
@@ -329,19 +316,19 @@ def test_walker_comparison():
     assert len(cmp_ops) >= 1, "Expected at least one comparison op"
 
     for c in cmp_ops:
-        print(f"  {c.op}: predicate={c.attrs.get('predicate')}, "
-              f"name={c.attrs.get('predicate_name')}")
+        print(f"  {c.op}: predicate={c.attrs.get('predicate')}, name={c.attrs.get('predicate_name')}")
 
 
 # ---------------------------------------------------------------------------
 # _parse_blocked_layout unit tests (no Triton/Metal required)
 # ---------------------------------------------------------------------------
 
+
 def test_parse_blocked_layout():
     """_parse_blocked_layout extracts sizePerThread from TTGIR text."""
     from triton_msl.codegen.mlir_walker import _parse_blocked_layout
 
-    text = '#blocked = #ttg.blocked<{sizePerThread = [4], threadsPerWarp = [32], warpsPerCTA = [4], order = [0]}>'
+    text = "#blocked = #ttg.blocked<{sizePerThread = [4], threadsPerWarp = [32], warpsPerCTA = [4], order = [0]}>"
     layout = _parse_blocked_layout(text)
     assert layout is not None
     assert layout["size_per_thread"] == [4]
@@ -353,7 +340,7 @@ def test_parse_blocked_layout_2d():
     """_parse_blocked_layout handles 2D layouts."""
     from triton_msl.codegen.mlir_walker import _parse_blocked_layout
 
-    text = '#blocked = #ttg.blocked<{sizePerThread = [1, 4], threadsPerWarp = [8, 4], warpsPerCTA = [4, 1], order = [1, 0]}>'
+    text = "#blocked = #ttg.blocked<{sizePerThread = [1, 4], threadsPerWarp = [8, 4], warpsPerCTA = [4, 1], order = [1, 0]}>"
     layout = _parse_blocked_layout(text)
     assert layout is not None
     assert layout["size_per_thread"] == [1, 4]

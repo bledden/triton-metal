@@ -6,6 +6,7 @@ truncating i64 values before comparing — a silent-wrong that was hidden becaus
 the upstream int64 tests are blanket-skipped. These tests pin the correct
 behavior so the skip can be narrowed honestly.
 """
+
 import numpy as np
 import pytest
 
@@ -14,6 +15,7 @@ try:
     import triton
     import triton.language as tl
     import Metal
+
     HAS = Metal.MTLCreateSystemDefaultDevice() is not None
 except Exception:
     HAS = False
@@ -22,6 +24,7 @@ requires_metal = pytest.mark.skipif(not HAS, reason="Metal/torch/triton needed")
 
 
 if HAS:
+
     @triton.jit
     def _i64_gt(X, O, thresh, N: tl.constexpr):
         i = tl.arange(0, N)
@@ -40,8 +43,9 @@ if HAS:
 def test_i64_signed_gt_no_truncation():
     # Values straddling 2^31 must compare correctly; a 32-bit truncation would
     # wrap 3e9/5e9 to negative and report them as NOT greater than 2e9.
-    x = torch.tensor([1_000_000_000, 3_000_000_000, 2_000_000_001, 0, -5,
-                      5_000_000_000, 2_000_000_000, 9], dtype=torch.int64)
+    x = torch.tensor(
+        [1_000_000_000, 3_000_000_000, 2_000_000_001, 0, -5, 5_000_000_000, 2_000_000_000, 9], dtype=torch.int64
+    )
     o = torch.zeros(8, dtype=torch.int32)
     _i64_gt[(1,)](x, o, 2_000_000_000, N=8)
     ref = (x.numpy() > 2_000_000_000).astype(np.int32)
@@ -51,8 +55,9 @@ def test_i64_signed_gt_no_truncation():
 @requires_metal
 def test_i64_compare_above_bit32():
     # 4e9 > 2^32? compare a mix; truncation to 32 bits loses the high word.
-    x = torch.tensor([3_999_999_999, 4_000_000_001, 4_294_967_297, 0,
-                      4_000_000_000, 8_000_000_000, 1, 2], dtype=torch.int64)
+    x = torch.tensor(
+        [3_999_999_999, 4_000_000_001, 4_294_967_297, 0, 4_000_000_000, 8_000_000_000, 1, 2], dtype=torch.int64
+    )
     o = torch.zeros(8, dtype=torch.int32)
     _i64_lt_unsigned[(1,)](x, o, N=8)
     ref = (x.numpy() < 4_000_000_000).astype(np.int32)
@@ -65,6 +70,7 @@ def test_i64_loop_bounds_refuse_not_hang():
     # Until implemented it must refuse loudly, not hang. Run in a subprocess
     # with a hard timeout so a regression cannot wedge the suite/GPU.
     import subprocess, sys, os
+
     code = (
         "import os; os.environ.setdefault('TRITON_DEFAULT_BACKEND','metal')\n"
         "import torch, triton, triton.language as tl\n"
@@ -82,6 +88,5 @@ def test_i64_loop_bounds_refuse_not_hang():
         "    print('REFUSED' if 'NonRecoverable' in type(e).__name__ else 'OTHER:' + type(e).__name__)\n"
     )
     env = dict(os.environ, PYTHONPATH=os.getcwd())
-    r = subprocess.run([sys.executable, "-c", code], capture_output=True,
-                       text=True, timeout=60, env=env)
+    r = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, timeout=60, env=env)
     assert "REFUSED" in r.stdout, f"stdout={r.stdout!r} stderr={r.stderr[-400:]!r}"

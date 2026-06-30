@@ -22,6 +22,7 @@ from typing import Optional
 # DeviceInfo dataclass
 # ---------------------------------------------------------------------------
 
+
 @dataclass(frozen=True)
 class DeviceInfo:
     """Cached snapshot of the Metal device capabilities."""
@@ -122,6 +123,7 @@ def _probe_metal_compiler() -> Optional[str]:
     jumped from 15.x to 26.x with macOS Tahoe).
     """
     import tempfile, os
+
     candidates = ["4.1", "4.0", "3.2", "3.1", "3.0"]
     test_src = "kernel void _probe() {}\n"
     for ver in candidates:
@@ -138,18 +140,22 @@ def _probe_metal_compiler() -> Optional[str]:
 
             # Step 1: compile to .air
             subprocess.run(
-                ["xcrun", "-sdk", "macosx", "metal", "-std=metal" + ver,
-                 "-c", metal_path, "-o", air_path],
-                capture_output=True, timeout=10, check=True,
+                ["xcrun", "-sdk", "macosx", "metal", "-std=metal" + ver, "-c", metal_path, "-o", air_path],
+                capture_output=True,
+                timeout=10,
+                check=True,
             )
             # Step 2: link to .metallib
             subprocess.run(
                 ["xcrun", "-sdk", "macosx", "metallib", air_path, "-o", lib_path],
-                capture_output=True, timeout=10, check=True,
+                capture_output=True,
+                timeout=10,
+                check=True,
             )
             # Step 3: verify the OS runtime can load it
             try:
                 import Metal, Foundation
+
                 device = Metal.MTLCreateSystemDefaultDevice()
                 if device is not None:
                     url = Foundation.NSURL.fileURLWithPath_(lib_path)
@@ -160,8 +166,7 @@ def _probe_metal_compiler() -> Optional[str]:
                 pass  # No Metal/Foundation module — trust the compiler result
 
             return ver
-        except (subprocess.CalledProcessError, FileNotFoundError,
-                subprocess.TimeoutExpired, OSError):
+        except (subprocess.CalledProcessError, FileNotFoundError, subprocess.TimeoutExpired, OSError):
             continue
         finally:
             for p in (metal_path, air_path, lib_path):
@@ -261,6 +266,7 @@ def _detect_device_info() -> DeviceInfo:
     # Lazy-import Metal to avoid crash on non-macOS or missing PyObjC.
     try:
         import Metal  # type: ignore[import-untyped]
+
         device = Metal.MTLCreateSystemDefaultDevice()
     except ImportError:
         device = None

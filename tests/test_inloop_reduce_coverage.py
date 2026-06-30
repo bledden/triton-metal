@@ -5,6 +5,7 @@ num_threads elements when block_size > num_threads. Under MEPT=0 (no register
 arrays) such a reduce must refuse loudly (Stage B); under the default flag the
 common where-on-reduce shape must compute correctly (Stage C). Serial GPU.
 """
+
 import pytest
 
 try:
@@ -13,6 +14,7 @@ try:
     import triton.language as tl
     import Metal
     from triton_msl.errors import MetalNonRecoverableError
+
     HAS = Metal.MTLCreateSystemDefaultDevice() is not None
 except Exception:
     HAS = False
@@ -20,6 +22,7 @@ except Exception:
 requires_metal = pytest.mark.skipif(not HAS, reason="Metal/torch/triton needed")
 
 if HAS:
+
     @triton.jit
     def _sum_carry_in_loop(X, OUT, C: tl.constexpr, BLOCK: tl.constexpr):
         acc = tl.zeros((), dtype=tl.float32)
@@ -33,24 +36,23 @@ if HAS:
         best = tl.zeros((), dtype=tl.float32) + 1e30
         for i in range(0, C):
             v = tl.load(X + i * BLOCK + tl.arange(0, BLOCK))
-            s = tl.sum(v)                       # in-loop reduce -> scalar
+            s = tl.sum(v)  # in-loop reduce -> scalar
             best = tl.where(s < best, s, best)  # cmpf + select on reduce result
         tl.store(OUT + tl.arange(0, 1), best)
 
     @triton.jit
     def _hoisted_reduce_in_loop(X, OUT, C: tl.constexpr, BLOCK: tl.constexpr):
-        v = tl.load(X + tl.arange(0, BLOCK))   # hoisted OUTSIDE the loop
+        v = tl.load(X + tl.arange(0, BLOCK))  # hoisted OUTSIDE the loop
         acc = tl.zeros((), dtype=tl.float32)
         for i in range(0, C):
             acc = acc + tl.sum(v)
         tl.store(OUT + tl.arange(0, 1), acc)
 
+
 # All @triton.jit kernels defined in this file.  The autouse fixture below
 # clears their in-process JIT caches before each test.  Add any new kernel
 # defined in this file to this tuple so the cache flush covers it.
-_MODULE_KERNELS = (
-    _sum_carry_in_loop, _min_blocksum_in_loop, _hoisted_reduce_in_loop
-) if HAS else ()
+_MODULE_KERNELS = (_sum_carry_in_loop, _min_blocksum_in_loop, _hoisted_reduce_in_loop) if HAS else ()
 
 
 @pytest.fixture(autouse=True)

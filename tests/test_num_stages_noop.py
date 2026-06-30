@@ -9,6 +9,7 @@ double-buffered matmul measured flat-to-slower (11.13 vs 11.2 TFLOP/s, 2048^3).
 Contract: passing num_stages>1 must (a) NOT change the result (it's ignored) and
 (b) not be SILENT — _warn_inert_num_stages notes it once at debug level >= 1.
 """
+
 import platform
 
 import pytest
@@ -48,9 +49,9 @@ def test_warn_inert_num_stages_is_one_shot():
     saved = C._NUM_STAGES_WARNED
     try:
         C._NUM_STAGES_WARNED = False
-        C._warn_inert_num_stages(2)   # first call may emit (depending on debug level)
+        C._warn_inert_num_stages(2)  # first call may emit (depending on debug level)
         assert C._NUM_STAGES_WARNED is True
-        C._warn_inert_num_stages(4)   # second call: must be a no-op (already warned)
+        C._warn_inert_num_stages(4)  # second call: must be a no-op (already warned)
         assert C._NUM_STAGES_WARNED is True
     finally:
         C._NUM_STAGES_WARNED = saved

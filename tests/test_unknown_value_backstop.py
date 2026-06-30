@@ -13,6 +13,7 @@ case. The loud-refusal UNKNOWN_ backstop now fires only for non-replayable
 chains (e.g. a load-derived tensor from outside the body); those are exercised
 in tests/test_inloop_reduce_coverage.py.
 """
+
 import pytest
 
 try:
@@ -20,6 +21,7 @@ try:
     import triton
     import triton.language as tl
     import Metal
+
     HAS = Metal.MTLCreateSystemDefaultDevice() is not None
 except Exception:
     HAS = False
@@ -37,9 +39,10 @@ def _force_mept_off(monkeypatch):
 
 
 if HAS:
+
     @triton.jit
     def _sum_in_loop(X, OUT, N, n_tiles, BLOCK: tl.constexpr):
-        offs = tl.arange(0, BLOCK)            # hoisted outside the runtime loop
+        offs = tl.arange(0, BLOCK)  # hoisted outside the runtime loop
         total = 0.0
         for i in range(n_tiles):
             idx = i * BLOCK + offs
@@ -51,7 +54,10 @@ if HAS:
 @requires_metal
 def test_sum_in_loop_block128_runs():
     from triton_msl.errors import MetalNonRecoverableError
-    N = 1024; X = torch.randn(N); OUT = torch.zeros(1)
+
+    N = 1024
+    X = torch.randn(N)
+    OUT = torch.zeros(1)
     _sum_in_loop[(1,)](X, OUT, N, (N + 127) // 128, BLOCK=128)
     assert abs(float(OUT[0]) - X.sum().item()) < 1e-2
 
@@ -64,8 +70,11 @@ def test_sum_in_loop_block128_runs():
 @requires_metal
 def test_sum_in_loop_block256_correct_not_refused():
     import torch
+
     torch.manual_seed(0)
-    N = 1024; X = torch.randn(N); OUT = torch.zeros(1)
+    N = 1024
+    X = torch.randn(N)
+    OUT = torch.zeros(1)
     _sum_in_loop[(1,)](X, OUT, N, (N + 255) // 256, BLOCK=256)
     assert abs(float(OUT[0]) - X.sum().item()) < 1e-2, (
         f"Stage A correctness check: got {float(OUT[0])} expected {X.sum().item()}"

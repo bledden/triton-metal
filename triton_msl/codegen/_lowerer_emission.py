@@ -24,9 +24,7 @@ from triton_msl.codegen._lowerer_helpers import (
 class _EmissionMixin:
     """Low-level MSL emit helpers used by ``GenericLowerer``."""
 
-    def _emit_binary_mept(self, ssa: SSAValue, n: int,
-                          read_a, read_b, make_expr,
-                          ty: str, dtype: str):
+    def _emit_binary_mept(self, ssa: SSAValue, n: int, read_a, read_b, make_expr, ty: str, dtype: str):
         """Phase 4b helper: emit a binary op per array position.
 
         ``read_a(i)`` / ``read_b(i)`` return the MSL expression for the
@@ -47,18 +45,15 @@ class _EmissionMixin:
         self.env_array[ssa.id] = (var_name, n, ty)
         self.env_types[ssa.id] = dtype
         self._propagate_shape_elementwise(ssa)
-        if ssa.elem_type == "i1" and ssa.op in (
-            "arith.andi", "arith.ori", "arith.xori"
-        ):
+        if ssa.elem_type == "i1" and ssa.op in ("arith.andi", "arith.ori", "arith.xori"):
             self.env_is_mask[ssa.id] = True
-        if (ssa.operand_ids[0] in self._is_splat
-                and ssa.operand_ids[1] in self._is_splat):
+        if ssa.operand_ids[0] in self._is_splat and ssa.operand_ids[1] in self._is_splat:
             self._is_splat.add(ssa.id)
         self._propagate_bcast_layout_binary(ssa)
 
-    def _mept_binary_dispatch(self, ssa: SSAValue, a_id: int, b_id: int,
-                              a: str, b: str, make_expr,
-                              ty: str, dtype: str) -> bool:
+    def _mept_binary_dispatch(
+        self, ssa: SSAValue, a_id: int, b_id: int, a: str, b: str, make_expr, ty: str, dtype: str
+    ) -> bool:
         """Phase 4b dispatch: if at least one operand is an array, emit
         a MEPT array result and return True. Otherwise return False so
         the caller continues with its scalar path.
@@ -92,8 +87,7 @@ class _EmissionMixin:
         self._emit_binary_mept(ssa, n, read_a, read_b, make_expr, ty, dtype)
         return True
 
-    def _mept_select_dispatch(self, ssa, cond_id, t_id, f_id,
-                              cond, t, f, ty, dtype) -> bool:
+    def _mept_select_dispatch(self, ssa, cond_id, t_id, f_id, cond, t, f, ty, dtype) -> bool:
         """MEPT array dispatch for arith.select (ternary). If any operand is a
         register array, emit a per-element select and return True; else False
         (caller does the scalar path). Mirrors _mept_binary_dispatch."""
@@ -109,12 +103,9 @@ class _EmissionMixin:
         if len(ns) != 1:
             return False  # mismatched array lengths -> scalar fallback
         n = ns.pop()
-        read_c = ((lambda i, an=c_arr[0]: f"{an}[{i}]") if c_arr
-                  else (lambda i, cv=cond: cv))
-        read_t = ((lambda i, an=t_arr[0]: f"{an}[{i}]") if t_arr
-                  else (lambda i, tv=t: tv))
-        read_f = ((lambda i, an=f_arr[0]: f"{an}[{i}]") if f_arr
-                  else (lambda i, fv=f: fv))
+        read_c = (lambda i, an=c_arr[0]: f"{an}[{i}]") if c_arr else (lambda i, cv=cond: cv)
+        read_t = (lambda i, an=t_arr[0]: f"{an}[{i}]") if t_arr else (lambda i, tv=t: tv)
+        read_f = (lambda i, an=f_arr[0]: f"{an}[{i}]") if f_arr else (lambda i, fv=f: fv)
         exprs = [f"({read_c(i)} ? {read_t(i)} : {read_f(i)})" for i in range(n)]
         var_name = self._var_array("r", exprs, ty)
         self.env[ssa.id] = var_name
@@ -134,7 +125,6 @@ class _EmissionMixin:
                 self._bcast_layout[ssa.id] = self._bcast_layout[oid]
                 break
         return True
-
 
     def _emit_binary(self, ssa: SSAValue, op_str: str, force_unsigned=False):
         """Emit a binary operation: result = a op b.
@@ -168,10 +158,10 @@ class _EmissionMixin:
         # clamps out-of-range shifts to a DEFINED result (0 for left + logical
         # right, sign-fill for arithmetic right). Match CUDA so shifts never
         # silently diverge (re-audit #4). Constant amounts fold the ternary away.
-        _shift_W = (int(mept_dtype[1:]) if (op_str in ("<<", ">>")
-                                            and not is_float) else None)
+        _shift_W = int(mept_dtype[1:]) if (op_str in ("<<", ">>") and not is_float) else None
         if force_unsigned and not is_float:
             unsigned_ty, _ud = _msl_int_type(ssa.elem_type, unsigned=True)
+
             def _make_expr(av, bv, _u=unsigned_ty, _op=op_str, _W=_shift_W):
                 base = f"({_u}){av} {_op} ({_u}){bv}"
                 if _W is None:
@@ -179,25 +169,26 @@ class _EmissionMixin:
                 # left / logical-right out-of-range -> 0
                 return f"((uint)({bv}) >= {_W}u ? 0 : ({base}))"
         else:
+
             def _make_expr(av, bv, _op=op_str, _W=_shift_W, _arith=(op_str == ">>")):
                 base = f"{av} {_op} {bv}"
                 if _W is None:
                     return base
                 if _arith:
                     # arithmetic right out-of-range -> sign fill (a >> (W-1))
-                    return (f"((uint)({bv}) >= {_W}u ? (({av}) >> {_W - 1}) "
-                            f": ({base}))")
+                    return f"((uint)({bv}) >= {_W}u ? (({av}) >> {_W - 1}) : ({base}))"
                 # left out-of-range -> 0
                 return f"((uint)({bv}) >= {_W}u ? 0 : ({base}))"
+
         if self._mept_binary_dispatch(
-                ssa, ssa.operand_ids[0], ssa.operand_ids[1], a, b,
-                _make_expr, mept_ty, mept_dtype):
+            ssa, ssa.operand_ids[0], ssa.operand_ids[1], a, b, _make_expr, mept_ty, mept_dtype
+        ):
             return
 
         bs = self.effective_block_size
 
         # Check if either operand is a shared-memory-backed oversized array.
-        smem_descs = getattr(self, '_shared_mem_descs', {})
+        smem_descs = getattr(self, "_shared_mem_descs", {})
         a_smem = smem_descs.get(ssa.operand_ids[0])
         b_smem = smem_descs.get(ssa.operand_ids[1])
 
@@ -231,8 +222,7 @@ class _EmissionMixin:
             is_per_row = (
                 (len(other_shape) == 1 and other_shape[0] == M)
                 or (len(other_shape) >= 2 and other_shape[1] == 1)
-                or (len(other_shape) >= 2 and other_shape == shape
-                    and total > bs)
+                or (len(other_shape) >= 2 and other_shape == shape and total > bs)
             )
 
             if is_per_row or total > bs:
@@ -241,24 +231,16 @@ class _EmissionMixin:
                 row_stride = max(1, bs // M)
                 temp_smem = f"smem_bcast_{self._shared_counter}"
                 self._shared_counter += 1
-                self.kb.declare_threadgroup_array(temp_smem, dtype="fp32",
-                                                  size=M)
+                self.kb.declare_threadgroup_array(temp_smem, dtype="fp32", size=M)
                 # Each thread writes its row's value (many threads per row
                 # write the same value — harmless).
-                self.kb.raw_line(
-                    f"    {temp_smem}[lid / {row_stride}u] = {other_var};")
-                self.kb.raw_line(
-                    f"    threadgroup_barrier(mem_flags::mem_threadgroup);")
+                self.kb.raw_line(f"    {temp_smem}[lid / {row_stride}u] = {other_var};")
+                self.kb.raw_line(f"    threadgroup_barrier(mem_flags::mem_threadgroup);")
                 # Strided in-place update
-                self.kb.raw_line(
-                    f"    for (uint _sb = lid; _sb < {total}u; "
-                    f"_sb += {bs}u) {{")
-                self.kb.raw_line(
-                    f"        {smem_name}[_sb] = {smem_name}[_sb] "
-                    f"{op_str} {temp_smem}[_sb / {N}u];")
+                self.kb.raw_line(f"    for (uint _sb = lid; _sb < {total}u; _sb += {bs}u) {{")
+                self.kb.raw_line(f"        {smem_name}[_sb] = {smem_name}[_sb] {op_str} {temp_smem}[_sb / {N}u];")
                 self.kb.raw_line(f"    }}")
-                self.kb.raw_line(
-                    f"    threadgroup_barrier(mem_flags::mem_threadgroup);")
+                self.kb.raw_line(f"    threadgroup_barrier(mem_flags::mem_threadgroup);")
 
                 # Result is the updated smem array
                 self.env[ssa.id] = smem_name
@@ -290,17 +272,12 @@ class _EmissionMixin:
         # (arith.andi / ori / xori on i1), the result is itself a mask.
         # Without this, tt.load / tt.store downstream can't recognize
         # `rmask & xmask` as a mask and emit unmasked memory ops.
-        if ssa.elem_type == "i1" and ssa.op in (
-            "arith.andi", "arith.ori", "arith.xori"
-        ):
+        if ssa.elem_type == "i1" and ssa.op in ("arith.andi", "arith.ori", "arith.xori"):
             self.env_is_mask[ssa.id] = True
         # Splat-ness propagates when both operands are splat.
-        if (ssa.operand_ids
-            and ssa.operand_ids[0] in self._is_splat
-            and ssa.operand_ids[1] in self._is_splat):
+        if ssa.operand_ids and ssa.operand_ids[0] in self._is_splat and ssa.operand_ids[1] in self._is_splat:
             self._is_splat.add(ssa.id)
         self._propagate_bcast_layout_binary(ssa)
-
 
     def _emit_unary(self, ssa: SSAValue, op_str: str):
         """Emit a unary operation: result = op(a)."""
@@ -326,7 +303,6 @@ class _EmissionMixin:
         # Shape: unary inherits shape from its operand
         self._propagate_shape_elementwise(ssa)
 
-
     def _emit_builtin_binary(self, ssa: SSAValue, fn_name: str, force_unsigned=False):
         """Emit a builtin binary function: result = fn(a, b)."""
         if len(ssa.operand_ids) < 2:
@@ -345,17 +321,19 @@ class _EmissionMixin:
         # Phase 4b: MEPT array path via shared dispatcher.
         if force_unsigned and not is_float:
             unsigned_ty, _ = _msl_int_type(ssa.elem_type, unsigned=True)
+
             def _make_expr(av, bv, _u=unsigned_ty, _fn=fn_name):
                 return f"{_fn}(({_u}){av}, ({_u}){bv})"
         elif not is_float:
+
             def _make_expr(av, bv, _t=ty, _fn=fn_name):
                 return f"{_fn}(({_t}){av}, ({_t}){bv})"
         else:
+
             def _make_expr(av, bv, _fn=fn_name):
                 return f"{_fn}({av}, {bv})"
-        if self._mept_binary_dispatch(
-                ssa, ssa.operand_ids[0], ssa.operand_ids[1], a, b,
-                _make_expr, ty, dtype):
+
+        if self._mept_binary_dispatch(ssa, ssa.operand_ids[0], ssa.operand_ids[1], a, b, _make_expr, ty, dtype):
             return
 
         var_name = self._next_var("r")
@@ -375,7 +353,6 @@ class _EmissionMixin:
         self._propagate_shape_elementwise(ssa)
         self._propagate_bcast_layout_binary(ssa)
 
-
     def _emit_nan_propagating_minmax(self, ssa: SSAValue, fn_name: str):
         """Emit NaN-propagating min/max: if either operand is NaN, result is NaN."""
         if len(ssa.operand_ids) < 2:
@@ -386,22 +363,17 @@ class _EmissionMixin:
         # Phase 4b: MEPT array path via shared dispatcher.
         def _make_expr(av, bv, _fn=fn_name):
             return f"(isnan({av}) || isnan({bv})) ? NAN : {_fn}({av}, {bv})"
-        if self._mept_binary_dispatch(
-                ssa, ssa.operand_ids[0], ssa.operand_ids[1], a, b,
-                _make_expr, "float", "fp32"):
+
+        if self._mept_binary_dispatch(ssa, ssa.operand_ids[0], ssa.operand_ids[1], a, b, _make_expr, "float", "fp32"):
             return
 
         var_name = self._next_var("r")
-        self.kb.raw_line(
-            f"    float {var_name} = (isnan({a}) || isnan({b})) "
-            f"? NAN : {fn_name}({a}, {b});"
-        )
+        self.kb.raw_line(f"    float {var_name} = (isnan({a}) || isnan({b})) ? NAN : {fn_name}({a}, {b});")
         self.env[ssa.id] = var_name
         self.env_types[ssa.id] = "fp32"
         # Shape: element-wise binary inherits shape from operands
         self._propagate_shape_elementwise(ssa)
         self._propagate_bcast_layout_binary(ssa)
-
 
     def _emit_passthrough(self, ssa: SSAValue):
         """Emit a type conversion that's a no-op in MSL (extf, truncf, etc.)."""
@@ -415,7 +387,7 @@ class _EmissionMixin:
             if src_id in self.env_is_ptr:
                 self.env_is_ptr[ssa.id] = self.env_is_ptr[src_id]
             # Propagate shared_mem_descs for smem-backed oversized arrays
-            smem_descs = getattr(self, '_shared_mem_descs', {})
+            smem_descs = getattr(self, "_shared_mem_descs", {})
             if src_id in smem_descs:
                 smem_descs[ssa.id] = smem_descs[src_id]
             # Propagate shape: passthrough preserves shape from source,
@@ -446,7 +418,6 @@ class _EmissionMixin:
             if src_id in self.env_array:
                 self.env_array[ssa.id] = self.env_array[src_id]
 
-
     def _emit_cast(self, ssa: SSAValue, target_type: str, dtype: str = None):
         """Emit a type cast."""
         if not ssa.operand_ids:
@@ -458,14 +429,12 @@ class _EmissionMixin:
         elif target_type == "float":
             out_dtype = "fp32"
         else:
-            out_dtype = (_mlir_to_triton_dtype(ssa.elem_type)
-                         if ssa.elem_type else "i32")
+            out_dtype = _mlir_to_triton_dtype(ssa.elem_type) if ssa.elem_type else "i32"
         # Phase 4b: when MEPT is on and the source SSA carries an array,
         # emit per-element cast into a parallel result array.
         if self.mept_enabled and src_id in self.env_array:
             src_name, n, _src_ty = self.env_array[src_id]
-            exprs = [f"static_cast<{target_type}>({src_name}[{i}])"
-                     for i in range(n)]
+            exprs = [f"static_cast<{target_type}>({src_name}[{i}])" for i in range(n)]
             var_name = self._var_array("r", exprs, target_type)
             self.env[ssa.id] = var_name
             self.env_array[ssa.id] = (var_name, n, target_type)
@@ -485,7 +454,6 @@ class _EmissionMixin:
         # identity, so the lid → flat-index mapping carries through.
         if src_id in self._bcast_layout:
             self._bcast_layout[ssa.id] = self._bcast_layout[src_id]
-
 
     def _emit_uitofp(self, ssa: SSAValue):
         """Emit unsigned-int-to-float conversion.
@@ -510,10 +478,10 @@ class _EmissionMixin:
         else:
             src_unsigned_ty, _ = _msl_int_type(src_dtype, unsigned=True)
             needs_unsigned_step = True
+
         def _conv(expr):
             if needs_unsigned_step:
-                return (f"static_cast<float>(static_cast<"
-                        f"{src_unsigned_ty}>({expr}))")
+                return f"static_cast<float>(static_cast<{src_unsigned_ty}>({expr}))"
             return f"static_cast<float>({expr})"
 
         # Phase 4b: MEPT array path.
@@ -533,7 +501,6 @@ class _EmissionMixin:
         self.env_types[ssa.id] = "fp32"
         # Shape: uitofp preserves shape
         self._propagate_shape_elementwise(ssa)
-
 
     def _emit_int_cast(self, ssa: SSAValue, unsigned: bool = False):
         """Emit an integer sign-extend, zero-extend, or truncation cast.
@@ -558,14 +525,15 @@ class _EmissionMixin:
         if unsigned and ssa.op == "arith.extui":
             src_dtype = self.env_types.get(src_id, "i32")
             src_unsigned_ty, _u = _msl_int_type(src_dtype, unsigned=True)
+
             def _conv(expr, _msl_ty=msl_ty, _su=src_unsigned_ty):
-                return (f"static_cast<{_msl_ty}>(static_cast<"
-                        f"{_su}>({expr}))")
-        elif ssa.op == "arith.trunci" and msl_ty in (
-                "char", "short", "uchar", "ushort"):
+                return f"static_cast<{_msl_ty}>(static_cast<{_su}>({expr}))"
+        elif ssa.op == "arith.trunci" and msl_ty in ("char", "short", "uchar", "ushort"):
+
             def _conv(expr, _msl_ty=msl_ty):
-                return (f"static_cast<{_msl_ty}>(static_cast<int>({expr}))")
+                return f"static_cast<{_msl_ty}>(static_cast<int>({expr}))"
         else:
+
             def _conv(expr, _msl_ty=msl_ty):
                 return f"static_cast<{_msl_ty}>({expr})"
 
@@ -598,7 +566,6 @@ class _EmissionMixin:
         if src_id in self._bcast_layout:
             self._bcast_layout[ssa.id] = self._bcast_layout[src_id]
 
-
     def _emit_cond_br_block(self, blocks, block_order, block_idx, result_var, msl_type):
         """Recursively emit a basic block as structured if/else."""
         if block_idx >= len(block_order):
@@ -614,10 +581,10 @@ class _EmissionMixin:
                 # Split operand_ids using walker-parsed arg counts
                 n_true = op.attrs.get("n_true_operands", 0)
                 n_false = op.attrs.get("n_false_operands", 0)
-                true_args = op.operand_ids[1:1 + n_true]
-                false_args = op.operand_ids[1 + n_true:1 + n_true + n_false]
+                true_args = op.operand_ids[1 : 1 + n_true]
+                false_args = op.operand_ids[1 + n_true : 1 + n_true + n_false]
 
-                remaining_blocks = block_order[block_idx + 1:]
+                remaining_blocks = block_order[block_idx + 1 :]
 
                 if not remaining_blocks:
                     return
@@ -669,5 +636,3 @@ class _EmissionMixin:
                 self._lower_op_dispatch(op)
 
     # -- Reductions --
-
-

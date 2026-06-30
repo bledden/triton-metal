@@ -1,6 +1,7 @@
 """Regression anchor for examples/local_triton_dev.py — the kernels in the
 'develop Triton locally on Apple Silicon' example must keep matching the CPU
 reference (they are real @triton.jit kernels run through the Metal backend)."""
+
 import importlib.util
 import os
 
@@ -12,6 +13,7 @@ try:
     import numpy as np  # noqa: F401
     import torch
     import triton  # noqa: F401
+
     _HAS = hasattr(torch, "mps") and torch.backends.mps.is_available()
 except Exception:  # noqa: BLE001
     _HAS = False
@@ -30,6 +32,7 @@ def _load_example():
 @pytest.mark.parametrize("runner", ["run_vector_add", "run_fused_softmax", "run_matmul"])
 def test_local_dev_example_matches_cpu(runner):
     import numpy as np
+
     np.random.seed(0)
     mod = _load_example()
     name, shape, err, tol = getattr(mod, runner)()

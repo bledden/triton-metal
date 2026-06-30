@@ -1,6 +1,7 @@
 """int64/uint64 reduce / where / transpose. Values exceed 2^32 to prove no
 truncation. Run with METAL_TEST_INT64=1 for the upstream corpus; the project
 tests here exercise the paths directly. Serial GPU."""
+
 import os
 import pytest
 
@@ -9,6 +10,7 @@ try:
     import triton
     import triton.language as tl
     import Metal
+
     HAS = Metal.MTLCreateSystemDefaultDevice() is not None
 except Exception:
     HAS = False
@@ -16,6 +18,7 @@ except Exception:
 requires_metal = pytest.mark.skipif(not HAS, reason="Metal/torch/triton needed")
 
 if HAS:
+
     @triton.jit
     def _sum_i64(X, OUT, BLOCK: tl.constexpr):
         x = tl.load(X + tl.arange(0, BLOCK))

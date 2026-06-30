@@ -42,6 +42,7 @@ class AutotuneConfig:
         tile_k: Tile size in K dimension.
         extra: Arbitrary extra parameters passed to kernel generator.
     """
+
     block_size: int = 256
     num_warps: int = 0  # auto-computed from block_size if 0
     tile_m: int = 0
@@ -74,6 +75,7 @@ class AutotuneConfig:
 @dataclass
 class AutotuneResult:
     """Result of an autotuning run."""
+
     best_config: AutotuneConfig
     best_time_us: float
     all_results: List[dict]  # [{config: ..., median_us: ..., min_us: ...}, ...]
@@ -86,9 +88,7 @@ class MetalAutotuner:
     best configuration. Results are cached to disk.
     """
 
-    def __init__(self, configs: List[AutotuneConfig],
-                 cache_dir: Optional[str] = None,
-                 warmup: int = 10, rep: int = 50):
+    def __init__(self, configs: List[AutotuneConfig], cache_dir: Optional[str] = None, warmup: int = 10, rep: int = 50):
         """
         Args:
             configs: List of configurations to try.
@@ -98,16 +98,19 @@ class MetalAutotuner:
             rep: Timed iterations per config.
         """
         self.configs = configs
-        self.cache_dir = cache_dir or os.path.join(
-            tempfile.gettempdir(), "triton_msl_autotune_cache"
-        )
+        self.cache_dir = cache_dir or os.path.join(tempfile.gettempdir(), "triton_msl_autotune_cache")
         self.warmup = warmup
         self.rep = rep
         os.makedirs(self.cache_dir, exist_ok=True)
 
-    def tune(self, kernel_gen_fn: Callable, kernel_name: str,
-             buffers: list, n_elements: int,
-             dispatch_fn: Optional[Callable] = None) -> AutotuneResult:
+    def tune(
+        self,
+        kernel_gen_fn: Callable,
+        kernel_name: str,
+        buffers: list,
+        n_elements: int,
+        dispatch_fn: Optional[Callable] = None,
+    ) -> AutotuneResult:
         """Run autotuning and return the best configuration.
 
         Args:
@@ -144,21 +147,22 @@ class MetalAutotuner:
                 pipeline = self._compile(device, msl_src, kernel_name)
 
                 # Benchmark
-                median_us = self._bench(
-                    queue, pipeline, buffers, n_elements,
-                    config.block_size, dispatch_fn, config
+                median_us = self._bench(queue, pipeline, buffers, n_elements, config.block_size, dispatch_fn, config)
+                all_results.append(
+                    {
+                        "config": config,
+                        "median_us": median_us,
+                        "status": "ok",
+                    }
                 )
-                all_results.append({
-                    "config": config,
-                    "median_us": median_us,
-                    "status": "ok",
-                })
             except Exception as e:
-                all_results.append({
-                    "config": config,
-                    "median_us": float("inf"),
-                    "status": f"error: {e}",
-                })
+                all_results.append(
+                    {
+                        "config": config,
+                        "median_us": float("inf"),
+                        "status": f"error: {e}",
+                    }
+                )
 
         # Select best
         best = min(all_results, key=lambda r: r["median_us"])
@@ -176,9 +180,7 @@ class MetalAutotuner:
         """Compile MSL source to a pipeline state."""
         import Foundation
 
-        compile_cache = os.path.join(
-            tempfile.gettempdir(), "triton_msl_autotune_compile"
-        )
+        compile_cache = os.path.join(tempfile.gettempdir(), "triton_msl_autotune_compile")
         os.makedirs(compile_cache, exist_ok=True)
 
         src_hash = hashlib.sha256(msl_src.encode()).hexdigest()[:16]
@@ -191,13 +193,11 @@ class MetalAutotuner:
             with open(metal_path, "w") as f:
                 f.write(msl_src)
             subprocess.check_call(
-                ["xcrun", "-sdk", "macosx", "metal", "-c", metal_path,
-                 "-o", air_path, "-std=metal3.2", "-O2"],
+                ["xcrun", "-sdk", "macosx", "metal", "-c", metal_path, "-o", air_path, "-std=metal3.2", "-O2"],
                 stderr=subprocess.PIPE,
             )
             subprocess.check_call(
-                ["xcrun", "-sdk", "macosx", "metallib", air_path,
-                 "-o", metallib_path],
+                ["xcrun", "-sdk", "macosx", "metallib", air_path, "-o", metallib_path],
                 stderr=subprocess.PIPE,
             )
 
@@ -210,15 +210,12 @@ class MetalAutotuner:
         if function is None:
             raise RuntimeError(f"Kernel '{kernel_name}' not found in library")
 
-        pipeline, error = device.newComputePipelineStateWithFunction_error_(
-            function, None
-        )
+        pipeline, error = device.newComputePipelineStateWithFunction_error_(function, None)
         if error is not None:
             raise RuntimeError(f"Pipeline creation failed: {error}")
         return pipeline
 
-    def _bench(self, queue, pipeline, buffers, n_elements, block_size,
-               dispatch_fn, config):
+    def _bench(self, queue, pipeline, buffers, n_elements, block_size, dispatch_fn, config):
         """Benchmark a single configuration and return median time in us."""
         import Metal
 

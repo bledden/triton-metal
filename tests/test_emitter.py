@@ -27,6 +27,7 @@ pytestmark = pytest.mark.skipif(
 # Tests
 # ---------------------------------------------------------------------------
 
+
 @requires_metal
 def test_vector_add(runner):
     """output = a + b"""
@@ -50,9 +51,7 @@ def test_vector_add(runner):
     result = runner.read_float_buffer(out_buf, n)
     for i in range(n):
         expected = a_data[i] + b_data[i]
-        assert abs(result[i] - expected) < 1e-4, (
-            f"[{i}] got {result[i]}, expected {expected}"
-        )
+        assert abs(result[i] - expected) < 1e-4, f"[{i}] got {result[i]}, expected {expected}"
 
 
 @requires_metal
@@ -78,9 +77,7 @@ def test_elementwise_sub(runner):
     result = runner.read_float_buffer(out_buf, n)
     for i in range(n):
         expected = a_data[i] - b_data[i]
-        assert abs(result[i] - expected) < 1e-4, (
-            f"[{i}] got {result[i]}, expected {expected}"
-        )
+        assert abs(result[i] - expected) < 1e-4, f"[{i}] got {result[i]}, expected {expected}"
 
 
 @requires_metal
@@ -106,9 +103,7 @@ def test_elementwise_mul(runner):
     result = runner.read_float_buffer(out_buf, n)
     for i in range(n):
         expected = a_data[i] * b_data[i]
-        assert abs(result[i] - expected) < 1e-2, (
-            f"[{i}] got {result[i]}, expected {expected}"
-        )
+        assert abs(result[i] - expected) < 1e-2, f"[{i}] got {result[i]}, expected {expected}"
 
 
 @requires_metal
@@ -133,9 +128,7 @@ def test_scalar_mul(runner):
     result = runner.read_float_buffer(out_buf, n)
     for i in range(n):
         expected = input_data[i] * scalar
-        assert abs(result[i] - expected) < 1e-2, (
-            f"[{i}] got {result[i]}, expected {expected}"
-        )
+        assert abs(result[i] - expected) < 1e-2, f"[{i}] got {result[i]}, expected {expected}"
 
 
 @requires_metal
@@ -160,9 +153,7 @@ def test_silu(runner):
     for i in range(n):
         x = input_data[i]
         expected = x / (1.0 + math.exp(-x))
-        assert abs(result[i] - expected) < 1e-4, (
-            f"[{i}] x={x}: got {result[i]}, expected {expected}"
-        )
+        assert abs(result[i] - expected) < 1e-4, f"[{i}] x={x}: got {result[i]}, expected {expected}"
 
 
 @requires_metal
@@ -186,12 +177,8 @@ def test_gelu(runner):
     for i in range(n):
         x = input_data[i]
         # GELU tanh approximation
-        expected = 0.5 * x * (1.0 + math.tanh(
-            0.7978845608028654 * (x + 0.044715 * x ** 3)
-        ))
-        assert abs(result[i] - expected) < 1e-4, (
-            f"[{i}] x={x}: got {result[i]}, expected {expected}"
-        )
+        expected = 0.5 * x * (1.0 + math.tanh(0.7978845608028654 * (x + 0.044715 * x**3)))
+        assert abs(result[i] - expected) < 1e-4, f"[{i}] x={x}: got {result[i]}, expected {expected}"
 
 
 @requires_metal
@@ -218,9 +205,7 @@ def test_exp(runner):
         expected = math.exp(x)
         # Relative tolerance for large values
         tol = max(1e-4, abs(expected) * 1e-5)
-        assert abs(result[i] - expected) < tol, (
-            f"[{i}] x={x}: got {result[i]}, expected {expected}"
-        )
+        assert abs(result[i] - expected) < tol, f"[{i}] x={x}: got {result[i]}, expected {expected}"
 
 
 @requires_metal
@@ -247,9 +232,7 @@ def test_non_power_of_2_size(runner):
     result = runner.read_float_buffer(out_buf, n)
     for i in range(n):
         expected = a_data[i] + b_data[i]
-        assert abs(result[i] - expected) < 1e-4, (
-            f"[{i}] got {result[i]}, expected {expected}"
-        )
+        assert abs(result[i] - expected) < 1e-4, f"[{i}] got {result[i]}, expected {expected}"
 
 
 @requires_metal
@@ -274,14 +257,13 @@ def test_large_buffer(runner):
     result = runner.read_float_buffer(out_buf, n)
     for i in [0, 1, 999, 1000, 500_000, 999_999]:
         expected = float(i % 1000) + 1.0
-        assert abs(result[i] - expected) < 1e-4, (
-            f"[{i}] got {result[i]}, expected {expected}"
-        )
+        assert abs(result[i] - expected) < 1e-4, f"[{i}] got {result[i]}, expected {expected}"
 
 
 # ---------------------------------------------------------------------------
 # Reduction tests
 # ---------------------------------------------------------------------------
+
 
 @requires_metal
 def test_reduce_sum(runner):
@@ -302,9 +284,7 @@ def test_reduce_sum(runner):
 
     result = runner.read_float_buffer(out_buf, 1)
     expected = sum(input_data)
-    assert abs(result[0] - expected) < 0.5, (
-        f"got {result[0]}, expected {expected}"
-    )
+    assert abs(result[0] - expected) < 0.5, f"got {result[0]}, expected {expected}"
 
 
 @requires_metal
@@ -327,9 +307,7 @@ def test_reduce_max(runner):
 
     result = runner.read_float_buffer(out_buf, 1)
     expected = max(input_data)
-    assert abs(result[0] - expected) < 1e-3, (
-        f"got {result[0]}, expected {expected}"
-    )
+    assert abs(result[0] - expected) < 1e-3, f"got {result[0]}, expected {expected}"
 
 
 @requires_metal
@@ -352,14 +330,13 @@ def test_reduce_min(runner):
 
     result = runner.read_float_buffer(out_buf, 1)
     expected = min(input_data)
-    assert abs(result[0] - expected) < 1e-3, (
-        f"got {result[0]}, expected {expected}"
-    )
+    assert abs(result[0] - expected) < 1e-3, f"got {result[0]}, expected {expected}"
 
 
 # ---------------------------------------------------------------------------
 # Softmax tests
 # ---------------------------------------------------------------------------
+
 
 @requires_metal
 def test_softmax(runner):
@@ -380,11 +357,11 @@ def test_softmax(runner):
     ncols_buf = runner.make_uint_buffer(n_cols)
 
     # Launch: one threadgroup per row
-    runner.run(pipeline, [input_buf, out_buf, ncols_buf], n_cols,
-               block_size=256)
+    runner.run(pipeline, [input_buf, out_buf, ncols_buf], n_cols, block_size=256)
 
     # Override run to use n_rows threadgroups
     import Metal
+
     n_groups = n_rows
     cmd = runner.queue.commandBuffer()
     enc = cmd.computeCommandEncoder()
@@ -405,8 +382,8 @@ def test_softmax(runner):
     # Verify each row
     for row in range(n_rows):
         start = row * n_cols
-        row_input = input_data[start:start + n_cols]
-        row_result = result[start:start + n_cols]
+        row_input = input_data[start : start + n_cols]
+        row_result = result[start : start + n_cols]
 
         # Reference softmax
         mx = max(row_input)
@@ -421,9 +398,7 @@ def test_softmax(runner):
 
         # Verify probabilities sum to ~1.0
         row_sum = sum(row_result)
-        assert abs(row_sum - 1.0) < 1e-4, (
-            f"row={row}: sum={row_sum}, expected 1.0"
-        )
+        assert abs(row_sum - 1.0) < 1e-4, f"row={row}: sum={row_sum}, expected 1.0"
 
 
 @requires_metal
@@ -443,6 +418,7 @@ def test_softmax_large_row(runner):
     ncols_buf = runner.make_uint_buffer(n_cols)
 
     import Metal
+
     cmd = runner.queue.commandBuffer()
     enc = cmd.computeCommandEncoder()
     enc.setComputePipelineState_(pipeline)
@@ -466,9 +442,7 @@ def test_softmax_large_row(runner):
     expected = [e / s for e in exps]
 
     for j in range(n_cols):
-        assert abs(result[j] - expected[j]) < 1e-4, (
-            f"col={j}: got {result[j]}, expected {expected[j]}"
-        )
+        assert abs(result[j] - expected[j]) < 1e-4, f"col={j}: got {result[j]}, expected {expected[j]}"
 
     assert abs(sum(result) - 1.0) < 1e-3
 
@@ -476,6 +450,7 @@ def test_softmax_large_row(runner):
 # ---------------------------------------------------------------------------
 # Matmul tests
 # ---------------------------------------------------------------------------
+
 
 @requires_metal
 def test_matmul_small(runner):
@@ -508,6 +483,7 @@ def test_matmul_small(runner):
     threads_per_tg = block_m * block_n
 
     import Metal
+
     cmd = runner.queue.commandBuffer()
     enc = cmd.computeCommandEncoder()
     enc.setComputePipelineState_(pipeline)
@@ -529,9 +505,7 @@ def test_matmul_small(runner):
         for j in range(N):
             expected = sum(A_data[i * K + k] * B_data[k * N + j] for k in range(K))
             got = result[i * N + j]
-            assert abs(got - expected) < 1e-2, (
-                f"C[{i},{j}]: got {got}, expected {expected}"
-            )
+            assert abs(got - expected) < 1e-2, f"C[{i},{j}]: got {got}, expected {expected}"
 
 
 @requires_metal
@@ -563,6 +537,7 @@ def test_matmul_rectangular(runner):
     threads_per_tg = block_m * block_n
 
     import Metal
+
     cmd = runner.queue.commandBuffer()
     enc = cmd.computeCommandEncoder()
     enc.setComputePipelineState_(pipeline)
@@ -583,9 +558,7 @@ def test_matmul_rectangular(runner):
         for j in range(N):
             expected = sum(A_data[i * K + k] * B_data[k * N + j] for k in range(K))
             got = result[i * N + j]
-            assert abs(got - expected) < 1e-2, (
-                f"C[{i},{j}]: got {got}, expected {expected}"
-            )
+            assert abs(got - expected) < 1e-2, f"C[{i},{j}]: got {got}, expected {expected}"
 
 
 @requires_metal
@@ -617,6 +590,7 @@ def test_matmul_multi_tile(runner):
     threads_per_tg = block_m * block_n
 
     import Metal
+
     cmd = runner.queue.commandBuffer()
     enc = cmd.computeCommandEncoder()
     enc.setComputePipelineState_(pipeline)
@@ -638,14 +612,13 @@ def test_matmul_multi_tile(runner):
         for j in range(0, N, 8):
             expected = sum(A_data[i * K + k] * B_data[k * N + j] for k in range(K))
             got = result[i * N + j]
-            assert abs(got - expected) < 1e-1, (
-                f"C[{i},{j}]: got {got}, expected {expected}"
-            )
+            assert abs(got - expected) < 1e-1, f"C[{i},{j}]: got {got}, expected {expected}"
 
 
 # ---------------------------------------------------------------------------
 # 2D dispatch matmul tests
 # ---------------------------------------------------------------------------
+
 
 @requires_metal
 def test_matmul_2d_small(runner):
@@ -675,6 +648,7 @@ def test_matmul_2d_small(runner):
     threads_per_tg = block_m * block_n
 
     import Metal
+
     cmd = runner.queue.commandBuffer()
     enc = cmd.computeCommandEncoder()
     enc.setComputePipelineState_(pipeline)
@@ -696,9 +670,7 @@ def test_matmul_2d_small(runner):
         for j in range(N):
             expected = sum(A_data[i * K + k] * B_data[k * N + j] for k in range(K))
             got = result[i * N + j]
-            assert abs(got - expected) < 1e-2, (
-                f"C[{i},{j}]: got {got}, expected {expected}"
-            )
+            assert abs(got - expected) < 1e-2, f"C[{i},{j}]: got {got}, expected {expected}"
 
 
 @requires_metal
@@ -729,6 +701,7 @@ def test_matmul_2d_multi_tile(runner):
     threads_per_tg = block_m * block_n
 
     import Metal
+
     cmd = runner.queue.commandBuffer()
     enc = cmd.computeCommandEncoder()
     enc.setComputePipelineState_(pipeline)
@@ -749,9 +722,7 @@ def test_matmul_2d_multi_tile(runner):
         for j in range(0, N, 8):
             expected = sum(A_data[i * K + k] * B_data[k * N + j] for k in range(K))
             got = result[i * N + j]
-            assert abs(got - expected) < 1e-1, (
-                f"C[{i},{j}]: got {got}, expected {expected}"
-            )
+            assert abs(got - expected) < 1e-1, f"C[{i},{j}]: got {got}, expected {expected}"
 
 
 @requires_metal
@@ -782,6 +753,7 @@ def test_matmul_2d_rectangular(runner):
     threads_per_tg = block_m * block_n
 
     import Metal
+
     cmd = runner.queue.commandBuffer()
     enc = cmd.computeCommandEncoder()
     enc.setComputePipelineState_(pipeline)
@@ -802,14 +774,13 @@ def test_matmul_2d_rectangular(runner):
         for j in range(0, N, 8):
             expected = sum(A_data[i * K + k] * B_data[k * N + j] for k in range(K))
             got = result[i * N + j]
-            assert abs(got - expected) < 1e-1, (
-                f"C[{i},{j}]: got {got}, expected {expected}"
-            )
+            assert abs(got - expected) < 1e-1, f"C[{i},{j}]: got {got}, expected {expected}"
 
 
 # ---------------------------------------------------------------------------
 # Swizzled matmul tests
 # ---------------------------------------------------------------------------
+
 
 @requires_metal
 def test_matmul_swizzled_small(runner):
@@ -840,6 +811,7 @@ def test_matmul_swizzled_small(runner):
     threads_per_tg = block_m * block_n
 
     import Metal
+
     cmd = runner.queue.commandBuffer()
     enc = cmd.computeCommandEncoder()
     enc.setComputePipelineState_(pipeline)
@@ -860,9 +832,7 @@ def test_matmul_swizzled_small(runner):
         for j in range(N):
             expected = sum(A_data[i * K + k] * B_data[k * N + j] for k in range(K))
             got = result[i * N + j]
-            assert abs(got - expected) < 1e-2, (
-                f"C[{i},{j}]: got {got}, expected {expected}"
-            )
+            assert abs(got - expected) < 1e-2, f"C[{i},{j}]: got {got}, expected {expected}"
 
 
 @requires_metal
@@ -873,8 +843,7 @@ def test_matmul_swizzled_large(runner):
     M, N, K = 128, 128, 64
     block_m, block_n, block_k = 32, 32, 32
 
-    msl = make_matmul_swizzled_kernel(block_m=block_m, block_n=block_n,
-                                       block_k=block_k, group_size=4)
+    msl = make_matmul_swizzled_kernel(block_m=block_m, block_n=block_n, block_k=block_k, group_size=4)
     path = runner.compile(msl, "matmul_swizzled")
     pipeline = runner.load(path, "matmul_swizzled")
 
@@ -895,6 +864,7 @@ def test_matmul_swizzled_large(runner):
     threads_per_tg = block_m * block_n
 
     import Metal
+
     cmd = runner.queue.commandBuffer()
     enc = cmd.computeCommandEncoder()
     enc.setComputePipelineState_(pipeline)
@@ -915,14 +885,13 @@ def test_matmul_swizzled_large(runner):
         for j in range(0, N, 16):
             expected = sum(A_data[i * K + k] * B_data[k * N + j] for k in range(K))
             got = result[i * N + j]
-            assert abs(got - expected) < 1e-1, (
-                f"C[{i},{j}]: got {got}, expected {expected}"
-            )
+            assert abs(got - expected) < 1e-1, f"C[{i},{j}]: got {got}, expected {expected}"
 
 
 # ---------------------------------------------------------------------------
 # Activation function tests
 # ---------------------------------------------------------------------------
+
 
 @requires_metal
 def test_activation_tanh(runner):
@@ -1047,6 +1016,7 @@ def test_activation_hardswish(runner):
 # FP16 tests
 # ---------------------------------------------------------------------------
 
+
 @requires_metal
 def test_vector_add_fp16(runner):
     """output = a + b in half precision"""
@@ -1072,9 +1042,7 @@ def test_vector_add_fp16(runner):
         expected = a_data[i] + b_data[i]
         # FP16 has ~3 decimal digits of precision
         tol = max(1e-2, abs(expected) * 1e-2)
-        assert abs(result[i] - expected) < tol, (
-            f"[{i}] got {result[i]}, expected {expected}"
-        )
+        assert abs(result[i] - expected) < tol, f"[{i}] got {result[i]}, expected {expected}"
 
 
 @requires_metal
@@ -1099,9 +1067,7 @@ def test_silu_fp16(runner):
         x = input_data[i]
         expected = x / (1.0 + math.exp(-x))
         tol = max(1e-2, abs(expected) * 5e-2)
-        assert abs(result[i] - expected) < tol, (
-            f"[{i}] x={x}: got {result[i]}, expected {expected}"
-        )
+        assert abs(result[i] - expected) < tol, f"[{i}] x={x}: got {result[i]}, expected {expected}"
 
 
 @requires_metal
@@ -1128,14 +1094,13 @@ def test_elementwise_mul_fp16(runner):
     for i in range(n):
         expected = a_data[i] * b_data[i]
         tol = max(1e-1, abs(expected) * 5e-2)
-        assert abs(result[i] - expected) < tol, (
-            f"[{i}] got {result[i]}, expected {expected}"
-        )
+        assert abs(result[i] - expected) < tol, f"[{i}] got {result[i]}, expected {expected}"
 
 
 # ---------------------------------------------------------------------------
 # FP16 activation tests
 # ---------------------------------------------------------------------------
+
 
 @requires_metal
 def test_activation_tanh_fp16(runner):
@@ -1212,6 +1177,7 @@ def test_activation_elu_fp16(runner):
 # simdgroup_matrix matmul tests
 # ---------------------------------------------------------------------------
 
+
 def _dispatch_simdgroup_matmul(runner, pipeline, buffers, M, N):
     """Dispatch a simdgroup matmul kernel with correct grid dimensions."""
     import Metal
@@ -1268,8 +1234,7 @@ def test_simdgroup_matmul_32x32(runner):
     N_buf = runner.make_uint_buffer(N)
     K_buf = runner.make_uint_buffer(K)
 
-    _dispatch_simdgroup_matmul(runner, pipeline,
-                               [A_buf, B_buf, C_buf, M_buf, N_buf, K_buf], M, N)
+    _dispatch_simdgroup_matmul(runner, pipeline, [A_buf, B_buf, C_buf, M_buf, N_buf, K_buf], M, N)
 
     result = runner.read_float_buffer(C_buf, M * N)
     expected = _ref_matmul(A_data, B_data, M, N, K)
@@ -1277,9 +1242,7 @@ def test_simdgroup_matmul_32x32(runner):
     for i in range(M):
         for j in range(N):
             idx = i * N + j
-            assert abs(result[idx] - expected[idx]) < 1e-2, (
-                f"C[{i},{j}]: got {result[idx]}, expected {expected[idx]}"
-            )
+            assert abs(result[idx] - expected[idx]) < 1e-2, f"C[{i},{j}]: got {result[idx]}, expected {expected[idx]}"
 
 
 @requires_metal
@@ -1303,8 +1266,7 @@ def test_simdgroup_matmul_64x64(runner):
     N_buf = runner.make_uint_buffer(N)
     K_buf = runner.make_uint_buffer(K)
 
-    _dispatch_simdgroup_matmul(runner, pipeline,
-                               [A_buf, B_buf, C_buf, M_buf, N_buf, K_buf], M, N)
+    _dispatch_simdgroup_matmul(runner, pipeline, [A_buf, B_buf, C_buf, M_buf, N_buf, K_buf], M, N)
 
     result = runner.read_float_buffer(C_buf, M * N)
     expected = _ref_matmul(A_data, B_data, M, N, K)
@@ -1313,9 +1275,7 @@ def test_simdgroup_matmul_64x64(runner):
     for i in range(0, M, 4):
         for j in range(0, N, 4):
             idx = i * N + j
-            assert abs(result[idx] - expected[idx]) < 1e-1, (
-                f"C[{i},{j}]: got {result[idx]}, expected {expected[idx]}"
-            )
+            assert abs(result[idx] - expected[idx]) < 1e-1, f"C[{i},{j}]: got {result[idx]}, expected {expected[idx]}"
 
 
 @requires_metal
@@ -1339,8 +1299,7 @@ def test_simdgroup_matmul_rectangular(runner):
     N_buf = runner.make_uint_buffer(N)
     K_buf = runner.make_uint_buffer(K)
 
-    _dispatch_simdgroup_matmul(runner, pipeline,
-                               [A_buf, B_buf, C_buf, M_buf, N_buf, K_buf], M, N)
+    _dispatch_simdgroup_matmul(runner, pipeline, [A_buf, B_buf, C_buf, M_buf, N_buf, K_buf], M, N)
 
     result = runner.read_float_buffer(C_buf, M * N)
     expected = _ref_matmul(A_data, B_data, M, N, K)
@@ -1348,14 +1307,13 @@ def test_simdgroup_matmul_rectangular(runner):
     for i in range(0, M, 4):
         for j in range(0, N, 4):
             idx = i * N + j
-            assert abs(result[idx] - expected[idx]) < 1e-1, (
-                f"C[{i},{j}]: got {result[idx]}, expected {expected[idx]}"
-            )
+            assert abs(result[idx] - expected[idx]) < 1e-1, f"C[{i},{j}]: got {result[idx]}, expected {expected[idx]}"
 
 
 # ---------------------------------------------------------------------------
 # FP16 simdgroup_matrix matmul tests
 # ---------------------------------------------------------------------------
+
 
 @requires_metal
 def test_simdgroup_matmul_fp16_compiles(runner):
@@ -1388,8 +1346,7 @@ def test_simdgroup_matmul_fp16_32x32(runner):
     N_buf = runner.make_uint_buffer(N)
     K_buf = runner.make_uint_buffer(K)
 
-    _dispatch_simdgroup_matmul(runner, pipeline,
-                               [A_buf, B_buf, C_buf, M_buf, N_buf, K_buf], M, N)
+    _dispatch_simdgroup_matmul(runner, pipeline, [A_buf, B_buf, C_buf, M_buf, N_buf, K_buf], M, N)
 
     result = runner.read_float_buffer(C_buf, M * N)
     expected = _ref_matmul(A_data, B_data, M, N, K)
@@ -1399,9 +1356,7 @@ def test_simdgroup_matmul_fp16_32x32(runner):
             idx = i * N + j
             # FP16 inputs lose precision → wider tolerance
             tol = max(0.1, abs(expected[idx]) * 0.05)
-            assert abs(result[idx] - expected[idx]) < tol, (
-                f"C[{i},{j}]: got {result[idx]}, expected {expected[idx]}"
-            )
+            assert abs(result[idx] - expected[idx]) < tol, f"C[{i},{j}]: got {result[idx]}, expected {expected[idx]}"
 
 
 @requires_metal
@@ -1425,8 +1380,7 @@ def test_simdgroup_matmul_fp16_64x64(runner):
     N_buf = runner.make_uint_buffer(N)
     K_buf = runner.make_uint_buffer(K)
 
-    _dispatch_simdgroup_matmul(runner, pipeline,
-                               [A_buf, B_buf, C_buf, M_buf, N_buf, K_buf], M, N)
+    _dispatch_simdgroup_matmul(runner, pipeline, [A_buf, B_buf, C_buf, M_buf, N_buf, K_buf], M, N)
 
     result = runner.read_float_buffer(C_buf, M * N)
     expected = _ref_matmul(A_data, B_data, M, N, K)
@@ -1435,14 +1389,13 @@ def test_simdgroup_matmul_fp16_64x64(runner):
         for j in range(0, N, 4):
             idx = i * N + j
             tol = max(0.15, abs(expected[idx]) * 0.1)
-            assert abs(result[idx] - expected[idx]) < tol, (
-                f"C[{i},{j}]: got {result[idx]}, expected {expected[idx]}"
-            )
+            assert abs(result[idx] - expected[idx]) < tol, f"C[{i},{j}]: got {result[idx]}, expected {expected[idx]}"
 
 
 # ---------------------------------------------------------------------------
 # RMS normalization tests
 # ---------------------------------------------------------------------------
+
 
 @requires_metal
 def test_rms_norm(runner):
@@ -1466,6 +1419,7 @@ def test_rms_norm(runner):
     ncols_buf = runner.make_uint_buffer(n_cols)
 
     import Metal
+
     cmd = runner.queue.commandBuffer()
     enc = cmd.computeCommandEncoder()
     enc.setComputePipelineState_(pipeline)
@@ -1484,8 +1438,8 @@ def test_rms_norm(runner):
 
     # Reference RMS norm
     for row in range(n_rows):
-        row_in = input_data[row * n_cols:(row + 1) * n_cols]
-        row_out = result[row * n_cols:(row + 1) * n_cols]
+        row_in = input_data[row * n_cols : (row + 1) * n_cols]
+        row_out = result[row * n_cols : (row + 1) * n_cols]
 
         mean_sq = sum(x * x for x in row_in) / n_cols
         rms = 1.0 / math.sqrt(mean_sq + eps)
@@ -1493,9 +1447,7 @@ def test_rms_norm(runner):
         for j in range(n_cols):
             expected = row_in[j] * rms * weight_data[j]
             tol = max(1e-4, abs(expected) * 1e-3)
-            assert abs(row_out[j] - expected) < tol, (
-                f"Row {row}[{j}] got {row_out[j]}, expected {expected}"
-            )
+            assert abs(row_out[j] - expected) < tol, f"Row {row}[{j}] got {row_out[j]}, expected {expected}"
 
 
 @requires_metal
@@ -1519,6 +1471,7 @@ def test_rms_norm_large_row(runner):
     ncols_buf = runner.make_uint_buffer(n_cols)
 
     import Metal
+
     cmd = runner.queue.commandBuffer()
     enc = cmd.computeCommandEncoder()
     enc.setComputePipelineState_(pipeline)
@@ -1540,14 +1493,13 @@ def test_rms_norm_large_row(runner):
     for j in range(n_cols):
         expected = input_data[j] * rms
         tol = max(1e-4, abs(expected) * 1e-3)
-        assert abs(result[j] - expected) < tol, (
-            f"[{j}] got {result[j]}, expected {expected}"
-        )
+        assert abs(result[j] - expected) < tol, f"[{j}] got {result[j]}, expected {expected}"
 
 
 # ---------------------------------------------------------------------------
 # RoPE (rotary position embeddings) tests
 # ---------------------------------------------------------------------------
+
 
 @requires_metal
 def test_rope(runner):
@@ -1573,6 +1525,7 @@ def test_rope(runner):
     pos_buf = runner.make_uint_buffer(0)  # pos_offset = 0
 
     import Metal
+
     cmd = runner.queue.commandBuffer()
     enc = cmd.computeCommandEncoder()
     enc.setComputePipelineState_(pipeline)
@@ -1602,17 +1555,14 @@ def test_rope(runner):
 
             got0 = result[pos * dim + 2 * i]
             got1 = result[pos * dim + 2 * i + 1]
-            assert abs(got0 - exp0) < 1e-4, (
-                f"pos={pos} pair={i}[0]: got {got0}, expected {exp0}"
-            )
-            assert abs(got1 - exp1) < 1e-4, (
-                f"pos={pos} pair={i}[1]: got {got1}, expected {exp1}"
-            )
+            assert abs(got0 - exp0) < 1e-4, f"pos={pos} pair={i}[0]: got {got0}, expected {exp0}"
+            assert abs(got1 - exp1) < 1e-4, f"pos={pos} pair={i}[1]: got {got1}, expected {exp1}"
 
 
 # ---------------------------------------------------------------------------
 # Layer normalization tests
 # ---------------------------------------------------------------------------
+
 
 @requires_metal
 def test_layer_norm(runner):
@@ -1638,6 +1588,7 @@ def test_layer_norm(runner):
     ncols_buf = runner.make_uint_buffer(n_cols)
 
     import Metal
+
     cmd = runner.queue.commandBuffer()
     enc = cmd.computeCommandEncoder()
     enc.setComputePipelineState_(pipeline)
@@ -1655,8 +1606,8 @@ def test_layer_norm(runner):
     result = runner.read_float_buffer(out_buf, n_rows * n_cols)
 
     for row in range(n_rows):
-        row_in = input_data[row * n_cols:(row + 1) * n_cols]
-        row_out = result[row * n_cols:(row + 1) * n_cols]
+        row_in = input_data[row * n_cols : (row + 1) * n_cols]
+        row_out = result[row * n_cols : (row + 1) * n_cols]
 
         mean = sum(row_in) / n_cols
         var = sum((x - mean) ** 2 for x in row_in) / n_cols
@@ -1665,9 +1616,7 @@ def test_layer_norm(runner):
         for j in range(n_cols):
             expected = (row_in[j] - mean) * inv_std * gamma_data[j] + beta_data[j]
             tol = max(1e-4, abs(expected) * 1e-3)
-            assert abs(row_out[j] - expected) < tol, (
-                f"Row {row}[{j}] got {row_out[j]}, expected {expected}"
-            )
+            assert abs(row_out[j] - expected) < tol, f"Row {row}[{j}] got {row_out[j]}, expected {expected}"
 
 
 @requires_metal
@@ -1693,6 +1642,7 @@ def test_layer_norm_large_row(runner):
     ncols_buf = runner.make_uint_buffer(n_cols)
 
     import Metal
+
     cmd = runner.queue.commandBuffer()
     enc = cmd.computeCommandEncoder()
     enc.setComputePipelineState_(pipeline)
@@ -1716,9 +1666,7 @@ def test_layer_norm_large_row(runner):
     for j in range(n_cols):
         expected = (input_data[j] - mean) * inv_std
         tol = max(1e-3, abs(expected) * 1e-2)
-        assert abs(result[j] - expected) < tol, (
-            f"[{j}] got {result[j]}, expected {expected}"
-        )
+        assert abs(result[j] - expected) < tol, f"[{j}] got {result[j]}, expected {expected}"
 
     # Output should have mean ~0 and variance ~1
     out_mean = sum(result) / n_cols
@@ -1728,6 +1676,7 @@ def test_layer_norm_large_row(runner):
 # ---------------------------------------------------------------------------
 # Cross-entropy loss tests
 # ---------------------------------------------------------------------------
+
 
 @requires_metal
 def test_cross_entropy(runner):
@@ -1748,9 +1697,8 @@ def test_cross_entropy(runner):
     # targets need int32 buffer
     import Metal
     import struct as st
-    targets_buf = runner.device.newBufferWithLength_options_(
-        n_rows * 4, Metal.MTLResourceStorageModeShared
-    )
+
+    targets_buf = runner.device.newBufferWithLength_options_(n_rows * 4, Metal.MTLResourceStorageModeShared)
     view = targets_buf.contents().as_buffer(n_rows * 4)
     for i, t in enumerate(targets_data):
         st.pack_into("i", view, i * 4, t)
@@ -1775,7 +1723,7 @@ def test_cross_entropy(runner):
     result = runner.read_float_buffer(losses_buf, n_rows)
 
     for row in range(n_rows):
-        row_logits = logits_data[row * vocab_size:(row + 1) * vocab_size]
+        row_logits = logits_data[row * vocab_size : (row + 1) * vocab_size]
         target = targets_data[row]
 
         # Reference: log_sum_exp - logits[target]
@@ -1783,9 +1731,7 @@ def test_cross_entropy(runner):
         log_sum_exp = mx + math.log(sum(math.exp(x - mx) for x in row_logits))
         expected = log_sum_exp - row_logits[target]
 
-        assert abs(result[row] - expected) < 1e-3, (
-            f"Row {row}: got {result[row]}, expected {expected}"
-        )
+        assert abs(result[row] - expected) < 1e-3, f"Row {row}: got {result[row]}, expected {expected}"
         # Loss should be non-negative
         assert result[row] >= -1e-6, f"Row {row}: negative loss {result[row]}"
 
@@ -1807,9 +1753,8 @@ def test_cross_entropy_large_vocab(runner):
     logits_buf = runner.make_float_buffer(logits_data)
     import Metal
     import struct as st
-    targets_buf = runner.device.newBufferWithLength_options_(
-        4, Metal.MTLResourceStorageModeShared
-    )
+
+    targets_buf = runner.device.newBufferWithLength_options_(4, Metal.MTLResourceStorageModeShared)
     view = targets_buf.contents().as_buffer(4)
     st.pack_into("i", view, 0, target)
 
@@ -1836,14 +1781,13 @@ def test_cross_entropy_large_vocab(runner):
     log_sum_exp = mx + math.log(sum(math.exp(x - mx) for x in logits_data))
     expected = log_sum_exp - logits_data[target]
 
-    assert abs(result[0] - expected) < 1e-2, (
-        f"got {result[0]}, expected {expected}"
-    )
+    assert abs(result[0] - expected) < 1e-2, f"got {result[0]}, expected {expected}"
 
 
 # ---------------------------------------------------------------------------
 # Flash Attention tests
 # ---------------------------------------------------------------------------
+
 
 @requires_metal
 def test_flash_attention_single_head(runner):
@@ -1875,6 +1819,7 @@ def test_flash_attention_single_head(runner):
     n_groups = n_heads * n_q_blocks
 
     import Metal
+
     cmd = runner.queue.commandBuffer()
     enc = cmd.computeCommandEncoder()
     enc.setComputePipelineState_(pipeline)
@@ -1917,9 +1862,7 @@ def test_flash_attention_single_head(runner):
                 expected = sum(P[i][j] * V_data[ho + j * head_dim + d] for j in range(seq_len))
                 got = result[ho + i * head_dim + d]
                 tol = max(1e-3, abs(expected) * 1e-2)
-                assert abs(got - expected) < tol, (
-                    f"head={h} pos={i} dim={d}: got {got}, expected {expected}"
-                )
+                assert abs(got - expected) < tol, f"head={h} pos={i} dim={d}: got {got}, expected {expected}"
 
 
 @requires_metal
@@ -1952,6 +1895,7 @@ def test_flash_attention_multi_block(runner):
     n_groups = n_heads * n_q_blocks
 
     import Metal
+
     cmd = runner.queue.commandBuffer()
     enc = cmd.computeCommandEncoder()
     enc.setComputePipelineState_(pipeline)
@@ -1988,14 +1932,13 @@ def test_flash_attention_multi_block(runner):
             expected = sum(P[i][j] * V_data[j * head_dim + d] for j in range(seq_len))
             got = result[i * head_dim + d]
             tol = max(1e-2, abs(expected) * 0.05)
-            assert abs(got - expected) < tol, (
-                f"pos={i} dim={d}: got {got}, expected {expected}"
-            )
+            assert abs(got - expected) < tol, f"pos={i} dim={d}: got {got}, expected {expected}"
 
 
 # ---------------------------------------------------------------------------
 # BFloat16 tests
 # ---------------------------------------------------------------------------
+
 
 @requires_metal
 def test_vector_add_bf16(runner):
@@ -2022,9 +1965,7 @@ def test_vector_add_bf16(runner):
         expected = a_data[i] + b_data[i]
         # BF16 has ~2-3 decimal digits of precision
         tol = max(0.1, abs(expected) * 0.02)
-        assert abs(result[i] - expected) < tol, (
-            f"[{i}] got {result[i]}, expected {expected}"
-        )
+        assert abs(result[i] - expected) < tol, f"[{i}] got {result[i]}, expected {expected}"
 
 
 @requires_metal
@@ -2049,14 +1990,13 @@ def test_silu_bf16(runner):
         x = input_data[i]
         expected = x / (1.0 + math.exp(-x))
         tol = max(0.05, abs(expected) * 0.1)
-        assert abs(result[i] - expected) < tol, (
-            f"[{i}] x={x}: got {result[i]}, expected {expected}"
-        )
+        assert abs(result[i] - expected) < tol, f"[{i}] x={x}: got {result[i]}, expected {expected}"
 
 
 # ---------------------------------------------------------------------------
 # Residual + bias add tests
 # ---------------------------------------------------------------------------
+
 
 @requires_metal
 def test_residual_add_with_bias(runner):
@@ -2083,9 +2023,7 @@ def test_residual_add_with_bias(runner):
     result = runner.read_float_buffer(out_buf, n)
     for i in range(n):
         expected = in_data[i] + res_data[i] + bias_data[i]
-        assert abs(result[i] - expected) < 1e-4, (
-            f"[{i}] got {result[i]}, expected {expected}"
-        )
+        assert abs(result[i] - expected) < 1e-4, f"[{i}] got {result[i]}, expected {expected}"
 
 
 @requires_metal
@@ -2111,14 +2049,13 @@ def test_residual_add_no_bias(runner):
     result = runner.read_float_buffer(out_buf, n)
     for i in range(n):
         expected = in_data[i] + res_data[i]
-        assert abs(result[i] - expected) < 1e-4, (
-            f"[{i}] got {result[i]}, expected {expected}"
-        )
+        assert abs(result[i] - expected) < 1e-4, f"[{i}] got {result[i]}, expected {expected}"
 
 
 # ---------------------------------------------------------------------------
 # KV-cache attention tests
 # ---------------------------------------------------------------------------
+
 
 @requires_metal
 def test_kv_cache_attention(runner):
@@ -2147,6 +2084,7 @@ def test_kv_cache_attention(runner):
     scale_buf = runner.make_float_scalar_buffer(scale)
 
     import Metal
+
     cmd = runner.queue.commandBuffer()
     enc = cmd.computeCommandEncoder()
     enc.setComputePipelineState_(pipeline)
@@ -2167,8 +2105,9 @@ def test_kv_cache_attention(runner):
     for h in range(n_heads):
         scores = []
         for j in range(seq_len):
-            dot = sum(Q_data[h * head_dim + d] * K_data[h * seq_len * head_dim + j * head_dim + d]
-                      for d in range(head_dim))
+            dot = sum(
+                Q_data[h * head_dim + d] * K_data[h * seq_len * head_dim + j * head_dim + d] for d in range(head_dim)
+            )
             scores.append(dot * scale)
 
         mx = max(scores)
@@ -2177,18 +2116,16 @@ def test_kv_cache_attention(runner):
         attn = [e / s for e in exps]
 
         for d in range(head_dim):
-            expected = sum(attn[j] * V_data[h * seq_len * head_dim + j * head_dim + d]
-                          for j in range(seq_len))
+            expected = sum(attn[j] * V_data[h * seq_len * head_dim + j * head_dim + d] for j in range(seq_len))
             got = result[h * head_dim + d]
             tol = max(1e-3, abs(expected) * 0.01)
-            assert abs(got - expected) < tol, (
-                f"head={h} dim={d}: got {got}, expected {expected}"
-            )
+            assert abs(got - expected) < tol, f"head={h} dim={d}: got {got}, expected {expected}"
 
 
 # ---------------------------------------------------------------------------
 # SwiGLU tests
 # ---------------------------------------------------------------------------
+
 
 @requires_metal
 def test_swiglu(runner):
@@ -2217,14 +2154,13 @@ def test_swiglu(runner):
         silu_g = g / (1.0 + math.exp(-g))
         expected = silu_g * x_data[i]
         tol = max(1e-4, abs(expected) * 1e-3)
-        assert abs(result[i] - expected) < tol, (
-            f"[{i}] got {result[i]}, expected {expected}"
-        )
+        assert abs(result[i] - expected) < tol, f"[{i}] got {result[i]}, expected {expected}"
 
 
 # ---------------------------------------------------------------------------
 # Embedding lookup tests
 # ---------------------------------------------------------------------------
+
 
 @requires_metal
 def test_embedding_lookup(runner):
@@ -2247,9 +2183,8 @@ def test_embedding_lookup(runner):
 
     import Metal
     import struct as st
-    indices_buf = runner.device.newBufferWithLength_options_(
-        batch_size * 4, Metal.MTLResourceStorageModeShared
-    )
+
+    indices_buf = runner.device.newBufferWithLength_options_(batch_size * 4, Metal.MTLResourceStorageModeShared)
     view = indices_buf.contents().as_buffer(batch_size * 4)
     for i, idx in enumerate(indices):
         st.pack_into("i", view, i * 4, idx)
@@ -2278,14 +2213,13 @@ def test_embedding_lookup(runner):
         for d in range(embed_dim):
             expected = table_data[token_idx * embed_dim + d]
             got = result[b * embed_dim + d]
-            assert abs(got - expected) < 1e-5, (
-                f"batch={b} dim={d}: got {got}, expected {expected}"
-            )
+            assert abs(got - expected) < 1e-5, f"batch={b} dim={d}: got {got}, expected {expected}"
 
 
 # ---------------------------------------------------------------------------
 # Causal Flash Attention tests
 # ---------------------------------------------------------------------------
+
 
 @requires_metal
 def test_flash_attention_causal(runner):
@@ -2317,6 +2251,7 @@ def test_flash_attention_causal(runner):
     n_groups = n_heads * n_q_blocks
 
     import Metal
+
     cmd = runner.queue.commandBuffer()
     enc = cmd.computeCommandEncoder()
     enc.setComputePipelineState_(pipeline)
@@ -2338,16 +2273,15 @@ def test_flash_attention_causal(runner):
     for i in range(seq_len):
         for j in range(seq_len):
             if j <= i:  # causal: attend only to past + self
-                dot = sum(Q_data[i * head_dim + d] * K_data[j * head_dim + d]
-                          for d in range(head_dim))
+                dot = sum(Q_data[i * head_dim + d] * K_data[j * head_dim + d] for d in range(head_dim))
                 S[i][j] = dot * scale
             else:
-                S[i][j] = float('-inf')
+                S[i][j] = float("-inf")
 
     P = []
     for i in range(seq_len):
         mx = max(S[i])
-        exps = [math.exp(s - mx) if s > float('-inf') else 0.0 for s in S[i]]
+        exps = [math.exp(s - mx) if s > float("-inf") else 0.0 for s in S[i]]
         s = sum(exps)
         P.append([e / s if s > 0 else 0.0 for e in exps])
 
@@ -2356,9 +2290,7 @@ def test_flash_attention_causal(runner):
             expected = sum(P[i][j] * V_data[j * head_dim + d] for j in range(seq_len))
             got = result[i * head_dim + d]
             tol = max(1e-3, abs(expected) * 0.02)
-            assert abs(got - expected) < tol, (
-                f"pos={i} dim={d}: got {got}, expected {expected}"
-            )
+            assert abs(got - expected) < tol, f"pos={i} dim={d}: got {got}, expected {expected}"
 
     # Verify causal property: first token output should only depend on first token
     # (i.e., O[0] = V[0] since attention is all on position 0)
@@ -2366,14 +2298,13 @@ def test_flash_attention_causal(runner):
         got = result[d]
         expected = V_data[d]  # position 0 attends only to itself
         tol = max(1e-3, abs(expected) * 0.02)
-        assert abs(got - expected) < tol, (
-            f"Causal check: O[0][{d}] = {got}, V[0][{d}] = {expected}"
-        )
+        assert abs(got - expected) < tol, f"Causal check: O[0][{d}] = {got}, V[0][{d}] = {expected}"
 
 
 # ---------------------------------------------------------------------------
 # Fused linear kernel tests
 # ---------------------------------------------------------------------------
+
 
 def _dispatch_fused_linear(runner, pipeline, buffers, M, N):
     """Dispatch a fused linear kernel with correct grid dimensions."""
@@ -2420,8 +2351,7 @@ def test_fused_linear_no_bias(runner):
     N_buf = runner.make_uint_buffer(N)
     K_buf = runner.make_uint_buffer(K)
 
-    _dispatch_fused_linear(runner, pipeline,
-                           [input_buf, weight_buf, C_buf, M_buf, N_buf, K_buf], M, N)
+    _dispatch_fused_linear(runner, pipeline, [input_buf, weight_buf, C_buf, M_buf, N_buf, K_buf], M, N)
 
     result = runner.read_float_buffer(C_buf, M * N)
 
@@ -2430,9 +2360,7 @@ def test_fused_linear_no_bias(runner):
         for j in range(N):
             expected = sum(input_data[i * K + k] * weight_data[j * K + k] for k in range(K))
             got = result[i * N + j]
-            assert abs(got - expected) < 1e-2, (
-                f"C[{i},{j}]: got {got}, expected {expected}"
-            )
+            assert abs(got - expected) < 1e-2, f"C[{i},{j}]: got {got}, expected {expected}"
 
 
 @requires_metal
@@ -2458,8 +2386,7 @@ def test_fused_linear_with_bias(runner):
     N_buf = runner.make_uint_buffer(N)
     K_buf = runner.make_uint_buffer(K)
 
-    _dispatch_fused_linear(runner, pipeline,
-                           [input_buf, weight_buf, C_buf, bias_buf, M_buf, N_buf, K_buf], M, N)
+    _dispatch_fused_linear(runner, pipeline, [input_buf, weight_buf, C_buf, bias_buf, M_buf, N_buf, K_buf], M, N)
 
     result = runner.read_float_buffer(C_buf, M * N)
 
@@ -2468,9 +2395,7 @@ def test_fused_linear_with_bias(runner):
             matmul = sum(input_data[i * K + k] * weight_data[j * K + k] for k in range(K))
             expected = matmul + bias_data[j]
             got = result[i * N + j]
-            assert abs(got - expected) < 1e-1, (
-                f"C[{i},{j}]: got {got}, expected {expected}"
-            )
+            assert abs(got - expected) < 1e-1, f"C[{i},{j}]: got {got}, expected {expected}"
 
 
 # ---------------------------------------------------------------------------
@@ -2497,11 +2422,9 @@ def test_gqa_attention(runner):
     # Q: [n_q_heads, head_dim] — each query head is different
     q_data = [random.uniform(-0.5, 0.5) for _ in range(n_q_heads * head_dim)]
     # K: [n_kv_heads, seq_len, head_dim]
-    k_data = [random.uniform(-0.5, 0.5)
-              for _ in range(n_kv_heads * seq_len * head_dim)]
+    k_data = [random.uniform(-0.5, 0.5) for _ in range(n_kv_heads * seq_len * head_dim)]
     # V: [n_kv_heads, seq_len, head_dim]
-    v_data = [random.uniform(-0.5, 0.5)
-              for _ in range(n_kv_heads * seq_len * head_dim)]
+    v_data = [random.uniform(-0.5, 0.5) for _ in range(n_kv_heads * seq_len * head_dim)]
 
     q_buf = runner.make_float_buffer(q_data)
     k_buf = runner.make_float_buffer(k_data)
@@ -2512,12 +2435,12 @@ def test_gqa_attention(runner):
     scale_buf = runner.make_float_scalar_buffer(scale_val)
 
     import Metal
+
     n_groups = n_q_heads  # one threadgroup per query head
     cmd = runner.queue.commandBuffer()
     enc = cmd.computeCommandEncoder()
     enc.setComputePipelineState_(pipeline)
-    for i, buf in enumerate([q_buf, k_buf, v_buf, out_buf,
-                              seq_buf, scale_buf]):
+    for i, buf in enumerate([q_buf, k_buf, v_buf, out_buf, seq_buf, scale_buf]):
         enc.setBuffer_offset_atIndex_(buf, 0, i)
     enc.dispatchThreadgroups_threadsPerThreadgroup_(
         Metal.MTLSizeMake(n_groups, 1, 1),
@@ -2539,9 +2462,7 @@ def test_gqa_attention(runner):
         # Compute attention scores
         scores = []
         for s in range(seq_len):
-            dot = sum(q_data[qh * head_dim + d] *
-                      k_data[(kv_h * seq_len + s) * head_dim + d]
-                      for d in range(head_dim))
+            dot = sum(q_data[qh * head_dim + d] * k_data[(kv_h * seq_len + s) * head_dim + d] for d in range(head_dim))
             scores.append(dot * scale)
 
         # Softmax
@@ -2552,17 +2473,13 @@ def test_gqa_attention(runner):
 
         # Weighted sum of V
         for d in range(head_dim):
-            expected = sum(attn[s] *
-                          v_data[(kv_h * seq_len + s) * head_dim + d]
-                          for s in range(seq_len))
+            expected = sum(attn[s] * v_data[(kv_h * seq_len + s) * head_dim + d] for s in range(seq_len))
             got = result[qh * head_dim + d]
-            assert abs(got - expected) < 0.05, (
-                f"head {qh}, dim {d}: got {got}, expected {expected}"
-            )
+            assert abs(got - expected) < 0.05, f"head {qh}, dim {d}: got {got}, expected {expected}"
 
     # Verify different query heads produce different outputs
     head0 = result[:head_dim]
-    head1 = result[head_dim:2 * head_dim]
+    head1 = result[head_dim : 2 * head_dim]
     diff = sum(abs(a - b) for a, b in zip(head0, head1))
     assert diff > 0.01, "Different query heads should produce different outputs"
 
@@ -2598,9 +2515,8 @@ def test_int8_matmul(runner):
 
     # Create int8 weight buffer (packed as signed bytes)
     import Metal
-    w_buf = runner.device.newBufferWithLength_options_(
-        N * K, Metal.MTLResourceStorageModeShared
-    )
+
+    w_buf = runner.device.newBufferWithLength_options_(N * K, Metal.MTLResourceStorageModeShared)
     w_view = w_buf.contents().as_buffer(N * K)
     for i, val in enumerate(weight_int8):
         struct_mod.pack_into("b", w_view, i, val)
@@ -2621,8 +2537,7 @@ def test_int8_matmul(runner):
     enc = cmd.computeCommandEncoder()
     enc.setComputePipelineState_(pipeline)
     # Buffer order matches kernel: input, weight, output, scales, zeros, M, N, K
-    for i, buf in enumerate([input_buf, w_buf, out_buf, scale_buf, zp_buf,
-                              M_buf, N_buf, K_buf]):
+    for i, buf in enumerate([input_buf, w_buf, out_buf, scale_buf, zp_buf, M_buf, N_buf, K_buf]):
         enc.setBuffer_offset_atIndex_(buf, 0, i)
     enc.dispatchThreadgroups_threadsPerThreadgroup_(
         Metal.MTLSizeMake(n_groups, 1, 1),
@@ -2639,14 +2554,10 @@ def test_int8_matmul(runner):
     for i in range(M):
         for j in range(N):
             expected = sum(
-                input_data[i * K + k] *
-                (float(weight_int8[j * K + k]) - zero_point) * scale
-                for k in range(K)
+                input_data[i * K + k] * (float(weight_int8[j * K + k]) - zero_point) * scale for k in range(K)
             )
             got = result[i * N + j]
-            assert abs(got - expected) < 0.5, (
-                f"C[{i},{j}]: got {got}, expected {expected}"
-            )
+            assert abs(got - expected) < 0.5, f"C[{i},{j}]: got {got}, expected {expected}"
 
 
 # ---------------------------------------------------------------------------
@@ -2676,20 +2587,17 @@ def test_concat_two_tensors(runner):
     n0_buf = runner.make_uint_buffer(n0)
     n1_buf = runner.make_uint_buffer(n1)
 
-    runner.run(pipeline, [a_buf, b_buf, out_buf, n0_buf, n1_buf],
-               total, block_size=256)
+    runner.run(pipeline, [a_buf, b_buf, out_buf, n0_buf, n1_buf], total, block_size=256)
 
     result = runner.read_float_buffer(out_buf, total)
 
     # First n0 elements should be a_data
     for i in range(n0):
-        assert result[i] == pytest.approx(a_data[i], abs=0.01), (
-            f"idx {i}: got {result[i]}, expected {a_data[i]}"
-        )
+        assert result[i] == pytest.approx(a_data[i], abs=0.01), f"idx {i}: got {result[i]}, expected {a_data[i]}"
     # Next n1 elements should be b_data
     for i in range(n1):
         assert result[n0 + i] == pytest.approx(b_data[i], abs=0.01), (
-            f"idx {n0+i}: got {result[n0+i]}, expected {b_data[i]}"
+            f"idx {n0 + i}: got {result[n0 + i]}, expected {b_data[i]}"
         )
 
 
@@ -2711,8 +2619,7 @@ def test_split_two_chunks(runner):
     out1_buf = runner.make_empty_buffer(chunk_size)
     cs_buf = runner.make_uint_buffer(chunk_size)
 
-    runner.run(pipeline, [in_buf, out0_buf, out1_buf, cs_buf],
-               total, block_size=256)
+    runner.run(pipeline, [in_buf, out0_buf, out1_buf, cs_buf], total, block_size=256)
 
     r0 = runner.read_float_buffer(out0_buf, chunk_size)
     r1 = runner.read_float_buffer(out1_buf, chunk_size)
@@ -2720,6 +2627,7 @@ def test_split_two_chunks(runner):
     for i in range(chunk_size):
         assert r0[i] == pytest.approx(data[i], abs=0.01)
         assert r1[i] == pytest.approx(data[chunk_size + i], abs=0.01)
+
 
 # ---------------------------------------------------------------------------
 # Top-K Sampling tests
@@ -2752,14 +2660,12 @@ def test_top_k_basic(runner):
     out_val_buf = runner.make_empty_buffer(k)
     # Create uint output buffer for indices
     import Metal
-    out_idx_buf = runner.device.newBufferWithLength_options_(
-        k * 4, Metal.MTLResourceStorageModeShared
-    )
+
+    out_idx_buf = runner.device.newBufferWithLength_options_(k * 4, Metal.MTLResourceStorageModeShared)
     vocab_buf = runner.make_uint_buffer(vocab_size)
     k_buf = runner.make_uint_buffer(k)
 
-    runner.run(pipeline, [logits_buf, out_val_buf, out_idx_buf, vocab_buf, k_buf],
-               256, block_size=256)
+    runner.run(pipeline, [logits_buf, out_val_buf, out_idx_buf, vocab_buf, k_buf], 256, block_size=256)
 
     result_vals = runner.read_float_buffer(out_val_buf, k)
     # Read uint indices
@@ -2775,7 +2681,7 @@ def test_top_k_basic(runner):
 
     # Verify indices match
     assert set(result_idxs) == set(top_indices)
-    assert result_idxs[0] == 17   # index of highest value
+    assert result_idxs[0] == 17  # index of highest value
     assert result_idxs[1] == 42
 
 
@@ -2803,14 +2709,12 @@ def test_top_k_large_vocab(runner):
     logits_buf = runner.make_float_buffer(logits)
     out_val_buf = runner.make_empty_buffer(k)
     import Metal
-    out_idx_buf = runner.device.newBufferWithLength_options_(
-        k * 4, Metal.MTLResourceStorageModeShared
-    )
+
+    out_idx_buf = runner.device.newBufferWithLength_options_(k * 4, Metal.MTLResourceStorageModeShared)
     vocab_buf = runner.make_uint_buffer(vocab_size)
     k_buf = runner.make_uint_buffer(k)
 
-    runner.run(pipeline, [logits_buf, out_val_buf, out_idx_buf, vocab_buf, k_buf],
-               256, block_size=256)
+    runner.run(pipeline, [logits_buf, out_val_buf, out_idx_buf, vocab_buf, k_buf], 256, block_size=256)
 
     result_vals = runner.read_float_buffer(out_val_buf, k)
     idx_view = out_idx_buf.contents().as_buffer(k * 4)
@@ -2858,20 +2762,16 @@ def test_top_p_sampling(runner):
     logits_buf = runner.make_float_buffer(logits)
     out_val_buf = runner.make_empty_buffer(max_k)
     import Metal
-    out_idx_buf = runner.device.newBufferWithLength_options_(
-        max_k * 4, Metal.MTLResourceStorageModeShared
-    )
-    out_count_buf = runner.device.newBufferWithLength_options_(
-        4, Metal.MTLResourceStorageModeShared
-    )
+
+    out_idx_buf = runner.device.newBufferWithLength_options_(max_k * 4, Metal.MTLResourceStorageModeShared)
+    out_count_buf = runner.device.newBufferWithLength_options_(4, Metal.MTLResourceStorageModeShared)
     vocab_buf = runner.make_uint_buffer(vocab_size)
     temp_buf = runner.make_float_scalar_buffer(temperature)
     p_buf = runner.make_float_scalar_buffer(p_threshold)
 
-    runner.run(pipeline,
-               [logits_buf, out_val_buf, out_idx_buf, out_count_buf,
-                vocab_buf, temp_buf, p_buf],
-               256, block_size=256)
+    runner.run(
+        pipeline, [logits_buf, out_val_buf, out_idx_buf, out_count_buf, vocab_buf, temp_buf, p_buf], 256, block_size=256
+    )
 
     # Read count
     count_view = out_count_buf.contents().as_buffer(4)
@@ -2884,7 +2784,7 @@ def test_top_p_sampling(runner):
     # Verify: probabilities should be in descending order
     for i in range(len(result_vals) - 1):
         assert result_vals[i] >= result_vals[i + 1] - 1e-6, (
-            f"Not sorted: p[{i}]={result_vals[i]} < p[{i+1}]={result_vals[i+1]}"
+            f"Not sorted: p[{i}]={result_vals[i]} < p[{i + 1}]={result_vals[i + 1]}"
         )
 
     # Verify: cumulative probability should reach p_threshold
@@ -2916,15 +2816,13 @@ def test_batched_kv_decode(runner):
     # Different sequence lengths per batch item
     actual_seq_lens = [8, 12]
 
-    msl = make_batched_kv_decode_kernel(n_heads=n_heads, head_dim=head_dim,
-                                         block_size=256)
+    msl = make_batched_kv_decode_kernel(n_heads=n_heads, head_dim=head_dim, block_size=256)
     path = runner.compile(msl, "batched_kv_decode")
     pipeline = runner.load(path, "batched_kv_decode")
 
     random.seed(6666)
     # Q: [batch, n_heads, head_dim]
-    q_data = [random.uniform(-0.5, 0.5)
-              for _ in range(batch_size * n_heads * head_dim)]
+    q_data = [random.uniform(-0.5, 0.5) for _ in range(batch_size * n_heads * head_dim)]
     # K/V: [batch, n_heads, max_seq_len, head_dim]
     kv_size = batch_size * n_heads * max_seq_len * head_dim
     k_data = [random.uniform(-0.5, 0.5) for _ in range(kv_size)]
@@ -2938,9 +2836,8 @@ def test_batched_kv_decode(runner):
     # seq_lens buffer: array of uints
     import Metal
     import struct as struct_mod
-    sl_buf = runner.device.newBufferWithLength_options_(
-        batch_size * 4, Metal.MTLResourceStorageModeShared
-    )
+
+    sl_buf = runner.device.newBufferWithLength_options_(batch_size * 4, Metal.MTLResourceStorageModeShared)
     sl_view = sl_buf.contents().as_buffer(batch_size * 4)
     for i, sl in enumerate(actual_seq_lens):
         struct_mod.pack_into("I", sl_view, i * 4, sl)
@@ -2951,11 +2848,11 @@ def test_batched_kv_decode(runner):
     # Dispatch: one threadgroup per (batch, head)
     n_groups = batch_size * n_heads
     import Metal
+
     cmd = runner.queue.commandBuffer()
     enc = cmd.computeCommandEncoder()
     enc.setComputePipelineState_(pipeline)
-    for i, buf in enumerate([q_buf, k_buf, v_buf, out_buf, sl_buf,
-                              max_sl_buf, bs_buf]):
+    for i, buf in enumerate([q_buf, k_buf, v_buf, out_buf, sl_buf, max_sl_buf, bs_buf]):
         enc.setBuffer_offset_atIndex_(buf, 0, i)
     enc.dispatchThreadgroups_threadsPerThreadgroup_(
         Metal.MTLSizeMake(n_groups, 1, 1),
@@ -2980,8 +2877,7 @@ def test_batched_kv_decode(runner):
             # Compute scores
             scores = []
             for j in range(seq_len):
-                dot = sum(q_data[q_off + d] * k_data[kv_off + j * head_dim + d]
-                          for d in range(head_dim))
+                dot = sum(q_data[q_off + d] * k_data[kv_off + j * head_dim + d] for d in range(head_dim))
                 scores.append(dot * scale)
 
             # Softmax
@@ -2992,12 +2888,9 @@ def test_batched_kv_decode(runner):
 
             # Weighted V
             for d in range(head_dim):
-                expected = sum(attn[j] * v_data[kv_off + j * head_dim + d]
-                               for j in range(seq_len))
+                expected = sum(attn[j] * v_data[kv_off + j * head_dim + d] for j in range(seq_len))
                 got = result[o_off + d]
-                assert abs(got - expected) < 0.05, (
-                    f"batch {b} head {h} dim {d}: got {got}, expected {expected}"
-                )
+                assert abs(got - expected) < 0.05, f"batch {b} head {h} dim {d}: got {got}, expected {expected}"
 
 
 # ---------------------------------------------------------------------------
@@ -3040,9 +2933,8 @@ def test_int4_matmul(runner):
 
     # Create packed weight buffer
     import Metal
-    w_buf = runner.device.newBufferWithLength_options_(
-        len(packed_bytes), Metal.MTLResourceStorageModeShared
-    )
+
+    w_buf = runner.device.newBufferWithLength_options_(len(packed_bytes), Metal.MTLResourceStorageModeShared)
     w_view = w_buf.contents().as_buffer(len(packed_bytes))
     for i, val in enumerate(packed_bytes):
         struct_mod.pack_into("B", w_view, i, val)
@@ -3058,10 +2950,9 @@ def test_int4_matmul(runner):
     total = M * N
     block_size = 256
     n_threadgroups = (total + block_size - 1) // block_size
-    runner.run(pipeline,
-               [input_buf, w_buf, out_buf, scale_buf, zp_buf,
-                M_buf, N_buf, K_buf],
-               total, block_size=block_size)
+    runner.run(
+        pipeline, [input_buf, w_buf, out_buf, scale_buf, zp_buf, M_buf, N_buf, K_buf], total, block_size=block_size
+    )
 
     result = runner.read_float_buffer(out_buf, M * N)
 
@@ -3069,14 +2960,10 @@ def test_int4_matmul(runner):
     for i in range(M):
         for j in range(N):
             expected = sum(
-                input_data[i * K + k] *
-                (float(weight_int4[j * K + k]) - zero_point) * scale
-                for k in range(K)
+                input_data[i * K + k] * (float(weight_int4[j * K + k]) - zero_point) * scale for k in range(K)
             )
             got = result[i * N + j]
-            assert abs(got - expected) < 0.5, (
-                f"C[{i},{j}]: got {got}, expected {expected}"
-            )
+            assert abs(got - expected) < 0.5, f"C[{i},{j}]: got {got}, expected {expected}"
 
 
 # ---------------------------------------------------------------------------
@@ -3120,11 +3007,11 @@ def test_rope_attention(runner):
 
     # Custom dispatch: single threadgroup
     import Metal
+
     cmd = runner.queue.commandBuffer()
     enc = cmd.computeCommandEncoder()
     enc.setComputePipelineState_(pipeline)
-    for i, buf in enumerate([q_buf, k_buf, v_buf, freqs_buf, out_buf,
-                              seq_buf, qpos_buf]):
+    for i, buf in enumerate([q_buf, k_buf, v_buf, freqs_buf, out_buf, seq_buf, qpos_buf]):
         enc.setBuffer_offset_atIndex_(buf, 0, i)
     enc.dispatchThreadgroups_threadsPerThreadgroup_(
         Metal.MTLSizeMake(1, 1, 1),
@@ -3174,9 +3061,7 @@ def test_rope_attention(runner):
     for d in range(head_dim):
         expected = sum(attn[j] * v_data[j * head_dim + d] for j in range(seq_len))
         got = result[d]
-        assert abs(got - expected) < 0.05, (
-            f"dim {d}: got {got}, expected {expected}"
-        )
+        assert abs(got - expected) < 0.05, f"dim {d}: got {got}, expected {expected}"
 
 
 # ---------------------------------------------------------------------------
@@ -3219,9 +3104,8 @@ def test_paged_attention(runner):
 
     # Page table buffer (uint array)
     import Metal
-    pt_buf = runner.device.newBufferWithLength_options_(
-        n_pages * 4, Metal.MTLResourceStorageModeShared
-    )
+
+    pt_buf = runner.device.newBufferWithLength_options_(n_pages * 4, Metal.MTLResourceStorageModeShared)
     pt_view = pt_buf.contents().as_buffer(n_pages * 4)
     for i, phys in enumerate(page_table):
         struct_mod.pack_into("I", pt_view, i * 4, phys)
@@ -3234,8 +3118,7 @@ def test_paged_attention(runner):
     cmd = runner.queue.commandBuffer()
     enc = cmd.computeCommandEncoder()
     enc.setComputePipelineState_(pipeline)
-    for i, buf in enumerate([q_buf, k_buf, v_buf, pt_buf, out_buf,
-                              sl_buf, np_buf]):
+    for i, buf in enumerate([q_buf, k_buf, v_buf, pt_buf, out_buf, sl_buf, np_buf]):
         enc.setBuffer_offset_atIndex_(buf, 0, i)
     enc.dispatchThreadgroups_threadsPerThreadgroup_(
         Metal.MTLSizeMake(1, 1, 1),
@@ -3274,9 +3157,7 @@ def test_paged_attention(runner):
             v_base = (phys_page * page_size + page_offset) * head_dim
             expected += attn[pos] * v_page_data[v_base + d]
         got = result[d]
-        assert abs(got - expected) < 0.05, (
-            f"dim {d}: got {got}, expected {expected}"
-        )
+        assert abs(got - expected) < 0.05, f"dim {d}: got {got}, expected {expected}"
 
 
 @requires_metal
@@ -3307,9 +3188,8 @@ def test_paged_attention_partial_page(runner):
     v_buf = runner.make_float_buffer(v_data)
 
     import Metal
-    pt_buf = runner.device.newBufferWithLength_options_(
-        n_pages * 4, Metal.MTLResourceStorageModeShared
-    )
+
+    pt_buf = runner.device.newBufferWithLength_options_(n_pages * 4, Metal.MTLResourceStorageModeShared)
     pt_view = pt_buf.contents().as_buffer(n_pages * 4)
     for i, phys in enumerate(page_table):
         struct_mod.pack_into("I", pt_view, i * 4, phys)
@@ -3321,8 +3201,7 @@ def test_paged_attention_partial_page(runner):
     cmd = runner.queue.commandBuffer()
     enc = cmd.computeCommandEncoder()
     enc.setComputePipelineState_(pipeline)
-    for i, buf in enumerate([q_buf, k_buf, v_buf, pt_buf, out_buf,
-                              sl_buf, np_buf]):
+    for i, buf in enumerate([q_buf, k_buf, v_buf, pt_buf, out_buf, sl_buf, np_buf]):
         enc.setBuffer_offset_atIndex_(buf, 0, i)
     enc.dispatchThreadgroups_threadsPerThreadgroup_(
         Metal.MTLSizeMake(1, 1, 1),
@@ -3360,9 +3239,7 @@ def test_paged_attention_partial_page(runner):
             vb = (pp * page_size + po) * head_dim
             expected += attn[pos] * v_data[vb + d]
         got = result[d]
-        assert abs(got - expected) < 0.05, (
-            f"dim {d}: got {got}, expected {expected}"
-        )
+        assert abs(got - expected) < 0.05, f"dim {d}: got {got}, expected {expected}"
 
 
 # ---------------------------------------------------------------------------
@@ -3422,18 +3299,15 @@ def test_speculative_decode_partial_accept(runner):
     tp_buf = runner.make_float_buffer(target_probs)
 
     import Metal
-    dt_buf = runner.device.newBufferWithLength_options_(
-        n_tokens * 4, Metal.MTLResourceStorageModeShared
-    )
+
+    dt_buf = runner.device.newBufferWithLength_options_(n_tokens * 4, Metal.MTLResourceStorageModeShared)
     dt_view = dt_buf.contents().as_buffer(n_tokens * 4)
     for i, tok in enumerate(draft_tokens):
         struct_mod.pack_into("I", dt_view, i * 4, tok)
 
     rv_buf = runner.make_float_buffer(rand_vals)
 
-    na_buf = runner.device.newBufferWithLength_options_(
-        4, Metal.MTLResourceStorageModeShared
-    )
+    na_buf = runner.device.newBufferWithLength_options_(4, Metal.MTLResourceStorageModeShared)
     adj_buf = runner.make_empty_buffer(vocab_size)
 
     nt_buf = runner.make_uint_buffer(n_tokens)
@@ -3442,8 +3316,7 @@ def test_speculative_decode_partial_accept(runner):
     cmd = runner.queue.commandBuffer()
     enc = cmd.computeCommandEncoder()
     enc.setComputePipelineState_(pipeline)
-    for i, buf in enumerate([dp_buf, tp_buf, dt_buf, rv_buf, na_buf, adj_buf,
-                              nt_buf, vs_buf]):
+    for i, buf in enumerate([dp_buf, tp_buf, dt_buf, rv_buf, na_buf, adj_buf, nt_buf, vs_buf]):
         enc.setBuffer_offset_atIndex_(buf, 0, i)
     enc.dispatchThreadgroups_threadsPerThreadgroup_(
         Metal.MTLSizeMake(1, 1, 1),
@@ -3505,17 +3378,14 @@ def test_speculative_decode_all_accepted(runner):
     tp_buf = runner.make_float_buffer(target_probs)
 
     import Metal
-    dt_buf = runner.device.newBufferWithLength_options_(
-        n_tokens * 4, Metal.MTLResourceStorageModeShared
-    )
+
+    dt_buf = runner.device.newBufferWithLength_options_(n_tokens * 4, Metal.MTLResourceStorageModeShared)
     dt_view = dt_buf.contents().as_buffer(n_tokens * 4)
     for i, tok in enumerate(draft_tokens):
         struct_mod.pack_into("I", dt_view, i * 4, tok)
 
     rv_buf = runner.make_float_buffer(rand_vals)
-    na_buf = runner.device.newBufferWithLength_options_(
-        4, Metal.MTLResourceStorageModeShared
-    )
+    na_buf = runner.device.newBufferWithLength_options_(4, Metal.MTLResourceStorageModeShared)
     adj_buf = runner.make_empty_buffer(vocab_size)
     nt_buf = runner.make_uint_buffer(n_tokens)
     vs_buf = runner.make_uint_buffer(vocab_size)
@@ -3523,8 +3393,7 @@ def test_speculative_decode_all_accepted(runner):
     cmd = runner.queue.commandBuffer()
     enc = cmd.computeCommandEncoder()
     enc.setComputePipelineState_(pipeline)
-    for i, buf in enumerate([dp_buf, tp_buf, dt_buf, rv_buf, na_buf, adj_buf,
-                              nt_buf, vs_buf]):
+    for i, buf in enumerate([dp_buf, tp_buf, dt_buf, rv_buf, na_buf, adj_buf, nt_buf, vs_buf]):
         enc.setBuffer_offset_atIndex_(buf, 0, i)
     enc.dispatchThreadgroups_threadsPerThreadgroup_(
         Metal.MTLSizeMake(1, 1, 1),
@@ -3572,11 +3441,11 @@ def test_fused_residual_norm(runner):
     ncols_buf = runner.make_uint_buffer(n_cols)
 
     import Metal
+
     cmd = runner.queue.commandBuffer()
     enc = cmd.computeCommandEncoder()
     enc.setComputePipelineState_(pipeline)
-    for i, buf in enumerate([in_buf, res_buf, gamma_buf, beta_buf, out_buf,
-                              res_out_buf, ncols_buf]):
+    for i, buf in enumerate([in_buf, res_buf, gamma_buf, beta_buf, out_buf, res_out_buf, ncols_buf]):
         enc.setBuffer_offset_atIndex_(buf, 0, i)
     enc.dispatchThreadgroups_threadsPerThreadgroup_(
         Metal.MTLSizeMake(n_rows, 1, 1),
@@ -3594,8 +3463,7 @@ def test_fused_residual_norm(runner):
     # Python reference
     for row in range(n_rows):
         # x = input + residual
-        x = [input_data[row * n_cols + i] + residual_data[row * n_cols + i]
-             for i in range(n_cols)]
+        x = [input_data[row * n_cols + i] + residual_data[row * n_cols + i] for i in range(n_cols)]
 
         # Check residual_out
         for i in range(n_cols):
@@ -3610,9 +3478,7 @@ def test_fused_residual_norm(runner):
         for i in range(n_cols):
             expected = (x[i] - mean) * inv_std * gamma_data[i] + beta_data[i]
             got = result[row * n_cols + i]
-            assert abs(got - expected) < 0.01, (
-                f"row {row} col {i}: got {got}, expected {expected}"
-            )
+            assert abs(got - expected) < 0.01, f"row {row} col {i}: got {got}, expected {expected}"
 
 
 # ---------------------------------------------------------------------------
@@ -3638,8 +3504,7 @@ def test_beam_search(runner):
 
     # Next-token log-probs per beam
     random.seed(4242)
-    log_probs_data = [random.uniform(-10.0, -1.0)
-                      for _ in range(beam_width * vocab_size)]
+    log_probs_data = [random.uniform(-10.0, -1.0) for _ in range(beam_width * vocab_size)]
 
     # Plant some known high-scoring candidates
     # beam 0, token 5: -1.0 + -0.1 = -1.1 (best)
@@ -3656,19 +3521,15 @@ def test_beam_search(runner):
     out_scores_buf = runner.make_empty_buffer(beam_width)
 
     import Metal
-    out_beams_buf = runner.device.newBufferWithLength_options_(
-        beam_width * 4, Metal.MTLResourceStorageModeShared
-    )
-    out_tokens_buf = runner.device.newBufferWithLength_options_(
-        beam_width * 4, Metal.MTLResourceStorageModeShared
-    )
+
+    out_beams_buf = runner.device.newBufferWithLength_options_(beam_width * 4, Metal.MTLResourceStorageModeShared)
+    out_tokens_buf = runner.device.newBufferWithLength_options_(beam_width * 4, Metal.MTLResourceStorageModeShared)
     vs_buf = runner.make_uint_buffer(vocab_size)
 
     cmd = runner.queue.commandBuffer()
     enc = cmd.computeCommandEncoder()
     enc.setComputePipelineState_(pipeline)
-    for i, buf in enumerate([bs_buf, lp_buf, out_scores_buf, out_beams_buf,
-                              out_tokens_buf, vs_buf]):
+    for i, buf in enumerate([bs_buf, lp_buf, out_scores_buf, out_beams_buf, out_tokens_buf, vs_buf]):
         enc.setBuffer_offset_atIndex_(buf, 0, i)
     enc.dispatchThreadgroups_threadsPerThreadgroup_(
         Metal.MTLSizeMake(1, 1, 1),
@@ -3682,10 +3543,8 @@ def test_beam_search(runner):
     result_scores = runner.read_float_buffer(out_scores_buf, beam_width)
     beams_view = out_beams_buf.contents().as_buffer(beam_width * 4)
     tokens_view = out_tokens_buf.contents().as_buffer(beam_width * 4)
-    result_beams = [struct_mod.unpack_from("I", beams_view, i * 4)[0]
-                    for i in range(beam_width)]
-    result_tokens = [struct_mod.unpack_from("I", tokens_view, i * 4)[0]
-                     for i in range(beam_width)]
+    result_beams = [struct_mod.unpack_from("I", beams_view, i * 4)[0] for i in range(beam_width)]
+    result_tokens = [struct_mod.unpack_from("I", tokens_view, i * 4)[0] for i in range(beam_width)]
 
     # Verify the top-4 are in descending score order
     assert result_scores[0] > result_scores[1] > result_scores[2] > result_scores[3]
@@ -3719,8 +3578,7 @@ def test_multi_head_paged_attention(runner):
     n_pages = 2
     page_table = [1, 0]  # Reversed
 
-    msl = make_multi_head_paged_attention_kernel(
-        n_heads=n_heads, head_dim=head_dim, page_size=page_size)
+    msl = make_multi_head_paged_attention_kernel(n_heads=n_heads, head_dim=head_dim, page_size=page_size)
     path = runner.compile(msl, "multi_head_paged_attn")
     pipeline = runner.load(path, "multi_head_paged_attention")
 
@@ -3739,9 +3597,8 @@ def test_multi_head_paged_attention(runner):
     v_buf = runner.make_float_buffer(v_data)
 
     import Metal
-    pt_buf = runner.device.newBufferWithLength_options_(
-        n_pages * 4, Metal.MTLResourceStorageModeShared
-    )
+
+    pt_buf = runner.device.newBufferWithLength_options_(n_pages * 4, Metal.MTLResourceStorageModeShared)
     pt_view = pt_buf.contents().as_buffer(n_pages * 4)
     for i, phys in enumerate(page_table):
         struct_mod.pack_into("I", pt_view, i * 4, phys)
@@ -3753,8 +3610,7 @@ def test_multi_head_paged_attention(runner):
     cmd = runner.queue.commandBuffer()
     enc = cmd.computeCommandEncoder()
     enc.setComputePipelineState_(pipeline)
-    for i, buf in enumerate([q_buf, k_buf, v_buf, pt_buf, out_buf,
-                              sl_buf, np_buf]):
+    for i, buf in enumerate([q_buf, k_buf, v_buf, pt_buf, out_buf, sl_buf, np_buf]):
         enc.setBuffer_offset_atIndex_(buf, 0, i)
     enc.dispatchThreadgroups_threadsPerThreadgroup_(
         Metal.MTLSizeMake(n_heads, 1, 1),
@@ -3795,9 +3651,7 @@ def test_multi_head_paged_attention(runner):
                 v_base = ((pp * page_size + po) * n_heads + h) * head_dim
                 expected += attn[pos] * v_data[v_base + d]
             got = result[q_off + d]
-            assert abs(got - expected) < 0.05, (
-                f"head {h} dim {d}: got {got}, expected {expected}"
-            )
+            assert abs(got - expected) < 0.05, f"head {h} dim {d}: got {got}, expected {expected}"
 
 
 # ---------------------------------------------------------------------------
@@ -3827,12 +3681,12 @@ def test_fp16_kv_attention(runner):
 
     # Create half-precision buffers for K and V
     import Metal
+
     k_buf = runner.device.newBufferWithLength_options_(
-        seq_len * head_dim * 2, Metal.MTLResourceStorageModeShared  # 2 bytes per half
+        seq_len * head_dim * 2,
+        Metal.MTLResourceStorageModeShared,  # 2 bytes per half
     )
-    v_buf = runner.device.newBufferWithLength_options_(
-        seq_len * head_dim * 2, Metal.MTLResourceStorageModeShared
-    )
+    v_buf = runner.device.newBufferWithLength_options_(seq_len * head_dim * 2, Metal.MTLResourceStorageModeShared)
 
     # Pack as half-precision (IEEE 754 binary16)
     k_view = k_buf.contents().as_buffer(seq_len * head_dim * 2)
@@ -3861,10 +3715,8 @@ def test_fp16_kv_attention(runner):
     result = runner.read_float_buffer(out_buf, head_dim)
 
     # Reference: use the half-precision-rounded values
-    k_half = [struct_mod.unpack_from("e", k_view, i * 2)[0]
-              for i in range(seq_len * head_dim)]
-    v_half = [struct_mod.unpack_from("e", v_view, i * 2)[0]
-              for i in range(seq_len * head_dim)]
+    k_half = [struct_mod.unpack_from("e", k_view, i * 2)[0] for i in range(seq_len * head_dim)]
+    v_half = [struct_mod.unpack_from("e", v_view, i * 2)[0] for i in range(seq_len * head_dim)]
 
     scale = 1.0 / math.sqrt(head_dim)
     scores = []
@@ -3880,9 +3732,7 @@ def test_fp16_kv_attention(runner):
     for d in range(head_dim):
         expected = sum(attn[j] * v_half[j * head_dim + d] for j in range(seq_len))
         got = result[d]
-        assert abs(got - expected) < 0.05, (
-            f"dim {d}: got {got}, expected {expected}"
-        )
+        assert abs(got - expected) < 0.05, f"dim {d}: got {got}, expected {expected}"
 
 
 # ---------------------------------------------------------------------------
@@ -3919,9 +3769,7 @@ def test_fused_mlp(runner):
         silu_g = g / (1.0 + math.exp(-g))
         expected = silu_g * up_data[i]
         got = result[i]
-        assert abs(got - expected) < 0.01, (
-            f"idx {i}: got {got}, expected {expected}"
-        )
+        assert abs(got - expected) < 0.01, f"idx {i}: got {got}, expected {expected}"
 
 
 # ---------------------------------------------------------------------------
@@ -3939,8 +3787,7 @@ def test_sliding_window_attention(runner):
     seq_len = 20
     q_pos = 15  # Will attend to positions 8..15
 
-    msl = make_sliding_window_attention_kernel(
-        head_dim=head_dim, window_size=window_size, block_size=256)
+    msl = make_sliding_window_attention_kernel(head_dim=head_dim, window_size=window_size, block_size=256)
     path = runner.compile(msl, "sliding_window_attn")
     pipeline = runner.load(path, "sliding_window_attention")
 
@@ -3957,6 +3804,7 @@ def test_sliding_window_attention(runner):
     sl_buf = runner.make_uint_buffer(seq_len)
 
     import Metal
+
     cmd = runner.queue.commandBuffer()
     enc = cmd.computeCommandEncoder()
     enc.setComputePipelineState_(pipeline)
@@ -3989,12 +3837,9 @@ def test_sliding_window_attention(runner):
     attn = [e / sum_exp for e in exp_s]
 
     for d in range(head_dim):
-        expected = sum(attn[w] * v_data[(win_start + w) * head_dim + d]
-                       for w in range(len(attn)))
+        expected = sum(attn[w] * v_data[(win_start + w) * head_dim + d] for w in range(len(attn)))
         got = result[d]
-        assert abs(got - expected) < 0.05, (
-            f"dim {d}: got {got}, expected {expected}"
-        )
+        assert abs(got - expected) < 0.05, f"dim {d}: got {got}, expected {expected}"
 
 
 # ---------------------------------------------------------------------------
@@ -4035,6 +3880,7 @@ def test_repeat_kv(runner):
     n_groups = (total_out + block_size - 1) // block_size
 
     import Metal
+
     cmd = runner.queue.commandBuffer()
     enc = cmd.computeCommandEncoder()
     enc.setComputePipelineState_(pipeline)
@@ -4060,14 +3906,13 @@ def test_repeat_kv(runner):
                 in_idx = (kv_h * seq_len + s) * head_dim + d
                 expected = in_data[in_idx]
                 got = result[out_idx]
-                assert abs(got - expected) < 0.001, (
-                    f"q_head={qh} s={s} d={d}: got {got}, expected {expected}"
-                )
+                assert abs(got - expected) < 0.001, f"q_head={qh} s={s} d={d}: got {got}, expected {expected}"
 
 
 # ---------------------------------------------------------------------------
 # Edge case and error handling tests
 # ---------------------------------------------------------------------------
+
 
 @requires_metal
 def test_vector_add_single_element(runner):
@@ -4229,8 +4074,7 @@ def test_layer_norm_zero_variance(runner):
     out_buf = runner.make_empty_buffer(n_cols)
     ncols_buf = runner.make_uint_buffer(n_cols)
 
-    runner.run(pipeline, [in_buf, gamma_buf, beta_buf, out_buf, ncols_buf],
-                        1, 256)
+    runner.run(pipeline, [in_buf, gamma_buf, beta_buf, out_buf, ncols_buf], 1, 256)
     result = runner.read_float_buffer(out_buf, n_cols)
 
     # With zero variance, normalized x = 0 (since x-mean=0), so output = 0*gamma + beta = beta
@@ -4263,6 +4107,7 @@ def test_variance_kernel(runner):
     ncols_buf = runner.make_uint_buffer(n_cols)
 
     import Metal
+
     cmd = runner.queue.commandBuffer()
     enc = cmd.computeCommandEncoder()
     enc.setComputePipelineState_(pipeline)
@@ -4320,6 +4165,7 @@ def test_kernel_builder_empty():
 # Batch normalization tests
 # ---------------------------------------------------------------------------
 
+
 @requires_metal
 def test_batch_norm_kernel(runner):
     """Batch norm (eval mode) with pre-computed running stats."""
@@ -4349,9 +4195,7 @@ def test_batch_norm_kernel(runner):
     nc_buf = runner.make_uint_buffer(C)
     hw_buf = runner.make_uint_buffer(HW)
 
-    runner.run(pipeline,
-               [in_buf, out_buf, gamma_buf, beta_buf, mean_buf, var_buf, nc_buf, hw_buf],
-               total, 256)
+    runner.run(pipeline, [in_buf, out_buf, gamma_buf, beta_buf, mean_buf, var_buf, nc_buf, hw_buf], total, 256)
     result = runner.read_float_buffer(out_buf, total)
 
     # Verify: output = gamma * (input - mean) / sqrt(var + eps) + beta
@@ -4359,7 +4203,9 @@ def test_batch_norm_kernel(runner):
     for idx in range(total):
         channel = (idx // HW) % C
         x = in_data[idx]
-        expected = gamma_data[channel] * (x - mean_data[channel]) / math.sqrt(var_data[channel] + eps) + beta_data[channel]
+        expected = (
+            gamma_data[channel] * (x - mean_data[channel]) / math.sqrt(var_data[channel] + eps) + beta_data[channel]
+        )
         assert abs(result[idx] - expected) < 0.01, f"idx={idx}: {result[idx]} != {expected}"
 
 
@@ -4391,9 +4237,7 @@ def test_batch_norm_with_affine(runner):
     nc_buf = runner.make_uint_buffer(C)
     hw_buf = runner.make_uint_buffer(HW)
 
-    runner.run(pipeline,
-               [in_buf, out_buf, gamma_buf, beta_buf, mean_buf, var_buf, nc_buf, hw_buf],
-               total, 256)
+    runner.run(pipeline, [in_buf, out_buf, gamma_buf, beta_buf, mean_buf, var_buf, nc_buf, hw_buf], total, 256)
     result = runner.read_float_buffer(out_buf, total)
 
     # input=1, mean=1 → normalized=0 → output = gamma*0 + beta = beta
@@ -4406,6 +4250,7 @@ def test_batch_norm_with_affine(runner):
 # ---------------------------------------------------------------------------
 # Online softmax tests
 # ---------------------------------------------------------------------------
+
 
 @requires_metal
 def test_online_softmax(runner):
@@ -4423,6 +4268,7 @@ def test_online_softmax(runner):
     ncols_buf = runner.make_uint_buffer(n_cols)
 
     import Metal
+
     cmd = runner.queue.commandBuffer()
     enc = cmd.computeCommandEncoder()
     enc.setComputePipelineState_(pipeline)
@@ -4467,6 +4313,7 @@ def test_online_softmax_uniform(runner):
     ncols_buf = runner.make_uint_buffer(n_cols)
 
     import Metal
+
     cmd = runner.queue.commandBuffer()
     enc = cmd.computeCommandEncoder()
     enc.setComputePipelineState_(pipeline)
@@ -4492,6 +4339,7 @@ def test_online_softmax_uniform(runner):
 # Causal attention tests
 # ---------------------------------------------------------------------------
 
+
 @requires_metal
 def test_causal_attention_compiles(runner):
     """Causal attention kernel compiles successfully."""
@@ -4504,6 +4352,7 @@ def test_causal_attention_compiles(runner):
 # ---------------------------------------------------------------------------
 # Group normalization tests
 # ---------------------------------------------------------------------------
+
 
 @requires_metal
 def test_group_norm_kernel(runner):
@@ -4530,9 +4379,7 @@ def test_group_norm_kernel(runner):
     spatial_buf = runner.make_uint_buffer(spatial)
 
     cmd = runner.queue.commandBuffer()
-    enc = cmd.computeCommandEncoderWithDescriptor_(
-        Metal.MTLComputePassDescriptor.computePassDescriptor()
-    )
+    enc = cmd.computeCommandEncoderWithDescriptor_(Metal.MTLComputePassDescriptor.computePassDescriptor())
     enc.setComputePipelineState_(pipeline)
     enc.setBuffer_offset_atIndex_(inp_buf, 0, 0)
     enc.setBuffer_offset_atIndex_(weight_buf, 0, 1)
@@ -4582,9 +4429,7 @@ def test_group_norm_varying_input(runner):
     spatial_buf = runner.make_uint_buffer(spatial)
 
     cmd = runner.queue.commandBuffer()
-    enc = cmd.computeCommandEncoderWithDescriptor_(
-        Metal.MTLComputePassDescriptor.computePassDescriptor()
-    )
+    enc = cmd.computeCommandEncoderWithDescriptor_(Metal.MTLComputePassDescriptor.computePassDescriptor())
     enc.setComputePipelineState_(pipeline)
     enc.setBuffer_offset_atIndex_(inp_buf, 0, 0)
     enc.setBuffer_offset_atIndex_(weight_buf, 0, 1)
@@ -4604,6 +4449,7 @@ def test_group_norm_varying_input(runner):
     result = runner.read_float_buffer(out_buf, n)
     # mean = 2.5, var = 1.25, inv_std = 1/sqrt(1.25+eps)
     import math
+
     mean = 2.5
     var = sum((x - mean) ** 2 for x in data) / len(data)
     inv_std = 1.0 / math.sqrt(var + eps)
@@ -4615,6 +4461,7 @@ def test_group_norm_varying_input(runner):
 # ---------------------------------------------------------------------------
 # Instance normalization tests
 # ---------------------------------------------------------------------------
+
 
 @requires_metal
 def test_instance_norm_uniform(runner):
@@ -4640,9 +4487,7 @@ def test_instance_norm_uniform(runner):
     nchan_buf = runner.make_uint_buffer(n_channels)
 
     cmd = runner.queue.commandBuffer()
-    enc = cmd.computeCommandEncoderWithDescriptor_(
-        Metal.MTLComputePassDescriptor.computePassDescriptor()
-    )
+    enc = cmd.computeCommandEncoderWithDescriptor_(Metal.MTLComputePassDescriptor.computePassDescriptor())
     enc.setComputePipelineState_(pipeline)
     enc.setBuffer_offset_atIndex_(inp_buf, 0, 0)
     enc.setBuffer_offset_atIndex_(weight_buf, 0, 1)
@@ -4690,9 +4535,7 @@ def test_instance_norm_varying(runner):
     nchan_buf = runner.make_uint_buffer(n_channels)
 
     cmd = runner.queue.commandBuffer()
-    enc = cmd.computeCommandEncoderWithDescriptor_(
-        Metal.MTLComputePassDescriptor.computePassDescriptor()
-    )
+    enc = cmd.computeCommandEncoderWithDescriptor_(Metal.MTLComputePassDescriptor.computePassDescriptor())
     enc.setComputePipelineState_(pipeline)
     enc.setBuffer_offset_atIndex_(inp_buf, 0, 0)
     enc.setBuffer_offset_atIndex_(weight_buf, 0, 1)
@@ -4721,6 +4564,7 @@ def test_instance_norm_varying(runner):
 # ---------------------------------------------------------------------------
 # Fused dropout tests
 # ---------------------------------------------------------------------------
+
 
 @requires_metal
 def test_fused_dropout_compiles(runner):
@@ -4751,9 +4595,7 @@ def test_fused_dropout_output(runner):
     seed_buf = runner.make_uint_buffer(42)
 
     cmd = runner.queue.commandBuffer()
-    enc = cmd.computeCommandEncoderWithDescriptor_(
-        Metal.MTLComputePassDescriptor.computePassDescriptor()
-    )
+    enc = cmd.computeCommandEncoderWithDescriptor_(Metal.MTLComputePassDescriptor.computePassDescriptor())
     enc.setComputePipelineState_(pipeline)
     enc.setBuffer_offset_atIndex_(inp_buf, 0, 0)
     enc.setBuffer_offset_atIndex_(out_buf, 0, 1)
@@ -4788,6 +4630,7 @@ def test_fused_dropout_output(runner):
 # FP16 softmax tests
 # ---------------------------------------------------------------------------
 
+
 @requires_metal
 def test_softmax_fp16(runner):
     """FP16 softmax produces valid probability distributions."""
@@ -4809,9 +4652,7 @@ def test_softmax_fp16(runner):
     ncols_buf = runner.make_uint_buffer(n_cols)
 
     cmd = runner.queue.commandBuffer()
-    enc = cmd.computeCommandEncoderWithDescriptor_(
-        Metal.MTLComputePassDescriptor.computePassDescriptor()
-    )
+    enc = cmd.computeCommandEncoderWithDescriptor_(Metal.MTLComputePassDescriptor.computePassDescriptor())
     enc.setComputePipelineState_(pipeline)
     enc.setBuffer_offset_atIndex_(inp_buf, 0, 0)
     enc.setBuffer_offset_atIndex_(out_buf, 0, 1)
@@ -4845,6 +4686,7 @@ def test_softmax_fp16(runner):
 # FP16 matmul tests
 # ---------------------------------------------------------------------------
 
+
 @requires_metal
 def test_matmul_fp16_identity(runner):
     """FP16 matmul with identity matrix produces correct result."""
@@ -4873,9 +4715,7 @@ def test_matmul_fp16_identity(runner):
     k_buf = runner.make_uint_buffer(K)
 
     cmd = runner.queue.commandBuffer()
-    enc = cmd.computeCommandEncoderWithDescriptor_(
-        Metal.MTLComputePassDescriptor.computePassDescriptor()
-    )
+    enc = cmd.computeCommandEncoderWithDescriptor_(Metal.MTLComputePassDescriptor.computePassDescriptor())
     enc.setComputePipelineState_(pipeline)
     enc.setBuffer_offset_atIndex_(a_buf, 0, 0)
     enc.setBuffer_offset_atIndex_(b_buf, 0, 1)
@@ -4900,13 +4740,13 @@ def test_matmul_fp16_identity(runner):
         for col in range(N):
             expected = float(col + 1)
             actual = result[row * N + col]
-            assert abs(actual - expected) < 0.5, \
-                f"C[{row},{col}] = {actual}, expected {expected}"
+            assert abs(actual - expected) < 0.5, f"C[{row},{col}] = {actual}, expected {expected}"
 
 
 # ---------------------------------------------------------------------------
 # BF16 tests
 # ---------------------------------------------------------------------------
+
 
 @requires_metal
 def test_vector_add_bf16(runner):
@@ -4932,8 +4772,7 @@ def test_vector_add_bf16(runner):
         expected = a_data[i] + b_data[i]
         # BF16 has ~3 decimal digits precision; tolerance scales with magnitude
         tol = max(2.0, abs(expected) * 0.02)
-        assert abs(result[i] - expected) < tol, \
-            f"i={i}: {result[i]} != {expected}"
+        assert abs(result[i] - expected) < tol, f"i={i}: {result[i]} != {expected}"
 
 
 @requires_metal
@@ -4947,6 +4786,7 @@ def test_activation_tanh_bf16(runner):
     pipeline = runner.load(path, "tanh_kernel")
 
     import math
+
     data = [0.0, 0.5, 1.0, -1.0] * 64
     inp_buf = runner.make_bf16_buffer(data)
     out_buf = runner.make_empty_bf16_buffer(n)
@@ -4957,13 +4797,13 @@ def test_activation_tanh_bf16(runner):
 
     for i in range(min(4, n)):
         expected = math.tanh(data[i])
-        assert abs(result[i] - expected) < 0.05, \
-            f"i={i}: {result[i]} != {expected}"
+        assert abs(result[i] - expected) < 0.05, f"i={i}: {result[i]} != {expected}"
 
 
 # ---------------------------------------------------------------------------
 # Gather kernel tests
 # ---------------------------------------------------------------------------
+
 
 @requires_metal
 def test_gather_kernel(runner):
@@ -4982,9 +4822,7 @@ def test_gather_kernel(runner):
 
     inp_buf = runner.make_float_buffer(data)
     # Make int buffer for indices
-    idx_buf = runner.device.newBufferWithLength_options_(
-        len(indices) * 4, Metal.MTLResourceStorageModeShared
-    )
+    idx_buf = runner.device.newBufferWithLength_options_(len(indices) * 4, Metal.MTLResourceStorageModeShared)
     view = idx_buf.contents().as_buffer(len(indices) * 4)
     for i, idx in enumerate(indices):
         struct.pack_into("i", view, i * 4, idx)
@@ -4992,9 +4830,7 @@ def test_gather_kernel(runner):
     n_buf = runner.make_uint_buffer(n)
 
     cmd = runner.queue.commandBuffer()
-    enc = cmd.computeCommandEncoderWithDescriptor_(
-        Metal.MTLComputePassDescriptor.computePassDescriptor()
-    )
+    enc = cmd.computeCommandEncoderWithDescriptor_(Metal.MTLComputePassDescriptor.computePassDescriptor())
     enc.setComputePipelineState_(pipeline)
     enc.setBuffer_offset_atIndex_(inp_buf, 0, 0)
     enc.setBuffer_offset_atIndex_(idx_buf, 0, 1)
@@ -5019,6 +4855,7 @@ def test_gather_kernel(runner):
 # Scatter kernel tests
 # ---------------------------------------------------------------------------
 
+
 @requires_metal
 def test_scatter_kernel(runner):
     """Scatter kernel writes to indexed positions."""
@@ -5035,9 +4872,7 @@ def test_scatter_kernel(runner):
     pipeline = runner.load(path, "scatter_kernel")
 
     inp_buf = runner.make_float_buffer(data)
-    idx_buf = runner.device.newBufferWithLength_options_(
-        len(indices) * 4, Metal.MTLResourceStorageModeShared
-    )
+    idx_buf = runner.device.newBufferWithLength_options_(len(indices) * 4, Metal.MTLResourceStorageModeShared)
     view = idx_buf.contents().as_buffer(len(indices) * 4)
     for i, idx in enumerate(indices):
         struct.pack_into("i", view, i * 4, idx)
@@ -5045,9 +4880,7 @@ def test_scatter_kernel(runner):
     n_buf = runner.make_uint_buffer(n)
 
     cmd = runner.queue.commandBuffer()
-    enc = cmd.computeCommandEncoderWithDescriptor_(
-        Metal.MTLComputePassDescriptor.computePassDescriptor()
-    )
+    enc = cmd.computeCommandEncoderWithDescriptor_(Metal.MTLComputePassDescriptor.computePassDescriptor())
     enc.setComputePipelineState_(pipeline)
     enc.setBuffer_offset_atIndex_(inp_buf, 0, 0)
     enc.setBuffer_offset_atIndex_(idx_buf, 0, 1)
@@ -5075,6 +4908,7 @@ def test_scatter_kernel(runner):
 # Transpose kernel tests
 # ---------------------------------------------------------------------------
 
+
 @requires_metal
 def test_transpose_kernel(runner):
     """Transpose kernel correctly transposes a small matrix."""
@@ -5100,9 +4934,7 @@ def test_transpose_kernel(runner):
     n_tiles_y = (rows + tile_size - 1) // tile_size
 
     cmd = runner.queue.commandBuffer()
-    enc = cmd.computeCommandEncoderWithDescriptor_(
-        Metal.MTLComputePassDescriptor.computePassDescriptor()
-    )
+    enc = cmd.computeCommandEncoderWithDescriptor_(Metal.MTLComputePassDescriptor.computePassDescriptor())
     enc.setComputePipelineState_(pipeline)
     enc.setBuffer_offset_atIndex_(inp_buf, 0, 0)
     enc.setBuffer_offset_atIndex_(out_buf, 0, 1)
@@ -5124,13 +4956,13 @@ def test_transpose_kernel(runner):
         for c in range(cols):
             expected = data[r * cols + c]
             actual = result[c * rows + r]
-            assert abs(actual - expected) < 0.01, \
-                f"T[{c},{r}] = {actual}, expected {expected} (from [{r},{c}])"
+            assert abs(actual - expected) < 0.01, f"T[{c},{r}] = {actual}, expected {expected} (from [{r},{c}])"
 
 
 # ---------------------------------------------------------------------------
 # Reduce-scatter kernel
 # ---------------------------------------------------------------------------
+
 
 @requires_metal
 def test_reduce_scatter_kernel(runner):
@@ -5155,8 +4987,7 @@ def test_reduce_scatter_kernel(runner):
 
     for i in range(n):
         expected = a[i] + b[i]
-        assert abs(result[i] - expected) < 0.01, \
-            f"reduce_scatter[{i}] = {result[i]}, expected {expected}"
+        assert abs(result[i] - expected) < 0.01, f"reduce_scatter[{i}] = {result[i]}, expected {expected}"
 
 
 @requires_metal
@@ -5184,13 +5015,13 @@ def test_reduce_scatter_3_buffers(runner):
 
     for i in range(n):
         expected = a[i] + b[i] + c[i]
-        assert abs(result[i] - expected) < 0.01, \
-            f"reduce_scatter_3[{i}] = {result[i]}, expected {expected}"
+        assert abs(result[i] - expected) < 0.01, f"reduce_scatter_3[{i}] = {result[i]}, expected {expected}"
 
 
 # ---------------------------------------------------------------------------
 # All-reduce kernel
 # ---------------------------------------------------------------------------
+
 
 @requires_metal
 def test_all_reduce_sum(runner):
@@ -5215,8 +5046,7 @@ def test_all_reduce_sum(runner):
 
     for i in range(n):
         expected = a[i] + b[i]
-        assert abs(result[i] - expected) < 0.01, \
-            f"all_reduce_sum[{i}] = {result[i]}, expected {expected}"
+        assert abs(result[i] - expected) < 0.01, f"all_reduce_sum[{i}] = {result[i]}, expected {expected}"
 
 
 @requires_metal
@@ -5243,13 +5073,13 @@ def test_all_reduce_max(runner):
 
     for i in range(n):
         expected = max(a[i], b[i])
-        assert abs(result[i] - expected) < 0.01, \
-            f"all_reduce_max[{i}] = {result[i]}, expected {expected}"
+        assert abs(result[i] - expected) < 0.01, f"all_reduce_max[{i}] = {result[i]}, expected {expected}"
 
 
 # ---------------------------------------------------------------------------
 # FP16 layer norm
 # ---------------------------------------------------------------------------
+
 
 @requires_metal
 def test_layer_norm_fp16(runner):
@@ -5299,6 +5129,7 @@ def test_layer_norm_fp16(runner):
 # FP16 RMS norm
 # ---------------------------------------------------------------------------
 
+
 @requires_metal
 def test_rms_norm_fp16(runner):
     """RMS normalization in half precision."""
@@ -5345,6 +5176,7 @@ def test_rms_norm_fp16(runner):
 # FP16 reduction
 # ---------------------------------------------------------------------------
 
+
 @requires_metal
 def test_reduce_sum_fp16(runner):
     """Sum reduction in half precision."""
@@ -5366,13 +5198,13 @@ def test_reduce_sum_fp16(runner):
 
     expected = sum(data)
     tol = max(1.0, abs(expected) * 0.05)  # 5% tolerance for FP16 reduction
-    assert abs(result[0] - expected) < tol, \
-        f"reduce_sum_fp16 = {result[0]}, expected {expected}"
+    assert abs(result[0] - expected) < tol, f"reduce_sum_fp16 = {result[0]}, expected {expected}"
 
 
 # ---------------------------------------------------------------------------
 # FP16 RoPE
 # ---------------------------------------------------------------------------
+
 
 @requires_metal
 def test_rope_fp16(runner):
@@ -5395,21 +5227,20 @@ def test_rope_fp16(runner):
     dim_buf = runner.make_uint_buffer(dim)
     pos_buf = runner.make_uint_buffer(0)  # position 0
 
-    runner.run(pipeline, [in_buf, freq_buf, out_buf, dim_buf, pos_buf],
-               1, block_size=256)
+    runner.run(pipeline, [in_buf, freq_buf, out_buf, dim_buf, pos_buf], 1, block_size=256)
     result = runner.read_half_buffer(out_buf, dim)
 
     # At position 0, theta = 0 for all freqs, so cos(0)=1, sin(0)=0
     # out[2i] = x0*1 - x1*0 = x0 = 1.0
     # out[2i+1] = x0*0 + x1*1 = x1 = 1.0
     for i in range(dim):
-        assert abs(result[i] - 1.0) < 0.05, \
-            f"rope_fp16[{i}] = {result[i]}, expected 1.0 (at position 0)"
+        assert abs(result[i] - 1.0) < 0.05, f"rope_fp16[{i}] = {result[i]}, expected 1.0 (at position 0)"
 
 
 # ---------------------------------------------------------------------------
 # BF16 reduction
 # ---------------------------------------------------------------------------
+
 
 @requires_metal
 def test_reduce_sum_bf16(runner):
@@ -5431,13 +5262,13 @@ def test_reduce_sum_bf16(runner):
 
     expected = sum(data)
     tol = max(2.0, abs(expected) * 0.05)
-    assert abs(result[0] - expected) < tol, \
-        f"reduce_sum_bf16 = {result[0]}, expected {expected}"
+    assert abs(result[0] - expected) < tol, f"reduce_sum_bf16 = {result[0]}, expected {expected}"
 
 
 # ---------------------------------------------------------------------------
 # BF16 layer norm
 # ---------------------------------------------------------------------------
+
 
 @requires_metal
 def test_layer_norm_bf16(runner):
@@ -5529,10 +5360,10 @@ def test_causal_attention_gpu(runner):
                 if kp <= qp:
                     qi = h * seq_len * head_dim + qp * head_dim
                     ki = h * seq_len * head_dim + kp * head_dim
-                    dot = _ref_dot(Q[qi:qi+head_dim], K[ki:ki+head_dim])
+                    dot = _ref_dot(Q[qi : qi + head_dim], K[ki : ki + head_dim])
                     scores.append(dot * scale)
                 else:
-                    scores.append(float('-inf'))
+                    scores.append(float("-inf"))
             weights = _ref_softmax(scores)
             for d in range(head_dim):
                 val = 0.0
@@ -5542,8 +5373,7 @@ def test_causal_attention_gpu(runner):
                 oi = h * seq_len * head_dim + qp * head_dim + d
                 expected[oi] = val
 
-    msl = make_causal_attention_kernel(n_heads=n_heads, head_dim=head_dim,
-                                        block_size=block_size)
+    msl = make_causal_attention_kernel(n_heads=n_heads, head_dim=head_dim, block_size=block_size)
     path = runner.compile(msl, "causal_attention")
     pipeline = runner.load(path, "causal_attention")
 
@@ -5571,8 +5401,7 @@ def test_causal_attention_gpu(runner):
 
     result = runner.read_float_buffer(out_buf, total)
     for i in range(total):
-        assert abs(result[i] - expected[i]) < 0.05, \
-            f"idx {i}: got {result[i]}, expected {expected[i]}"
+        assert abs(result[i] - expected[i]) < 0.05, f"idx {i}: got {result[i]}, expected {expected[i]}"
 
 
 @requires_metal
@@ -5602,7 +5431,7 @@ def test_flash_attention_gpu(runner):
             for kp in range(seq_len):
                 qi = h * seq_len * head_dim + qp * head_dim
                 ki = h * seq_len * head_dim + kp * head_dim
-                dot = _ref_dot(Q[qi:qi+head_dim], K[ki:ki+head_dim])
+                dot = _ref_dot(Q[qi : qi + head_dim], K[ki : ki + head_dim])
                 scores.append(dot * scale)
             weights = _ref_softmax(scores)
             for d in range(head_dim):
@@ -5613,8 +5442,7 @@ def test_flash_attention_gpu(runner):
                 oi = h * seq_len * head_dim + qp * head_dim + d
                 expected[oi] = val
 
-    msl = make_flash_attention_kernel(head_dim=head_dim, Br=Br, Bc=Bc,
-                                       block_size=block_size, causal=False)
+    msl = make_flash_attention_kernel(head_dim=head_dim, Br=Br, Bc=Bc, block_size=block_size, causal=False)
     path = runner.compile(msl, "flash_attention")
     pipeline = runner.load(path, "flash_attention")
 
@@ -5644,8 +5472,7 @@ def test_flash_attention_gpu(runner):
 
     result = runner.read_float_buffer(out_buf, total)
     for i in range(total):
-        assert abs(result[i] - expected[i]) < 0.1, \
-            f"idx {i}: got {result[i]}, expected {expected[i]}"
+        assert abs(result[i] - expected[i]) < 0.1, f"idx {i}: got {result[i]}, expected {expected[i]}"
 
 
 @requires_metal
@@ -5672,7 +5499,7 @@ def test_kv_cache_attention_gpu(runner):
         for j in range(seq_len):
             qi = h * head_dim
             ki = h * seq_len * head_dim + j * head_dim
-            dot = _ref_dot(Q[qi:qi+head_dim], K[ki:ki+head_dim])
+            dot = _ref_dot(Q[qi : qi + head_dim], K[ki : ki + head_dim])
             scores.append(dot * scale)
         weights = _ref_softmax(scores)
         for d in range(head_dim):
@@ -5709,8 +5536,7 @@ def test_kv_cache_attention_gpu(runner):
 
     result = runner.read_float_buffer(out_buf, n_heads * head_dim)
     for i in range(n_heads * head_dim):
-        assert abs(result[i] - expected[i]) < 0.05, \
-            f"idx {i}: got {result[i]}, expected {expected[i]}"
+        assert abs(result[i] - expected[i]) < 0.05, f"idx {i}: got {result[i]}, expected {expected[i]}"
 
 
 @requires_metal
@@ -5740,7 +5566,7 @@ def test_gqa_attention_gpu(runner):
         for j in range(seq_len):
             qi = qh * head_dim
             ki = kv_head * seq_len * head_dim + j * head_dim
-            dot = _ref_dot(Q[qi:qi+head_dim], K[ki:ki+head_dim])
+            dot = _ref_dot(Q[qi : qi + head_dim], K[ki : ki + head_dim])
             scores.append(dot * scale)
         weights = _ref_softmax(scores)
         for d in range(head_dim):
@@ -5750,8 +5576,7 @@ def test_gqa_attention_gpu(runner):
                 val += weights[j] * V[vi]
             expected[qh * head_dim + d] = val
 
-    msl = make_gqa_attention_kernel(head_dim=head_dim, n_q_per_kv=n_q_per_kv,
-                                     block_size=block_size)
+    msl = make_gqa_attention_kernel(head_dim=head_dim, n_q_per_kv=n_q_per_kv, block_size=block_size)
     path = runner.compile(msl, "gqa_attention")
     pipeline = runner.load(path, "gqa_attention")
 
@@ -5778,8 +5603,7 @@ def test_gqa_attention_gpu(runner):
 
     result = runner.read_float_buffer(out_buf, n_q_heads * head_dim)
     for i in range(n_q_heads * head_dim):
-        assert abs(result[i] - expected[i]) < 0.05, \
-            f"idx {i}: got {result[i]}, expected {expected[i]}"
+        assert abs(result[i] - expected[i]) < 0.05, f"idx {i}: got {result[i]}, expected {expected[i]}"
 
 
 @requires_metal
@@ -5810,7 +5634,7 @@ def test_paged_attention_gpu(runner):
         within_page = j % page_size
         phys_page = page_table[page_idx]
         ki = phys_page * page_size * head_dim + within_page * head_dim
-        dot = _ref_dot(Q, K_pages[ki:ki+head_dim])
+        dot = _ref_dot(Q, K_pages[ki : ki + head_dim])
         scores.append(dot * scale)
     weights = _ref_softmax(scores)
 
@@ -5823,8 +5647,7 @@ def test_paged_attention_gpu(runner):
             vi = phys_page * page_size * head_dim + within_page * head_dim + d
             expected[d] += weights[j] * V_pages[vi]
 
-    msl = make_paged_attention_kernel(head_dim=head_dim, page_size=page_size,
-                                       block_size=block_size)
+    msl = make_paged_attention_kernel(head_dim=head_dim, page_size=page_size, block_size=block_size)
     path = runner.compile(msl, "paged_attention")
     pipeline = runner.load(path, "paged_attention")
 
@@ -5834,6 +5657,7 @@ def test_paged_attention_gpu(runner):
     # page_table is uint array
     pt_buf = runner.make_float_buffer([0.0] * n_pages)  # placeholder, will pack uints
     import struct as _struct
+
     pt_view = pt_buf.contents().as_buffer(n_pages * 4)
     for i, p in enumerate(page_table):
         _struct.pack_into("I", pt_view, i * 4, p)
@@ -5858,8 +5682,7 @@ def test_paged_attention_gpu(runner):
 
     result = runner.read_float_buffer(out_buf, head_dim)
     for d in range(head_dim):
-        assert abs(result[d] - expected[d]) < 0.1, \
-            f"dim {d}: got {result[d]}, expected {expected[d]}"
+        assert abs(result[d] - expected[d]) < 0.1, f"dim {d}: got {result[d]}, expected {expected[d]}"
 
 
 @requires_metal
@@ -5886,7 +5709,7 @@ def test_sliding_window_attention_gpu(runner):
     scores = []
     for j in range(win_start, win_end):
         ki = j * head_dim
-        dot = _ref_dot(Q, K_cache[ki:ki+head_dim])
+        dot = _ref_dot(Q, K_cache[ki : ki + head_dim])
         scores.append(dot * scale)
     weights = _ref_softmax(scores)
 
@@ -5895,9 +5718,7 @@ def test_sliding_window_attention_gpu(runner):
         for d in range(head_dim):
             expected[d] += weights[idx] * V_cache[j * head_dim + d]
 
-    msl = make_sliding_window_attention_kernel(head_dim=head_dim,
-                                                window_size=window_size,
-                                                block_size=block_size)
+    msl = make_sliding_window_attention_kernel(head_dim=head_dim, window_size=window_size, block_size=block_size)
     path = runner.compile(msl, "sliding_window_attention")
     pipeline = runner.load(path, "sliding_window_attention")
 
@@ -5925,8 +5746,7 @@ def test_sliding_window_attention_gpu(runner):
 
     result = runner.read_float_buffer(out_buf, head_dim)
     for d in range(head_dim):
-        assert abs(result[d] - expected[d]) < 0.1, \
-            f"dim {d}: got {result[d]}, expected {expected[d]}"
+        assert abs(result[d] - expected[d]) < 0.1, f"dim {d}: got {result[d]}, expected {expected[d]}"
 
 
 # ---------------------------------------------------------------------------
@@ -5992,8 +5812,7 @@ def test_matmul_gpu(runner):
 
     result = runner.read_float_buffer(c_buf, M * N)
     for i in range(M * N):
-        assert abs(result[i] - expected[i]) < 0.01, \
-            f"idx {i}: got {result[i]}, expected {expected[i]}"
+        assert abs(result[i] - expected[i]) < 0.01, f"idx {i}: got {result[i]}, expected {expected[i]}"
 
 
 @requires_metal
@@ -6042,8 +5861,7 @@ def test_matmul_non_square_gpu(runner):
 
     result = runner.read_float_buffer(c_buf, M * N)
     for i in range(M * N):
-        assert abs(result[i] - expected[i]) < 0.05, \
-            f"idx {i}: got {result[i]}, expected {expected[i]}"
+        assert abs(result[i] - expected[i]) < 0.05, f"idx {i}: got {result[i]}, expected {expected[i]}"
 
 
 @requires_metal
@@ -6093,8 +5911,7 @@ def test_simdgroup_matmul_gpu(runner):
 
     result = runner.read_float_buffer(c_buf, M * N)
     for i in range(M * N):
-        assert abs(result[i] - expected[i]) < 0.1, \
-            f"idx {i}: got {result[i]}, expected {expected[i]}"
+        assert abs(result[i] - expected[i]) < 0.1, f"idx {i}: got {result[i]}, expected {expected[i]}"
 
 
 @requires_metal
@@ -6130,9 +5947,7 @@ def test_int8_matmul_gpu(runner):
 
     in_buf = runner.make_float_buffer(input_data)
     # Pack weight as signed chars
-    w_buf = runner.device.newBufferWithLength_options_(
-        N * K, Metal.MTLResourceStorageModeShared
-    )
+    w_buf = runner.device.newBufferWithLength_options_(N * K, Metal.MTLResourceStorageModeShared)
     w_view = w_buf.contents().as_buffer(N * K)
     for i, v in enumerate(weight_int8):
         _struct.pack_into("b", w_view, i, v)
@@ -6144,13 +5959,11 @@ def test_int8_matmul_gpu(runner):
     k_buf = runner.make_uint_buffer(K)
 
     n_elements = M * N
-    runner.run(pipeline, [in_buf, w_buf, out_buf, s_buf, z_buf,
-                          m_buf, n_buf, k_buf], n_elements, block_size=256)
+    runner.run(pipeline, [in_buf, w_buf, out_buf, s_buf, z_buf, m_buf, n_buf, k_buf], n_elements, block_size=256)
 
     result = runner.read_float_buffer(out_buf, M * N)
     for i in range(M * N):
-        assert abs(result[i] - expected[i]) < 0.01, \
-            f"idx {i}: got {result[i]}, expected {expected[i]}"
+        assert abs(result[i] - expected[i]) < 0.01, f"idx {i}: got {result[i]}, expected {expected[i]}"
 
 
 @requires_metal
@@ -6191,9 +6004,7 @@ def test_int4_matmul_gpu(runner):
     in_buf = runner.make_float_buffer(input_data)
     # Pack as pairs of int4 into bytes
     n_bytes = N * (K // 2)
-    w_buf = runner.device.newBufferWithLength_options_(
-        n_bytes, Metal.MTLResourceStorageModeShared
-    )
+    w_buf = runner.device.newBufferWithLength_options_(n_bytes, Metal.MTLResourceStorageModeShared)
     w_view = w_buf.contents().as_buffer(n_bytes)
     for j in range(N):
         for k in range(0, K, 2):
@@ -6210,18 +6021,17 @@ def test_int4_matmul_gpu(runner):
     k_buf = runner.make_uint_buffer(K)
 
     n_elements = M * N
-    runner.run(pipeline, [in_buf, w_buf, out_buf, s_buf, z_buf,
-                          m_buf, n_buf, k_buf], n_elements, block_size=256)
+    runner.run(pipeline, [in_buf, w_buf, out_buf, s_buf, z_buf, m_buf, n_buf, k_buf], n_elements, block_size=256)
 
     result = runner.read_float_buffer(out_buf, M * N)
     for i in range(M * N):
-        assert abs(result[i] - expected[i]) < 0.1, \
-            f"idx {i}: got {result[i]}, expected {expected[i]}"
+        assert abs(result[i] - expected[i]) < 0.1, f"idx {i}: got {result[i]}, expected {expected[i]}"
 
 
 # ---------------------------------------------------------------------------
 # 2D axis-aware reduction tests
 # ---------------------------------------------------------------------------
+
 
 @requires_metal
 def test_row_reduce_sum_gpu(runner):
@@ -6257,9 +6067,8 @@ def test_row_reduce_sum_gpu(runner):
 
     result = runner.read_float_buffer(out_buf, n_rows)
     for r in range(n_rows):
-        expected = sum(data[r * n_cols:(r + 1) * n_cols])
-        assert abs(result[r] - expected) < 0.5, \
-            f"row {r}: got {result[r]}, expected {expected}"
+        expected = sum(data[r * n_cols : (r + 1) * n_cols])
+        assert abs(result[r] - expected) < 0.5, f"row {r}: got {result[r]}, expected {expected}"
 
 
 @requires_metal
@@ -6295,9 +6104,8 @@ def test_row_reduce_max_gpu(runner):
 
     result = runner.read_float_buffer(out_buf, n_rows)
     for r in range(n_rows):
-        expected = max(data[r * n_cols:(r + 1) * n_cols])
-        assert abs(result[r] - expected) < 1e-3, \
-            f"row {r}: got {result[r]}, expected {expected}"
+        expected = max(data[r * n_cols : (r + 1) * n_cols])
+        assert abs(result[r] - expected) < 1e-3, f"row {r}: got {result[r]}, expected {expected}"
 
 
 @requires_metal
@@ -6334,8 +6142,7 @@ def test_col_reduce_sum_gpu(runner):
     result = runner.read_float_buffer(out_buf, n_cols)
     for c in range(n_cols):
         expected = sum(data[r * n_cols + c] for r in range(n_rows))
-        assert abs(result[c] - expected) < 0.5, \
-            f"col {c}: got {result[c]}, expected {expected}"
+        assert abs(result[c] - expected) < 0.5, f"col {c}: got {result[c]}, expected {expected}"
 
 
 @requires_metal
@@ -6372,13 +6179,13 @@ def test_col_reduce_min_gpu(runner):
     result = runner.read_float_buffer(out_buf, n_cols)
     for c in range(n_cols):
         expected = min(data[r * n_cols + c] for r in range(n_rows))
-        assert abs(result[c] - expected) < 1e-3, \
-            f"col {c}: got {result[c]}, expected {expected}"
+        assert abs(result[c] - expected) < 1e-3, f"col {c}: got {result[c]}, expected {expected}"
 
 
 # ---------------------------------------------------------------------------
 # Cumulative sum (prefix sum) tests
 # ---------------------------------------------------------------------------
+
 
 @requires_metal
 def test_cumsum_gpu(runner):
@@ -6416,13 +6223,13 @@ def test_cumsum_gpu(runner):
         for c in range(n_cols):
             running += data[r * n_cols + c]
             got = result[r * n_cols + c]
-            assert abs(got - running) < 0.1, \
-                f"row {r} col {c}: got {got}, expected {running}"
+            assert abs(got - running) < 0.1, f"row {r} col {c}: got {got}, expected {running}"
 
 
 # ---------------------------------------------------------------------------
 # Bitonic sort tests
 # ---------------------------------------------------------------------------
+
 
 @requires_metal
 def test_bitonic_sort_gpu(runner):
@@ -6452,18 +6259,19 @@ def test_bitonic_sort_gpu(runner):
 
     # Verify sorted
     for i in range(n - 1):
-        assert vals[i] <= vals[i + 1], \
-            f"Not sorted at {i}: {vals[i]} > {vals[i+1]}"
+        assert vals[i] <= vals[i + 1], f"Not sorted at {i}: {vals[i]} > {vals[i + 1]}"
 
     # Verify indices point back to original values
     for i in range(n):
-        assert abs(vals[i] - data[indices[i]]) < 1e-5, \
+        assert abs(vals[i] - data[indices[i]]) < 1e-5, (
             f"Index mismatch at {i}: vals[{i}]={vals[i]}, data[{indices[i]}]={data[indices[i]]}"
+        )
 
 
 # ---------------------------------------------------------------------------
 # Atomic operations tests
 # ---------------------------------------------------------------------------
+
 
 @requires_metal
 def test_atomic_add_gpu(runner):
@@ -6495,13 +6303,13 @@ def test_atomic_add_gpu(runner):
     # Each bin should have n/n_bins = 64 additions of 1.0
     expected_per_bin = n // n_bins
     for i in range(n_bins):
-        assert abs(result[i] - expected_per_bin) < 1.0, \
-            f"bin {i}: got {result[i]}, expected {expected_per_bin}"
+        assert abs(result[i] - expected_per_bin) < 1.0, f"bin {i}: got {result[i]}, expected {expected_per_bin}"
 
 
 # ---------------------------------------------------------------------------
 # Conv2D tests
 # ---------------------------------------------------------------------------
+
 
 @requires_metal
 def test_conv2d_gpu(runner):
@@ -6514,10 +6322,17 @@ def test_conv2d_gpu(runner):
     out_h, out_w = 4, 4  # same padding
     batch = 1
 
-    msl = make_conv2d_kernel(in_channels=in_c, out_channels=out_c,
-                             kernel_h=kh, kernel_w=kw,
-                             stride_h=1, stride_w=1,
-                             pad_h=1, pad_w=1, block_size=256)
+    msl = make_conv2d_kernel(
+        in_channels=in_c,
+        out_channels=out_c,
+        kernel_h=kh,
+        kernel_w=kw,
+        stride_h=1,
+        stride_w=1,
+        pad_h=1,
+        pad_w=1,
+        block_size=256,
+    )
     path = runner.compile(msl, "conv2d_kernel")
     pipeline = runner.load(path, "conv2d_kernel")
 
@@ -6538,9 +6353,9 @@ def test_conv2d_gpu(runner):
     ow_buf = runner.make_uint_buffer(out_w)
 
     n_elements = batch * out_c * out_h * out_w
-    runner.run(pipeline, [in_buf, w_buf, b_buf, out_buf,
-                          batch_buf, ih_buf, iw_buf, oh_buf, ow_buf],
-               n_elements, block_size=256)
+    runner.run(
+        pipeline, [in_buf, w_buf, b_buf, out_buf, batch_buf, ih_buf, iw_buf, oh_buf, ow_buf], n_elements, block_size=256
+    )
 
     result = runner.read_float_buffer(out_buf, n_elements)
 
@@ -6559,13 +6374,13 @@ def test_conv2d_gpu(runner):
             expected.append(val)
 
     for i in range(n_elements):
-        assert abs(result[i] - expected[i]) < 1e-3, \
-            f"idx {i}: got {result[i]}, expected {expected[i]}"
+        assert abs(result[i] - expected[i]) < 1e-3, f"idx {i}: got {result[i]}, expected {expected[i]}"
 
 
 # ---------------------------------------------------------------------------
 # Pooling tests
 # ---------------------------------------------------------------------------
+
 
 @requires_metal
 def test_max_pool2d_gpu(runner):
@@ -6592,8 +6407,7 @@ def test_max_pool2d_gpu(runner):
     ow_buf = runner.make_uint_buffer(out_w)
 
     n_out = batch * channels * out_h * out_w
-    runner.run(pipeline, [in_buf, out_buf, b_buf, c_buf, ih_buf, iw_buf,
-                          oh_buf, ow_buf], n_out, block_size=256)
+    runner.run(pipeline, [in_buf, out_buf, b_buf, c_buf, ih_buf, iw_buf, oh_buf, ow_buf], n_out, block_size=256)
 
     result = runner.read_float_buffer(out_buf, n_out)
     # Expected: max of each 2x2 block
@@ -6601,8 +6415,7 @@ def test_max_pool2d_gpu(runner):
     # max(8,9,12,13)=13, max(10,11,14,15)=15
     expected = [5.0, 7.0, 13.0, 15.0]
     for i in range(n_out):
-        assert abs(result[i] - expected[i]) < 1e-3, \
-            f"idx {i}: got {result[i]}, expected {expected[i]}"
+        assert abs(result[i] - expected[i]) < 1e-3, f"idx {i}: got {result[i]}, expected {expected[i]}"
 
 
 @requires_metal
@@ -6629,20 +6442,19 @@ def test_avg_pool2d_gpu(runner):
     ow_buf = runner.make_uint_buffer(out_w)
 
     n_out = batch * channels * out_h * out_w
-    runner.run(pipeline, [in_buf, out_buf, b_buf, c_buf, ih_buf, iw_buf,
-                          oh_buf, ow_buf], n_out, block_size=256)
+    runner.run(pipeline, [in_buf, out_buf, b_buf, c_buf, ih_buf, iw_buf, oh_buf, ow_buf], n_out, block_size=256)
 
     result = runner.read_float_buffer(out_buf, n_out)
     # avg(0,1,4,5)=2.5, avg(2,3,6,7)=4.5, avg(8,9,12,13)=10.5, avg(10,11,14,15)=12.5
     expected = [2.5, 4.5, 10.5, 12.5]
     for i in range(n_out):
-        assert abs(result[i] - expected[i]) < 1e-3, \
-            f"idx {i}: got {result[i]}, expected {expected[i]}"
+        assert abs(result[i] - expected[i]) < 1e-3, f"idx {i}: got {result[i]}, expected {expected[i]}"
 
 
 # ---------------------------------------------------------------------------
 # Index select and where tests
 # ---------------------------------------------------------------------------
+
 
 @requires_metal
 def test_index_select_gpu(runner):
@@ -6673,8 +6485,7 @@ def test_index_select_gpu(runner):
     result = runner.read_float_buffer(out_buf, n)
     for i in range(n):
         expected = src_data[indices[i]]
-        assert abs(result[i] - expected) < 1e-5, \
-            f"idx {i}: got {result[i]}, expected {expected}"
+        assert abs(result[i] - expected) < 1e-5, f"idx {i}: got {result[i]}, expected {expected}"
 
 
 @requires_metal
@@ -6707,13 +6518,13 @@ def test_where_gpu(runner):
     result = runner.read_float_buffer(out_buf, n)
     for i in range(n):
         expected = 1.0 if cond[i] else -1.0
-        assert abs(result[i] - expected) < 1e-5, \
-            f"idx {i}: got {result[i]}, expected {expected}"
+        assert abs(result[i] - expected) < 1e-5, f"idx {i}: got {result[i]}, expected {expected}"
 
 
 # ---------------------------------------------------------------------------
 # Clamp and comparison tests
 # ---------------------------------------------------------------------------
+
 
 @requires_metal
 def test_clamp_gpu(runner):
@@ -6737,8 +6548,7 @@ def test_clamp_gpu(runner):
     result = runner.read_float_buffer(out_buf, n)
     for i in range(n):
         expected = max(-50.0, min(50.0, data[i]))
-        assert abs(result[i] - expected) < 1e-3, \
-            f"idx {i}: got {result[i]}, expected {expected}"
+        assert abs(result[i] - expected) < 1e-3, f"idx {i}: got {result[i]}, expected {expected}"
 
 
 @requires_metal
@@ -6765,8 +6575,7 @@ def test_compare_lt_gpu(runner):
     for i in range(n):
         val = struct.unpack_from("I", out_view, i * 4)[0]
         expected = 1 if a_data[i] < b_data[i] else 0
-        assert val == expected, \
-            f"idx {i}: got {val}, expected {expected}"
+        assert val == expected, f"idx {i}: got {val}, expected {expected}"
 
 
 def test_threadgroup_reduce_refuses_partial_simd_group():
@@ -6782,8 +6591,7 @@ def test_threadgroup_reduce_refuses_partial_simd_group():
     # >32 and not a multiple of 32 -> must refuse loudly.
     for bad in (48, 80, 100):
         with pytest.raises(MetalNonRecoverableError):
-            KernelBuilder("k", block_size=bad).threadgroup_reduce(
-                "sum", "acc", "shared", "total")
+            KernelBuilder("k", block_size=bad).threadgroup_reduce("sum", "acc", "shared", "total")
 
     # Multiples of 32 (and <=32) must NOT trip the guard.
     for ok in (32, 64, 128, 256):

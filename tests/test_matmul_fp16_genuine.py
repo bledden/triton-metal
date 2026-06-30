@@ -6,6 +6,7 @@ measured fp16==fp32==7.00 TFLOP/s). These tests assert on the GENERATED MSL so
 "fp16" can never silently regress to fp32 again. The accumulator stays float
 (fp32 accumulation for precision); only the INPUT fragments become half.
 """
+
 import re
 
 import pytest
@@ -19,8 +20,7 @@ from triton_msl.codegen.msl_emitter import make_simdgroup_matmul_kernel
 
 def test_fp16_matmul_uses_half_input_fragments():
     msl = make_simdgroup_matmul_kernel(dtype="fp16")
-    assert "simdgroup_half8x8" in msl, \
-        "fp16 MMA must use simdgroup_half8x8 INPUT fragments, not float8x8"
+    assert "simdgroup_half8x8" in msl, "fp16 MMA must use simdgroup_half8x8 INPUT fragments, not float8x8"
 
 
 def test_fp16_matmul_does_not_upcast_inputs_before_mma():
@@ -33,8 +33,7 @@ def test_fp16_matmul_does_not_upcast_inputs_before_mma():
 
 def test_fp16_accumulator_stays_float_for_precision():
     msl = make_simdgroup_matmul_kernel(dtype="fp16")
-    assert "simdgroup_float8x8 acc" in msl, \
-        "accumulator must stay simdgroup_float8x8 (fp32 accumulation)"
+    assert "simdgroup_float8x8 acc" in msl, "accumulator must stay simdgroup_float8x8 (fp32 accumulation)"
 
 
 def test_fp32_matmul_unchanged_still_float_fragments():
@@ -69,12 +68,12 @@ def _emit_jit_matmul_msl(dtype_sig):
     t = GPUTarget("metal", "apple-m4", 32)
     be = MetalBackend(t)
     o = be.parse_options({})
-    src = ASTSource(fn=mm, signature={"A": dtype_sig, "B": dtype_sig, "C": "*fp32"},
-                    constexprs=dict(BM=32, BN=32, BK=32))
+    src = ASTSource(
+        fn=mm, signature={"A": dtype_sig, "B": dtype_sig, "C": "*fp32"}, constexprs=dict(BM=32, BN=32, BK=32)
+    )
     ctx = ir.context()
     ir.load_dialects(ctx)
-    mod = src.make_ir(t, o, be.get_codegen_implementation(o),
-                      be.get_module_map(), ctx)
+    mod = src.make_ir(t, o, be.get_codegen_implementation(o), be.get_module_map(), ctx)
     meta = {}
     mod = be.make_ttir(mod, meta, o)
     mod = be.make_ttgir(mod, meta, o)
@@ -109,6 +108,7 @@ def test_import_order_msl_templates_first_reexports_matmul(tmp_path):
     Run in a subprocess so the import order is actually fresh."""
     import subprocess
     import sys
+
     code = (
         "import triton_msl.codegen._msl_templates\n"
         "import triton_msl.codegen.msl_emitter as e\n"

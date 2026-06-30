@@ -6,6 +6,7 @@ STANDARD Triton matmul tiling (64/128) — columns 32+ were silently never
 computed: a reachable silent-wrong. These tests dispatch real @triton.jit
 tiled matmuls at several BLOCK_N and compare every column against numpy.
 """
+
 import numpy as np
 import pytest
 
@@ -14,6 +15,7 @@ try:
     import triton
     import triton.language as tl
     import Metal
+
     HAS = Metal.MTLCreateSystemDefaultDevice() is not None
 except Exception:
     HAS = False
@@ -21,9 +23,9 @@ except Exception:
 requires_metal = pytest.mark.skipif(not HAS, reason="Metal/torch/triton needed")
 
 if HAS:
+
     @triton.jit
-    def _mm(A, B, C, M, N, K, BM: tl.constexpr, BN: tl.constexpr,
-            BK: tl.constexpr):
+    def _mm(A, B, C, M, N, K, BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr):
         pid_m = tl.program_id(0)
         pid_n = tl.program_id(1)
         om = pid_m * BM + tl.arange(0, BM)
@@ -60,9 +62,9 @@ def test_kloop_matmul_all_columns_correct(BN):
 
 
 if HAS:
+
     @triton.jit
-    def _mm_f16out(A, B, C, M, N, K, BM: tl.constexpr, BN: tl.constexpr,
-                   BK: tl.constexpr):
+    def _mm_f16out(A, B, C, M, N, K, BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr):
         pid_m = tl.program_id(0)
         pid_n = tl.program_id(1)
         om = pid_m * BM + tl.arange(0, BM)
@@ -77,9 +79,9 @@ if HAS:
 
 
 if HAS:
+
     @triton.jit
-    def _mm_masked(A, B, C, M, N, K, BM: tl.constexpr, BN: tl.constexpr,
-                   BK: tl.constexpr):
+    def _mm_masked(A, B, C, M, N, K, BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr):
         pid_m = tl.program_id(0)
         pid_n = tl.program_id(1)
         om = pid_m * BM + tl.arange(0, BM)
@@ -87,13 +89,14 @@ if HAS:
         ok = tl.arange(0, BK)
         acc = tl.zeros((BM, BN), tl.float32)
         for k in range(0, K, BK):
-            a = tl.load(A + om[:, None] * K + (k + ok)[None, :],
-                        mask=(om[:, None] < M) & ((k + ok)[None, :] < K), other=0.)
-            b = tl.load(B + (k + ok)[:, None] * N + on[None, :],
-                        mask=((k + ok)[:, None] < K) & (on[None, :] < N), other=0.)
+            a = tl.load(
+                A + om[:, None] * K + (k + ok)[None, :], mask=(om[:, None] < M) & ((k + ok)[None, :] < K), other=0.0
+            )
+            b = tl.load(
+                B + (k + ok)[:, None] * N + on[None, :], mask=((k + ok)[:, None] < K) & (on[None, :] < N), other=0.0
+            )
             acc += tl.dot(a, b)
-        tl.store(C + om[:, None] * N + on[None, :], acc,
-                 mask=(om[:, None] < M) & (on[None, :] < N))
+        tl.store(C + om[:, None] * N + on[None, :], acc, mask=(om[:, None] < M) & (on[None, :] < N))
 
 
 @requires_metal
@@ -124,11 +127,11 @@ def test_kloop_matmul_fp16_output_correct(BN):
     c = torch.zeros(M, N, dtype=torch.float16)
     grid = ((M + 32 - 1) // 32, (N + BN - 1) // BN)
     _mm_f16out[grid](a, b, c, M, N, K, BM=32, BN=BN, BK=BK)
-    np.testing.assert_allclose(c.numpy().astype(np.float32), (a @ b).numpy(),
-                               atol=2e-2, rtol=2e-2)
+    np.testing.assert_allclose(c.numpy().astype(np.float32), (a @ b).numpy(), atol=2e-2, rtol=2e-2)
 
 
 if HAS:
+
     @triton.jit
     def _mm_softmax(A, B, C, M: tl.constexpr, N: tl.constexpr, K: tl.constexpr):
         om = tl.arange(0, M)
@@ -166,6 +169,7 @@ def test_matmul_softmax_not_dropped(dt):
 
 
 if HAS:
+
     @triton.jit
     def _mm_scale(A, B, C, M: tl.constexpr, N: tl.constexpr, K: tl.constexpr):
         om = tl.arange(0, M)
@@ -174,7 +178,7 @@ if HAS:
         a = tl.load(A + om[:, None] * K + ok[None, :])
         b = tl.load(B + ok[:, None] * N + on[None, :])
         acc = tl.dot(a, b)
-        acc = acc * 3.0 + 1.0          # non-softmax elementwise epilogue
+        acc = acc * 3.0 + 1.0  # non-softmax elementwise epilogue
         tl.store(C + om[:, None] * N + on[None, :], acc)
 
 
@@ -185,19 +189,21 @@ def test_matmul_nonsoftmax_epilogue_computed_not_dropped():
     # epilogue (returned A@B). #157 made it refuse; #158 now COMPUTES it via the
     # fused-epilogue template. Either way it is never silently dropped: verify
     # the epilogue is actually applied (result != bare A@B, == A@B*3+1).
-    a = (torch.randn(32, 32) * 0.3)
-    b = (torch.randn(32, 32) * 0.3)
+    a = torch.randn(32, 32) * 0.3
+    b = torch.randn(32, 32) * 0.3
     c = torch.zeros(32, 32)
     _mm_scale[(1,)](a, b, c, M=32, N=32, K=32)
-    np.testing.assert_allclose(c.numpy(), (a @ b).numpy() * 3.0 + 1.0,
-                               atol=2e-2, rtol=2e-2)
+    np.testing.assert_allclose(c.numpy(), (a @ b).numpy() * 3.0 + 1.0, atol=2e-2, rtol=2e-2)
 
 
 # --- follow-ups (2026-06-26): N%8/N%16 fast-path rescue + accurate 2-D accumulator refusal ---
 if HAS:
+
     @triton.jit
     def _mm_2dacc(A, B, C, Out, M: tl.constexpr, N: tl.constexpr, K: tl.constexpr):
-        om = tl.arange(0, M); on = tl.arange(0, N); ok = tl.arange(0, K)
+        om = tl.arange(0, M)
+        on = tl.arange(0, N)
+        ok = tl.arange(0, K)
         a = tl.load(A + om[:, None] * K + ok[None, :])
         b = tl.load(B + ok[:, None] * N + on[None, :])
         c = tl.load(C + om[:, None] * N + on[None, :])
@@ -205,7 +211,7 @@ if HAS:
 
 
 @requires_metal
-@pytest.mark.parametrize("N", [520, 528, 544])   # %8-not-%16, %16-not-%32, %32 (all unaligned vs (4,4))
+@pytest.mark.parametrize("N", [520, 528, 544])  # %8-not-%16, %16-not-%32, %32 (all unaligned vs (4,4))
 def test_matmul_unaligned_N_rescue_byte_exact(N):
     # The N%32 perf-cliff fix: N%8==0 shapes now reach the fast path (finer rc tile). Must be
     # byte-exact regardless of which tile the selector picks (a partial strip would OOB).
@@ -222,7 +228,11 @@ def test_2d_accumulator_refuses_with_accurate_message():
     # C = A@B + C with a FULL 2-D accumulator is refused with an ACCURATE message (was
     # mislabeled a 'row bias'); the simdgroup epilogue only adds a 1-D bias.
     M = N = K = 32
-    a = torch.randn(M, K); b = torch.randn(K, N); c = torch.randn(M, N); out = torch.zeros(M, N)
+    a = torch.randn(M, K)
+    b = torch.randn(K, N)
+    c = torch.randn(M, N)
+    out = torch.zeros(M, N)
     from triton_msl.errors import MetalNonRecoverableError
+
     with pytest.raises(MetalNonRecoverableError, match="2-D accumulator"):
         _mm_2dacc[(1,)](a, b, c, out, M=M, N=N, K=K)

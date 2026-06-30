@@ -16,6 +16,7 @@ If the xcrun compile fails on simdgroup_half8x8 / the mixed accumulate, STOP:
 pivot to the documented fallback (half x half -> half with periodic float
 accumulation, or honest docs that fp16 runs fp32). Do not work around it.
 """
+
 import subprocess
 
 import numpy as np
@@ -24,6 +25,7 @@ import pytest
 try:
     import Metal
     import Foundation
+
     HAS_METAL = Metal.MTLCreateSystemDefaultDevice() is not None
 except Exception:
     HAS_METAL = False
@@ -47,13 +49,10 @@ def _compile(msl_src, name, tmp_path):
     with open(metal_p, "w") as f:
         f.write(msl_src)
     # This compile is the make-or-break for the genuine-fp16 path.
-    subprocess.check_call(["xcrun", "-sdk", "macosx", "metal", "-c", metal_p,
-                           "-o", air, "-std=metal3.2", "-O2"])
-    subprocess.check_call(["xcrun", "-sdk", "macosx", "metallib", air,
-                           "-o", lib_p])
+    subprocess.check_call(["xcrun", "-sdk", "macosx", "metal", "-c", metal_p, "-o", air, "-std=metal3.2", "-O2"])
+    subprocess.check_call(["xcrun", "-sdk", "macosx", "metallib", air, "-o", lib_p])
     dev = Metal.MTLCreateSystemDefaultDevice()
-    lib, err = dev.newLibraryWithURL_error_(
-        Foundation.NSURL.fileURLWithPath_(lib_p), None)
+    lib, err = dev.newLibraryWithURL_error_(Foundation.NSURL.fileURLWithPath_(lib_p), None)
     assert err is None, f"load: {err}"
     fn = lib.newFunctionWithName_(name)
     pso, err = dev.newComputePipelineStateWithFunction_error_(fn, None)
@@ -79,8 +78,7 @@ def _dispatch(dev, pso, buffers, threads):
     enc.setComputePipelineState_(pso)
     for i, b in enumerate(buffers):
         enc.setBuffer_offset_atIndex_(b, 0, i)
-    enc.dispatchThreadgroups_threadsPerThreadgroup_(
-        Metal.MTLSizeMake(1, 1, 1), Metal.MTLSizeMake(threads, 1, 1))
+    enc.dispatchThreadgroups_threadsPerThreadgroup_(Metal.MTLSizeMake(1, 1, 1), Metal.MTLSizeMake(threads, 1, 1))
     enc.endEncoding()
     cmd.commit()
     cmd.waitUntilCompleted()
@@ -143,8 +141,7 @@ def test_half_mma_compiles_and_is_correct(tmp_path):
     b = ((np.arange(64).reshape(8, 8) * 0.1)[::-1].copy()).astype(np.float16)
     A, B, C = _hbuf(dev, a), _hbuf(dev, b), _fout(dev, 64)
     _dispatch(dev, pso, [A, B, C], 32)
-    got = np.frombuffer(C.contents().as_buffer(64 * 4),
-                        dtype=np.float32).reshape(8, 8)
+    got = np.frombuffer(C.contents().as_buffer(64 * 4), dtype=np.float32).reshape(8, 8)
     ref = a.astype(np.float32) @ b.astype(np.float32)
     np.testing.assert_allclose(got, ref, rtol=1e-2, atol=1e-2)
 
@@ -158,8 +155,7 @@ def test_half_mma_kloop_256_precision(tmp_path):
     b = (rng.standard_normal((256, 8)) * 0.1).astype(np.float16)
     A, B, C = _hbuf(dev, a), _hbuf(dev, b), _fout(dev, 64)
     _dispatch(dev, pso, [A, B, C], 32)
-    got = np.frombuffer(C.contents().as_buffer(64 * 4),
-                        dtype=np.float32).reshape(8, 8)
+    got = np.frombuffer(C.contents().as_buffer(64 * 4), dtype=np.float32).reshape(8, 8)
     ref = a.astype(np.float32) @ b.astype(np.float32)
     # fp16 inputs, float accumulation: expect close but not exact.
     np.testing.assert_allclose(got, ref, rtol=2e-2, atol=2e-2)
@@ -167,6 +163,7 @@ def test_half_mma_kloop_256_precision(tmp_path):
 
 def _uint(dev, v):
     import struct
+
     b = dev.newBufferWithLength_options_(4, _shared())
     b.contents().as_buffer(4)[:] = struct.pack("I", v)
     return b
@@ -179,10 +176,10 @@ def test_genuine_fp16_full_template_is_numerically_correct(tmp_path):
     is what proves the genuine-fp16 fix is correct end-to-end, not only that it
     compiles."""
     from triton_msl.codegen._msl_templates import make_simdgroup_matmul_kernel
+
     M = N = 64
     K = 128
-    dev, pso = _compile(make_simdgroup_matmul_kernel(dtype="fp16"),
-                        "simdgroup_matmul", tmp_path)
+    dev, pso = _compile(make_simdgroup_matmul_kernel(dtype="fp16"), "simdgroup_matmul", tmp_path)
     rng = np.random.default_rng(1)
     a = (rng.standard_normal((M, K)) * 0.1).astype(np.float16)
     b = (rng.standard_normal((K, N)) * 0.1).astype(np.float16)
@@ -190,14 +187,16 @@ def test_genuine_fp16_full_template_is_numerically_correct(tmp_path):
     C = _fout(dev, M * N)
     Mb, Nb, Kb = _uint(dev, M), _uint(dev, N), _uint(dev, K)
     n_groups = ((M + 31) // 32) * ((N + 31) // 32)
-    q = dev.newCommandQueue(); cmd = q.commandBuffer()
-    enc = cmd.computeCommandEncoder(); enc.setComputePipelineState_(pso)
+    q = dev.newCommandQueue()
+    cmd = q.commandBuffer()
+    enc = cmd.computeCommandEncoder()
+    enc.setComputePipelineState_(pso)
     for i, bf in enumerate([A, B, C, Mb, Nb, Kb]):
         enc.setBuffer_offset_atIndex_(bf, 0, i)
-    enc.dispatchThreadgroups_threadsPerThreadgroup_(
-        Metal.MTLSizeMake(n_groups, 1, 1), Metal.MTLSizeMake(128, 1, 1))
-    enc.endEncoding(); cmd.commit(); cmd.waitUntilCompleted()
-    got = np.frombuffer(C.contents().as_buffer(M * N * 4),
-                        dtype=np.float32).reshape(M, N)
+    enc.dispatchThreadgroups_threadsPerThreadgroup_(Metal.MTLSizeMake(n_groups, 1, 1), Metal.MTLSizeMake(128, 1, 1))
+    enc.endEncoding()
+    cmd.commit()
+    cmd.waitUntilCompleted()
+    got = np.frombuffer(C.contents().as_buffer(M * N * 4), dtype=np.float32).reshape(M, N)
     ref = a.astype(np.float32) @ b.astype(np.float32)
     np.testing.assert_allclose(got, ref, rtol=2e-2, atol=2e-2)

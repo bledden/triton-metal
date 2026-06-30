@@ -59,8 +59,7 @@ class LinearLayout:
 
     @property
     def total_elements(self) -> int:
-        return (self.num_registers_per_thread * self.num_lanes
-                * self.num_warps * self.num_blocks)
+        return self.num_registers_per_thread * self.num_lanes * self.num_warps * self.num_blocks
 
     def position(self, register: int, lane: int, warp: int, block: int = 0) -> int:
         """Compute the logical 1-D tensor position for a hardware location.
@@ -82,8 +81,7 @@ class LinearLayout:
                 out ^= basis
         return out
 
-    def msl_position_expr(self, reg_var: str, lane_var: str, warp_var: str,
-                          block_var: str = "0") -> str:
+    def msl_position_expr(self, reg_var: str, lane_var: str, warp_var: str, block_var: str = "0") -> str:
         """Generate an MSL expression that computes ``position(reg, lane, warp, block)``.
 
         The expression assumes ``reg_var``/``lane_var``/``warp_var`` are
@@ -125,11 +123,7 @@ def parse_linear_layout(mod_text: str, layout_name: str) -> Optional[LinearLayou
     dimensional we return None (signalling "not handled here" so the
     generic passthrough path is used).
     """
-    pattern = (
-        r"#"
-        + re.escape(layout_name)
-        + r"\s*=\s*#ttg\.linear<\{(.+?)\}>"
-    )
+    pattern = r"#" + re.escape(layout_name) + r"\s*=\s*#ttg\.linear<\{(.+?)\}>"
     m = re.search(pattern, mod_text, re.DOTALL)
     if not m:
         return None
@@ -157,7 +151,7 @@ def parse_linear_layout(mod_text: str, layout_name: str) -> Optional[LinearLayou
             i += 1
         if end is None:
             return None
-        inner = body[anchor.end():end].strip()
+        inner = body[anchor.end() : end].strip()
         if not inner:
             return []
         out = []
@@ -184,17 +178,25 @@ def parse_linear_layout(mod_text: str, layout_name: str) -> Optional[LinearLayou
     )
 
 
-def blocked_to_linear(size_per_thread: List[int], threads_per_warp: List[int],
-                      warps_per_cta: List[int], order: List[int],
-                      tensor_shape: Tuple[int, ...]) -> Optional[LinearLayout]:
+def blocked_to_linear(
+    size_per_thread: List[int],
+    threads_per_warp: List[int],
+    warps_per_cta: List[int],
+    order: List[int],
+    tensor_shape: Tuple[int, ...],
+) -> Optional[LinearLayout]:
     """Convert a 1-D blocked layout to its LinearLayout equivalent.
 
     Only handles the 1-D case used by ``test_trans_reshape``\\'s output
     layout. Returns None for multi-dimensional layouts.
     """
-    if (len(size_per_thread) != 1 or len(threads_per_warp) != 1
-            or len(warps_per_cta) != 1 or len(order) != 1
-            or len(tensor_shape) != 1):
+    if (
+        len(size_per_thread) != 1
+        or len(threads_per_warp) != 1
+        or len(warps_per_cta) != 1
+        or len(order) != 1
+        or len(tensor_shape) != 1
+    ):
         return None
     spt = size_per_thread[0]
     tpw = threads_per_warp[0]

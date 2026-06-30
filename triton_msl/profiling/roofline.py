@@ -15,6 +15,7 @@ bandwidth (546 GB/s) is Apple-published. The compute roofs are **estimates**
 "% of peak compute" should never be presented as more precise than the roof
 it's measured against.
 """
+
 from __future__ import annotations
 
 from dataclasses import dataclass, asdict
@@ -65,17 +66,17 @@ class RooflineResult:
     # achieved
     achieved_gbps: float
     achieved_tflops: float
-    arithmetic_intensity: float       # flops / byte
+    arithmetic_intensity: float  # flops / byte
     # roofs
     mem_bw_gbps: float
     compute_roof_tflops: float
-    ridge_point: float                # AI at which compute == bandwidth roof
+    ridge_point: float  # AI at which compute == bandwidth roof
     # fractions of roof reached (0..1)
     pct_of_bandwidth: float
     pct_of_compute: float
     # classification
-    bound: str                        # "memory" | "compute"
-    limiting_pct: float               # fraction of the *limiting* roof reached
+    bound: str  # "memory" | "compute"
+    limiting_pct: float  # fraction of the *limiting* roof reached
     compute_roof_is_estimate: bool
     # True when achieved exceeds a roof (>~100%): physically impossible, so the
     # byte/flop model is wrong OR the kernel does less work than modelled OR the
@@ -86,9 +87,9 @@ class RooflineResult:
         return asdict(self)
 
 
-def classify(bytes_moved: int, flops: int, seconds: float, *,
-             dtype: str = "fp32",
-             roofs: Optional[HardwareRoofs] = None) -> RooflineResult:
+def classify(
+    bytes_moved: int, flops: int, seconds: float, *, dtype: str = "fp32", roofs: Optional[HardwareRoofs] = None
+) -> RooflineResult:
     """Classify a measured kernel against the roofline.
 
     Args:
@@ -150,9 +151,11 @@ def classify(bytes_moved: int, flops: int, seconds: float, *,
 def format_roofline(name: str, r: RooflineResult) -> str:
     """One-line human summary."""
     if r.suspect_measurement:
-        return (f"{name}: SUSPECT ({r.limiting_pct * 100:.0f}% of roof — "
-                "exceeds the roof, so the byte/flop model or the kernel's "
-                "actual work is wrong; do not trust this row)")
+        return (
+            f"{name}: SUSPECT ({r.limiting_pct * 100:.0f}% of roof — "
+            "exceeds the roof, so the byte/flop model or the kernel's "
+            "actual work is wrong; do not trust this row)"
+        )
     roof_note = " (est.)" if r.compute_roof_is_estimate and r.bound == "compute" else ""
     return (
         f"{name}: {r.bound}-bound at {r.limiting_pct * 100:.1f}% of "

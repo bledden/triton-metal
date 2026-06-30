@@ -14,6 +14,7 @@ import torch
 try:
     import triton
     import triton.language as tl
+
     _HAS_TRITON = True
 except ImportError:
     _HAS_TRITON = False
@@ -33,13 +34,32 @@ except Exception:
 
 @triton.jit
 def _flash_attn_fwd(
-    Q, K, V, Out,
-    stride_qz, stride_qh, stride_qm, stride_qk,
-    stride_kz, stride_kh, stride_kn, stride_kk,
-    stride_vz, stride_vh, stride_vn, stride_vk,
-    stride_oz, stride_oh, stride_om, stride_ok,
-    Z, H, N_CTX,
-    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, HEAD_DIM: tl.constexpr,
+    Q,
+    K,
+    V,
+    Out,
+    stride_qz,
+    stride_qh,
+    stride_qm,
+    stride_qk,
+    stride_kz,
+    stride_kh,
+    stride_kn,
+    stride_kk,
+    stride_vz,
+    stride_vh,
+    stride_vn,
+    stride_vk,
+    stride_oz,
+    stride_oh,
+    stride_om,
+    stride_ok,
+    Z,
+    H,
+    N_CTX,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
     IS_CAUSAL: tl.constexpr,
 ):
     """Flash Attention v2 forward kernel.
@@ -78,7 +98,13 @@ def _flash_attn_fwd(
     # K/V loop
     for start_n in range(0, hi, BLOCK_N):
         # Load K block [BLOCK_N, HEAD_DIM]
-        k_ptrs = K + off_z * stride_kz + off_h * stride_kh + (start_n + offs_n)[:, None] * stride_kn + offs_d[None, :] * stride_kk
+        k_ptrs = (
+            K
+            + off_z * stride_kz
+            + off_h * stride_kh
+            + (start_n + offs_n)[:, None] * stride_kn
+            + offs_d[None, :] * stride_kk
+        )
         k = tl.load(k_ptrs, mask=(start_n + offs_n)[:, None] < N_CTX, other=0.0)
 
         # QK^T [BLOCK_M, BLOCK_N]
@@ -103,7 +129,13 @@ def _flash_attn_fwd(
         acc = acc * alpha[:, None]
 
         # Load V block [BLOCK_N, HEAD_DIM]
-        v_ptrs = V + off_z * stride_vz + off_h * stride_vh + (start_n + offs_n)[:, None] * stride_vn + offs_d[None, :] * stride_vk
+        v_ptrs = (
+            V
+            + off_z * stride_vz
+            + off_h * stride_vh
+            + (start_n + offs_n)[:, None] * stride_vn
+            + offs_d[None, :] * stride_vk
+        )
         v = tl.load(v_ptrs, mask=(start_n + offs_n)[:, None] < N_CTX, other=0.0)
 
         # Accumulate P @ V. Both dot operands must share a dtype; `p` is fp32
@@ -128,7 +160,7 @@ def _ref_attention(q, k, v, causal=False):
     if causal:
         N = attn.shape[-1]
         mask = torch.tril(torch.ones(N, N, device=attn.device))
-        attn = attn.masked_fill(mask[None, None] == 0, float('-inf'))
+        attn = attn.masked_fill(mask[None, None] == 0, float("-inf"))
     attn = torch.softmax(attn, dim=-1)
     # Replace NaN from all-masked rows with 0
     attn = torch.nan_to_num(attn, nan=0.0)
@@ -136,8 +168,7 @@ def _ref_attention(q, k, v, causal=False):
 
 
 @triton.jit
-def _fa_pretransposed_k(Q, K, V, O, N: tl.constexpr, HD: tl.constexpr,
-                        sm: tl.constexpr):
+def _fa_pretransposed_k(Q, K, V, O, N: tl.constexpr, HD: tl.constexpr, sm: tl.constexpr):
     """Single-block attention that stages K PRE-TRANSPOSED.
 
     K is [N, HD] in memory but loaded as its [HD, N] transpose
@@ -152,7 +183,7 @@ def _fa_pretransposed_k(Q, K, V, O, N: tl.constexpr, HD: tl.constexpr,
     offs_n = tl.arange(0, N)
     offs_d = tl.arange(0, HD)
     q = tl.load(Q + offs_m[:, None] * HD + offs_d[None, :]) * sm
-    k = tl.load(K + offs_d[:, None] + offs_n[None, :] * HD)   # [HD, N] = Kᵀ
+    k = tl.load(K + offs_d[:, None] + offs_n[None, :] * HD)  # [HD, N] = Kᵀ
     qk = tl.dot(q, k)
     qk = qk - tl.max(qk, 1)[:, None]
     p = tl.exp(qk)
@@ -166,87 +197,137 @@ class TestFlashAttention:
     """Flash Attention tests via @triton.jit → Metal GPU."""
 
     @requires_triton
-    @pytest.mark.parametrize("Z,H,N_CTX,HEAD_DIM", [
-        (1, 1, 32, 32),
-        (1, 1, 64, 32),
-        (1, 1, 64, 64),
-        (1, 2, 64, 32),
-        (2, 2, 64, 32),
-        (1, 1, 128, 32),
-    ])
+    @pytest.mark.parametrize(
+        "Z,H,N_CTX,HEAD_DIM",
+        [
+            (1, 1, 32, 32),
+            (1, 1, 64, 32),
+            (1, 1, 64, 64),
+            (1, 2, 64, 32),
+            (2, 2, 64, 32),
+            (1, 1, 128, 32),
+        ],
+    )
     def test_non_causal(self, Z, H, N_CTX, HEAD_DIM):
         """Non-causal attention."""
         BLOCK_M = min(32, N_CTX)
         BLOCK_N = min(32, N_CTX)
         torch.manual_seed(42)
-        q = torch.randn(Z, H, N_CTX, HEAD_DIM, device='cpu', dtype=torch.float32)
-        k = torch.randn(Z, H, N_CTX, HEAD_DIM, device='cpu', dtype=torch.float32)
-        v = torch.randn(Z, H, N_CTX, HEAD_DIM, device='cpu', dtype=torch.float32)
+        q = torch.randn(Z, H, N_CTX, HEAD_DIM, device="cpu", dtype=torch.float32)
+        k = torch.randn(Z, H, N_CTX, HEAD_DIM, device="cpu", dtype=torch.float32)
+        v = torch.randn(Z, H, N_CTX, HEAD_DIM, device="cpu", dtype=torch.float32)
         out = torch.empty_like(q)
 
         grid = (N_CTX // BLOCK_M, Z * H)
         _flash_attn_fwd[grid](
-            q, k, v, out,
-            q.stride(0), q.stride(1), q.stride(2), q.stride(3),
-            k.stride(0), k.stride(1), k.stride(2), k.stride(3),
-            v.stride(0), v.stride(1), v.stride(2), v.stride(3),
-            out.stride(0), out.stride(1), out.stride(2), out.stride(3),
-            Z, H, N_CTX,
-            BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, HEAD_DIM=HEAD_DIM,
+            q,
+            k,
+            v,
+            out,
+            q.stride(0),
+            q.stride(1),
+            q.stride(2),
+            q.stride(3),
+            k.stride(0),
+            k.stride(1),
+            k.stride(2),
+            k.stride(3),
+            v.stride(0),
+            v.stride(1),
+            v.stride(2),
+            v.stride(3),
+            out.stride(0),
+            out.stride(1),
+            out.stride(2),
+            out.stride(3),
+            Z,
+            H,
+            N_CTX,
+            BLOCK_M=BLOCK_M,
+            BLOCK_N=BLOCK_N,
+            HEAD_DIM=HEAD_DIM,
             IS_CAUSAL=False,
         )
         ref = _ref_attention(q, k, v, causal=False)
-        assert (out - ref).abs().max().item() < 0.01, \
+        assert (out - ref).abs().max().item() < 0.01, (
             f"Non-causal attention max error: {(out - ref).abs().max().item()}"
+        )
 
     @requires_triton
-    @pytest.mark.parametrize("Z,H,N_CTX,HEAD_DIM", [
-        (1, 1, 32, 32),
-        (1, 1, 64, 32),
-        (1, 1, 64, 64),
-        (1, 2, 64, 32),
-        (1, 1, 128, 32),
-    ])
+    @pytest.mark.parametrize(
+        "Z,H,N_CTX,HEAD_DIM",
+        [
+            (1, 1, 32, 32),
+            (1, 1, 64, 32),
+            (1, 1, 64, 64),
+            (1, 2, 64, 32),
+            (1, 1, 128, 32),
+        ],
+    )
     def test_causal(self, Z, H, N_CTX, HEAD_DIM):
         """Causal (autoregressive) attention."""
         BLOCK_M = min(32, N_CTX)
         BLOCK_N = min(32, N_CTX)
         torch.manual_seed(42)
-        q = torch.randn(Z, H, N_CTX, HEAD_DIM, device='cpu', dtype=torch.float32)
-        k = torch.randn(Z, H, N_CTX, HEAD_DIM, device='cpu', dtype=torch.float32)
-        v = torch.randn(Z, H, N_CTX, HEAD_DIM, device='cpu', dtype=torch.float32)
+        q = torch.randn(Z, H, N_CTX, HEAD_DIM, device="cpu", dtype=torch.float32)
+        k = torch.randn(Z, H, N_CTX, HEAD_DIM, device="cpu", dtype=torch.float32)
+        v = torch.randn(Z, H, N_CTX, HEAD_DIM, device="cpu", dtype=torch.float32)
         out = torch.empty_like(q)
 
         grid = (N_CTX // BLOCK_M, Z * H)
         _flash_attn_fwd[grid](
-            q, k, v, out,
-            q.stride(0), q.stride(1), q.stride(2), q.stride(3),
-            k.stride(0), k.stride(1), k.stride(2), k.stride(3),
-            v.stride(0), v.stride(1), v.stride(2), v.stride(3),
-            out.stride(0), out.stride(1), out.stride(2), out.stride(3),
-            Z, H, N_CTX,
-            BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, HEAD_DIM=HEAD_DIM,
+            q,
+            k,
+            v,
+            out,
+            q.stride(0),
+            q.stride(1),
+            q.stride(2),
+            q.stride(3),
+            k.stride(0),
+            k.stride(1),
+            k.stride(2),
+            k.stride(3),
+            v.stride(0),
+            v.stride(1),
+            v.stride(2),
+            v.stride(3),
+            out.stride(0),
+            out.stride(1),
+            out.stride(2),
+            out.stride(3),
+            Z,
+            H,
+            N_CTX,
+            BLOCK_M=BLOCK_M,
+            BLOCK_N=BLOCK_N,
+            HEAD_DIM=HEAD_DIM,
             IS_CAUSAL=True,
         )
         ref = _ref_attention(q, k, v, causal=True)
-        assert (out - ref).abs().max().item() < 0.01, \
-            f"Causal attention max error: {(out - ref).abs().max().item()}"
+        assert (out - ref).abs().max().item() < 0.01, f"Causal attention max error: {(out - ref).abs().max().item()}"
 
     @requires_triton
-    @pytest.mark.parametrize("dtype,tol", [
-        (torch.float32, 0.01),
-        # fp16 in / fp32 accumulate / fp16 out: the cast-epilogue template
-        # (Task 4) rounds the output to half on store, so the bar is looser
-        # (fp16 ~3-decimal mantissa) but still a real correctness check vs the
-        # torch fp16 reference — NOT a silent-wrong escape hatch.
-        (torch.float16, 0.05),
-    ])
-    @pytest.mark.parametrize("Z,H,N_CTX,HEAD_DIM", [
-        (1, 1, 64, 128),
-        (1, 1, 128, 128),
-        (1, 2, 96, 128),
-        (2, 2, 64, 128),
-    ])
+    @pytest.mark.parametrize(
+        "dtype,tol",
+        [
+            (torch.float32, 0.01),
+            # fp16 in / fp32 accumulate / fp16 out: the cast-epilogue template
+            # (Task 4) rounds the output to half on store, so the bar is looser
+            # (fp16 ~3-decimal mantissa) but still a real correctness check vs the
+            # torch fp16 reference — NOT a silent-wrong escape hatch.
+            (torch.float16, 0.05),
+        ],
+    )
+    @pytest.mark.parametrize(
+        "Z,H,N_CTX,HEAD_DIM",
+        [
+            (1, 1, 64, 128),
+            (1, 1, 128, 128),
+            (1, 2, 96, 128),
+            (2, 2, 64, 128),
+        ],
+    )
     def test_non_causal_large_head(self, Z, H, N_CTX, HEAD_DIM, dtype, tol):
         """Non-causal attention at head_dim=128, BLOCK_M=BLOCK_N=32.
 
@@ -260,38 +341,64 @@ class TestFlashAttention:
         refused (Task 5)."""
         BLOCK_M = BLOCK_N = 32
         torch.manual_seed(42)
-        q = torch.randn(Z, H, N_CTX, HEAD_DIM, device='cpu', dtype=dtype)
-        k = torch.randn(Z, H, N_CTX, HEAD_DIM, device='cpu', dtype=dtype)
-        v = torch.randn(Z, H, N_CTX, HEAD_DIM, device='cpu', dtype=dtype)
+        q = torch.randn(Z, H, N_CTX, HEAD_DIM, device="cpu", dtype=dtype)
+        k = torch.randn(Z, H, N_CTX, HEAD_DIM, device="cpu", dtype=dtype)
+        v = torch.randn(Z, H, N_CTX, HEAD_DIM, device="cpu", dtype=dtype)
         out = torch.empty_like(q)
 
         grid = (N_CTX // BLOCK_M, Z * H)
         _flash_attn_fwd[grid](
-            q, k, v, out,
-            q.stride(0), q.stride(1), q.stride(2), q.stride(3),
-            k.stride(0), k.stride(1), k.stride(2), k.stride(3),
-            v.stride(0), v.stride(1), v.stride(2), v.stride(3),
-            out.stride(0), out.stride(1), out.stride(2), out.stride(3),
-            Z, H, N_CTX,
-            BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, HEAD_DIM=HEAD_DIM,
+            q,
+            k,
+            v,
+            out,
+            q.stride(0),
+            q.stride(1),
+            q.stride(2),
+            q.stride(3),
+            k.stride(0),
+            k.stride(1),
+            k.stride(2),
+            k.stride(3),
+            v.stride(0),
+            v.stride(1),
+            v.stride(2),
+            v.stride(3),
+            out.stride(0),
+            out.stride(1),
+            out.stride(2),
+            out.stride(3),
+            Z,
+            H,
+            N_CTX,
+            BLOCK_M=BLOCK_M,
+            BLOCK_N=BLOCK_N,
+            HEAD_DIM=HEAD_DIM,
             IS_CAUSAL=False,
         )
         # Reference in fp32 for a stable target, compared in the kernel's dtype.
         ref = _ref_attention(q.float(), k.float(), v.float(), causal=False).to(dtype)
-        assert (out - ref).abs().max().item() < tol, \
+        assert (out - ref).abs().max().item() < tol, (
             f"Non-causal large-head ({dtype}) max error: {(out - ref).abs().max().item()}"
+        )
 
     @requires_triton
-    @pytest.mark.parametrize("dtype,tol", [
-        (torch.float32, 0.01),
-        (torch.float16, 0.05),
-    ])
-    @pytest.mark.parametrize("Z,H,N_CTX,HEAD_DIM", [
-        (1, 1, 64, 128),
-        (1, 1, 128, 128),
-        (1, 2, 96, 128),
-        (2, 2, 64, 128),
-    ])
+    @pytest.mark.parametrize(
+        "dtype,tol",
+        [
+            (torch.float32, 0.01),
+            (torch.float16, 0.05),
+        ],
+    )
+    @pytest.mark.parametrize(
+        "Z,H,N_CTX,HEAD_DIM",
+        [
+            (1, 1, 64, 128),
+            (1, 1, 128, 128),
+            (1, 2, 96, 128),
+            (2, 2, 64, 128),
+        ],
+    )
     def test_causal_large_head(self, Z, H, N_CTX, HEAD_DIM, dtype, tol):
         """Causal attention at head_dim=128, BLOCK_M=BLOCK_N=32 (Task 5).
 
@@ -303,26 +410,46 @@ class TestFlashAttention:
         fp16 < 0.05 (cast-epilogue rounding)."""
         BLOCK_M = BLOCK_N = 32
         torch.manual_seed(42)
-        q = torch.randn(Z, H, N_CTX, HEAD_DIM, device='cpu', dtype=dtype)
-        k = torch.randn(Z, H, N_CTX, HEAD_DIM, device='cpu', dtype=dtype)
-        v = torch.randn(Z, H, N_CTX, HEAD_DIM, device='cpu', dtype=dtype)
+        q = torch.randn(Z, H, N_CTX, HEAD_DIM, device="cpu", dtype=dtype)
+        k = torch.randn(Z, H, N_CTX, HEAD_DIM, device="cpu", dtype=dtype)
+        v = torch.randn(Z, H, N_CTX, HEAD_DIM, device="cpu", dtype=dtype)
         out = torch.empty_like(q)
 
         grid = (N_CTX // BLOCK_M, Z * H)
         _flash_attn_fwd[grid](
-            q, k, v, out,
-            q.stride(0), q.stride(1), q.stride(2), q.stride(3),
-            k.stride(0), k.stride(1), k.stride(2), k.stride(3),
-            v.stride(0), v.stride(1), v.stride(2), v.stride(3),
-            out.stride(0), out.stride(1), out.stride(2), out.stride(3),
-            Z, H, N_CTX,
-            BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, HEAD_DIM=HEAD_DIM,
+            q,
+            k,
+            v,
+            out,
+            q.stride(0),
+            q.stride(1),
+            q.stride(2),
+            q.stride(3),
+            k.stride(0),
+            k.stride(1),
+            k.stride(2),
+            k.stride(3),
+            v.stride(0),
+            v.stride(1),
+            v.stride(2),
+            v.stride(3),
+            out.stride(0),
+            out.stride(1),
+            out.stride(2),
+            out.stride(3),
+            Z,
+            H,
+            N_CTX,
+            BLOCK_M=BLOCK_M,
+            BLOCK_N=BLOCK_N,
+            HEAD_DIM=HEAD_DIM,
             IS_CAUSAL=True,
         )
         # Reference in fp32 for a stable target, compared in the kernel's dtype.
         ref = _ref_attention(q.float(), k.float(), v.float(), causal=True).to(dtype)
-        assert (out - ref).abs().max().item() < tol, \
+        assert (out - ref).abs().max().item() < tol, (
             f"Causal large-head ({dtype}) max error: {(out - ref).abs().max().item()}"
+        )
 
     @requires_triton
     @pytest.mark.parametrize("BLOCK", [16, 8])
@@ -337,20 +464,39 @@ class TestFlashAttention:
         BLOCK_M/BLOCK_N < 32."""
         Z, H, N_CTX, HEAD_DIM = 1, 1, 128, 128
         torch.manual_seed(42)
-        q = torch.randn(Z, H, N_CTX, HEAD_DIM, device='cpu', dtype=torch.float32)
-        k = torch.randn(Z, H, N_CTX, HEAD_DIM, device='cpu', dtype=torch.float32)
-        v = torch.randn(Z, H, N_CTX, HEAD_DIM, device='cpu', dtype=torch.float32)
+        q = torch.randn(Z, H, N_CTX, HEAD_DIM, device="cpu", dtype=torch.float32)
+        k = torch.randn(Z, H, N_CTX, HEAD_DIM, device="cpu", dtype=torch.float32)
+        v = torch.randn(Z, H, N_CTX, HEAD_DIM, device="cpu", dtype=torch.float32)
         out = torch.empty_like(q)
         grid = (N_CTX // BLOCK, Z * H)
         with pytest.raises(MetalNonRecoverableError):
             _flash_attn_fwd[grid](
-                q, k, v, out,
-                q.stride(0), q.stride(1), q.stride(2), q.stride(3),
-                k.stride(0), k.stride(1), k.stride(2), k.stride(3),
-                v.stride(0), v.stride(1), v.stride(2), v.stride(3),
-                out.stride(0), out.stride(1), out.stride(2), out.stride(3),
-                Z, H, N_CTX,
-                BLOCK_M=BLOCK, BLOCK_N=BLOCK, HEAD_DIM=HEAD_DIM,
+                q,
+                k,
+                v,
+                out,
+                q.stride(0),
+                q.stride(1),
+                q.stride(2),
+                q.stride(3),
+                k.stride(0),
+                k.stride(1),
+                k.stride(2),
+                k.stride(3),
+                v.stride(0),
+                v.stride(1),
+                v.stride(2),
+                v.stride(3),
+                out.stride(0),
+                out.stride(1),
+                out.stride(2),
+                out.stride(3),
+                Z,
+                H,
+                N_CTX,
+                BLOCK_M=BLOCK,
+                BLOCK_N=BLOCK,
+                HEAD_DIM=HEAD_DIM,
                 IS_CAUSAL=False,
             )
 
@@ -372,21 +518,39 @@ class TestFlashAttention:
         """
         Z, H, N_CTX, BLOCK = 1, 1, 64, 32
         torch.manual_seed(42)
-        q = torch.randn(Z, H, N_CTX, HEAD_DIM, device='cpu', dtype=torch.float32)
-        k = torch.randn(Z, H, N_CTX, HEAD_DIM, device='cpu', dtype=torch.float32)
-        v = torch.randn(Z, H, N_CTX, HEAD_DIM, device='cpu', dtype=torch.float32)
+        q = torch.randn(Z, H, N_CTX, HEAD_DIM, device="cpu", dtype=torch.float32)
+        k = torch.randn(Z, H, N_CTX, HEAD_DIM, device="cpu", dtype=torch.float32)
+        v = torch.randn(Z, H, N_CTX, HEAD_DIM, device="cpu", dtype=torch.float32)
         out = torch.empty_like(q)
         grid = (N_CTX // BLOCK, Z * H)
-        with pytest.raises(MetalNonRecoverableError,
-                           match="head_dim > 64"):
+        with pytest.raises(MetalNonRecoverableError, match="head_dim > 64"):
             _flash_attn_fwd[grid](
-                q, k, v, out,
-                q.stride(0), q.stride(1), q.stride(2), q.stride(3),
-                k.stride(0), k.stride(1), k.stride(2), k.stride(3),
-                v.stride(0), v.stride(1), v.stride(2), v.stride(3),
-                out.stride(0), out.stride(1), out.stride(2), out.stride(3),
-                Z, H, N_CTX,
-                BLOCK_M=BLOCK, BLOCK_N=BLOCK, HEAD_DIM=HEAD_DIM,
+                q,
+                k,
+                v,
+                out,
+                q.stride(0),
+                q.stride(1),
+                q.stride(2),
+                q.stride(3),
+                k.stride(0),
+                k.stride(1),
+                k.stride(2),
+                k.stride(3),
+                v.stride(0),
+                v.stride(1),
+                v.stride(2),
+                v.stride(3),
+                out.stride(0),
+                out.stride(1),
+                out.stride(2),
+                out.stride(3),
+                Z,
+                H,
+                N_CTX,
+                BLOCK_M=BLOCK,
+                BLOCK_N=BLOCK,
+                HEAD_DIM=HEAD_DIM,
                 IS_CAUSAL=False,
             )
 
@@ -414,9 +578,9 @@ class TestFlashAttention:
         """
         Z, H, N_CTX, HEAD_DIM, BLOCK = 1, 1, 64, 128, 32
         torch.manual_seed(42)
-        q = torch.randn(Z, H, N_CTX, HEAD_DIM, device='cpu', dtype=torch.bfloat16)
-        k = torch.randn(Z, H, N_CTX, HEAD_DIM, device='cpu', dtype=torch.bfloat16)
-        v = torch.randn(Z, H, N_CTX, HEAD_DIM, device='cpu', dtype=torch.bfloat16)
+        q = torch.randn(Z, H, N_CTX, HEAD_DIM, device="cpu", dtype=torch.bfloat16)
+        k = torch.randn(Z, H, N_CTX, HEAD_DIM, device="cpu", dtype=torch.bfloat16)
+        v = torch.randn(Z, H, N_CTX, HEAD_DIM, device="cpu", dtype=torch.bfloat16)
         out = torch.empty_like(q)
         grid = (N_CTX // BLOCK, Z * H)
         # Narrowed to the two semantically-meaningful exception types:
@@ -430,13 +594,32 @@ class TestFlashAttention:
             match=r"bf16|bfloat16|dtype|not supported|unsupported|head_dim",
         ):
             _flash_attn_fwd[grid](
-                q, k, v, out,
-                q.stride(0), q.stride(1), q.stride(2), q.stride(3),
-                k.stride(0), k.stride(1), k.stride(2), k.stride(3),
-                v.stride(0), v.stride(1), v.stride(2), v.stride(3),
-                out.stride(0), out.stride(1), out.stride(2), out.stride(3),
-                Z, H, N_CTX,
-                BLOCK_M=BLOCK, BLOCK_N=BLOCK, HEAD_DIM=HEAD_DIM,
+                q,
+                k,
+                v,
+                out,
+                q.stride(0),
+                q.stride(1),
+                q.stride(2),
+                q.stride(3),
+                k.stride(0),
+                k.stride(1),
+                k.stride(2),
+                k.stride(3),
+                v.stride(0),
+                v.stride(1),
+                v.stride(2),
+                v.stride(3),
+                out.stride(0),
+                out.stride(1),
+                out.stride(2),
+                out.stride(3),
+                Z,
+                H,
+                N_CTX,
+                BLOCK_M=BLOCK,
+                BLOCK_N=BLOCK,
+                HEAD_DIM=HEAD_DIM,
                 IS_CAUSAL=False,
             )
 
@@ -455,20 +638,39 @@ class TestFlashAttention:
         """
         Z, H, N_CTX = 1, 1, 16
         torch.manual_seed(42)
-        q = torch.randn(Z, H, N_CTX, HEAD_DIM, device='cpu', dtype=torch.float32)
-        k = torch.randn(Z, H, N_CTX, HEAD_DIM, device='cpu', dtype=torch.float32)
-        v = torch.randn(Z, H, N_CTX, HEAD_DIM, device='cpu', dtype=torch.float32)
+        q = torch.randn(Z, H, N_CTX, HEAD_DIM, device="cpu", dtype=torch.float32)
+        k = torch.randn(Z, H, N_CTX, HEAD_DIM, device="cpu", dtype=torch.float32)
+        v = torch.randn(Z, H, N_CTX, HEAD_DIM, device="cpu", dtype=torch.float32)
         out = torch.empty_like(q)
         grid = (N_CTX // BLOCK, Z * H)
         with pytest.raises(MetalNonRecoverableError):
             _flash_attn_fwd[grid](
-                q, k, v, out,
-                q.stride(0), q.stride(1), q.stride(2), q.stride(3),
-                k.stride(0), k.stride(1), k.stride(2), k.stride(3),
-                v.stride(0), v.stride(1), v.stride(2), v.stride(3),
-                out.stride(0), out.stride(1), out.stride(2), out.stride(3),
-                Z, H, N_CTX,
-                BLOCK_M=BLOCK, BLOCK_N=BLOCK, HEAD_DIM=HEAD_DIM,
+                q,
+                k,
+                v,
+                out,
+                q.stride(0),
+                q.stride(1),
+                q.stride(2),
+                q.stride(3),
+                k.stride(0),
+                k.stride(1),
+                k.stride(2),
+                k.stride(3),
+                v.stride(0),
+                v.stride(1),
+                v.stride(2),
+                v.stride(3),
+                out.stride(0),
+                out.stride(1),
+                out.stride(2),
+                out.stride(3),
+                Z,
+                H,
+                N_CTX,
+                BLOCK_M=BLOCK,
+                BLOCK_N=BLOCK,
+                HEAD_DIM=HEAD_DIM,
                 IS_CAUSAL=False,
             )
 
@@ -486,6 +688,7 @@ class TestFlashAttention:
         (never torch-on-mps).
         """
         import numpy as np
+
         if not (hasattr(torch, "mps") and torch.backends.mps.is_available()):
             pytest.skip("MPS not available")
         N = 32
@@ -493,12 +696,12 @@ class TestFlashAttention:
         Qn = rng.randn(N, HEAD_DIM).astype(np.float32)
         Kn = rng.randn(N, HEAD_DIM).astype(np.float32)
         Vn = rng.randn(N, HEAD_DIM).astype(np.float32)
-        sm = 1.0 / (HEAD_DIM ** 0.5)
+        sm = 1.0 / (HEAD_DIM**0.5)
 
-        Q = torch.tensor(Qn, device='mps')
-        K = torch.tensor(Kn, device='mps')
-        V = torch.tensor(Vn, device='mps')
-        O = torch.zeros(N, HEAD_DIM, device='mps')
+        Q = torch.tensor(Qn, device="mps")
+        K = torch.tensor(Kn, device="mps")
+        V = torch.tensor(Vn, device="mps")
+        O = torch.zeros(N, HEAD_DIM, device="mps")
         _fa_pretransposed_k[(1,)](Q, K, V, O, N=N, HD=HEAD_DIM, sm=float(sm))
         torch.mps.synchronize()
 

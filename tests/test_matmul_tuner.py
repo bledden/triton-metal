@@ -4,6 +4,7 @@
 No GPU needed: selection is pure logic (cores pinned to 40 -> gate = 8*40 = 320).
 The selector NEVER returns an invalid (rr,rc); for low-occupancy unaligned shapes
 it returns None (-> the caller uses the generic path, never-regress)."""
+
 import pytest
 
 from triton_msl.autotuning import matmul_tuner as MT
@@ -12,15 +13,15 @@ from triton_msl.autotuning.matmul_tuner import CANDIDATES, valid_candidates, bes
 
 @pytest.fixture(autouse=True)
 def _fixed_env(monkeypatch):
-    monkeypatch.setattr(MT, "_CORES", 40)               # gate = 8*40 = 320
+    monkeypatch.setattr(MT, "_CORES", 40)  # gate = 8*40 = 320
     monkeypatch.delenv("TRITON_MSL_MATMUL_AUTOTUNE", raising=False)
     yield
 
 
 def test_candidates_default_first_register_safe_includes_rr1():
-    assert CANDIDATES[0] == (4, 4)                       # default + aligned common case
-    assert all(rr * rc <= 32 for rr, rc in CANDIDATES)   # register budget
-    assert any(rr == 1 for rr, rc in CANDIDATES)         # rr=1 -> M%8 coverage
+    assert CANDIDATES[0] == (4, 4)  # default + aligned common case
+    assert all(rr * rc <= 32 for rr, rc in CANDIDATES)  # register budget
+    assert any(rr == 1 for rr, rc in CANDIDATES)  # rr=1 -> M%8 coverage
 
 
 def test_valid_candidates_N_contract_is_strip_width_8rc():
@@ -64,17 +65,17 @@ def test_low_parallelism_routes_to_generic():
     # the fast rc=1 path (measured ~14x faster than generic, byte-exact) — so M alone no
     # longer routes to generic; only true low total parallelism does.
     assert best_rrrc("fp32", "fp32", 48, 48, 2048) is None
-    assert best_rrrc("fp32", "fp32", 48, 2048, 2048) is not None   # large N -> fast (rc=1)
+    assert best_rrrc("fp32", "fp32", 48, 2048, 2048) is not None  # large N -> fast (rc=1)
 
 
 def test_killswitch_pins_default_or_none(monkeypatch):
     monkeypatch.setenv("TRITON_MSL_MATMUL_AUTOTUNE", "0")
-    assert best_rrrc("fp32", "fp32", 2048, 2048, 2048) == (4, 4)   # aligned -> (4,4)
-    assert best_rrrc("fp32", "fp32", 2032, 2048, 2048) is None     # unaligned -> generic
+    assert best_rrrc("fp32", "fp32", 2048, 2048, 2048) == (4, 4)  # aligned -> (4,4)
+    assert best_rrrc("fp32", "fp32", 2032, 2048, 2048) is None  # unaligned -> generic
 
 
 def test_no_valid_candidate_returns_none():
-    assert best_rrrc("fp32", "fp32", 64, 40, 64) is None           # N=40 not %64
+    assert best_rrrc("fp32", "fp32", 64, 40, 64) is None  # N=40 not %64
 
 
 def test_selector_never_returns_invalid_config():

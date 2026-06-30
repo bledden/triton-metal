@@ -11,6 +11,7 @@ Two patterns, both validated above 1024:
 
 Run with TRITON_MSL_MEPT=1. Serial only.
 """
+
 import os
 import pytest
 
@@ -19,16 +20,18 @@ try:
     import triton
     import triton.language as tl
     import Metal
+
     HAS = Metal.MTLCreateSystemDefaultDevice() is not None
 except Exception:
     HAS = False
 
 requires_metal = pytest.mark.skipif(not HAS, reason="Metal/torch/triton needed")
 requires_mept = pytest.mark.skipif(
-    os.environ.get("TRITON_MSL_MEPT") != "1",
-    reason="requires TRITON_MSL_MEPT=1 (M3 register-array form)")
+    os.environ.get("TRITON_MSL_MEPT") != "1", reason="requires TRITON_MSL_MEPT=1 (M3 register-array form)"
+)
 
 if HAS:
+
     @triton.jit
     def _vec_acc(X, OUT, n_tiles, BLOCK: tl.constexpr):
         offs = tl.arange(0, BLOCK)
@@ -58,7 +61,8 @@ def test_iter_carry_above_1024(BLOCK):
     _vec_acc[(1,)](X, OUT, n_tiles, BLOCK=BLOCK)
     want = X.view(n_tiles, BLOCK).sum(0)
     assert torch.allclose(OUT, want, atol=1e-2), (
-        f"iter-carry BLOCK={BLOCK}: max|diff|={float((OUT-want).abs().max()):.4g}")
+        f"iter-carry BLOCK={BLOCK}: max|diff|={float((OUT - want).abs().max()):.4g}"
+    )
 
 
 @requires_metal
@@ -70,4 +74,5 @@ def test_reduce_in_loop_above_1024(BLOCK):
     OUT = torch.zeros(1)
     _sum_in_loop[(1,)](X, OUT, N, (N + BLOCK - 1) // BLOCK, BLOCK=BLOCK)
     assert abs(float(OUT[0]) - X.sum().item()) < 5e-1, (
-        f"reduce-in-loop BLOCK={BLOCK}: got {float(OUT[0])} want {X.sum().item()}")
+        f"reduce-in-loop BLOCK={BLOCK}: got {float(OUT[0])} want {X.sum().item()}"
+    )

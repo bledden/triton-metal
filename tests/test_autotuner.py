@@ -9,14 +9,12 @@ import pytest
 # Skip entire module if Metal framework not available
 try:
     import Metal
+
     HAS_METAL = True
 except ImportError:
     HAS_METAL = False
 
-requires_metal = pytest.mark.skipif(
-    not HAS_METAL,
-    reason="Metal framework not available"
-)
+requires_metal = pytest.mark.skipif(not HAS_METAL, reason="Metal framework not available")
 
 from triton_msl.autotuning.autotuner import (
     AutotuneConfig,
@@ -30,6 +28,7 @@ from triton_msl.autotuning.autotuner import (
 # ---------------------------------------------------------------------------
 # AutotuneConfig tests (no GPU needed)
 # ---------------------------------------------------------------------------
+
 
 def test_config_defaults():
     """Config has sensible defaults."""
@@ -95,20 +94,13 @@ def test_presets_exist():
 # GPU autotuning tests
 # ---------------------------------------------------------------------------
 
+
 def make_test_buffers(device, n):
     """Create simple input/output buffers for vector_add autotuning."""
-    a_buf = device.newBufferWithLength_options_(
-        n * 4, Metal.MTLResourceStorageModeShared
-    )
-    b_buf = device.newBufferWithLength_options_(
-        n * 4, Metal.MTLResourceStorageModeShared
-    )
-    out_buf = device.newBufferWithLength_options_(
-        n * 4, Metal.MTLResourceStorageModeShared
-    )
-    n_buf = device.newBufferWithLength_options_(
-        4, Metal.MTLResourceStorageModeShared
-    )
+    a_buf = device.newBufferWithLength_options_(n * 4, Metal.MTLResourceStorageModeShared)
+    b_buf = device.newBufferWithLength_options_(n * 4, Metal.MTLResourceStorageModeShared)
+    out_buf = device.newBufferWithLength_options_(n * 4, Metal.MTLResourceStorageModeShared)
+    n_buf = device.newBufferWithLength_options_(4, Metal.MTLResourceStorageModeShared)
 
     # Fill
     for buf_obj, pattern in [(a_buf, 1.0), (b_buf, 2.0)]:
@@ -139,8 +131,7 @@ def test_autotune_vector_add():
     # Use temp cache dir to avoid stale results
     cache_dir = tempfile.mkdtemp(prefix="autotune_test_")
     tuner = MetalAutotuner(configs, cache_dir=cache_dir, warmup=5, rep=20)
-    result = tuner.tune(make_vector_add_kernel, "vector_add",
-                         buffers=buffers, n_elements=n)
+    result = tuner.tune(make_vector_add_kernel, "vector_add", buffers=buffers, n_elements=n)
 
     assert isinstance(result, AutotuneResult)
     assert result.best_config.block_size in [128, 256, 512]
@@ -167,12 +158,10 @@ def test_autotune_cache_hit():
     tuner = MetalAutotuner(configs, cache_dir=cache_dir, warmup=3, rep=10)
 
     # First call: benchmarks
-    r1 = tuner.tune(make_vector_add_kernel, "vector_add",
-                      buffers=buffers, n_elements=n)
+    r1 = tuner.tune(make_vector_add_kernel, "vector_add", buffers=buffers, n_elements=n)
 
     # Second call: should hit cache (no GPU work)
-    r2 = tuner.tune(make_vector_add_kernel, "vector_add",
-                      buffers=buffers, n_elements=n)
+    r2 = tuner.tune(make_vector_add_kernel, "vector_add", buffers=buffers, n_elements=n)
 
     assert r1.best_config.block_size == r2.best_config.block_size
     assert r1.best_time_us == r2.best_time_us
@@ -186,15 +175,9 @@ def test_autotune_silu():
     device = Metal.MTLCreateSystemDefaultDevice()
     n = 65536
 
-    in_buf = device.newBufferWithLength_options_(
-        n * 4, Metal.MTLResourceStorageModeShared
-    )
-    out_buf = device.newBufferWithLength_options_(
-        n * 4, Metal.MTLResourceStorageModeShared
-    )
-    n_buf = device.newBufferWithLength_options_(
-        4, Metal.MTLResourceStorageModeShared
-    )
+    in_buf = device.newBufferWithLength_options_(n * 4, Metal.MTLResourceStorageModeShared)
+    out_buf = device.newBufferWithLength_options_(n * 4, Metal.MTLResourceStorageModeShared)
+    n_buf = device.newBufferWithLength_options_(4, Metal.MTLResourceStorageModeShared)
     n_view = n_buf.contents().as_buffer(4)
     struct.pack_into("I", n_view, 0, n)
 
@@ -205,8 +188,7 @@ def test_autotune_silu():
 
     cache_dir = tempfile.mkdtemp(prefix="autotune_silu_test_")
     tuner = MetalAutotuner(configs, cache_dir=cache_dir, warmup=3, rep=10)
-    result = tuner.tune(make_silu_kernel, "silu_kernel",
-                         buffers=[in_buf, out_buf, n_buf], n_elements=n)
+    result = tuner.tune(make_silu_kernel, "silu_kernel", buffers=[in_buf, out_buf, n_buf], n_elements=n)
 
     assert result.best_config.block_size in [256, 512]
     assert result.best_time_us > 0
@@ -215,10 +197,12 @@ def test_autotune_silu():
 @requires_metal
 def test_autotune_handles_compile_error():
     """Autotuner handles kernel compilation failure gracefully."""
+
     def bad_kernel(block_size=256):
         if block_size == 512:
             return "THIS IS NOT VALID MSL"
         from triton_msl.codegen.msl_emitter import make_vector_add_kernel
+
         return make_vector_add_kernel(block_size=block_size)
 
     device = Metal.MTLCreateSystemDefaultDevice()
@@ -232,8 +216,7 @@ def test_autotune_handles_compile_error():
 
     cache_dir = tempfile.mkdtemp(prefix="autotune_error_test_")
     tuner = MetalAutotuner(configs, cache_dir=cache_dir, warmup=3, rep=10)
-    result = tuner.tune(bad_kernel, "vector_add",
-                         buffers=buffers, n_elements=n)
+    result = tuner.tune(bad_kernel, "vector_add", buffers=buffers, n_elements=n)
 
     # Should still return a result (the working config)
     assert result.best_config.block_size == 256
@@ -250,25 +233,27 @@ def test_autotune_handles_compile_error():
 try:
     import triton
     import triton.language as tl
+
     HAS_TRITON = True
 except ImportError:
     HAS_TRITON = False
 
 try:
     import torch
+
     HAS_TORCH = torch.backends.mps.is_available() if hasattr(torch.backends, "mps") else False
 except ImportError:
     HAS_TORCH = False
 
 requires_triton_msl = pytest.mark.skipif(
-    not (HAS_METAL and HAS_TRITON and HAS_TORCH),
-    reason="Requires Metal + Triton + PyTorch MPS"
+    not (HAS_METAL and HAS_TRITON and HAS_TORCH), reason="Requires Metal + Triton + PyTorch MPS"
 )
 
 
 @requires_triton_msl
 def test_triton_autotune_vector_add():
     """End-to-end: @triton.autotune selects a config for vector_add on Metal."""
+
     @triton.autotune(
         configs=[
             triton.Config({"BLOCK_SIZE": 128}, num_warps=4),
@@ -294,6 +279,5 @@ def test_triton_autotune_vector_add():
     add_kernel[grid](x, y, out, n)
 
     expected = x + y
-    assert torch.allclose(out, expected, atol=1e-5), \
-        f"Max diff: {(out - expected).abs().max()}"
+    assert torch.allclose(out, expected, atol=1e-5), f"Max diff: {(out - expected).abs().max()}"
     print("@triton.autotune vector_add: PASS")

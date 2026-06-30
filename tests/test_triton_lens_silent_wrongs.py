@@ -9,6 +9,7 @@ on core language semantics the matmul/reduce campaign never touched:
       accumulator) was declared `float` — silent precision loss for i32 > 2^24 and i64.
       Now derives the dtype from the IR result type + has a long/ulong branch.
 """
+
 import pytest
 import numpy as np
 import torch
@@ -16,6 +17,7 @@ import torch
 try:
     import triton
     import triton.language as tl
+
     _HAS = True
 except Exception:
     _HAS = False
@@ -25,6 +27,7 @@ from triton_msl.errors import MetalNonRecoverableError
 requires = pytest.mark.skipif(not _HAS, reason="triton not available")
 
 if _HAS:
+
     @triton.jit
     def _mul(a, b):
         return a * b
@@ -55,57 +58,62 @@ if _HAS:
         acc = 1
         if c > 0:
             for _ in range(10):
-                acc += 2000003          # 1 + 10*2000003 = 20000031, odd, > 2^24
+                acc += 2000003  # 1 + 10*2000003 = 20000031, odd, > 2^24
         tl.store(OUT, acc)
 
     @triton.jit
     def _k_if_i64(COND, INIT, OUT):
         c = tl.load(COND)
-        acc = tl.load(INIT)             # i64 (forces the scf.if result dtype to i64)
+        acc = tl.load(INIT)  # i64 (forces the scf.if result dtype to i64)
         if c > 0:
             for _ in range(10):
-                acc += 1600000003       # 16000000031, well beyond fp32 mantissa
+                acc += 1600000003  # 16000000031, well beyond fp32 mantissa
         tl.store(OUT, acc)
 
 
 def _clear():
     import os
+
     os.system("rm -rf ~/.cache/triton_msl ~/.triton/cache")
 
 
 @requires
-@pytest.mark.parametrize("N", [8, 2048])   # single-pass + multipass
+@pytest.mark.parametrize("N", [8, 2048])  # single-pass + multipass
 def test_product_reduce_computes_not_sum(N):
     # A product reduce (a * b combine) now COMPUTES correctly (via simd_product); it was
     # previously refused. Must be the PRODUCT, never silently folded as a sum.
     _clear()
     import numpy as _np
+
     # values very close to 1 so the product stays finite even over 2048 elements
     vals = (_np.random.RandomState(0).rand(N) * 0.02 + 0.99).astype(_np.float32)
     X = torch.tensor(vals, device="mps")
     OUT = torch.zeros(1, device="mps")
-    _k_prod[(1,)](X, OUT, N=N); torch.mps.synchronize()
+    _k_prod[(1,)](X, OUT, N=N)
+    torch.mps.synchronize()
     ref = float(_np.prod(vals))
     assert abs(OUT.item() - ref) / abs(ref) < 1e-3, (N, OUT.item(), ref)
-    assert abs(OUT.item() - float(vals.sum())) > 1e-2   # definitely not the sum
+    assert abs(OUT.item() - float(vals.sum())) > 1e-2  # definitely not the sum
 
 
 @requires
 def test_max_by_magnitude_reduce_refuses_not_plain_max():
     _clear()
-    X = torch.tensor([1., -5., 3., -2., 4., -9., 0.5, 2.], device="mps")
+    X = torch.tensor([1.0, -5.0, 3.0, -2.0, 4.0, -9.0, 0.5, 2.0], device="mps")
     OUT = torch.zeros(1, device="mps")
     with pytest.raises(MetalNonRecoverableError):
-        _k_maxmag[(1,)](X, OUT, N=8); torch.mps.synchronize()
+        _k_maxmag[(1,)](X, OUT, N=8)
+        torch.mps.synchronize()
 
 
 @requires
 def test_plain_sum_max_still_compute():
     _clear()
-    X = torch.tensor([1., -5., 3., -2., 4., -9., 0.5, 2.], device="mps")
+    X = torch.tensor([1.0, -5.0, 3.0, -2.0, 4.0, -9.0, 0.5, 2.0], device="mps")
     for kern, ref in ((_k_sum, X.sum().item()), (_k_max, X.max().item())):
         OUT = torch.zeros(1, device="mps")
-        kern[(1,)](X, OUT, N=8); torch.mps.synchronize()
+        kern[(1,)](X, OUT, N=8)
+        torch.mps.synchronize()
         assert abs(OUT.item() - ref) < 1e-3, (OUT.item(), ref)
 
 
@@ -114,8 +122,9 @@ def test_scf_if_int_accumulator_not_float_rounded():
     _clear()
     COND = torch.ones(1, dtype=torch.int32, device="mps")
     OUT = torch.zeros(1, dtype=torch.int32, device="mps")
-    _k_if_i32[(1,)](COND, OUT); torch.mps.synchronize()
-    assert OUT.item() == 1 + 10 * 2000003   # 20000031 exactly, no fp32 rounding
+    _k_if_i32[(1,)](COND, OUT)
+    torch.mps.synchronize()
+    assert OUT.item() == 1 + 10 * 2000003  # 20000031 exactly, no fp32 rounding
 
 
 @requires
@@ -125,14 +134,16 @@ def test_scf_if_i64_accumulator_not_truncated():
     INIT = torch.ones(1, dtype=torch.int64, device="mps")
     OUT = torch.zeros(1, dtype=torch.int64, device="mps")
     try:
-        _k_if_i64[(1,)](COND, INIT, OUT); torch.mps.synchronize()
+        _k_if_i64[(1,)](COND, INIT, OUT)
+        torch.mps.synchronize()
     except MetalNonRecoverableError:
-        return   # refusing is acceptable (correct-or-refuse); silently truncating is not
-    assert OUT.item() == 1 + 10 * 1600000003   # 16000000031 exactly, no i64->i32/float loss
+        return  # refusing is acceptable (correct-or-refuse); silently truncating is not
+    assert OUT.item() == 1 + 10 * 1600000003  # 16000000031 exactly, no i64->i32/float loss
 
 
 # --- gather i64 truncation (Triton-lens re-audit 2026-06-25; the systematic-lead sibling) ---
 if _HAS:
+
     @triton.jit
     def _k_gather1d(SRC, IDX, OUT, S: tl.constexpr, I: tl.constexpr):
         src = tl.load(SRC + tl.arange(0, S))
@@ -151,30 +162,34 @@ def test_gather_i64_not_truncated_to_i32():
     SRC = torch.arange(S, dtype=torch.int64, device="mps") + base
     IDX = torch.tensor([7, 0, 3, 5, 1, 6, 2, 4], dtype=torch.int32, device="mps")
     OUT = torch.zeros(I, dtype=torch.int64, device="mps")
-    _k_gather1d[(1,)](SRC, IDX, OUT, S=S, I=I); torch.mps.synchronize()
-    expected = [base + j for j in IDX.tolist()]           # src[idx], i64-exact
+    _k_gather1d[(1,)](SRC, IDX, OUT, S=S, I=I)
+    torch.mps.synchronize()
+    expected = [base + j for j in IDX.tolist()]  # src[idx], i64-exact
     assert OUT.tolist() == expected, (OUT.tolist(), expected)
 
 
 # --- join/cat i64 truncation + cmp+select reduce inversion (re-audit round 2, 2026-06-25) ---
 if _HAS:
+
     @triton.jit
     def _k_join(A, B, OUT, N: tl.constexpr):
-        a = tl.load(A + tl.arange(0, N)); b = tl.load(B + tl.arange(0, N))
+        a = tl.load(A + tl.arange(0, N))
+        b = tl.load(B + tl.arange(0, N))
         tl.store(OUT + tl.arange(0, 2 * N), tl.reshape(tl.join(a, b), (2 * N,)))
 
     @triton.jit
     def _k_cat(A, B, OUT, N: tl.constexpr):
-        a = tl.load(A + tl.arange(0, N)); b = tl.load(B + tl.arange(0, N))
+        a = tl.load(A + tl.arange(0, N))
+        b = tl.load(B + tl.arange(0, N))
         tl.store(OUT + tl.arange(0, 2 * N), tl.cat(a, b, can_reorder=True))
 
     @triton.jit
     def _min_via_gt(a, b):
-        return tl.where(a > b, b, a)        # semantic MIN (predicate says gt)
+        return tl.where(a > b, b, a)  # semantic MIN (predicate says gt)
 
     @triton.jit
     def _max_via_lt(a, b):
-        return tl.where(a < b, b, a)        # semantic MAX (predicate says lt)
+        return tl.where(a < b, b, a)  # semantic MAX (predicate says lt)
 
     @triton.jit
     def _k_reduce_cmbsel(X, OUT, N: tl.constexpr, which: tl.constexpr):
@@ -190,19 +205,21 @@ def test_join_i64_not_truncated():
     A = torch.arange(N, dtype=torch.int64, device="mps") + base
     B = torch.arange(N, dtype=torch.int64, device="mps") + base + 100
     OUT = torch.zeros(2 * N, dtype=torch.int64, device="mps")
-    _k_join[(1,)](A, B, OUT, N=N); torch.mps.synchronize()
-    exp = torch.stack([A.cpu(), B.cpu()], dim=1).reshape(2 * N)   # CPU reference
+    _k_join[(1,)](A, B, OUT, N=N)
+    torch.mps.synchronize()
+    exp = torch.stack([A.cpu(), B.cpu()], dim=1).reshape(2 * N)  # CPU reference
     assert (OUT.cpu() == exp).all(), (OUT[:4].tolist(), exp[:4].tolist())
 
 
 @requires
 def test_cat_i64_not_truncated():
     _clear()
-    N, base = 8, (2 ** 40) + 7
+    N, base = 8, (2**40) + 7
     A = torch.arange(N, dtype=torch.int64, device="mps") + base
     B = torch.arange(N, dtype=torch.int64, device="mps") + base + 100
     OUT = torch.zeros(2 * N, dtype=torch.int64, device="mps")
-    _k_cat[(1,)](A, B, OUT, N=N); torch.mps.synchronize()
+    _k_cat[(1,)](A, B, OUT, N=N)
+    torch.mps.synchronize()
     exp = torch.cat([A.cpu(), B.cpu()])
     assert (OUT.cpu() == exp).all(), (OUT[:4].tolist(), exp[:4].tolist())
 
@@ -212,25 +229,28 @@ def test_reduce_cmp_select_not_inverted():
     # where(a>b,b,a) is a MIN and where(a<b,b,a) is a MAX — classifying by the cmpf
     # predicate alone inverted them (MIN computed as MAX). Must compute correctly (or refuse).
     _clear()
-    X = torch.tensor([1., -5., 3., -2., 4., -9., 0.5, 2.])
+    X = torch.tensor([1.0, -5.0, 3.0, -2.0, 4.0, -9.0, 0.5, 2.0])
     for which, ref in ((0, X.min().item()), (1, X.max().item())):
         OUT = torch.zeros(1, device="mps")
         try:
-            _k_reduce_cmbsel[(1,)](X.to("mps"), OUT, N=8, which=which); torch.mps.synchronize()
+            _k_reduce_cmbsel[(1,)](X.to("mps"), OUT, N=8, which=which)
+            torch.mps.synchronize()
         except MetalNonRecoverableError:
-            continue   # refusing is acceptable (correct-or-refuse)
+            continue  # refusing is acceptable (correct-or-refuse)
         assert abs(OUT.item() - ref) < 1e-3, (which, OUT.item(), ref)
 
 
 # --- argmax/argmin i64 (re-audit round 2 sibling: SIMD-shuffle value staging truncated i64) ---
 if _HAS:
+
     @triton.jit
     def _k_argmax1d(X, OUT, N: tl.constexpr):
         tl.store(OUT, tl.argmax(tl.load(X + tl.arange(0, N)), 0))
 
     @triton.jit
     def _k_argmax2d(X, OUT, M: tl.constexpr, N: tl.constexpr):
-        om = tl.arange(0, M); on = tl.arange(0, N)
+        om = tl.arange(0, M)
+        on = tl.arange(0, N)
         tl.store(OUT + om, tl.argmax(tl.load(X + om[:, None] * N + on[None, :]), 1))
 
 
@@ -239,13 +259,15 @@ def test_argmax_i64_1d_refuses_not_wrong_index():
     # 1-D argmax over i64 must REFUSE (the SIMD-shuffle reduction has no 64-bit path; a
     # 32-bit staging silently truncated and returned the wrong index). i32 must still work.
     _clear()
-    X = torch.tensor([3_000_000_005, 1, 3_000_000_009, 2, 3_000_000_001, 0, 7, 3],
-                     dtype=torch.int64, device="mps")
+    X = torch.tensor([3_000_000_005, 1, 3_000_000_009, 2, 3_000_000_001, 0, 7, 3], dtype=torch.int64, device="mps")
     OUT = torch.zeros(1, dtype=torch.int32, device="mps")
     with pytest.raises(MetalNonRecoverableError):
-        _k_argmax1d[(1,)](X, OUT, N=8); torch.mps.synchronize()
-    Xi = X.to(torch.int32); OUT2 = torch.zeros(1, dtype=torch.int32, device="mps")
-    _k_argmax1d[(1,)](Xi, OUT2, N=8); torch.mps.synchronize()   # i32 still computes
+        _k_argmax1d[(1,)](X, OUT, N=8)
+        torch.mps.synchronize()
+    Xi = X.to(torch.int32)
+    OUT2 = torch.zeros(1, dtype=torch.int32, device="mps")
+    _k_argmax1d[(1,)](Xi, OUT2, N=8)
+    torch.mps.synchronize()  # i32 still computes
     assert OUT2.item() == int(Xi.cpu().argmax())
 
 
@@ -256,15 +278,18 @@ def test_argmax_i64_2d_correct_index():
     M, N = 4, 32
     X = (torch.arange(M * N, dtype=torch.int64, device="mps") + 3_000_000_000).reshape(M, N)
     OUT = torch.zeros(M, dtype=torch.int32, device="mps")
-    _k_argmax2d[(1,)](X, OUT, M=M, N=N); torch.mps.synchronize()
+    _k_argmax2d[(1,)](X, OUT, M=M, N=N)
+    torch.mps.synchronize()
     assert OUT.cpu().tolist() == X.cpu().argmax(1).tolist()
 
 
 # --- round 3: convert_layout i64 / integer cmp+select / Welford-misroute (2026-06-25) ---
 if _HAS:
+
     @triton.jit
     def _k_2dsum(X, OUT, M: tl.constexpr, N: tl.constexpr):
-        om = tl.arange(0, M); on = tl.arange(0, N)
+        om = tl.arange(0, M)
+        on = tl.arange(0, N)
         tl.store(OUT + on, tl.sum(tl.load(X + om[:, None] * N + on[None, :]), 0))
 
     @triton.jit
@@ -286,9 +311,13 @@ if _HAS:
 
     @triton.jit
     def _k_3tuple(X, Y, Z, OA, OB, OC, N: tl.constexpr):
-        x = tl.load(X + tl.arange(0, N)); y = tl.load(Y + tl.arange(0, N)); z = tl.load(Z + tl.arange(0, N))
+        x = tl.load(X + tl.arange(0, N))
+        y = tl.load(Y + tl.arange(0, N))
+        z = tl.load(Z + tl.arange(0, N))
         a, b, c = tl.reduce((x, y, z), 0, _tmax)
-        tl.store(OA, a); tl.store(OB, b); tl.store(OC, c)
+        tl.store(OA, a)
+        tl.store(OB, b)
+        tl.store(OC, c)
 
 
 @requires
@@ -297,7 +326,8 @@ def test_2d_int64_reduce_not_truncated_by_convert_layout():
     M = N = 16
     X = ((1 << 34) + torch.arange(M * N, dtype=torch.int64, device="mps")).reshape(M, N)
     OUT = torch.zeros(N, dtype=torch.int64, device="mps")
-    _k_2dsum[(1,)](X, OUT, M=M, N=N); torch.mps.synchronize()
+    _k_2dsum[(1,)](X, OUT, M=M, N=N)
+    torch.mps.synchronize()
     assert (OUT.cpu() == X.cpu().sum(0)).all(), (OUT[0].item(), X.cpu().sum(0)[0].item())
 
 
@@ -309,9 +339,10 @@ def test_integer_cmp_select_reduce_not_sum():
     for w, ref in ((0, int(X.cpu().max())), (1, int(X.cpu().min()))):
         OUT = torch.zeros(1, dtype=torch.int32, device="mps")
         try:
-            _k_int_cmpsel[(1,)](X, OUT, N=128, w=w); torch.mps.synchronize()
+            _k_int_cmpsel[(1,)](X, OUT, N=128, w=w)
+            torch.mps.synchronize()
         except MetalNonRecoverableError:
-            continue   # refuse is acceptable; silently summing is not
+            continue  # refuse is acceptable; silently summing is not
         assert OUT.item() == ref, (w, OUT.item(), ref)
 
 
@@ -319,14 +350,18 @@ def test_integer_cmp_select_reduce_not_sum():
 def test_custom_3tuple_reduce_refuses_not_welford():
     _clear()
     N = 128
-    X = torch.randn(N, device="mps"); Y = torch.randn(N, device="mps"); Z = torch.randn(N, device="mps")
+    X = torch.randn(N, device="mps")
+    Y = torch.randn(N, device="mps")
+    Z = torch.randn(N, device="mps")
     O = [torch.zeros(1, device="mps") for _ in range(3)]
     with pytest.raises(MetalNonRecoverableError):
-        _k_3tuple[(1,)](X, Y, Z, *O, N=N); torch.mps.synchronize()
+        _k_3tuple[(1,)](X, Y, Z, *O, N=N)
+        torch.mps.synchronize()
 
 
 # --- round 4: unsigned max/min, NaN-propagate, ge/le predicate (re-audit 2026-06-25) ---
 if _HAS:
+
     @triton.jit
     def _k_umax(X, O, N: tl.constexpr):
         tl.store(O, tl.max(tl.load(X + tl.arange(0, N)), 0))
@@ -353,57 +388,67 @@ if _HAS:
 
 
 @requires
-@pytest.mark.parametrize("N", [64, 2048])   # small-N simd path + large-N multipass path
+@pytest.mark.parametrize("N", [64, 2048])  # small-N simd path + large-N multipass path
 def test_uint32_max_min_unsigned_not_signed(N):
     _clear()
-    vals = np.arange(N, dtype=np.uint32); vals[0] = 0xFFFFFFFF; vals[1] = 0x80000000
+    vals = np.arange(N, dtype=np.uint32)
+    vals[0] = 0xFFFFFFFF
+    vals[1] = 0x80000000
     X = torch.tensor(vals, dtype=torch.uint32, device="mps")
     Omax = torch.zeros(1, dtype=torch.uint32, device="mps")
-    _k_umax[(1,)](X, Omax, N=N); torch.mps.synchronize()
+    _k_umax[(1,)](X, Omax, N=N)
+    torch.mps.synchronize()
     assert Omax.item() == int(vals.max()), (N, Omax.item(), int(vals.max()))
     Omin = torch.zeros(1, dtype=torch.uint32, device="mps")
-    _k_umin[(1,)](X, Omin, N=N); torch.mps.synchronize()
+    _k_umin[(1,)](X, Omin, N=N)
+    torch.mps.synchronize()
     assert Omin.item() == int(vals.min()), (N, Omin.item(), int(vals.min()))
 
 
 @requires
-@pytest.mark.parametrize("N", [64, 2048])   # single-pass simd + multipass
+@pytest.mark.parametrize("N", [64, 2048])  # single-pass simd + multipass
 def test_uint64_max_min_unsigned_not_signed(N):
     # uint64 is the SIGNLESS i64 in Triton; a signed `long` reduce reads 2^64-1 as -1 and
     # silently loses the max (and 2^63 wins the min). Must compute UNSIGNED (audit 2026-06-27
     # BLOCKER). The 32-bit twin already worked; this is the missed 64-bit case.
     _clear()
     vals = np.full(N, 5, dtype=np.uint64)
-    vals[0] = 2 ** 64 - 1          # all-ones: max if unsigned, -1 (loses) if signed
-    vals[1] = 2 ** 63              # high bit: would wrongly win a signed min
-    vals[2] = 1                    # the true unsigned min
+    vals[0] = 2**64 - 1  # all-ones: max if unsigned, -1 (loses) if signed
+    vals[1] = 2**63  # high bit: would wrongly win a signed min
+    vals[2] = 1  # the true unsigned min
     X = torch.tensor(vals, dtype=torch.uint64, device="mps")
     Omax = torch.zeros(1, dtype=torch.uint64, device="mps")
-    _k_umax[(1,)](X, Omax, N=N); torch.mps.synchronize()
-    assert int(Omax.item()) == int(vals.max()) == 2 ** 64 - 1, (N, int(Omax.item()))
+    _k_umax[(1,)](X, Omax, N=N)
+    torch.mps.synchronize()
+    assert int(Omax.item()) == int(vals.max()) == 2**64 - 1, (N, int(Omax.item()))
     Omin = torch.zeros(1, dtype=torch.uint64, device="mps")
-    _k_umin[(1,)](X, Omin, N=N); torch.mps.synchronize()
+    _k_umin[(1,)](X, Omin, N=N)
+    torch.mps.synchronize()
     assert int(Omin.item()) == int(vals.min()) == 1, (N, int(Omin.item()))
 
 
 @requires
-@pytest.mark.parametrize("N", [128, 2048])   # single-pass + multipass
+@pytest.mark.parametrize("N", [128, 2048])  # single-pass + multipass
 def test_nan_propagating_max_computes_and_propagates(N):
     # A NaN-PROPAGATING max (tl.maximum propagate_nan=ALL, == inductor triton_helpers.maximum)
     # now COMPUTES correctly (was refused): finite inputs -> the true max; a NaN anywhere ->
     # NaN (propagates, matching numpy/torch). The cross-thread simd step (NaN-quiet) carries
     # an any-NaN side-channel so propagation survives the threadgroup reduction.
     import math
+
     _clear()
     x = torch.randn(N)
     O = torch.zeros(1, device="mps")
-    _k_nanprop[(1,)](x.to("mps"), O, N=N); torch.mps.synchronize()
+    _k_nanprop[(1,)](x.to("mps"), O, N=N)
+    torch.mps.synchronize()
     assert abs(O.item() - x.max().item()) < 1e-3, (N, O.item(), x.max().item())
     # a NaN present anywhere must propagate to the result
     _clear()
-    x2 = torch.randn(N); x2[40] = float("nan")
+    x2 = torch.randn(N)
+    x2[40] = float("nan")
     O2 = torch.zeros(1, device="mps")
-    _k_nanprop[(1,)](x2.to("mps"), O2, N=N); torch.mps.synchronize()
+    _k_nanprop[(1,)](x2.to("mps"), O2, N=N)
+    torch.mps.synchronize()
     assert math.isnan(O2.item()), (N, O2.item())
 
 
@@ -412,12 +457,14 @@ def test_float_ge_max_not_over_refused():
     _clear()
     x = torch.randn(128)
     O = torch.zeros(1, device="mps")
-    _k_ge[(1,)](x.to("mps"), O, N=128); torch.mps.synchronize()   # ge/le must compute, not refuse
+    _k_ge[(1,)](x.to("mps"), O, N=128)
+    torch.mps.synchronize()  # ge/le must compute, not refuse
     assert abs(O.item() - x.max().item()) < 1e-3, (O.item(), x.max().item())
 
 
 # --- Phase-1 structural classifier: custom combine refuses, 1-D bitwise computes (2026-06-25) ---
 if _HAS:
+
     @triton.jit
     def _relusum(a, b):
         return a + tl.where(b > 0, b, 0.0)
@@ -444,9 +491,11 @@ def test_sum_of_relu_custom_combine_refuses():
     # a + relu(b) is a custom (non-canonical) combine — the structural classifier refuses it
     # (the yielded addf's operands are not the two block args). Sniffing flipped it to MAX.
     _clear()
-    x = torch.randn(64, device="mps"); O = torch.zeros(1, device="mps")
+    x = torch.randn(64, device="mps")
+    O = torch.zeros(1, device="mps")
     with pytest.raises(MetalNonRecoverableError):
-        _k_relusum[(1,)](x, O, N=64); torch.mps.synchronize()
+        _k_relusum[(1,)](x, O, N=64)
+        torch.mps.synchronize()
 
 
 @requires
@@ -454,17 +503,21 @@ def test_1d_bitwise_and_xor_compute():
     # 1-D all()/any()/xor must COMPUTE (was over-refused via a KeyError in threadgroup_reduce).
     _clear()
     import numpy as _np
+
     x = torch.randint(0, 255, (64,), dtype=torch.int32, device="mps")
     OA = torch.zeros(1, dtype=torch.int32, device="mps")
-    _k_and[(1,)](x, OA, N=64); torch.mps.synchronize()
+    _k_and[(1,)](x, OA, N=64)
+    torch.mps.synchronize()
     assert OA.item() == int(_np.bitwise_and.reduce(x.cpu().numpy()))
     OX = torch.zeros(1, dtype=torch.int32, device="mps")
-    _k_xor[(1,)](x, OX, N=64); torch.mps.synchronize()
+    _k_xor[(1,)](x, OX, N=64)
+    torch.mps.synchronize()
     assert OX.item() == int(_np.bitwise_xor.reduce(x.cpu().numpy()))
 
 
 # --- structural-classifier validation: block-arg pick refuses, i64 and/or computes (2026-06-25) ---
 if _HAS:
+
     @triton.jit
     def _first(a, b):
         return a
@@ -483,7 +536,7 @@ if _HAS:
 
 
 @requires
-@pytest.mark.parametrize("N", [64, 1024])   # single-pass simd + multipass
+@pytest.mark.parametrize("N", [64, 1024])  # single-pass simd + multipass
 def test_first_pick_combine_refuses_not_sum(N):
     # `return a` (a first/last/identity pick) is a non-canonical combine — must REFUSE
     # (an empty combine region after terminator-strip used to default to SUM).
@@ -491,7 +544,8 @@ def test_first_pick_combine_refuses_not_sum(N):
     x = torch.arange(1, N + 1, dtype=torch.float32, device="mps")
     O = torch.zeros(1, device="mps")
     with pytest.raises(MetalNonRecoverableError):
-        _k_first[(1,)](x, O, N=N); torch.mps.synchronize()
+        _k_first[(1,)](x, O, N=N)
+        torch.mps.synchronize()
 
 
 @requires
@@ -499,15 +553,18 @@ def test_i64_and_reduce_computes():
     # i64 bitwise-and reduce computes (was over-refused — combine table lacked and/or).
     _clear()
     import numpy as _np
-    vals = (_np.random.RandomState(0).randint(0, 2 ** 40, 64)).astype(_np.int64)
+
+    vals = (_np.random.RandomState(0).randint(0, 2**40, 64)).astype(_np.int64)
     X = torch.tensor(vals, dtype=torch.int64, device="mps")
     O = torch.zeros(1, dtype=torch.int64, device="mps")
-    _k_and_i64[(1,)](X, O, N=64); torch.mps.synchronize()
+    _k_and_i64[(1,)](X, O, N=64)
+    torch.mps.synchronize()
     assert O.item() == int(_np.bitwise_and.reduce(vals))
 
 
 # --- multipass and/or/xor consistency (final validation re-audit, 2026-06-25) ---
 if _HAS:
+
     @triton.jit
     def _xorc(a, b):
         return a ^ b
@@ -518,21 +575,24 @@ if _HAS:
 
 
 @requires
-@pytest.mark.parametrize("N", [64, 2048])   # single-pass + multipass must AGREE
+@pytest.mark.parametrize("N", [64, 2048])  # single-pass + multipass must AGREE
 def test_xor_reduce_both_paths_compute(N):
     # and/or/xor must compute on BOTH the single-pass and multipass paths (the multipass
     # whitelist used to refuse them at N>=1024 while single-pass computed — inconsistent).
     _clear()
     import numpy as _np
-    vals = _np.random.RandomState(0).randint(0, 2 ** 28, N).astype(_np.int32)
+
+    vals = _np.random.RandomState(0).randint(0, 2**28, N).astype(_np.int32)
     X = torch.tensor(vals, dtype=torch.int32, device="mps")
     O = torch.zeros(1, dtype=torch.int32, device="mps")
-    _k_xor_big[(1,)](X, O, N=N); torch.mps.synchronize()
+    _k_xor_big[(1,)](X, O, N=N)
+    torch.mps.synchronize()
     assert O.item() == int(_np.bitwise_xor.reduce(vals))
 
 
 # --- confirming re-audit 2026-06-27: unsigned argminmax + fused-argminmax barrier ---
 if _HAS:
+
     @triton.jit
     def _k_argmax(X, O, N: tl.constexpr):
         tl.store(O, tl.argmax(tl.load(X + tl.arange(0, N)), 0))
@@ -543,30 +603,36 @@ if _HAS:
 
     @triton.jit
     def _k_dual_argminmax(X, Omin, Omax, M: tl.constexpr, N: tl.constexpr):
-        rm = tl.arange(0, M); rn = tl.arange(0, N)
+        rm = tl.arange(0, M)
+        rn = tl.arange(0, N)
         x = tl.load(X + rm[:, None] * N + rn[None, :])
         tl.store(Omin + rm, tl.argmin(x, axis=1))
         tl.store(Omax + rm, tl.argmax(x, axis=1))
 
 
 @requires
-@pytest.mark.parametrize("dt,np_dt,hi", [
-    (torch.uint32, np.uint32, 0xFFFFFFFF),
-    (torch.uint16, np.uint16, 0xFFFF),
-    (torch.uint8, np.uint8, 0xFF),
-])
+@pytest.mark.parametrize(
+    "dt,np_dt,hi",
+    [
+        (torch.uint32, np.uint32, 0xFFFFFFFF),
+        (torch.uint16, np.uint16, 0xFFFF),
+        (torch.uint8, np.uint8, 0xFF),
+    ],
+)
 def test_unsigned_argminmax_not_signed(dt, np_dt, hi):
     # argmax/argmin over unsigned ints must compare UNSIGNED — uintN is the signless iN, so a
     # signed compare reads the high-bit value as negative and picks the wrong index (audit
     # 2026-06-27 BLOCKER, twin of the uint64 max/min one).
     _clear()
-    vals = np.array([10, 20, 30, 40, hi, 5, 60, 70], dtype=np_dt)   # argmax=4 (hi), argmin=5 (5)
+    vals = np.array([10, 20, 30, 40, hi, 5, 60, 70], dtype=np_dt)  # argmax=4 (hi), argmin=5 (5)
     X = torch.tensor(vals, dtype=dt, device="mps")
     Omax = torch.zeros(1, dtype=torch.int32, device="mps")
-    _k_argmax[(1,)](X, Omax, N=8); torch.mps.synchronize()
+    _k_argmax[(1,)](X, Omax, N=8)
+    torch.mps.synchronize()
     assert int(Omax.item()) == int(np.argmax(vals)) == 4, (np_dt, int(Omax.item()))
     Omin = torch.zeros(1, dtype=torch.int32, device="mps")
-    _k_argmin[(1,)](X, Omin, N=8); torch.mps.synchronize()
+    _k_argmin[(1,)](X, Omin, N=8)
+    torch.mps.synchronize()
     assert int(Omin.item()) == int(np.argmin(vals)) == 5, (np_dt, int(Omin.item()))
 
 
@@ -580,21 +646,25 @@ def test_fused_2d_argmin_argmax_no_race():
         X = torch.tensor(xv, device="mps")
         Omin = torch.zeros(8, dtype=torch.int32, device="mps")
         Omax = torch.zeros(8, dtype=torch.int32, device="mps")
-        _k_dual_argminmax[(1,)](X, Omin, Omax, M=8, N=128); torch.mps.synchronize()
+        _k_dual_argminmax[(1,)](X, Omin, Omax, M=8, N=128)
+        torch.mps.synchronize()
         np.testing.assert_array_equal(Omin.cpu().numpy(), xv.argmin(1), err_msg=f"argmin seed {seed}")
         np.testing.assert_array_equal(Omax.cpu().numpy(), xv.argmax(1), err_msg=f"argmax seed {seed}")
 
 
 # --- exhaust re-audit 2026-06-27: 2-D uint64 argminmax (64-bit twin) ---
 if _HAS:
+
     @triton.jit
     def _k_argmax2d(X, O, M: tl.constexpr, N: tl.constexpr):
-        rm = tl.arange(0, M); rn = tl.arange(0, N)
+        rm = tl.arange(0, M)
+        rn = tl.arange(0, N)
         tl.store(O + rm, tl.argmax(tl.load(X + rm[:, None] * N + rn[None, :]), axis=1))
 
     @triton.jit
     def _k_argmin2d(X, O, M: tl.constexpr, N: tl.constexpr):
-        rm = tl.arange(0, M); rn = tl.arange(0, N)
+        rm = tl.arange(0, M)
+        rn = tl.arange(0, N)
         tl.store(O + rm, tl.argmin(tl.load(X + rm[:, None] * N + rn[None, :]), axis=1))
 
 
@@ -609,18 +679,21 @@ def test_uint64_2d_argminmax_not_signed():
     vals = np.zeros((M, N), dtype=np.uint64)
     for r in range(M):
         vals[r] = [10, 20, 30, 40, 50, 60, 70, 80]
-        vals[r][1 + r] = 2 ** 63 + 100 + r          # the true UNSIGNED max for that row
+        vals[r][1 + r] = 2**63 + 100 + r  # the true UNSIGNED max for that row
     X = torch.tensor(vals, dtype=torch.uint64, device="mps")
     Omax = torch.zeros(M, dtype=torch.int32, device="mps")
-    _k_argmax2d[(1,)](X, Omax, M=M, N=N); torch.mps.synchronize()
+    _k_argmax2d[(1,)](X, Omax, M=M, N=N)
+    torch.mps.synchronize()
     np.testing.assert_array_equal(Omax.cpu().numpy(), vals.argmax(1))
     Omin = torch.zeros(M, dtype=torch.int32, device="mps")
-    _k_argmin2d[(1,)](X, Omin, M=M, N=N); torch.mps.synchronize()
+    _k_argmin2d[(1,)](X, Omin, M=M, N=N)
+    torch.mps.synchronize()
     np.testing.assert_array_equal(Omin.cpu().numpy(), vals.argmin(1))
 
 
 # --- confirm-4 re-audit 2026-06-27: fp32->fp8 RTNE rounding (third class) ---
 if _HAS:
+
     @triton.jit
     def _k_fp8e4_rt(X, O, N: tl.constexpr):
         tl.store(O + tl.arange(0, N), tl.load(X + tl.arange(0, N)).to(tl.float8e4nv).to(tl.float32))
@@ -631,10 +704,13 @@ if _HAS:
 
 
 @requires
-@pytest.mark.parametrize("kern,tdt,name", [
-    ("_k_fp8e4_rt", torch.float8_e4m3fn, "e4m3"),
-    ("_k_fp8e5_rt", torch.float8_e5m2, "e5m2"),
-])
+@pytest.mark.parametrize(
+    "kern,tdt,name",
+    [
+        ("_k_fp8e4_rt", torch.float8_e4m3fn, "e4m3"),
+        ("_k_fp8e5_rt", torch.float8_e5m2, "e5m2"),
+    ],
+)
 def test_fp8_downcast_round_to_nearest_even(kern, tdt, name):
     # fp32->fp8 must round-to-nearest-EVEN at exact midpoints (the IR carries rounding=rtne),
     # not round-half-away-from-zero (which biased quantization upward). confirm-4 audit MINOR.
@@ -643,37 +719,52 @@ def test_fp8_downcast_round_to_nearest_even(kern, tdt, name):
     # exact fp8 midpoints where rtne (down-to-even) != half-up
     mids = np.array([100.0, 1.0625, 1.5625, 8.5, 3.0625, 5.5, 10.5, 1.125], dtype=np.float32)
     Np = 16
-    padded = np.zeros(Np, dtype=np.float32); padded[:len(mids)] = mids
-    X = torch.tensor(padded, device="mps"); O = torch.zeros(Np, device="mps")
-    k[(1,)](X, O, N=Np); torch.mps.synchronize()
-    got = O.cpu().numpy()[:len(mids)]
-    ref = torch.tensor(mids).cpu().to(tdt).float().numpy()    # CPU torch = RTNE, never torch-mps
-    np.testing.assert_allclose(got, ref, rtol=0, atol=0,
-                               err_msg=f"{name} fp8 downcast not RTNE: got {got} ref {ref}")
+    padded = np.zeros(Np, dtype=np.float32)
+    padded[: len(mids)] = mids
+    X = torch.tensor(padded, device="mps")
+    O = torch.zeros(Np, device="mps")
+    k[(1,)](X, O, N=Np)
+    torch.mps.synchronize()
+    got = O.cpu().numpy()[: len(mids)]
+    ref = torch.tensor(mids).cpu().to(tdt).float().numpy()  # CPU torch = RTNE, never torch-mps
+    np.testing.assert_allclose(got, ref, rtol=0, atol=0, err_msg=f"{name} fp8 downcast not RTNE: got {got} ref {ref}")
     # broad random sweep must also match CPU exactly (no regression on non-midpoints)
     v = (np.random.RandomState(0).randn(256) * 8).astype(np.float32)
-    Xs = torch.tensor(v, device="mps"); Os = torch.zeros(256, device="mps")
-    k[(1,)](Xs, Os, N=256); torch.mps.synchronize()
+    Xs = torch.tensor(v, device="mps")
+    Os = torch.zeros(256, device="mps")
+    k[(1,)](Xs, Os, N=256)
+    torch.mps.synchronize()
     np.testing.assert_allclose(Os.cpu().numpy(), torch.tensor(v).cpu().to(tdt).float().numpy(), rtol=0, atol=0)
 
 
 # --- staging-fix re-audit 2026-06-27: multi-block matmul+softmax + fp16 dot-result store ---
 if _HAS:
+
     @triton.jit
     def _k_mb_mmsoft(A, B, O, M: tl.constexpr, N: tl.constexpr, K: tl.constexpr, BM: tl.constexpr):
         pid = tl.program_id(0)
-        rm = pid * BM + tl.arange(0, BM); rn = tl.arange(0, N); rk = tl.arange(0, K)
-        a = tl.load(A + rm[:, None] * K + rk[None, :]); b = tl.load(B + rk[:, None] * N + rn[None, :])
-        c = tl.dot(a, b); c = c - tl.max(c, 1)[:, None]; p = tl.exp(c); p = p / tl.sum(p, 1)[:, None]
+        rm = pid * BM + tl.arange(0, BM)
+        rn = tl.arange(0, N)
+        rk = tl.arange(0, K)
+        a = tl.load(A + rm[:, None] * K + rk[None, :])
+        b = tl.load(B + rk[:, None] * N + rn[None, :])
+        c = tl.dot(a, b)
+        c = c - tl.max(c, 1)[:, None]
+        p = tl.exp(c)
+        p = p / tl.sum(p, 1)[:, None]
         tl.store(O + rm[:, None] * N + rn[None, :], p)
 
     @triton.jit
     def _k_fa_fp16out(Q, K, V, O, N: tl.constexpr, HD: tl.constexpr, sm: tl.constexpr):
-        om = tl.arange(0, N); on = tl.arange(0, N); od = tl.arange(0, HD)
+        om = tl.arange(0, N)
+        on = tl.arange(0, N)
+        od = tl.arange(0, HD)
         q = tl.load(Q + om[:, None] * HD + od[None, :]) * sm
         k = tl.load(K + on[:, None] * HD + od[None, :])
-        qk = tl.dot(q, tl.trans(k)); qk = qk - tl.max(qk, 1)[:, None]
-        p = tl.exp(qk); p = p / tl.sum(p, 1)[:, None]
+        qk = tl.dot(q, tl.trans(k))
+        qk = qk - tl.max(qk, 1)[:, None]
+        p = tl.exp(qk)
+        p = p / tl.sum(p, 1)[:, None]
         v = tl.load(V + on[:, None] * HD + od[None, :])
         o = tl.dot(p.to(tl.float16), v.to(tl.float16))
         tl.store(O + om[:, None] * HD + od[None, :], o.to(O.dtype.element_ty))
@@ -688,9 +779,12 @@ def test_multiblock_matmul_softmax_refuses_not_stale_rows():
     M, N, K, BM = 64, 32, 32, 32
     An = np.random.RandomState(0).randn(M, K).astype(np.float32)
     Bn = np.random.RandomState(1).randn(K, N).astype(np.float32)
-    A = torch.tensor(An, device="mps"); B = torch.tensor(Bn, device="mps"); O = torch.zeros(M, N, device="mps")
+    A = torch.tensor(An, device="mps")
+    B = torch.tensor(Bn, device="mps")
+    O = torch.zeros(M, N, device="mps")
     with pytest.raises(MetalNonRecoverableError):
-        _k_mb_mmsoft[(M // BM,)](A, B, O, M=M, N=N, K=K, BM=BM); torch.mps.synchronize()
+        _k_mb_mmsoft[(M // BM,)](A, B, O, M=M, N=N, K=K, BM=BM)
+        torch.mps.synchronize()
 
 
 @requires
@@ -702,27 +796,35 @@ def test_fp16_dot_result_store_over_blocksize_writes_all_rows():
     _clear()
     N, HD = 32, 64
     rng = np.random.RandomState(0)
-    Qn, Kn, Vn = (rng.randn(N, HD).astype(np.float32) for _ in range(3)); sm = 1.0 / np.sqrt(HD)
+    Qn, Kn, Vn = (rng.randn(N, HD).astype(np.float32) for _ in range(3))
+    sm = 1.0 / np.sqrt(HD)
     Q = torch.tensor(Qn, device="mps").to(torch.float16)
     K = torch.tensor(Kn, device="mps").to(torch.float16)
     V = torch.tensor(Vn, device="mps").to(torch.float16)
     O = torch.zeros(N, HD, device="mps", dtype=torch.float16)
-    _k_fa_fp16out[(1,)](Q, K, V, O, N=N, HD=HD, sm=float(sm)); torch.mps.synchronize()
+    _k_fa_fp16out[(1,)](Q, K, V, O, N=N, HD=HD, sm=float(sm))
+    torch.mps.synchronize()
     got = O.float().cpu().numpy()
     assert int((np.abs(got).sum(1) > 0).sum()) == N, "rows past block_size/2 left unwritten"
     qk = (Qn.astype(np.float64) @ Kn.astype(np.float64).T) * sm
-    qk -= qk.max(1, keepdims=True); pp = np.exp(qk); pp /= pp.sum(1, keepdims=True)
+    qk -= qk.max(1, keepdims=True)
+    pp = np.exp(qk)
+    pp /= pp.sum(1, keepdims=True)
     ref = pp @ Vn.astype(np.float64)
     assert float(np.abs(got - ref).max()) < 5e-2, "fp16 FA output mismatch"
 
 
 # --- mask-store/twin hunt 2026-06-27: 3 BLOCKERs (pid simple-dot, size-1 atomic, output mask) ---
 if _HAS:
+
     @triton.jit
     def _k_pid_simpledot(A, B, O, N: tl.constexpr, K: tl.constexpr, BM: tl.constexpr):
-        pid = tl.program_id(0); rm = pid * BM + tl.arange(0, BM)
-        rn = tl.arange(0, N); rk = tl.arange(0, K)
-        a = tl.load(A + rm[:, None] * K + rk[None, :]); b = tl.load(B + rk[:, None] * N + rn[None, :])
+        pid = tl.program_id(0)
+        rm = pid * BM + tl.arange(0, BM)
+        rn = tl.arange(0, N)
+        rk = tl.arange(0, K)
+        a = tl.load(A + rm[:, None] * K + rk[None, :])
+        b = tl.load(B + rk[:, None] * N + rn[None, :])
         tl.store(O + rm[:, None] * N + rn[None, :], tl.dot(a, b))
 
     @triton.jit
@@ -731,14 +833,20 @@ if _HAS:
 
     @triton.jit
     def _k_mm_boundmask(A, B, O, M: tl.constexpr, N: tl.constexpr, K: tl.constexpr, BOUND: tl.constexpr):
-        rm = tl.arange(0, M); rn = tl.arange(0, N); rk = tl.arange(0, K)
-        a = tl.load(A + rm[:, None] * K + rk[None, :]); b = tl.load(B + rk[:, None] * N + rn[None, :])
+        rm = tl.arange(0, M)
+        rn = tl.arange(0, N)
+        rk = tl.arange(0, K)
+        a = tl.load(A + rm[:, None] * K + rk[None, :])
+        b = tl.load(B + rk[:, None] * N + rn[None, :])
         tl.store(O + rm[:, None] * N + rn[None, :], tl.dot(a, b), mask=rm[:, None] < BOUND)
 
     @triton.jit
     def _k_mm_tilemask(A, B, O, M: tl.constexpr, N: tl.constexpr, K: tl.constexpr):
-        rm = tl.arange(0, M); rn = tl.arange(0, N); rk = tl.arange(0, K)
-        a = tl.load(A + rm[:, None] * K + rk[None, :]); b = tl.load(B + rk[:, None] * N + rn[None, :])
+        rm = tl.arange(0, M)
+        rn = tl.arange(0, N)
+        rk = tl.arange(0, K)
+        a = tl.load(A + rm[:, None] * K + rk[None, :])
+        b = tl.load(B + rk[:, None] * N + rn[None, :])
         tl.store(O + rm[:, None] * N + rn[None, :], tl.dot(a, b), mask=(rm[:, None] < M) & (rn[None, :] < N))
 
 
@@ -749,9 +857,12 @@ def test_pid_tiled_simpledot_matmul_refuses():
     # Must refuse loudly. (mask-store/twin hunt 2026-06-27)
     _clear()
     M, N, K, BM = 64, 32, 16, 32
-    A = torch.randn(M, K, device="mps"); B = torch.randn(K, N, device="mps"); O = torch.zeros(M, N, device="mps")
+    A = torch.randn(M, K, device="mps")
+    B = torch.randn(K, N, device="mps")
+    O = torch.zeros(M, N, device="mps")
     with pytest.raises(MetalNonRecoverableError):
-        _k_pid_simpledot[(M // BM,)](A, B, O, N=N, K=K, BM=BM); torch.mps.synchronize()
+        _k_pid_simpledot[(M // BM,)](A, B, O, N=N, K=K, BM=BM)
+        torch.mps.synchronize()
 
 
 @requires
@@ -760,7 +871,8 @@ def test_size1_1d_atomic_not_overcounted():
     # -> all threads RMW the same address (256x over-count). Must execute on one lane only.
     _clear()
     O = torch.zeros(1, device="mps")
-    _k_size1_atomic[(1,)](O); torch.mps.synchronize()
+    _k_size1_atomic[(1,)](O)
+    torch.mps.synchronize()
     assert abs(float(O.cpu().item()) - 1.0) < 1e-6, f"over-count: {O.cpu().item()}"
 
 
@@ -771,9 +883,12 @@ def test_matmul_nontileboundary_output_mask_refuses_not_clobber():
     # A non-tile-boundary mask must refuse loudly. (mask-store/twin hunt 2026-06-27)
     _clear()
     M, N, K, BOUND = 64, 64, 64, 40
-    A = torch.randn(M, K, device="mps"); B = torch.randn(K, N, device="mps"); O = torch.zeros(M, N, device="mps")
+    A = torch.randn(M, K, device="mps")
+    B = torch.randn(K, N, device="mps")
+    O = torch.zeros(M, N, device="mps")
     with pytest.raises(MetalNonRecoverableError):
-        _k_mm_boundmask[(1,)](A, B, O, M=M, N=N, K=K, BOUND=BOUND); torch.mps.synchronize()
+        _k_mm_boundmask[(1,)](A, B, O, M=M, N=N, K=K, BOUND=BOUND)
+        torch.mps.synchronize()
 
 
 @requires
@@ -784,21 +899,26 @@ def test_matmul_tileboundary_output_mask_still_computes():
     M = N = K = 64
     An = np.random.RandomState(0).randn(M, K).astype(np.float32)
     Bn = np.random.RandomState(1).randn(K, N).astype(np.float32)
-    A = torch.tensor(An, device="mps"); B = torch.tensor(Bn, device="mps"); O = torch.zeros(M, N, device="mps")
-    _k_mm_tilemask[(1,)](A, B, O, M=M, N=N, K=K); torch.mps.synchronize()
+    A = torch.tensor(An, device="mps")
+    B = torch.tensor(Bn, device="mps")
+    O = torch.zeros(M, N, device="mps")
+    _k_mm_tilemask[(1,)](A, B, O, M=M, N=N, K=K)
+    torch.mps.synchronize()
     assert float(np.abs(O.cpu().numpy() - An.astype(np.float64) @ Bn.astype(np.float64)).max()) < 1e-3
 
 
 # --- remaining-twins hunt 2026-06-28: K-loop integer output epilogue dropped ---
 if _HAS:
+
     @triton.jit
     def _k_kloop_int_bias(A, B, Bias, O, M: tl.constexpr, N: tl.constexpr, K: tl.constexpr, BK: tl.constexpr):
-        rm = tl.arange(0, M); rn = tl.arange(0, N)
+        rm = tl.arange(0, M)
+        rn = tl.arange(0, N)
         acc = tl.zeros((M, N), dtype=tl.int32)
         for kk in range(0, K, BK):
             rk = kk + tl.arange(0, BK)
             acc += tl.dot(tl.load(A + rm[:, None] * K + rk[None, :]), tl.load(B + rk[:, None] * N + rn[None, :]))
-        acc = acc + tl.load(Bias + rn)[None, :]      # INTEGER output epilogue
+        acc = acc + tl.load(Bias + rn)[None, :]  # INTEGER output epilogue
         tl.store(O + rm[:, None] * N + rn[None, :], acc)
 
 
@@ -815,18 +935,24 @@ def test_kloop_int_matmul_int_epilogue_refuses():
     Bias = torch.randint(-100, 100, (N,), dtype=torch.int32, device="mps")
     O = torch.zeros(M, N, dtype=torch.int32, device="mps")
     with pytest.raises(MetalNonRecoverableError):
-        _k_kloop_int_bias[(1,)](A, B, Bias, O, M=M, N=N, K=K, BK=BK); torch.mps.synchronize()
+        _k_kloop_int_bias[(1,)](A, B, Bias, O, M=M, N=N, K=K, BK=BK)
+        torch.mps.synchronize()
 
 
 # --- de-dup wiring 2026-06-28: masked-store refuse moved off the pre-dispatch chokepoint ---
 if _HAS:
+
     @triton.jit
     def _k_fa_masked(Q, K, V, O, N: tl.constexpr, HD: tl.constexpr, sm: tl.constexpr, BOUND: tl.constexpr):
-        om = tl.arange(0, N); on = tl.arange(0, N); od = tl.arange(0, HD)
+        om = tl.arange(0, N)
+        on = tl.arange(0, N)
+        od = tl.arange(0, HD)
         q = tl.load(Q + om[:, None] * HD + od[None, :]) * sm
         k = tl.load(K + on[:, None] * HD + od[None, :])
-        qk = tl.dot(q, tl.trans(k)); qk = qk - tl.max(qk, 1)[:, None]
-        p = tl.exp(qk); p = p / tl.sum(p, 1)[:, None]
+        qk = tl.dot(q, tl.trans(k))
+        qk = qk - tl.max(qk, 1)[:, None]
+        p = tl.exp(qk)
+        p = p / tl.sum(p, 1)[:, None]
         o = tl.dot(p.to(tl.float32), tl.load(V + on[:, None] * HD + od[None, :]))
         tl.store(O + om[:, None] * HD + od[None, :], o, mask=om[:, None] < BOUND)
 
@@ -840,14 +966,20 @@ def test_masked_fa_generic_honors_not_refused():
     _clear()
     N, HD, BOUND = 32, 64, 20
     rng = np.random.RandomState(0)
-    Qn, Kn, Vn = (rng.randn(N, HD).astype(np.float32) for _ in range(3)); sm = 1.0 / np.sqrt(HD)
-    Q = torch.tensor(Qn, device="mps"); K = torch.tensor(Kn, device="mps"); V = torch.tensor(Vn, device="mps")
+    Qn, Kn, Vn = (rng.randn(N, HD).astype(np.float32) for _ in range(3))
+    sm = 1.0 / np.sqrt(HD)
+    Q = torch.tensor(Qn, device="mps")
+    K = torch.tensor(Kn, device="mps")
+    V = torch.tensor(Vn, device="mps")
     O = torch.full((N, HD), -999.0, device="mps")
-    _k_fa_masked[(1,)](Q, K, V, O, N=N, HD=HD, sm=float(sm), BOUND=BOUND); torch.mps.synchronize()
+    _k_fa_masked[(1,)](Q, K, V, O, N=N, HD=HD, sm=float(sm), BOUND=BOUND)
+    torch.mps.synchronize()
     got = O.cpu().numpy()
     assert (got[BOUND:] == -999.0).all(), "rows>=BOUND clobbered (mask dropped)"
     qk = (Qn.astype(np.float64) @ Kn.astype(np.float64).T) * sm
-    qk -= qk.max(1, keepdims=True); pp = np.exp(qk); pp /= pp.sum(1, keepdims=True)
+    qk -= qk.max(1, keepdims=True)
+    pp = np.exp(qk)
+    pp /= pp.sum(1, keepdims=True)
     ref = pp @ Vn.astype(np.float64)
     assert float(np.abs(got[:BOUND] - ref[:BOUND]).max()) < 1e-4, "kept rows wrong"
 
@@ -858,29 +990,40 @@ def test_masked_fa_head128_refuses():
     # refuse it (the chokepoint no longer covers FA). (de-dup wiring 2026-06-28)
     _clear()
     N, HD, BOUND = 128, 128, 20
-    Q = torch.randn(N, HD, device="mps"); K = torch.randn(N, HD, device="mps"); V = torch.randn(N, HD, device="mps")
+    Q = torch.randn(N, HD, device="mps")
+    K = torch.randn(N, HD, device="mps")
+    V = torch.randn(N, HD, device="mps")
     O = torch.zeros(N, HD, device="mps")
     with pytest.raises(MetalNonRecoverableError):
-        _k_fa_masked[(1,)](Q, K, V, O, N=N, HD=HD, sm=0.0884, BOUND=BOUND); torch.mps.synchronize()
+        _k_fa_masked[(1,)](Q, K, V, O, N=N, HD=HD, sm=0.0884, BOUND=BOUND)
+        torch.mps.synchronize()
 
 
 # --- classifier hole 2026-06-28: multi-block constant bound is NOT trivially-true ---
 if _HAS:
+
     @triton.jit
-    def _k_mb_fa128(Q, K, V, O, N_CTX, HD: tl.constexpr, BM: tl.constexpr, BN: tl.constexpr,
-                    CONST: tl.constexpr, sm: tl.constexpr):
-        pm = tl.program_id(0); offs_m = pm * BM + tl.arange(0, BM); offs_d = tl.arange(0, HD)
+    def _k_mb_fa128(
+        Q, K, V, O, N_CTX, HD: tl.constexpr, BM: tl.constexpr, BN: tl.constexpr, CONST: tl.constexpr, sm: tl.constexpr
+    ):
+        pm = tl.program_id(0)
+        offs_m = pm * BM + tl.arange(0, BM)
+        offs_d = tl.arange(0, HD)
         q = tl.load(Q + offs_m[:, None] * HD + offs_d[None, :]) * sm
-        m_i = tl.full([BM], -float('inf'), tl.float32); l_i = tl.zeros([BM], tl.float32)
+        m_i = tl.full([BM], -float("inf"), tl.float32)
+        l_i = tl.zeros([BM], tl.float32)
         acc = tl.zeros([BM, HD], tl.float32)
         for sn in range(0, N_CTX, BN):
             offs_n = sn + tl.arange(0, BN)
             k = tl.load(K + offs_n[:, None] * HD + offs_d[None, :])
             v = tl.load(V + offs_n[:, None] * HD + offs_d[None, :])
-            qk = tl.dot(q, tl.trans(k)); m_ij = tl.maximum(m_i, tl.max(qk, 1))
-            p = tl.exp(qk - m_ij[:, None]); alpha = tl.exp(m_i - m_ij)
+            qk = tl.dot(q, tl.trans(k))
+            m_ij = tl.maximum(m_i, tl.max(qk, 1))
+            p = tl.exp(qk - m_ij[:, None])
+            alpha = tl.exp(m_i - m_ij)
             l_i = l_i * alpha + tl.sum(p, 1)
-            acc = acc * alpha[:, None] + tl.dot(p.to(tl.float32), v); m_i = m_ij
+            acc = acc * alpha[:, None] + tl.dot(p.to(tl.float32), v)
+            m_i = m_ij
         acc = acc / l_i[:, None]
         tl.store(O + offs_m[:, None] * HD + offs_d[None, :], acc, mask=offs_m[:, None] < CONST)
 
@@ -893,9 +1036,11 @@ def test_multiblock_constant_bound_mask_not_trivial():
     # classifier used to mis-call it trivial -> the mask-dropping head_dim=128 FA template
     # would clobber the masked-off rows. Must now refuse. (classifier hole 2026-06-28)
     _clear()
-    N_CTX, HD, BM, BN, CONST = 64, 128, 32, 32, 40   # CONST between BM=32 and N_CTX=64
-    Q = torch.randn(N_CTX, HD, device="mps"); K = torch.randn(N_CTX, HD, device="mps")
-    V = torch.randn(N_CTX, HD, device="mps"); O = torch.zeros(N_CTX, HD, device="mps")
+    N_CTX, HD, BM, BN, CONST = 64, 128, 32, 32, 40  # CONST between BM=32 and N_CTX=64
+    Q = torch.randn(N_CTX, HD, device="mps")
+    K = torch.randn(N_CTX, HD, device="mps")
+    V = torch.randn(N_CTX, HD, device="mps")
+    O = torch.zeros(N_CTX, HD, device="mps")
     with pytest.raises(MetalNonRecoverableError):
         _k_mb_fa128[(N_CTX // BM,)](Q, K, V, O, N_CTX, HD=HD, BM=BM, BN=BN, CONST=CONST, sm=0.0884)
         torch.mps.synchronize()

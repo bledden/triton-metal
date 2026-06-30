@@ -17,6 +17,7 @@ Fix: treat a vanished metallib as a cache miss / retriable transient.  The
 cache-hit read recompiles on FileNotFoundError; the final read is moved inside
 the retry loop.  Real metal -c / metallib compile errors still raise.
 """
+
 import os
 import platform
 import subprocess
@@ -97,11 +98,7 @@ def test_cache_hit_vanish_recovers(tmp_path, monkeypatch):
     state = {"raised": False}
 
     def flaky_open(path, *args, **kwargs):
-        if (
-            not state["raised"]
-            and isinstance(path, (str, bytes, os.PathLike))
-            and str(path).endswith(".metallib")
-        ):
+        if not state["raised"] and isinstance(path, (str, bytes, os.PathLike)) and str(path).endswith(".metallib"):
             state["raised"] = True
             raise FileNotFoundError(f"simulated concurrent delete of {path}")
         return real_open(path, *args, **kwargs)
@@ -116,9 +113,7 @@ def test_cache_hit_vanish_recovers(tmp_path, monkeypatch):
     # 3) Second call hits the cache → first read raises FNF → must recompile and succeed.
     data2 = MetalBackend.make_metallib(_MINIMAL_MSL, dict(metadata), options)
     assert state["raised"], "test harness never triggered the simulated vanish — patch ineffective"
-    assert data2 and len(data2) > 0, (
-        "make_metallib raised/returned empty after the cached metallib vanished mid-read"
-    )
+    assert data2 and len(data2) > 0, "make_metallib raised/returned empty after the cached metallib vanished mid-read"
     assert data2 == data1, "recompiled metallib differs from the original (cache key drift?)"
 
 
@@ -160,9 +155,7 @@ def test_concurrent_compile_and_clear(tmp_path):
             def worker():
                 for _ in range(10):
                     try:
-                        data = MetalBackend.make_metallib(
-                            _MINIMAL_MSL, dict(metadata), options
-                        )
+                        data = MetalBackend.make_metallib(_MINIMAL_MSL, dict(metadata), options)
                         assert data and len(data) > 0, "empty metallib bytes"
                     except Exception as exc:  # noqa: BLE001
                         with lock:
@@ -201,12 +194,10 @@ def test_concurrent_compile_and_clear(tmp_path):
             fnf = [e for e in errors if isinstance(e, FileNotFoundError)]
             assert not fnf, (
                 f"round {_round}: {len(fnf)} FileNotFoundError escaped make_metallib "
-                f"under concurrent cache clear:\n"
-                + "\n".join(f"  {type(e).__name__}: {e}" for e in fnf[:5])
+                f"under concurrent cache clear:\n" + "\n".join(f"  {type(e).__name__}: {e}" for e in fnf[:5])
             )
-            assert errors == [], (
-                f"round {_round}: {len(errors)} non-FNF exception(s) during stress:\n"
-                + "\n".join(f"  {type(e).__name__}: {e}" for e in errors[:5])
+            assert errors == [], f"round {_round}: {len(errors)} non-FNF exception(s) during stress:\n" + "\n".join(
+                f"  {type(e).__name__}: {e}" for e in errors[:5]
             )
     finally:
         os.environ.pop("TRITON_MSL_CACHE_DIR", None)
@@ -233,6 +224,4 @@ def test_real_compile_error_still_raises(tmp_path, monkeypatch):
     assert "shader compilation" in err_msg or "compilation failed" in err_msg, (
         f"Expected a shader-compilation error, got: {err_msg!r}"
     )
-    assert "linking" not in err_msg, (
-        f"Error should not mention 'linking' for an MSL syntax error, got: {err_msg!r}"
-    )
+    assert "linking" not in err_msg, f"Error should not mention 'linking' for an MSL syntax error, got: {err_msg!r}"

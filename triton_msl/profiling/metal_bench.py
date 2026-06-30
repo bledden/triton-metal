@@ -75,8 +75,7 @@ class MetalBenchmark:
         self.device = Metal.MTLCreateSystemDefaultDevice()
         self.queue = self.device.newCommandQueue()
 
-    def time_kernel(self, pipeline, buffers, n_elements, block_size=256,
-                    warmup=10, rep=100):
+    def time_kernel(self, pipeline, buffers, n_elements, block_size=256, warmup=10, rep=100):
         """Time a compute kernel dispatch using GPU timestamps.
 
         Args:
@@ -166,9 +165,11 @@ def compute_gflops(n_flops, time_us):
 def format_benchmark_result(name, result, n_bytes=None, n_flops=None):
     """Format a benchmark result as a human-readable string."""
     lines = [f"  {name}:"]
-    lines.append(f"    GPU time: {result['median_us']:.1f} us "
-                 f"(min={result['min_us']:.1f}, max={result['max_us']:.1f}, "
-                 f"p10={result['p10_us']:.1f}, p90={result['p90_us']:.1f})")
+    lines.append(
+        f"    GPU time: {result['median_us']:.1f} us "
+        f"(min={result['min_us']:.1f}, max={result['max_us']:.1f}, "
+        f"p10={result['p10_us']:.1f}, p90={result['p90_us']:.1f})"
+    )
     if n_bytes:
         bw = compute_throughput(n_bytes, result["median_us"])
         lines.append(f"    Bandwidth: {bw:.1f} GB/s")

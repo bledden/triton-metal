@@ -19,6 +19,7 @@ try:
     import triton
     import triton.language as tl
     from triton._C.libtriton import ir
+
     _HAS_TRITON = True
 except ImportError:
     _HAS_TRITON = False
@@ -49,24 +50,45 @@ def _build_fa_lowerer(causal=False, head_dim=128, block=32):
     options = backend.parse_options({})
 
     sig = {
-        "Q": "*fp32", "K": "*fp32", "V": "*fp32", "Out": "*fp32",
-        "stride_qz": "i32", "stride_qh": "i32", "stride_qm": "i32", "stride_qk": "i32",
-        "stride_kz": "i32", "stride_kh": "i32", "stride_kn": "i32", "stride_kk": "i32",
-        "stride_vz": "i32", "stride_vh": "i32", "stride_vn": "i32", "stride_vk": "i32",
-        "stride_oz": "i32", "stride_oh": "i32", "stride_om": "i32", "stride_ok": "i32",
-        "Z": "i32", "H": "i32", "N_CTX": "i32",
+        "Q": "*fp32",
+        "K": "*fp32",
+        "V": "*fp32",
+        "Out": "*fp32",
+        "stride_qz": "i32",
+        "stride_qh": "i32",
+        "stride_qm": "i32",
+        "stride_qk": "i32",
+        "stride_kz": "i32",
+        "stride_kh": "i32",
+        "stride_kn": "i32",
+        "stride_kk": "i32",
+        "stride_vz": "i32",
+        "stride_vh": "i32",
+        "stride_vn": "i32",
+        "stride_vk": "i32",
+        "stride_oz": "i32",
+        "stride_oh": "i32",
+        "stride_om": "i32",
+        "stride_ok": "i32",
+        "Z": "i32",
+        "H": "i32",
+        "N_CTX": "i32",
     }
     constexprs = {
-        "BLOCK_M": block, "BLOCK_N": block, "HEAD_DIM": head_dim,
+        "BLOCK_M": block,
+        "BLOCK_N": block,
+        "HEAD_DIM": head_dim,
         "IS_CAUSAL": causal,
     }
     src = ASTSource(fn=_flash_attn_fwd, signature=sig, constexprs=constexprs)
     context = ir.context()
     ir.load_dialects(context)
     mod = src.make_ir(
-        target, options,
+        target,
+        options,
         backend.get_codegen_implementation(options),
-        backend.get_module_map(), context,
+        backend.get_module_map(),
+        context,
     )
     metadata = {}
     mod = backend.make_ttir(mod, metadata, options)
@@ -111,7 +133,7 @@ def test_detect_flash_attention_non_causal():
     assert info["causal"] is False
 
     # scale = 1/sqrt(head_dim) ≈ 0.0883883.
-    assert abs(info["scale"] - (1.0 / (128 ** 0.5))) < 1e-4
+    assert abs(info["scale"] - (1.0 / (128**0.5))) < 1e-4
 
     # fp32 output.
     assert info["out_dtype"] == "f32"
@@ -157,10 +179,10 @@ def test_fa_pattern_with_unresolvable_stride_refuses():
                 _break(s.region_ops)
             if s.else_ops:
                 _break(s.else_ops)
+
     _break(lo.graph.ops)
 
-    with pytest.raises(MetalNonRecoverableError,
-                       match="Q pointer/stride chain"):
+    with pytest.raises(MetalNonRecoverableError, match="Q pointer/stride chain"):
         lo._detect_flash_attention()
 
 
@@ -195,11 +217,11 @@ def test_fa_near_miss_refuses_through_lower():
                 _break(s.region_ops)
             if s.else_ops:
                 _break(s.else_ops)
+
     _break(lo.graph.ops)
 
     # The refusal must surface through lower() — not just the detector method.
-    with pytest.raises(MetalNonRecoverableError,
-                       match="Q pointer/stride chain"):
+    with pytest.raises(MetalNonRecoverableError, match="Q pointer/stride chain"):
         lo.lower()
 
 
@@ -229,9 +251,11 @@ def test_non_fa_kernel_returns_none():
     context = ir.context()
     ir.load_dialects(context)
     mod = src.make_ir(
-        target, options,
+        target,
+        options,
         backend.get_codegen_implementation(options),
-        backend.get_module_map(), context,
+        backend.get_module_map(),
+        context,
     )
     metadata = {}
     mod = backend.make_ttir(mod, metadata, options)

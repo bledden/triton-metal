@@ -27,8 +27,7 @@ from triton_msl.codegen._lowerer_helpers import _mlir_to_triton_dtype
 class _ReduceScanMixin:
     """``tt.reduce`` and ``tt.scan`` lowering for ``GenericLowerer``."""
 
-    def _mept_reduce_fold(self, arr_name: str, n: int, combine_op: str,
-                          msl_type: str) -> str:
+    def _mept_reduce_fold(self, arr_name: str, n: int, combine_op: str, msl_type: str) -> str:
         """Phase 4e: fold a per-thread register array to a scalar partial.
 
         ``arr_name[0..n-1]`` are this thread's elements (single-pass MEPT,
@@ -44,7 +43,7 @@ class _ReduceScanMixin:
             "min": lambda a, b: f"min({a}, {b})",
             "xor": lambda a, b: f"{a} ^ {b}",
             "and": lambda a, b: f"{a} & {b}",
-            "or":  lambda a, b: f"{a} | {b}",
+            "or": lambda a, b: f"{a} | {b}",
             # NaN-PROPAGATING max/min: a NaN in either operand must propagate (max()/min()
             # are NaN-quiet); the cross-thread threadgroup_reduce propagates too.
             "nanmax": lambda a, b: f"(({a} > {b}) || ({a} != {a})) ? {a} : {b}",
@@ -54,9 +53,13 @@ class _ReduceScanMixin:
             # Never default to sum — that would SILENTLY mis-compute an unrecognised combine
             # on the register-array path. Refuse loudly (matches the rest of the surface).
             from triton_msl.errors import MetalNonRecoverableError
+
             raise MetalNonRecoverableError(
                 f"register-array reduce: unsupported combine op '{combine_op}' — refusing "
-                f"rather than silently folding as a sum.", op_name="tt.reduce")
+                f"rather than silently folding as a sum.",
+                op_name="tt.reduce",
+            )
+
         # Cast each array read to ``msl_type`` so both combine operands have
         # the same type. Without this, an unsigned array (uint8/uint16) mixed
         # with an int ``fold_var`` makes MSL's max/min overload resolution
@@ -66,11 +69,11 @@ class _ReduceScanMixin:
         # which reduces unsigned narrow ints in signed int32 (they fit).
         def _read(i):
             return f"({msl_type}){arr_name}[{i}]"
+
         fold_var = self._next_var("fold")
         self.kb.raw_line(f"    {msl_type} {fold_var} = {_read(0)};")
         for i in range(1, n):
-            self.kb.raw_line(
-                f"    {fold_var} = {combine(fold_var, _read(i))};")
+            self.kb.raw_line(f"    {fold_var} = {combine(fold_var, _read(i))};")
         return fold_var
 
     def _cover_inloop_reduce(self, ssa, combine_op, msl_type, total):
@@ -120,6 +123,7 @@ class _ReduceScanMixin:
         _load_derived = set()
         _DATA_OPS = frozenset({"tt.load", "tt.atomic_rmw", "tt.atomic_cas"})
         _all_by_id = {}
+
         def _scan_all(ops):
             for op in ops:
                 _all_by_id[op.id] = op
@@ -127,6 +131,7 @@ class _ReduceScanMixin:
                     _scan_all(op.region_ops)
                 if op.else_ops:
                     _scan_all(op.else_ops)
+
         _scan_all(getattr(self, "graph", None) and self.graph.ops or [])
         # BFS: seed with load ops, propagate to their consumers.
         _worklist = [o for o in _all_by_id.values() if o.op in _DATA_OPS]
@@ -154,11 +159,20 @@ class _ReduceScanMixin:
         # Superset of _SAFE_PREEMIT_OPS in _lowerer_control.py; that set is the
         # index-only subset safe to pre-emit at outer body scope, while this
         # set covers all ops safe to replay inside the _cover_inloop_reduce loop.
-        _SAFE_REPLAY_OPS = frozenset({
-            "tt.make_range", "tt.splat", "tt.broadcast", "tt.expand_dims",
-            "tt.addptr", "arith.constant", "arith.extf", "arith.truncf",
-            "arith.sitofp", "arith.fptosi",
-        })
+        _SAFE_REPLAY_OPS = frozenset(
+            {
+                "tt.make_range",
+                "tt.splat",
+                "tt.broadcast",
+                "tt.expand_dims",
+                "tt.addptr",
+                "arith.constant",
+                "arith.extf",
+                "arith.truncf",
+                "arith.sitofp",
+                "arith.fptosi",
+            }
+        )
         external_safe_deps = []
         external_safe_dep_ids = set()
         # BFS over external references from body deps
@@ -190,7 +204,7 @@ class _ReduceScanMixin:
                 if ext_op.op in _SAFE_REPLAY_OPS:
                     external_safe_dep_ids.add(oid)
                     # Walk its operands too
-                    for sub_oid in (ext_op.operand_ids or []):
+                    for sub_oid in ext_op.operand_ids or []:
                         if sub_oid not in _visited_ext:
                             _ext_worklist.append(sub_oid)
                 else:
@@ -201,17 +215,13 @@ class _ReduceScanMixin:
         # Build the ordered list of external safe deps in graph order
         _all_id_order = {oid: idx for idx, oid in enumerate(_all_by_id.keys())}
         external_safe_deps = [
-            _all_by_id[oid]
-            for oid in sorted(external_safe_dep_ids,
-                              key=lambda i: _all_id_order.get(i, 0))
+            _all_by_id[oid] for oid in sorted(external_safe_dep_ids, key=lambda i: _all_id_order.get(i, 0))
         ]
 
         identity, combine_expr = self._reduce_identity_combine(combine_op, msl_type)
         acc = self._next_var("inloop_acc")
         self.kb.raw_line(f"        {msl_type} {acc} = {identity};")
-        self.kb.raw_line(
-            f"        for (uint _loop_e = lid; _loop_e < {total}u; "
-            f"_loop_e += {self.kb.block_size}u) {{")
+        self.kb.raw_line(f"        for (uint _loop_e = lid; _loop_e < {total}u; _loop_e += {self.kb.block_size}u) {{")
 
         # Save env bindings the replay will overwrite, so later body ops keep
         # their original in-scope vars (a 2nd reduce's shared elementwise would
@@ -236,8 +246,8 @@ class _ReduceScanMixin:
             self._lower_op(d)
         val = self._lookup(iid)
         self.kb.raw_line(
-            f"            {{ {msl_type} acc = {acc}; "
-            f"{msl_type} val = ({msl_type}){val}; {acc} = {combine_expr}; }}")
+            f"            {{ {msl_type} acc = {acc}; {msl_type} val = ({msl_type}){val}; {acc} = {combine_expr}; }}"
+        )
         self._needs_wrapping = False
         self.kb.raw_line(f"        }}")
 
@@ -271,7 +281,7 @@ class _ReduceScanMixin:
         emits the unsigned op, so the reduction must compare UNSIGNED — a signed compare reads
         0xFFFFFFFF as -1 and returns the wrong element (Triton-lens re-audit 2026-06-25).
         """
-        for b in (region_ops or []):
+        for b in region_ops or []:
             nm = b.op or ""
             if "maxui" in nm or "minui" in nm:
                 return True
@@ -326,25 +336,33 @@ class _ReduceScanMixin:
         ops = ssa.region_ops or []
         ba = (ssa.attrs or {}).get("block_arg_ids") or []
         if not ops or len(ba) != 2:
-            return None   # tuple combines (argmax/argmin/Welford) use the multi-value path
+            return None  # tuple combines (argmax/argmin/Welford) use the multi-value path
         a, b = ba[0], ba[1]
         bargs = {a, b}
-        top = ops[-1]                          # yielded op (the reduce.return terminator is parsed out)
+        top = ops[-1]  # yielded op (the reduce.return terminator is parsed out)
         nm = top.op or ""
         # (1) a DIRECT binary op of exactly the two block args.
         if set(top.operand_ids or []) == bargs:
             _DIRECT = {
-                "arith.addf": ("sum", True), "arith.addi": ("sum", True),
-                "arith.mulf": ("prod", True), "arith.muli": ("prod", True),
-                "arith.maxnumf": ("max", True), "arith.maxf": ("max", True),
-                "arith.minnumf": ("min", True), "arith.minf": ("min", True),
-                "arith.maxsi": ("max", True), "arith.minsi": ("min", True),
-                "arith.maxui": ("max", False), "arith.minui": ("min", False),
-                "arith.xori": ("xor", True), "arith.andi": ("and", True),
+                "arith.addf": ("sum", True),
+                "arith.addi": ("sum", True),
+                "arith.mulf": ("prod", True),
+                "arith.muli": ("prod", True),
+                "arith.maxnumf": ("max", True),
+                "arith.maxf": ("max", True),
+                "arith.minnumf": ("min", True),
+                "arith.minf": ("min", True),
+                "arith.maxsi": ("max", True),
+                "arith.minsi": ("min", True),
+                "arith.maxui": ("max", False),
+                "arith.minui": ("min", False),
+                "arith.xori": ("xor", True),
+                "arith.andi": ("and", True),
                 "arith.ori": ("or", True),
                 # NaN-PROPAGATING max/min as a direct op — lowered correctly (with NaN
                 # propagation) via the nanmax/nanmin path, not as NaN-quiet fmax.
-                "arith.maximumf": ("nanmax", True), "arith.minimumf": ("nanmin", True),
+                "arith.maximumf": ("nanmax", True),
+                "arith.minimumf": ("nanmin", True),
             }
             # everything else falls through to None -> refuse.
             return _DIRECT.get(nm)
@@ -363,7 +381,7 @@ class _ReduceScanMixin:
         in which case the kind is the NaN-propagating ``nanmax``/``nanmin``."""
         t, f = sel.operand_ids[1], sel.operand_ids[2]
         if {t, f} != {a, b}:
-            return None   # picks value-vs-mask / a derived value -> not a plain max/min
+            return None  # picks value-vs-mask / a derived value -> not a plain max/min
         cond = sel.operand_ids[0]
         by_id = {o.id: o for o in ops}
         cond_op = by_id.get(cond)
@@ -371,20 +389,32 @@ class _ReduceScanMixin:
         nan_prop = False
         if cond_op is not None and cond_op.op in ("arith.cmpf", "arith.cmpi"):
             cmp = cond_op
-        elif (cond_op is not None and cond_op.op == "arith.ori"
-              and len(cond_op.operand_ids or []) == 2):
+        elif cond_op is not None and cond_op.op == "arith.ori" and len(cond_op.operand_ids or []) == 2:
             # NaN-propagating max/min: mask = (a CMP b) | (x != x), select(mask, a, b),
             # where `x != x` (cmpf une, same operand twice) is isnan(x). Triton inductor's
             # triton_helpers.maximum/minimum emit exactly this.
             parts = [by_id.get(i) for i in cond_op.operand_ids]
-            cmp = next((o for o in parts if o is not None
-                        and o.op in ("arith.cmpf", "arith.cmpi")
-                        and set(o.operand_ids or []) == {a, b}), None)
-            isnan = next((o for o in parts if o is not None and o.op == "arith.cmpf"
-                          and len(o.operand_ids or []) >= 2
-                          and o.operand_ids[0] == o.operand_ids[1]
-                          and o.operand_ids[0] in (a, b)
-                          and "une" in (o.attrs.get("predicate_name", "") or "")), None)
+            cmp = next(
+                (
+                    o
+                    for o in parts
+                    if o is not None and o.op in ("arith.cmpf", "arith.cmpi") and set(o.operand_ids or []) == {a, b}
+                ),
+                None,
+            )
+            isnan = next(
+                (
+                    o
+                    for o in parts
+                    if o is not None
+                    and o.op == "arith.cmpf"
+                    and len(o.operand_ids or []) >= 2
+                    and o.operand_ids[0] == o.operand_ids[1]
+                    and o.operand_ids[0] in (a, b)
+                    and "une" in (o.attrs.get("predicate_name", "") or "")
+                ),
+                None,
+            )
             if cmp is None or isnan is None:
                 return None
             nan_prop = True
@@ -393,7 +423,7 @@ class _ReduceScanMixin:
         lhs, rhs = cmp.operand_ids[0], cmp.operand_ids[1]
         if {lhs, rhs} != {a, b}:
             return None
-        pred = (cmp.attrs.get("predicate_name", "") or "")
+        pred = cmp.attrs.get("predicate_name", "") or ""
         is_gt = "gt" in pred or "ge" in pred
         is_lt = "lt" in pred or "le" in pred
         signed = not (cmp.op == "arith.cmpi" and pred.startswith("u"))
@@ -404,7 +434,7 @@ class _ReduceScanMixin:
         else:
             kind = None
         if kind and nan_prop:
-            kind = "nan" + kind   # nanmax / nanmin
+            kind = "nan" + kind  # nanmax / nanmin
         return (kind, signed) if kind else None
 
     def _get_reduce_combine_info(self, ssa):
@@ -420,14 +450,24 @@ class _ReduceScanMixin:
         # same set the single-pass path does); a custom / NaN-propagating combine refuses.
         if _res is None:
             from triton_msl.errors import MetalNonRecoverableError
+
             raise MetalNonRecoverableError(
                 "tl.reduce on the multipass reduction path supports only canonical "
                 "sum / max / min / and / or / xor; a custom or NaN-propagating combine is "
-                "refused rather than silently mis-computed.")
+                "refused rather than silently mis-computed."
+            )
         combine_op = _res[0]
-        identities = {"sum": "0.0f", "prod": "1.0f", "max": "-INFINITY", "min": "INFINITY",
-                      "and": "(~0)", "or": "0", "xor": "0",
-                      "nanmax": "-INFINITY", "nanmin": "INFINITY"}
+        identities = {
+            "sum": "0.0f",
+            "prod": "1.0f",
+            "max": "-INFINITY",
+            "min": "INFINITY",
+            "and": "(~0)",
+            "or": "0",
+            "xor": "0",
+            "nanmax": "-INFINITY",
+            "nanmin": "INFINITY",
+        }
         return combine_op, identities.get(combine_op, "0.0f")
 
     def _reduce_identity_combine(self, combine_op, msl_type):
@@ -482,16 +522,15 @@ class _ReduceScanMixin:
             identity = "0"
             combine_expr = "acc ^ val"
         elif combine_op == "and":
-            identity = "~0"            # all-ones: AND identity
+            identity = "~0"  # all-ones: AND identity
             combine_expr = "acc & val"
         elif combine_op == "or":
-            identity = "0"             # OR identity
+            identity = "0"  # OR identity
             combine_expr = "acc | val"
         else:
             identity = "0.0f" if is_float else "0"
             combine_expr = "acc + val"
         return identity, combine_expr
-
 
     def _lower_multipass_reduction(self, block_size):
         """Emit multi-pass reduction: per-element loops separated by reductions.
@@ -574,6 +613,7 @@ class _ReduceScanMixin:
                     for d in vshape:
                         nel *= d
                     return nel <= 1
+
                 # No recorded shape: fall back to the producing op's tensor flag
                 # (a reduce result / scalar arithmetic is not a tensor). Index ALL
                 # ops (including scf.for/if region bodies), not just the top level, so
@@ -588,6 +628,7 @@ class _ReduceScanMixin:
                             _index_all(s.region_ops, acc)
                         if getattr(s, "else_ops", None):
                             _index_all(s.else_ops, acc)
+
                 _all_by_id = {}
                 _index_all(self.graph.ops, _all_by_id)
                 vop = _all_by_id.get(val_id)
@@ -638,20 +679,15 @@ class _ReduceScanMixin:
                 # may not be in env_types after multipass replay/reordering (a
                 # reshape between load and reduce can drop the type), so fall
                 # back to the reduce op's own element type (reliable from IR).
-                reduce_input_dtype = self.env_types.get(
-                    next_reduce.operand_ids[0]) if next_reduce.operand_ids else None
+                reduce_input_dtype = self.env_types.get(next_reduce.operand_ids[0]) if next_reduce.operand_ids else None
                 if reduce_input_dtype is None:
                     _et = getattr(next_reduce, "elem_type", None)
-                    reduce_input_dtype = (
-                        _mlir_to_triton_dtype(_et) if _et else "fp32")
-                is_int_reduce = not (
-                    reduce_input_dtype.startswith("fp") or reduce_input_dtype.startswith("bf")
-                )
+                    reduce_input_dtype = _mlir_to_triton_dtype(_et) if _et else "fp32"
+                is_int_reduce = not (reduce_input_dtype.startswith("fp") or reduce_input_dtype.startswith("bf"))
                 is_i64_reduce = reduce_input_dtype in ("i64", "u64", "ui64")
                 # unsigned 32-bit max/min compares UNSIGNED; the final cross-thread simd
                 # reduce casts to reduce_ty in threadgroup_reduce.
-                _unsigned = (combine_op in ("max", "min")
-                             and self._reduce_is_unsigned_minmax(next_reduce.region_ops))
+                _unsigned = combine_op in ("max", "min") and self._reduce_is_unsigned_minmax(next_reduce.region_ops)
                 # uint64 is the SIGNLESS i64 in Triton, so an unsigned 64-bit max/min arrives
                 # as dtype 'i64' + _unsigned — treat it as u64 for the ulong/ULONG_MAX path,
                 # not just the explicit u64/ui64 names (else signed LONG_MIN/MAX identities
@@ -663,26 +699,26 @@ class _ReduceScanMixin:
                 _bitwise_ident = {"and": "(~0)", "or": "0", "xor": "0", "prod": "1"}
                 if is_i64_reduce:
                     # 64-bit identities (LONG_MIN/MAX); ulong min identity is 0.
-                    i64_identities = ({"sum": "0", "max": "0", "min": "ULONG_MAX"}
-                                      if is_u64_reduce
-                                      else {"sum": "0", "max": "LONG_MIN", "min": "LONG_MAX"})
+                    i64_identities = (
+                        {"sum": "0", "max": "0", "min": "ULONG_MAX"}
+                        if is_u64_reduce
+                        else {"sum": "0", "max": "LONG_MIN", "min": "LONG_MAX"}
+                    )
                     i64_identities.update(_bitwise_ident)
                     identity = i64_identities.get(combine_op, "0")
                 elif is_int_reduce:
                     if _unsigned:
                         identity = "0" if combine_op == "max" else "UINT_MAX"
                     else:
-                        identity = {"sum": "0", "max": "INT_MIN", "min": "INT_MAX",
-                                    **_bitwise_ident}.get(combine_op, "0")
+                        identity = {"sum": "0", "max": "INT_MIN", "min": "INT_MAX", **_bitwise_ident}.get(
+                            combine_op, "0"
+                        )
                 # else float: identity preserved from above
                 self.kb.raw_line(f"    {acc_msl_type} {acc_var} = {identity};")
 
             # Open the per-element loop
             self._needs_wrapping = True
-            self.kb.raw_line(
-                f"    for (uint _loop_e = lid; _loop_e < {total}u; "
-                f"_loop_e += {block_size}u) {{"
-            )
+            self.kb.raw_line(f"    for (uint _loop_e = lid; _loop_e < {total}u; _loop_e += {block_size}u) {{")
 
             # Re-emit tensor dependency ops from earlier phases
             for ssa in replay_tensor:
@@ -718,7 +754,8 @@ class _ReduceScanMixin:
                     _c = ">" if combine_op == "nanmax" else "<"
                     self.kb.raw_line(
                         f"        {acc_var} = (({acc_var} {_c} {cast_input}) || "
-                        f"({acc_var} != {acc_var})) ? {acc_var} : {cast_input};")
+                        f"({acc_var} != {acc_var})) ? {acc_var} : {cast_input};"
+                    )
 
             # Close the loop
             self.kb.raw_line(f"    }}")
@@ -735,6 +772,7 @@ class _ReduceScanMixin:
             # operand's type was dropped by a preceding reshape.
             if next_reduce and acc_var:
                 reduce_input_id = next_reduce.operand_ids[0]
+
                 # GUARD (re-audit silent-wrong #3): if this exact input SSA feeds MORE THAN
                 # ONE tt.reduce (two INDEPENDENT reductions of the SAME loaded tile, e.g.
                 # sum(x) and max(x)), the env rebind below aliases the shared input to THIS
@@ -751,24 +789,27 @@ class _ReduceScanMixin:
                             yield from _all_reduce_ops(s.region_ops)
                         if s.else_ops:
                             yield from _all_reduce_ops(s.else_ops)
-                _sharers = [r for r in _all_reduce_ops(self.graph.ops)
-                            if r.operand_ids and r.operand_ids[0] == reduce_input_id]
+
+                _sharers = [
+                    r for r in _all_reduce_ops(self.graph.ops) if r.operand_ids and r.operand_ids[0] == reduce_input_id
+                ]
                 if len(_sharers) > 1:
                     from triton_msl.errors import MetalNonRecoverableError
+
                     raise MetalNonRecoverableError(
                         "two or more reductions of the SAME loaded tile (e.g. tl.sum(x) and "
                         "tl.max(x) of the same x) are not supported by the multipass reduce "
                         "lowering: the second silently reduces over the first's accumulator. "
-                        "Load the tile separately for each reduction.", op_name="tt.reduce")
+                        "Load the tile separately for each reduction.",
+                        op_name="tt.reduce",
+                    )
                 self.env[reduce_input_id] = acc_var
-                _acc_dtype = {"long": "i64", "ulong": "u64",
-                              "int": "i32", "float": "fp32"}.get(acc_msl_type)
+                _acc_dtype = {"long": "i64", "ulong": "u64", "int": "i32", "float": "fp32"}.get(acc_msl_type)
                 if _acc_dtype is not None:
                     self.env_types[reduce_input_id] = _acc_dtype
 
             # Add this phase's ops to the preceding ops for future phases
             all_preceding_ops.extend(phase_ops)
-
 
     def _lower_reduce(self, ssa: SSAValue):
         """tt.reduce → SIMD + threadgroup shared memory reduction.
@@ -783,8 +824,7 @@ class _ReduceScanMixin:
             return
 
         # Detect multi-value reduce (argmax/argmin): 2+ inputs, 2+ results
-        if (len(ssa.operand_ids) >= 2 and ssa.result_ids
-                and len(ssa.result_ids) >= 2):
+        if len(ssa.operand_ids) >= 2 and ssa.result_ids and len(ssa.result_ids) >= 2:
             self._lower_reduce_multi_value(ssa)
             return
 
@@ -802,11 +842,13 @@ class _ReduceScanMixin:
             # the prior historical default — matches the multipass path). A real
             # single-input reduce always carries a combine with >=1 op.
             from triton_msl.errors import MetalNonRecoverableError
+
             raise MetalNonRecoverableError(
                 "tl.reduce with a combine that is not a canonical sum / max / min / and / "
                 "or / xor reduction is not supported — a product, max-by-magnitude, NaN-"
                 "propagating max/min, a + relu(b), a first/last/identity pick, or other "
-                "custom combine is refused rather than silently mis-computed.")
+                "custom combine is refused rather than silently mis-computed."
+            )
         combine_op, _signed = _res
         has_unsigned_minmax = combine_op in ("max", "min") and not _signed
 
@@ -819,13 +861,12 @@ class _ReduceScanMixin:
         if input_dtype is None:
             _et = getattr(ssa, "elem_type", None)
             input_dtype = _mlir_to_triton_dtype(_et) if _et else "fp32"
-        is_int_reduce = not (
-            input_dtype.startswith("fp") or input_dtype.startswith("bf")
-        )
+        is_int_reduce = not (input_dtype.startswith("fp") or input_dtype.startswith("bf"))
         is_i64 = input_dtype in ("i64", "u64", "ui64")
         is_u64 = input_dtype in ("u64", "ui64")
         msl_type, shared_dtype = self._reduce_acc_msl_type(
-            input_dtype, has_unsigned_minmax and combine_op in ("max", "min"))
+            input_dtype, has_unsigned_minmax and combine_op in ("max", "min")
+        )
 
         # Check if this is a 2D axis-specific reduction
         input_shape = self.env_shapes.get(ssa.operand_ids[0])
@@ -839,25 +880,21 @@ class _ReduceScanMixin:
         # reduces here (the prescan requires a 1-D reduce for MEPT-reduce
         # eligibility), so folding to 1-D and skipping the multi-dim
         # dispatch is correct.
-        mept_arr = (self.env_array.get(ssa.operand_ids[0])
-                    if getattr(self, "mept_enabled", False) else None)
+        mept_arr = self.env_array.get(ssa.operand_ids[0]) if getattr(self, "mept_enabled", False) else None
         if mept_arr is not None:
             arr_name, n_arr, _arr_ty = mept_arr
-            input_var = self._mept_reduce_fold(
-                arr_name, n_arr, combine_op, msl_type)
+            input_var = self._mept_reduce_fold(arr_name, n_arr, combine_op, msl_type)
             input_shape = None  # already folded to one element per thread
 
         if input_shape and len(input_shape) == 3:
-            self._lower_reduce_3d(ssa, input_var, axis, combine_op,
-                                  msl_type, shared_dtype, input_shape)
+            self._lower_reduce_3d(ssa, input_var, axis, combine_op, msl_type, shared_dtype, input_shape)
             return
 
         # N-D axis-specific reduce (n >= 4). Used by e.g. tl.sort's bitonic
         # decomposition, which reshapes to (2,)*n and reduces along a specific
         # axis per compare-and-swap step.
         if input_shape and len(input_shape) >= 4:
-            self._lower_reduce_nd(ssa, input_var, axis, combine_op,
-                                  msl_type, shared_dtype, input_shape)
+            self._lower_reduce_nd(ssa, input_var, axis, combine_op, msl_type, shared_dtype, input_shape)
             return
 
         if self._is_2d and input_shape and len(input_shape) >= 2:
@@ -879,13 +916,15 @@ class _ReduceScanMixin:
                     _tot2d *= _d
                 if _tot2d > self.kb.block_size:
                     from triton_msl.errors import MetalNonRecoverableError
+
                     raise MetalNonRecoverableError(
                         f"Refusing 2-D reduction: a {tuple(input_shape)} tile exceeds "
                         f"the {self.kb.block_size}-thread threadgroup, so the cross-lane "
                         f"reduce would cover only the first {self.kb.block_size} lanes "
-                        f"(silent-wrong). Use BLOCK <= num_threads.", op_name="tt.reduce")
-                self._lower_reduce_2d(ssa, input_var, axis, combine_op,
-                                      msl_type, shared_dtype, input_shape)
+                        f"(silent-wrong). Use BLOCK <= num_threads.",
+                        op_name="tt.reduce",
+                    )
+                self._lower_reduce_2d(ssa, input_var, axis, combine_op, msl_type, shared_dtype, input_shape)
                 return
 
         # Stage B (in-loop reduction coverage): a 1-D full reduce whose tile
@@ -901,27 +940,30 @@ class _ReduceScanMixin:
         # Scope: 1-D full reduces only (len(input_shape)==1). The (1,N) axis==1
         # fall-through and the ND reduce paths share the same under-coverage gap
         # but are out of Stage B's 1-D scope (tracked by Task 2 corpus measure).
-        if (mept_arr is None
-                and self._control_flow_depth > 0
-                and input_shape is not None
-                and len(input_shape) == 1
-                and input_shape[0] > self.kb.block_size):
+        if (
+            mept_arr is None
+            and self._control_flow_depth > 0
+            and input_shape is not None
+            and len(input_shape) == 1
+            and input_shape[0] > self.kb.block_size
+        ):
             # Stage A: try to cover the whole tile by folding each thread's
             # strided share before the cross-thread reduce.
-            _acc = self._cover_inloop_reduce(
-                ssa, combine_op, msl_type, input_shape[0])
+            _acc = self._cover_inloop_reduce(ssa, combine_op, msl_type, input_shape[0])
             if _acc is not None:
                 input_var = _acc
-                input_shape = None   # folded to one scalar per thread
+                input_shape = None  # folded to one scalar per thread
             else:
                 from triton_msl.errors import MetalNonRecoverableError
+
                 raise MetalNonRecoverableError(
                     f"Refusing in-loop reduction: a tile of {input_shape[0]} "
                     f"elements exceeds the {self.kb.block_size}-thread threadgroup "
                     f"and is not register-array-covered, so a cross-lane reduce "
                     f"here would sum only the first {self.kb.block_size} elements "
                     f"(silent-wrong). Use the default register-array path "
-                    f"(TRITON_MSL_MEPT unset) or BLOCK <= num_threads.")
+                    f"(TRITON_MSL_MEPT unset) or BLOCK <= num_threads."
+                )
 
         # Cast bool (i1) to int before reduction — MSL SIMD intrinsics reject bool
         if input_dtype == "i1" or (isinstance(input_var, str) and input_var in ("true", "false", "1", "0")):
@@ -930,8 +972,7 @@ class _ReduceScanMixin:
             input_var = cast_var
 
         if is_i64:
-            self._lower_reduce_1d_i64(ssa, input_var, combine_op,
-                                      msl_type, shared_dtype)
+            self._lower_reduce_1d_i64(ssa, input_var, combine_op, msl_type, shared_dtype)
             return
 
         # The dispatch may run more threads (block_size = num_threads) than the
@@ -943,6 +984,7 @@ class _ReduceScanMixin:
         _rn = input_shape[0] if (input_shape and len(input_shape) == 1) else None
         if _rn is not None and _rn < self.kb.block_size:
             from triton_msl.errors import MetalNonRecoverableError
+
             _is_float = msl_type in ("float", "half", "bfloat")
             if combine_op == "sum":
                 _ident = "0"
@@ -970,11 +1012,12 @@ class _ReduceScanMixin:
                     f"with {self.kb.block_size} threads (no make_range pins the "
                     f"length): cannot mask the tail lanes for this combine/dtype, so "
                     f"the cross-lane reduce would over-count. Refusing.",
-                    op_name="tt.reduce")
+                    op_name="tt.reduce",
+                )
             _masked = self._next_var("rmask")
             self.kb.raw_line(
-                f"    {msl_type} {_masked} = (lid < {_rn}u) ? "
-                f"({msl_type}){input_var} : ({msl_type}){_ident};")
+                f"    {msl_type} {_masked} = (lid < {_rn}u) ? ({msl_type}){input_var} : ({msl_type}){_ident};"
+            )
             input_var = _masked
 
         # 1D full reduction (original behavior)
@@ -985,8 +1028,7 @@ class _ReduceScanMixin:
 
         result_var = self._next_var("reduced")
         # Reduce IN the element type — integer reductions in float lost precision >2^24.
-        self.kb.threadgroup_reduce(combine_op, input_var, shared_name, result_var,
-                                   reduce_ty=msl_type)
+        self.kb.threadgroup_reduce(combine_op, input_var, shared_name, result_var, reduce_ty=msl_type)
 
         # Narrow-type masking: when reducing in wider type but output is narrow,
         # apply modular arithmetic (i1 sum = XOR, i8 sum = mod 256, etc.)
@@ -1007,9 +1049,7 @@ class _ReduceScanMixin:
         self.env[ssa.id] = result_var
         self.env_types[ssa.id] = shared_dtype
 
-
-    def _lower_reduce_1d_i64(self, ssa, input_var, combine_op,
-                             msl_type, shared_dtype):
+    def _lower_reduce_1d_i64(self, ssa, input_var, combine_op, msl_type, shared_dtype):
         """1-D full reduce for 64-bit ints via a shared-memory tree (Metal has
         no simd_sum/max/min overload for long/ulong). Each thread writes its
         value to a threadgroup array; a stride-doubling tree (non-power-of-2
@@ -1033,8 +1073,8 @@ class _ReduceScanMixin:
         }.get(combine_op)
         if combine is None:
             from triton_msl.errors import MetalNonRecoverableError
-            raise MetalNonRecoverableError(
-                f"i64 reduce: unsupported combine op {combine_op}")
+
+            raise MetalNonRecoverableError(f"i64 reduce: unsupported combine op {combine_op}")
         kb = self.kb
         kb.raw_line(f"    {sh}[lid] = {input_var};")
         kb.raw_line("    threadgroup_barrier(mem_flags::mem_threadgroup);")
@@ -1048,7 +1088,6 @@ class _ReduceScanMixin:
         kb.raw_line(f"    {msl_type} {result_var} = {sh}[0];")
         self.env[ssa.id] = result_var
         self.env_types[ssa.id] = shared_dtype
-
 
     def _lower_reduce_multi_value(self, ssa: SSAValue):
         """Multi-value reduce: argmax/argmin (2-value) or Welford (3-value).
@@ -1068,17 +1107,17 @@ class _ReduceScanMixin:
         # and emits uncompilable MSL (an undeclared per-iteration var) -> a cryptic
         # MetalCompilationError instead of a clean refusal (re-audit #3). Either way,
         # a 1-D multi-value reduce wider than the threadgroup is unsupported: refuse.
-        _ishape = self.env_shapes.get(ssa.operand_ids[0]) or _extract_shape(
-            self._find_op_type_str(ssa.operand_ids[0]))
-        if (_ishape is not None
-                and len(_ishape) == 1 and _ishape[0] > self.kb.block_size):
+        _ishape = self.env_shapes.get(ssa.operand_ids[0]) or _extract_shape(self._find_op_type_str(ssa.operand_ids[0]))
+        if _ishape is not None and len(_ishape) == 1 and _ishape[0] > self.kb.block_size:
             from triton_msl.errors import MetalNonRecoverableError
+
             raise MetalNonRecoverableError(
                 f"Multi-value reduce (argmax/argmin/Welford) over a 1-D tile of "
                 f"{_ishape[0]} elements exceeds the {self.kb.block_size}-thread "
                 f"threadgroup; the multipass path can't aggregate a tuple reduce, so "
                 f"this would be silently wrong / uncompilable. Refusing. "
-                f"Use BLOCK <= num_threads.")
+                f"Use BLOCK <= num_threads."
+            )
 
         # Dispatch Welford (3-value) vs argmax/argmin (2-value)
         if len(ssa.operand_ids) >= 3 and ssa.result_ids and len(ssa.result_ids) >= 3:
@@ -1088,16 +1127,18 @@ class _ReduceScanMixin:
             # mean/m2/weight math (Triton-lens re-audit 2026-06-25: a triple-max returned
             # Welford output). Refuse it rather than mis-compute, mirroring the 2-value
             # comparison-presence guard below.
-            _has_div = any((bop.op or "").startswith("arith.div")
-                           for bop in (ssa.region_ops or []))
+            _has_div = any((bop.op or "").startswith("arith.div") for bop in (ssa.region_ops or []))
             if not _has_div:
                 from triton_msl.errors import MetalNonRecoverableError
+
                 raise MetalNonRecoverableError(
                     "multi-value tl.reduce with a 3+ element tuple body that is not the "
                     "Welford online-variance recurrence (it does not divide by a running "
                     "count) is not supported — it would be silently computed as variance. "
                     "Refusing. Only tl.var/tl.std (Welford) 3-tuples and value+index "
-                    "argmax/argmin 2-tuples are handled.", op_name="tt.reduce")
+                    "argmax/argmin 2-tuples are handled.",
+                    op_name="tt.reduce",
+                )
             self._lower_reduce_welford(ssa)
             return
 
@@ -1105,21 +1146,23 @@ class _ReduceScanMixin:
         # has a COMPARISON (cmpf/cmpi) — argmin/argmax compare values. A custom 2-value
         # combine (e.g. (x+y, i+j)) has no comparison and would be SILENTLY mis-computed
         # by the argminmax path (reduce-probe finding). Refuse it.
-        if (len(ssa.operand_ids) >= 2
-                and not any(bop.op in ("arith.cmpf", "arith.cmpi")
-                            for bop in (ssa.region_ops or []))):
+        if len(ssa.operand_ids) >= 2 and not any(
+            bop.op in ("arith.cmpf", "arith.cmpi") for bop in (ssa.region_ops or [])
+        ):
             from triton_msl.errors import MetalNonRecoverableError
+
             raise MetalNonRecoverableError(
                 "multi-value tl.reduce whose body is not argmax/argmin (no comparison) "
                 "is not supported — only value+index argmax/argmin 2-tuples are handled. "
-                "Refusing.", op_name="tt.reduce")
+                "Refusing.",
+                op_name="tt.reduce",
+            )
 
         # Check for 2D argmin/argmax
         if len(ssa.operand_ids) >= 2:
             input_shape = self.env_shapes.get(ssa.operand_ids[0])
             if not input_shape:
-                input_shape = _extract_shape(
-                    self._find_op_type_str(ssa.operand_ids[0]))
+                input_shape = _extract_shape(self._find_op_type_str(ssa.operand_ids[0]))
             if input_shape and len(input_shape) == 2 and self._is_2d:
                 axis = ssa.attrs.get("axis", 0)
                 # Skip 2D dispatch when first dim is 1 and axis is 1
@@ -1130,7 +1173,6 @@ class _ReduceScanMixin:
 
         self._lower_reduce_argminmax(ssa)
 
-
     def _lower_reduce_welford(self, ssa: SSAValue):
         """Welford online variance reduction: (mean, m2, weight) via SIMD shuffle + shared memory."""
         mean_var = self._lookup(ssa.operand_ids[0])
@@ -1140,19 +1182,22 @@ class _ReduceScanMixin:
         n_simd_groups = (self.kb.block_size + 31) // 32
 
         # Shared memory for 3 values
-        sh_mean = f"shared_{self._shared_counter}"; self._shared_counter += 1
-        sh_m2 = f"shared_{self._shared_counter}"; self._shared_counter += 1
-        sh_w = f"shared_{self._shared_counter}"; self._shared_counter += 1
+        sh_mean = f"shared_{self._shared_counter}"
+        self._shared_counter += 1
+        sh_m2 = f"shared_{self._shared_counter}"
+        self._shared_counter += 1
+        sh_w = f"shared_{self._shared_counter}"
+        self._shared_counter += 1
         self.kb.declare_threadgroup_array(sh_mean, dtype="fp32", size=n_simd_groups)
         self.kb.declare_threadgroup_array(sh_m2, dtype="fp32", size=n_simd_groups)
         self.kb.declare_threadgroup_array(sh_w, dtype="fp32", size=n_simd_groups)
 
-        wm = self._next_var("wm")   # working mean
-        wv = self._next_var("wv")    # working m2
-        ww = self._next_var("ww")    # working weight
-        rm = self._next_var("rm")    # result mean
-        rv = self._next_var("rv")    # result m2
-        rw = self._next_var("rw")    # result weight
+        wm = self._next_var("wm")  # working mean
+        wv = self._next_var("wv")  # working m2
+        ww = self._next_var("ww")  # working weight
+        rm = self._next_var("rm")  # result mean
+        rv = self._next_var("rv")  # result m2
+        rw = self._next_var("rw")  # result weight
 
         self.kb.raw_line(f"    // Welford reduce")
         self.kb.raw_line(f"    float {wm} = {mean_var};")
@@ -1219,7 +1264,6 @@ class _ReduceScanMixin:
             self.env[ssa.result_ids[2]] = rw
             self.env_types[ssa.result_ids[2]] = "fp32"
 
-
     def _lower_reduce_argminmax(self, ssa: SSAValue):
         """Argmax/argmin: value + index via SIMD shuffle + shared memory."""
         val_var = self._lookup(ssa.operand_ids[0])
@@ -1235,11 +1279,14 @@ class _ReduceScanMixin:
         # 'no matching simd_shuffle_down' compile error.
         if val_dtype in ("i64", "u64", "ui64"):
             from triton_msl.errors import MetalNonRecoverableError
+
             raise MetalNonRecoverableError(
                 "argmax/argmin over a 64-bit integer value is not supported (the SIMD-shuffle "
                 "reduction has no 64-bit path; a 32-bit staging would silently truncate the "
                 "high word and return the wrong index). Refusing. Cast the values to int32 or "
-                "float first.", op_name="tt.reduce")
+                "float first.",
+                op_name="tt.reduce",
+            )
         # uint8/16/32 are the SIGNLESS i8/i16/i32 in Triton — a signed compare picks the
         # wrong arg index above the sign bit. Stage + compare as uint when the combine is
         # unsigned (arith.cmpi ugt/ult). 64-bit already refused above.
@@ -1283,8 +1330,9 @@ class _ReduceScanMixin:
         self.kb.raw_line(f"    for (ushort _d = 16; _d >= 1; _d >>= 1) {{")
         self.kb.raw_line(f"        {msl_val_type} _ov = simd_shuffle_down({mv}, _d);")
         self.kb.raw_line(f"        int _oi = simd_shuffle_down({mi}, _d);")
-        self.kb.raw_line(f"        bool _take = ((lid + _d) < {_bs}u) && "
-                         f"((_ov {cmp_op} {mv}) || (_ov == {mv} && _oi < {mi}));")
+        self.kb.raw_line(
+            f"        bool _take = ((lid + _d) < {_bs}u) && ((_ov {cmp_op} {mv}) || (_ov == {mv} && _oi < {mi}));"
+        )
         self.kb.raw_line(f"        {mv} = _take ? _ov : {mv};")
         self.kb.raw_line(f"        {mi} = _take ? _oi : {mi};")
         self.kb.raw_line(f"    }}")
@@ -1330,7 +1378,6 @@ class _ReduceScanMixin:
             self.env[ssa.result_ids[1]] = result_idx
             self.env_types[ssa.result_ids[1]] = "i32"
 
-
     def _lower_reduce_2d_argminmax(self, ssa, axis, input_shape):
         """Lower 2D argmin/argmax: find min/max value and index along axis.
 
@@ -1344,10 +1391,12 @@ class _ReduceScanMixin:
         # the index (column-0's index to every column); rectangular tiles are correct.
         if axis == 0 and M == N:
             from triton_msl.errors import MetalNonRecoverableError
+
             raise MetalNonRecoverableError(
                 "2-D argmin/argmax along axis=0 on a square (M==N) tile mis-broadcasts "
                 "the index. Refusing. Use a non-square tile or reduce along axis=1.",
-                op_name="tt.reduce")
+                op_name="tt.reduce",
+            )
         # (#5 reduce-probe) axis=1, BOTH value AND index consumed: the value is moved to
         # simple layout (convert_layout) before its store but the index is not, so the
         # index store broadcasts row-0's index. Index-only / value-only is correct.
@@ -1357,11 +1406,13 @@ class _ReduceScanMixin:
                 _used_ids.update(o.operand_ids or [])
             if ssa.result_ids[0] in _used_ids and ssa.result_ids[1] in _used_ids:
                 from triton_msl.errors import MetalNonRecoverableError
+
                 raise MetalNonRecoverableError(
                     "2-D argmin/argmax along axis=1 with BOTH the value and the index "
                     "consumed mis-stores the index (broadcasts row-0's index). Refusing. "
                     "Use the value or the index alone, or separate kernels.",
-                    op_name="tt.reduce")
+                    op_name="tt.reduce",
+                )
 
         val_var = self._lookup(ssa.operand_ids[0])
         idx_var = self._lookup(ssa.operand_ids[1])
@@ -1384,7 +1435,7 @@ class _ReduceScanMixin:
         elif is_i64:
             msl_val_type, val_shared_dtype = ("ulong", "u64") if _u64 else ("long", "i64")
         elif _unsigned:
-            msl_val_type, val_shared_dtype = "uint", "u32"   # uint8/16/32 widen to uint
+            msl_val_type, val_shared_dtype = "uint", "u32"  # uint8/16/32 widen to uint
         else:
             msl_val_type, val_shared_dtype = "int", "i32"
 
@@ -1392,11 +1443,11 @@ class _ReduceScanMixin:
         cmp_op = ">" if is_max else "<"
         identity = "(-INFINITY)" if is_max and not is_int else "INFINITY"
         if is_int:
-            if _u64:                                       # unsigned 64-bit (incl signless i64)
+            if _u64:  # unsigned 64-bit (incl signless i64)
                 identity = "0" if is_max else "ULONG_MAX"
-            elif is_i64:                                   # signed 64-bit
+            elif is_i64:  # signed 64-bit
                 identity = "LONG_MIN" if is_max else "LONG_MAX"
-            elif _unsigned:                                # uint8/16/32
+            elif _unsigned:  # uint8/16/32
                 identity = "0" if is_max else "UINT_MAX"
             else:
                 identity = "INT_MIN" if is_max else "INT_MAX"
@@ -1500,7 +1551,6 @@ class _ReduceScanMixin:
             for rid in ssa.result_ids:
                 self.env_shapes[rid] = out_shape
 
-
     def _has_combined_2d_reduce(self):
         """True if two DIFFERENT 2-D axis-reduce results are the two operands of one
         binary arithmetic op (e.g. tl.sum(x,1) + tl.max(x,1)).
@@ -1526,12 +1576,11 @@ class _ReduceScanMixin:
                 _ish = _extract_shape(_it) if _it else None
                 if _ish and len(_ish) == 2:
                     reduce_ids.add(s.id)
-                    for _rid in (s.result_ids or []):
+                    for _rid in s.result_ids or []:
                         reduce_ids.add(_rid)
         if len(reduce_ids) < 2:
             return False
-        _LAYOUT = {"tt.broadcast", "tt.expand_dims", "ttg.convert_layout",
-                   "tt.reshape", "tt.splat"}
+        _LAYOUT = {"tt.broadcast", "tt.expand_dims", "ttg.convert_layout", "tt.reshape", "tt.splat"}
 
         def _to_reduce(sid, depth=0, seen=None):
             if seen is None:
@@ -1547,9 +1596,20 @@ class _ReduceScanMixin:
             if op.op in _LAYOUT:
                 return _to_reduce(op.operand_ids[0], depth + 1, seen)
             return None
-        _BIN = {"arith.addf", "arith.subf", "arith.mulf", "arith.divf",
-                "arith.addi", "arith.subi", "arith.muli", "arith.maxnumf",
-                "arith.minnumf", "arith.maximumf", "arith.minimumf"}
+
+        _BIN = {
+            "arith.addf",
+            "arith.subf",
+            "arith.mulf",
+            "arith.divf",
+            "arith.addi",
+            "arith.subi",
+            "arith.muli",
+            "arith.maxnumf",
+            "arith.minnumf",
+            "arith.maximumf",
+            "arith.minimumf",
+        }
         for s in all_ops:
             if s.op in _BIN and s.operand_ids and len(s.operand_ids) >= 2:
                 r0 = _to_reduce(s.operand_ids[0])
@@ -1558,8 +1618,7 @@ class _ReduceScanMixin:
                     return True
         return False
 
-    def _lower_reduce_2d(self, ssa, input_var, axis, combine_op,
-                         msl_type, shared_dtype, input_shape):
+    def _lower_reduce_2d(self, ssa, input_var, axis, combine_op, msl_type, shared_dtype, input_shape):
         """Lower a 2D axis-specific reduction.
 
         For axis=1 on (M, N): each of M rows sums its N values.
@@ -1578,11 +1637,14 @@ class _ReduceScanMixin:
         # silently mis-compute. Single reduces, separate stores, and 1-D combines are fine.
         if self._has_combined_2d_reduce():
             from triton_msl.errors import MetalNonRecoverableError
+
             raise MetalNonRecoverableError(
                 "two 2-D axis reductions combined in one arithmetic expression (e.g. "
                 "tl.sum(x,1) + tl.max(x,1)) mis-compute a subset of rows — the combined "
                 "result is not layout-converted before the store. Refusing. Use separate "
-                "stores, or reduce to 1-D.", op_name="tt.reduce")
+                "stores, or reduce to 1-D.",
+                op_name="tt.reduce",
+            )
 
         # UNDER-FILL guard (re-audit #14, twin of the >block_size over-fill guard). Inside
         # control flow the threadgroup is forced to the num_warps*32 minimum, so a small
@@ -1598,33 +1660,36 @@ class _ReduceScanMixin:
         # shared-memory staging/result reuse corrupts iterations 2+ so every row collapses
         # to the first row's value (reduce-fuzzer: T=1 fp16 correct, T>=2 WRONG; fp32 fine
         # at any T). Refuse fp16/bf16 in-loop 2-D reduces; fp32 + no-loop are unaffected.
-        _in_dt = (self.env_types.get(ssa.operand_ids[0], "fp32")
-                  if ssa.operand_ids else "fp32")
-        if (getattr(self, "_control_flow_depth", 0) > 0
-                and _in_dt in ("fp16", "bf16")):
+        _in_dt = self.env_types.get(ssa.operand_ids[0], "fp32") if ssa.operand_ids else "fp32"
+        if getattr(self, "_control_flow_depth", 0) > 0 and _in_dt in ("fp16", "bf16"):
             from triton_msl.errors import MetalNonRecoverableError
+
             raise MetalNonRecoverableError(
                 "in-loop 2-D reduction of fp16/bf16 input is mis-staged across iterations "
                 "(silent-wrong: rows collapse to the first). Refusing. Reduce in fp32, or "
-                "outside the loop.", op_name="tt.reduce")
+                "outside the loop.",
+                op_name="tt.reduce",
+            )
 
         _tg_threads = max(max(1, getattr(self.graph, "num_warps", 1)) * 32, 256)
-        if (getattr(self, "_control_flow_depth", 0) > 0
-                and total < _tg_threads):
+        if getattr(self, "_control_flow_depth", 0) > 0 and total < _tg_threads:
             from triton_msl.errors import MetalNonRecoverableError
+
             raise MetalNonRecoverableError(
                 f"Refusing in-loop 2-D reduction of a {tuple(input_shape)} tile that "
                 f"under-fills the {_tg_threads}-thread group "
                 f"(M*N={total} < block_size): the surplus threads corrupt the staged "
                 f"reduce (silent-wrong). Use a tile with M*N >= block_size, or reduce "
-                f"outside the loop.", op_name="tt.reduce")
+                f"outside the loop.",
+                op_name="tt.reduce",
+            )
 
         # Check if the input data is already in a shared memory array (e.g.,
         # from a dot result or local_alloc). If so, skip the copy and reuse it.
         input_id = ssa.operand_ids[0] if ssa.operand_ids else None
         existing_shared = None
         if input_id is not None:
-            existing_shared = getattr(self, '_shared_mem_descs', {}).get(input_id)
+            existing_shared = getattr(self, "_shared_mem_descs", {}).get(input_id)
 
         if existing_shared:
             shared_name = existing_shared[0]
@@ -1638,8 +1703,7 @@ class _ReduceScanMixin:
         # Identity + combine expression. Must branch on the actual MSL type:
         # long/ulong need 64-bit identities and the integer max/min overload,
         # not the 32-bit INT_MIN/INT_MAX or the float fmax/fmin.
-        identity, combine_expr = self._reduce_identity_combine(
-            combine_op, msl_type)
+        identity, combine_expr = self._reduce_identity_combine(combine_op, msl_type)
 
         result_var = self._next_var("reduced")
 
@@ -1659,9 +1723,7 @@ class _ReduceScanMixin:
                 # last-writer-wins).  Threads whose mapped index is out of
                 # range (shouldn't happen for consistent layouts) are guarded.
                 bs = self.effective_block_size
-                self.kb.raw_line(
-                    f"    if (lid < {bs}u) {shared_name}[{input_bcast_idx}] = {input_var};"
-                )
+                self.kb.raw_line(f"    if (lid < {bs}u) {shared_name}[{input_bcast_idx}] = {input_var};")
             else:
                 self.kb.raw_line(f"    if (lid < {total}u) {shared_name}[lid] = {input_var};")
             self.kb.raw_line(f"    threadgroup_barrier(mem_flags::mem_threadgroup);")
@@ -1720,9 +1782,7 @@ class _ReduceScanMixin:
         else:
             self.env_shapes[ssa.id] = (N,)
 
-
-    def _lower_reduce_3d(self, ssa, input_var, axis, combine_op,
-                         msl_type, shared_dtype, input_shape):
+    def _lower_reduce_3d(self, ssa, input_var, axis, combine_op, msl_type, shared_dtype, input_shape):
         """Lower a 3D axis-specific reduction.
 
         For (M, N, K) tensor reducing along axis:
@@ -1756,8 +1816,7 @@ class _ReduceScanMixin:
             input_bcast_idx = self._bcast_layout.get(ssa.operand_ids[0])
 
         # Identity and combine expression (4-way: float/long/ulong/int).
-        identity, combine_expr = self._reduce_identity_combine(
-            combine_op, msl_type)
+        identity, combine_expr = self._reduce_identity_combine(combine_op, msl_type)
 
         # Allocate shared memory for the full 3D tensor
         shared_name = f"shared_{self._shared_counter}"
@@ -1769,9 +1828,7 @@ class _ReduceScanMixin:
         if total <= block_size:
             if input_bcast_idx is not None:
                 # Non-canonical layout: write at bcast position.
-                self.kb.raw_line(
-                    f"    if (lid < {block_size}u) {shared_name}[{input_bcast_idx}] = {input_var};"
-                )
+                self.kb.raw_line(f"    if (lid < {block_size}u) {shared_name}[{input_bcast_idx}] = {input_var};")
             else:
                 self.kb.raw_line(f"    if (lid < {total}u) {shared_name}[lid] = {input_var};")
         else:
@@ -1863,12 +1920,9 @@ class _ReduceScanMixin:
         # Downstream reduces/stores use this to re-stage data correctly when
         # the logical mapping is not lid → lid.
         self._bcast_layout[ssa.id] = f"({read_idx})"
-        self._register_bcast_layout_by_type(ssa.type_str, tuple(result_dims),
-                                            f"({read_idx})")
+        self._register_bcast_layout_by_type(ssa.type_str, tuple(result_dims), f"({read_idx})")
 
-
-    def _lower_reduce_nd(self, ssa, input_var, axis, combine_op,
-                         msl_type, shared_dtype, input_shape):
+    def _lower_reduce_nd(self, ssa, input_var, axis, combine_op, msl_type, shared_dtype, input_shape):
         """Lower an axis-specific reduction for N-D tensors (N >= 4).
 
         Used by tl.sort's bitonic decomposition, which reshapes to (2,)*n and
@@ -1893,10 +1947,13 @@ class _ReduceScanMixin:
         # a direct store. Refuse a non-xor N-D reduce rather than silently mis-compute.
         if combine_op != "xor":
             from triton_msl.errors import MetalNonRecoverableError
+
             raise MetalNonRecoverableError(
                 f"N-D (rank {len(input_shape)}) tl.reduce with a '{combine_op}' combine "
                 f"is not correctly lowered (the result compaction is wrong for all axes). "
-                f"Refusing. Reduce in <= 3 dimensions.", op_name="tt.reduce")
+                f"Refusing. Reduce in <= 3 dimensions.",
+                op_name="tt.reduce",
+            )
         n = len(input_shape)
         total = 1
         for s in input_shape:
@@ -1909,7 +1966,7 @@ class _ReduceScanMixin:
             src_strides[i] = src_strides[i + 1] * input_shape[i + 1]
 
         # Result shape = input_shape with axis removed
-        result_shape = tuple(input_shape[:axis]) + tuple(input_shape[axis + 1:])
+        result_shape = tuple(input_shape[:axis]) + tuple(input_shape[axis + 1 :])
         result_total = 1
         for s in result_shape:
             result_total *= s
@@ -1926,8 +1983,7 @@ class _ReduceScanMixin:
                 break
 
         # Identity and combine expression (4-way: float/long/ulong/int).
-        identity, combine_expr = self._reduce_identity_combine(
-            combine_op, msl_type)
+        identity, combine_expr = self._reduce_identity_combine(combine_op, msl_type)
 
         # Check if input has a tracked broadcast layout. If so, thread `lid`
         # does not hold the value at flat position `lid` — it holds the value
@@ -1942,13 +1998,12 @@ class _ReduceScanMixin:
         input_id = ssa.operand_ids[0] if ssa.operand_ids else None
         existing_shared = None
         if input_id is not None:
-            existing_shared = getattr(self, '_shared_mem_descs', {}).get(input_id)
+            existing_shared = getattr(self, "_shared_mem_descs", {}).get(input_id)
 
         # Allocate shared memory for the full N-D tensor
         shared_name = f"shared_{self._shared_counter}"
         self._shared_counter += 1
-        self.kb.declare_threadgroup_array(
-            shared_name, dtype=shared_dtype, size=total)
+        self.kb.declare_threadgroup_array(shared_name, dtype=shared_dtype, size=total)
 
         # Stage values to shared memory from the already-computed input_var
         if total <= block_size:
@@ -1957,35 +2012,26 @@ class _ReduceScanMixin:
                 # input_bcast_idx. Write accordingly. Multiple threads may
                 # map to the same logical position (broadcast redundancy);
                 # they all write the same value so last-writer-wins is safe.
-                self.kb.raw_line(
-                    f"    if (lid < {block_size}u) {shared_name}[{input_bcast_idx}] = {input_var};"
-                )
+                self.kb.raw_line(f"    if (lid < {block_size}u) {shared_name}[{input_bcast_idx}] = {input_var};")
             else:
-                self.kb.raw_line(
-                    f"    if (lid < {total}u) {shared_name}[lid] = {input_var};")
+                self.kb.raw_line(f"    if (lid < {total}u) {shared_name}[lid] = {input_var};")
         else:
             if x_ptr_name is None:
                 # Fallback — cannot handle without a source pointer
                 return
-            self.kb.raw_line(
-                f"    for (uint _e = lid; _e < {total}u; _e += {block_size}u) {{")
-            self.kb.raw_line(
-                f"        {shared_name}[_e] = ({msl_type}){x_ptr_name}[_e];")
+            self.kb.raw_line(f"    for (uint _e = lid; _e < {total}u; _e += {block_size}u) {{")
+            self.kb.raw_line(f"        {shared_name}[_e] = ({msl_type}){x_ptr_name}[_e];")
             self.kb.raw_line(f"    }}")
-        self.kb.raw_line(
-            f"    threadgroup_barrier(mem_flags::mem_threadgroup);")
+        self.kb.raw_line(f"    threadgroup_barrier(mem_flags::mem_threadgroup);")
 
         # Allocate result shared memory
         result_shared = f"shared_{self._shared_counter}"
         self._shared_counter += 1
-        self.kb.declare_threadgroup_array(
-            result_shared, dtype=shared_dtype, size=result_total)
+        self.kb.declare_threadgroup_array(result_shared, dtype=shared_dtype, size=result_total)
 
         # Per-output-position reduction: thread _r reduces along the reduce axis
         axis_size = input_shape[axis]
-        self.kb.raw_line(
-            f"    for (uint _r = lid; _r < {result_total}u; "
-            f"_r += {block_size}u) {{")
+        self.kb.raw_line(f"    for (uint _r = lid; _r < {result_total}u; _r += {block_size}u) {{")
         self.kb.raw_line(f"        {msl_type} acc = {identity};")
 
         # Decompose _r into result coords, then build src base offset by
@@ -2013,17 +2059,13 @@ class _ReduceScanMixin:
                 parts.append(f"{coord} * {ss}u")
             self.kb.raw_line(f"        uint _base = {' + '.join(parts)};")
 
-        self.kb.raw_line(
-            f"        for (uint _a = 0; _a < {axis_size}u; _a++) {{")
-        self.kb.raw_line(
-            f"            {msl_type} val = {shared_name}"
-            f"[_base + _a * {src_strides[axis]}u];")
+        self.kb.raw_line(f"        for (uint _a = 0; _a < {axis_size}u; _a++) {{")
+        self.kb.raw_line(f"            {msl_type} val = {shared_name}[_base + _a * {src_strides[axis]}u];")
         self.kb.raw_line(f"            acc = {combine_expr};")
         self.kb.raw_line(f"        }}")
         self.kb.raw_line(f"        {result_shared}[_r] = acc;")
         self.kb.raw_line(f"    }}")
-        self.kb.raw_line(
-            f"    threadgroup_barrier(mem_flags::mem_threadgroup);")
+        self.kb.raw_line(f"    threadgroup_barrier(mem_flags::mem_threadgroup);")
 
         # Readback: each thread computes the result position corresponding to
         # its own coords in the original N-D tensor, with axis d removed.
@@ -2040,8 +2082,7 @@ class _ReduceScanMixin:
         lid_input = input_bcast_idx if input_bcast_idx is not None else "lid"
         result_var = self._next_var("reduced")
         if nr == 0:
-            self.kb.raw_line(
-                f"    {msl_type} {result_var} = {result_shared}[0];")
+            self.kb.raw_line(f"    {msl_type} {result_var} = {result_shared}[0];")
             result_read_idx = None
         else:
             read_parts = []
@@ -2059,8 +2100,7 @@ class _ReduceScanMixin:
                 else:
                     read_parts.append(f"{coord} * {rs}u")
             read_idx = " + ".join(read_parts)
-            self.kb.raw_line(
-                f"    {msl_type} {result_var} = {result_shared}[{read_idx}];")
+            self.kb.raw_line(f"    {msl_type} {result_var} = {result_shared}[{read_idx}];")
             result_read_idx = read_idx
         # Barrier after the broadcast read — guards the result array against a following op's
         # re-stage (the recurring shared-memory-race class; cf. _lower_reduce_2d / _3d / the
@@ -2075,9 +2115,7 @@ class _ReduceScanMixin:
         # store, make_range rewrite) use this to re-stage data correctly.
         if result_read_idx is not None and nr >= 2:
             self._bcast_layout[ssa.id] = f"({result_read_idx})"
-            self._register_bcast_layout_by_type(ssa.type_str, tuple(result_shape),
-                                                f"({result_read_idx})")
-
+            self._register_bcast_layout_by_type(ssa.type_str, tuple(result_shape), f"({result_read_idx})")
 
     def _lower_scan(self, ssa: SSAValue):
         """tt.scan → prefix scan via shared memory.
@@ -2104,8 +2142,7 @@ class _ReduceScanMixin:
         is_1d = False
         input_shape = _extract_shape(ssa.type_str)
         if not input_shape or len(input_shape) < 2:
-            input_shape = _extract_shape(
-                self._find_op_type_str(ssa.operand_ids[0]))
+            input_shape = _extract_shape(self._find_op_type_str(ssa.operand_ids[0]))
         if not input_shape or len(input_shape) < 2:
             # 1D tensor: treat as (1, size) and scan along axis=1
             sz = input_shape[0] if input_shape else self.effective_block_size
@@ -2125,12 +2162,14 @@ class _ReduceScanMixin:
         # The MSL scan has no multi-element-per-thread path, so refuse loudly.
         if total > 1024:
             from triton_msl.errors import MetalNonRecoverableError
+
             raise MetalNonRecoverableError(
                 f"Refusing a {total}-element scan (tl.cumsum / associative_scan): "
                 f"Metal allows at most 1024 threads per threadgroup and the scan maps "
                 f"one element per thread, so elements past 1024 would be left "
                 f"uninitialized and the result silently wrong. Reduce the scan tile to "
-                f"<= 1024 elements.")
+                f"<= 1024 elements."
+            )
 
         # Determine element type and MSL type
         input_dtype = self.env_types.get(ssa.operand_ids[0], "fp32")
@@ -2149,28 +2188,28 @@ class _ReduceScanMixin:
             _slot_dtypes = {self.env_types.get(o, "fp32") for o in ssa.operand_ids}
             if len(_slot_dtypes) > 1:
                 from triton_msl.errors import MetalNonRecoverableError
+
                 raise MetalNonRecoverableError(
                     "multi-value tl.associative_scan with mixed operand dtypes is not "
                     "supported — all slots would be staged with the first operand's "
-                    "dtype, silently truncating the others. Refusing.", op_name="tt.scan")
+                    "dtype, silently truncating the others. Refusing.",
+                    op_name="tt.scan",
+                )
 
         # Allocate shared memory for each input value
         shared_names = []
         for i in range(n_values):
             shared_name = f"scan_shared_{self._shared_counter}"
             self._shared_counter += 1
-            self.kb.declare_threadgroup_array(shared_name, dtype=shared_dtype,
-                                              size=total)
+            self.kb.declare_threadgroup_array(shared_name, dtype=shared_dtype, size=total)
             shared_names.append(shared_name)
 
         # Write input values to shared memory
         for i, operand_id in enumerate(ssa.operand_ids):
             input_var = self._lookup(operand_id)
             cast = f"({msl_type})" if input_dtype == "bf16" else ""
-            self.kb.raw_line(
-                f"    if (lid < {total}u) {shared_names[i]}[lid] = {cast}{input_var};")
-        self.kb.raw_line(
-            f"    threadgroup_barrier(mem_flags::mem_threadgroup);")
+            self.kb.raw_line(f"    if (lid < {total}u) {shared_names[i]}[lid] = {cast}{input_var};")
+        self.kb.raw_line(f"    threadgroup_barrier(mem_flags::mem_threadgroup);")
 
         # Compute position and base expressions
         if axis == 1:
@@ -2197,16 +2236,13 @@ class _ReduceScanMixin:
                     init_idx = f"(lid % {N}u)"
                 else:
                     init_idx = f"({(M - 1)}u * {N}u + (lid % {N}u))"
-            self.kb.raw_line(
-                f"    {msl_type} {acc_var} = ({msl_type}){shared_names[i]}[{init_idx}];")
+            self.kb.raw_line(f"    {msl_type} {acc_var} = ({msl_type}){shared_names[i]}[{init_idx}];")
 
         # Emit scan loop
         if not reverse:
-            self.kb.raw_line(
-                f"    for (uint scan_j = 1u; scan_j <= {pos_expr}; scan_j++) {{")
+            self.kb.raw_line(f"    for (uint scan_j = 1u; scan_j <= {pos_expr}; scan_j++) {{")
         else:
-            self.kb.raw_line(
-                f"    for (uint scan_j = 1u; scan_j <= ({scan_size - 1}u - {pos_expr}); scan_j++) {{")
+            self.kb.raw_line(f"    for (uint scan_j = 1u; scan_j <= ({scan_size - 1}u - {pos_expr}); scan_j++) {{")
 
         # Load current elements (rhs) from shared memory
         rhs_vars = []
@@ -2223,8 +2259,7 @@ class _ReduceScanMixin:
                     idx_expr = f"scan_j * {N}u + (lid % {N}u)"
                 else:
                     idx_expr = f"({M - 1}u - scan_j) * {N}u + (lid % {N}u)"
-            self.kb.raw_line(
-                f"        {msl_type} {rhs_var} = ({msl_type}){shared_names[i]}[{idx_expr}];")
+            self.kb.raw_line(f"        {msl_type} {rhs_var} = ({msl_type}){shared_names[i]}[{idx_expr}];")
 
         # Map block args to accumulator (lhs) and current element (rhs) vars
         block_arg_ids = ssa.attrs.get("block_arg_ids", [])
@@ -2266,24 +2301,18 @@ class _ReduceScanMixin:
         # For 1D scans, subsequent reshape+broadcast needs all threads to access
         # the scan results. Write back to shared memory and read with modular index.
         if is_1d and total < self.effective_block_size:
-            self.kb.raw_line(
-                f"    if (lid < {total}u) {shared_names[0]}[lid] = {acc_vars[0]};")
-            self.kb.raw_line(
-                f"    threadgroup_barrier(mem_flags::mem_threadgroup);")
+            self.kb.raw_line(f"    if (lid < {total}u) {shared_names[0]}[lid] = {acc_vars[0]};")
+            self.kb.raw_line(f"    threadgroup_barrier(mem_flags::mem_threadgroup);")
             result_var = self._next_var("scan_result")
-            self.kb.raw_line(
-                f"    {msl_type} {result_var} = ({msl_type}){shared_names[0]}[lid % {total}u];")
+            self.kb.raw_line(f"    {msl_type} {result_var} = ({msl_type}){shared_names[0]}[lid % {total}u];")
             for i in range(1, n_values):
-                self.kb.raw_line(
-                    f"    if (lid < {total}u) {shared_names[i]}[lid] = {acc_vars[i]};")
+                self.kb.raw_line(f"    if (lid < {total}u) {shared_names[i]}[lid] = {acc_vars[i]};")
             if n_values > 1:
-                self.kb.raw_line(
-                    f"    threadgroup_barrier(mem_flags::mem_threadgroup);")
+                self.kb.raw_line(f"    threadgroup_barrier(mem_flags::mem_threadgroup);")
             acc_vars_out = [result_var]
             for i in range(1, n_values):
                 rv = self._next_var("scan_result")
-                self.kb.raw_line(
-                    f"    {msl_type} {rv} = ({msl_type}){shared_names[i]}[lid % {total}u];")
+                self.kb.raw_line(f"    {msl_type} {rv} = ({msl_type}){shared_names[i]}[lid % {total}u];")
                 acc_vars_out.append(rv)
         else:
             acc_vars_out = acc_vars
@@ -2300,5 +2329,3 @@ class _ReduceScanMixin:
             self.env_shapes[ssa.id] = input_shape
 
     # -- Shared memory ops (ttg.local_alloc / ttg.local_load) --
-
-

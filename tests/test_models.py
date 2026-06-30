@@ -18,18 +18,19 @@ import torch.nn as nn
 # can't run here. The gate auto-lifts the instant the running torch supports it.
 pytestmark = pytest.mark.skipif(
     not torch._dynamo.is_dynamo_supported(),
-    reason="torch.compile/TorchDynamo unsupported in this interpreter "
-    "(torch._dynamo.is_dynamo_supported() is False).",
+    reason="torch.compile/TorchDynamo unsupported in this interpreter (torch._dynamo.is_dynamo_supported() is False).",
 )
 
 try:
     from transformers import GPT2LMHeadModel, GPT2Config
+
     HAS_TRANSFORMERS = True
 except ImportError:
     HAS_TRANSFORMERS = False
 
 try:
     from torchvision.models import resnet18, resnet50, ResNet18_Weights, ResNet50_Weights
+
     HAS_TORCHVISION = True
 except ImportError:
     HAS_TORCHVISION = False
@@ -46,6 +47,7 @@ def setup_backend():
     is not fork-safe); the backend owns that requirement, so tests don't set it.
     """
     import triton_msl.inductor
+
     triton_msl.inductor.register_metal_triton_backend()
     torch._dynamo.reset()
     yield
@@ -75,14 +77,18 @@ def _warmup_and_bench(fn, n_warmup=3, n_iter=10):
 
 @pytest.mark.skipif(not HAS_TRANSFORMERS, reason="transformers not installed")
 class TestGPT2:
-
     def test_gpt2_tiny_forward(self):
         """GPT-2 tiny (2 layer, 128 dim) forward pass."""
         torch.manual_seed(42)
         config = GPT2Config(
-            n_layer=2, n_head=4, n_embd=128,
-            vocab_size=1000, n_positions=64,
-            attn_pdrop=0.0, embd_pdrop=0.0, resid_pdrop=0.0,
+            n_layer=2,
+            n_head=4,
+            n_embd=128,
+            vocab_size=1000,
+            n_positions=64,
+            attn_pdrop=0.0,
+            embd_pdrop=0.0,
+            resid_pdrop=0.0,
         )
         model = GPT2LMHeadModel(config)
         model.eval()
@@ -98,17 +104,20 @@ class TestGPT2:
         # Metal compute precision can differ from MPS eager. Use cosine similarity.
         expected_flat = expected.cpu().float().flatten()
         result_flat = result.cpu().float().flatten()
-        cos_sim = torch.nn.functional.cosine_similarity(
-            expected_flat.unsqueeze(0), result_flat.unsqueeze(0)
-        ).item()
+        cos_sim = torch.nn.functional.cosine_similarity(expected_flat.unsqueeze(0), result_flat.unsqueeze(0)).item()
         assert cos_sim > 0.95, f"GPT-2 tiny: cosine_sim={cos_sim:.6f} (want > 0.95)"
 
     def test_gpt2_small_forward(self):
         """GPT-2 small (6 layer, 384 dim) forward pass."""
         config = GPT2Config(
-            n_layer=6, n_head=6, n_embd=384,
-            vocab_size=5000, n_positions=128,
-            attn_pdrop=0.0, embd_pdrop=0.0, resid_pdrop=0.0,
+            n_layer=6,
+            n_head=6,
+            n_embd=384,
+            vocab_size=5000,
+            n_positions=128,
+            attn_pdrop=0.0,
+            embd_pdrop=0.0,
+            resid_pdrop=0.0,
         )
         model = GPT2LMHeadModel(config)
         model.eval()
@@ -122,18 +131,21 @@ class TestGPT2:
 
         expected_flat = expected.cpu().float().flatten()
         result_flat = result.cpu().float().flatten()
-        cos_sim = torch.nn.functional.cosine_similarity(
-            expected_flat.unsqueeze(0), result_flat.unsqueeze(0)
-        ).item()
+        cos_sim = torch.nn.functional.cosine_similarity(expected_flat.unsqueeze(0), result_flat.unsqueeze(0)).item()
         assert cos_sim > 0.98, f"GPT-2 small: cosine_sim={cos_sim:.6f} (want > 0.98)"
 
     def test_gpt2_tiny_generation(self):
         """GPT-2 tiny token-by-token generation — verify compiled model produces valid output."""
         torch.manual_seed(42)
         config = GPT2Config(
-            n_layer=2, n_head=4, n_embd=128,
-            vocab_size=1000, n_positions=64,
-            attn_pdrop=0.0, embd_pdrop=0.0, resid_pdrop=0.0,
+            n_layer=2,
+            n_head=4,
+            n_embd=128,
+            vocab_size=1000,
+            n_positions=64,
+            attn_pdrop=0.0,
+            embd_pdrop=0.0,
+            resid_pdrop=0.0,
         )
         model = GPT2LMHeadModel(config)
         model.eval()
@@ -156,9 +168,14 @@ class TestGPT2:
     def test_gpt2_small_benchmark(self):
         """Benchmark GPT-2 small forward pass: eager vs compiled."""
         config = GPT2Config(
-            n_layer=6, n_head=6, n_embd=384,
-            vocab_size=5000, n_positions=128,
-            attn_pdrop=0.0, embd_pdrop=0.0, resid_pdrop=0.0,
+            n_layer=6,
+            n_head=6,
+            n_embd=384,
+            vocab_size=5000,
+            n_positions=128,
+            attn_pdrop=0.0,
+            embd_pdrop=0.0,
+            resid_pdrop=0.0,
         )
         model = GPT2LMHeadModel(config)
         model.eval()
@@ -167,21 +184,17 @@ class TestGPT2:
 
         with torch.no_grad():
             # Eager benchmark
-            eager_min, eager_avg = _warmup_and_bench(
-                lambda: model(input_ids), n_warmup=3, n_iter=10
-            )
+            eager_min, eager_avg = _warmup_and_bench(lambda: model(input_ids), n_warmup=3, n_iter=10)
 
             # Compiled benchmark
             compiled = torch.compile(model, backend="inductor")
             compiled(input_ids)  # first compile
-            comp_min, comp_avg = _warmup_and_bench(
-                lambda: compiled(input_ids), n_warmup=3, n_iter=10
-            )
+            comp_min, comp_avg = _warmup_and_bench(lambda: compiled(input_ids), n_warmup=3, n_iter=10)
 
         print(f"\nGPT-2 small forward (1x64 tokens):")
-        print(f"  Eager:    {eager_min*1000:.1f}ms min, {eager_avg*1000:.1f}ms avg")
-        print(f"  Compiled: {comp_min*1000:.1f}ms min, {comp_avg*1000:.1f}ms avg")
-        print(f"  Speedup:  {eager_min/comp_min:.2f}x min, {eager_avg/comp_avg:.2f}x avg")
+        print(f"  Eager:    {eager_min * 1000:.1f}ms min, {eager_avg * 1000:.1f}ms avg")
+        print(f"  Compiled: {comp_min * 1000:.1f}ms min, {comp_avg * 1000:.1f}ms avg")
+        print(f"  Speedup:  {eager_min / comp_min:.2f}x min, {eager_avg / comp_avg:.2f}x avg")
 
 
 # ---------------------------------------------------------------------------
@@ -191,7 +204,6 @@ class TestGPT2:
 
 @pytest.mark.skipif(not HAS_TORCHVISION, reason="torchvision not installed")
 class TestVisionModels:
-
     def test_resnet18_forward(self):
         """ResNet-18 forward pass."""
         model = resnet18(weights=None)
@@ -206,9 +218,7 @@ class TestVisionModels:
 
         expected_flat = expected.cpu().float().flatten()
         result_flat = result.cpu().float().flatten()
-        cos_sim = torch.nn.functional.cosine_similarity(
-            expected_flat.unsqueeze(0), result_flat.unsqueeze(0)
-        ).item()
+        cos_sim = torch.nn.functional.cosine_similarity(expected_flat.unsqueeze(0), result_flat.unsqueeze(0)).item()
         assert cos_sim > 0.99, f"ResNet-18: cosine_sim={cos_sim:.6f} (want > 0.99)"
 
     def test_resnet50_forward(self):
@@ -225,9 +235,7 @@ class TestVisionModels:
 
         expected_flat = expected.cpu().float().flatten()
         result_flat = result.cpu().float().flatten()
-        cos_sim = torch.nn.functional.cosine_similarity(
-            expected_flat.unsqueeze(0), result_flat.unsqueeze(0)
-        ).item()
+        cos_sim = torch.nn.functional.cosine_similarity(expected_flat.unsqueeze(0), result_flat.unsqueeze(0)).item()
         assert cos_sim > 0.99, f"ResNet-50: cosine_sim={cos_sim:.6f} (want > 0.99)"
 
     @pytest.mark.slow
@@ -239,20 +247,16 @@ class TestVisionModels:
         x = torch.randn(4, 3, 64, 64, device=DEVICE)
 
         with torch.no_grad():
-            eager_min, eager_avg = _warmup_and_bench(
-                lambda: model(x), n_warmup=3, n_iter=10
-            )
+            eager_min, eager_avg = _warmup_and_bench(lambda: model(x), n_warmup=3, n_iter=10)
 
             compiled = torch.compile(model, backend="inductor")
             compiled(x)  # first compile
-            comp_min, comp_avg = _warmup_and_bench(
-                lambda: compiled(x), n_warmup=3, n_iter=10
-            )
+            comp_min, comp_avg = _warmup_and_bench(lambda: compiled(x), n_warmup=3, n_iter=10)
 
         print(f"\nResNet-18 forward (4x3x64x64):")
-        print(f"  Eager:    {eager_min*1000:.1f}ms min, {eager_avg*1000:.1f}ms avg")
-        print(f"  Compiled: {comp_min*1000:.1f}ms min, {comp_avg*1000:.1f}ms avg")
-        print(f"  Speedup:  {eager_min/comp_min:.2f}x min, {eager_avg/comp_avg:.2f}x avg")
+        print(f"  Eager:    {eager_min * 1000:.1f}ms min, {eager_avg * 1000:.1f}ms avg")
+        print(f"  Compiled: {comp_min * 1000:.1f}ms min, {comp_avg * 1000:.1f}ms avg")
+        print(f"  Speedup:  {eager_min / comp_min:.2f}x min, {eager_avg / comp_avg:.2f}x avg")
 
 
 # ---------------------------------------------------------------------------
@@ -261,18 +265,22 @@ class TestVisionModels:
 
 
 class TestCustomModels:
-
     def test_mlp_large(self):
         """Large MLP (4 layers, 512 dim)."""
+
         class LargeMLP(nn.Module):
             def __init__(self):
                 super().__init__()
                 self.layers = nn.Sequential(
-                    nn.Linear(512, 1024), nn.GELU(),
-                    nn.Linear(1024, 1024), nn.GELU(),
-                    nn.Linear(1024, 512), nn.GELU(),
+                    nn.Linear(512, 1024),
+                    nn.GELU(),
+                    nn.Linear(1024, 1024),
+                    nn.GELU(),
+                    nn.Linear(1024, 512),
+                    nn.GELU(),
                     nn.Linear(512, 10),
                 )
+
             def forward(self, x):
                 return self.layers(x)
 
@@ -292,8 +300,11 @@ class TestCustomModels:
     def test_transformer_encoder_large(self):
         """Transformer encoder with larger config."""
         encoder_layer = nn.TransformerEncoderLayer(
-            d_model=256, nhead=8, dim_feedforward=512,
-            batch_first=True, dropout=0.0,
+            d_model=256,
+            nhead=8,
+            dim_feedforward=512,
+            batch_first=True,
+            dropout=0.0,
         )
         model = nn.TransformerEncoder(encoder_layer, num_layers=4)
         model.eval()

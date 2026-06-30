@@ -16,6 +16,7 @@ gate on occupancy and fall back to generic below it (never-regress).
 All candidates compute a CORRECT matmul (the kernel is correct for any blocking
 meeting its size contract), so selection is perf-only -- never correctness.
 """
+
 import math
 import os
 
@@ -25,13 +26,23 @@ import os
 # NOTE: (4,8) is effectively UNREACHABLE via best_rrrc — it needs N%256, which implies
 # N%128, so (4,4) is always also valid and is returned first. It is kept only for
 # valid_candidates completeness/symmetry; it is never *selected*.
-CANDIDATES = [(4, 4), (4, 2), (4, 8),
-              (2, 8), (2, 4), (2, 2),
-              (1, 8), (1, 4), (1, 2),
-              # rc=1 (per-simdgroup strip width 8) — serve N % 8 == 0 but N % 16 != 0,
-              # the finest column tiling; tried last (smallest tile) so an N%16-aligned
-              # shape still prefers a wider rc.
-              (4, 1), (2, 1), (1, 1)]
+CANDIDATES = [
+    (4, 4),
+    (4, 2),
+    (4, 8),
+    (2, 8),
+    (2, 4),
+    (2, 2),
+    (1, 8),
+    (1, 4),
+    (1, 2),
+    # rc=1 (per-simdgroup strip width 8) — serve N % 8 == 0 but N % 16 != 0,
+    # the finest column tiling; tried last (smallest tile) so an N%16-aligned
+    # shape still prefers a wider rc.
+    (4, 1),
+    (2, 1),
+    (1, 1),
+]
 
 _CORES = None
 
@@ -41,6 +52,7 @@ def _gpu_cores(default=40):
     if _CORES is None:
         try:
             from triton_msl.backend.device_detect import get_device_info
+
             _CORES = get_device_info().gpu_core_count or default
         except Exception:
             _CORES = default
@@ -69,8 +81,7 @@ def valid_candidates(M, N, K):
     strip would write past N)."""
     if K % 8 != 0:
         return []
-    return [(rr, rc) for (rr, rc) in CANDIDATES
-            if M % (8 * rr) == 0 and N % (8 * rc) == 0]
+    return [(rr, rc) for (rr, rc) in CANDIDATES if M % (8 * rr) == 0 and N % (8 * rc) == 0]
 
 
 def _occupancy_ok(M, N, rr, rc):
@@ -98,7 +109,7 @@ def best_rrrc(msl_dtype, msl_out, M, N, K, runtime=None, cache_dir=None):
         return (4, 4) if (4, 4) in valid else None
     if (4, 4) in valid:
         return (4, 4)
-    for (rr, rc) in valid:            # CANDIDATES order: largest tile first
+    for rr, rc in valid:  # CANDIDATES order: largest tile first
         if _occupancy_ok(M, N, rr, rc):
             return (rr, rc)
-    return None                       # low occupancy -> generic (never-regress)
+    return None  # low occupancy -> generic (never-regress)

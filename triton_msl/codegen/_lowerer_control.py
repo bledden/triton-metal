@@ -58,9 +58,11 @@ class _ControlFlowMixin:
         for bid in ssa.operand_ids[:3]:
             if self.env_types.get(bid) in ("i64", "u64", "ui64"):
                 from triton_msl.errors import MetalNonRecoverableError
+
                 raise MetalNonRecoverableError(
                     "Refusing scf.for with 64-bit loop bounds: the induction "
-                    "lowering would not terminate (hang). Use 32-bit bounds.")
+                    "lowering would not terminate (hang). Use 32-bit bounds."
+                )
 
         start_var = self._lookup(ssa.operand_ids[0])
         end_var = self._lookup(ssa.operand_ids[1])
@@ -101,22 +103,17 @@ class _ControlFlowMixin:
                 # Allocate persistent shared memory for this iter_arg
                 smem_name = f"smem_iter_{self._shared_counter}"
                 self._shared_counter += 1
-                self.kb.declare_threadgroup_array(smem_name, dtype="fp32",
-                                                  size=init_total)
+                self.kb.declare_threadgroup_array(smem_name, dtype="fp32", size=init_total)
                 # Cooperative init from the constant value
-                self.kb.raw_line(
-                    f"    for (uint _si = lid; _si < {init_total}u; "
-                    f"_si += {bs}u) {{")
-                self.kb.raw_line(
-                    f"        {smem_name}[_si] = {init_val};")
+                self.kb.raw_line(f"    for (uint _si = lid; _si < {init_total}u; _si += {bs}u) {{")
+                self.kb.raw_line(f"        {smem_name}[_si] = {init_val};")
                 self.kb.raw_line(f"    }}")
-                self.kb.raw_line(
-                    f"    threadgroup_barrier(mem_flags::mem_threadgroup);")
+                self.kb.raw_line(f"    threadgroup_barrier(mem_flags::mem_threadgroup);")
                 iter_vars.append(smem_name)
                 iter_dtypes.append(init_type)
                 smem_iter_indices.add(i)
                 # Register in _shared_mem_descs so downstream ops can find it
-                if not hasattr(self, '_shared_mem_descs'):
+                if not hasattr(self, "_shared_mem_descs"):
                     self._shared_mem_descs = {}
                 # We will register the block_arg_id below after mapping
                 continue
@@ -127,9 +124,12 @@ class _ControlFlowMixin:
             # or already an env_array; declare T v[n] and seed every element.
             # Gated on the single-pass array regime so flag-off / scalar
             # kernels are unaffected.
-            if (getattr(self, "_mept_single_pass", False)
-                    and len(init_shape) == 1
-                    and init_total > bs and init_total % bs == 0):
+            if (
+                getattr(self, "_mept_single_pass", False)
+                and len(init_shape) == 1
+                and init_total > bs
+                and init_total % bs == 0
+            ):
                 n = init_total // bs
                 if init_type.startswith("f") or init_type.startswith("bf"):
                     msl_type = "float"
@@ -146,9 +146,11 @@ class _ControlFlowMixin:
                     # rather than emit out-of-bounds src_arr[e] (silent UB).
                     if _src_n != n:
                         from triton_msl.errors import MetalNonRecoverableError
+
                         raise MetalNonRecoverableError(
                             f"MEPT iter-arg array width mismatch: env_array has "
-                            f"{_src_n}, init_total//bs gives {n} (init_id={init_id})")
+                            f"{_src_n}, init_total//bs gives {n} (init_id={init_id})"
+                        )
                     exprs = [f"{src_arr}[{e}]" for e in range(n)]
                 else:
                     exprs = [init_val for _ in range(n)]
@@ -180,8 +182,7 @@ class _ControlFlowMixin:
         loop_var = self._next_var("k")
 
         self.kb.raw_line(
-            f"    for ({loop_type} {loop_var} = {start_var}; "
-            f"{loop_var} < {end_var}; {loop_var} += {step_var}) {{"
+            f"    for ({loop_type} {loop_var} = {start_var}; {loop_var} < {end_var}; {loop_var} += {step_var}) {{"
         )
 
         # Map block args to MSL variables
@@ -216,14 +217,13 @@ class _ControlFlowMixin:
                         self.env_n_elems[ba_id] = n_arr
                     # Register shared-memory-backed iter_args
                     if i in smem_iter_indices:
-                        init_shape = self.env_shapes.get(
-                            init_ids[i], ()) if i < len(init_ids) else ()
-                        if not hasattr(self, '_shared_mem_descs'):
+                        init_shape = self.env_shapes.get(init_ids[i], ()) if i < len(init_ids) else ()
+                        if not hasattr(self, "_shared_mem_descs"):
                             self._shared_mem_descs = {}
                         self._shared_mem_descs[ba_id] = (var, init_shape, "fp32")
                         # Also track that this block_arg is smem-backed so
                         # that scf.yield can skip the scalar assignment.
-                        if not hasattr(self, '_smem_iter_args'):
+                        if not hasattr(self, "_smem_iter_args"):
                             self._smem_iter_args = {}
                         self._smem_iter_args[ba_id] = var
 
@@ -256,10 +256,16 @@ class _ControlFlowMixin:
             # Index-only subset of ops safe to pre-emit at outer body scope.
             # See _SAFE_REPLAY_OPS in _lowerer_reduce.py for the superset used
             # inside _cover_inloop_reduce (which adds addptr + type-conv ops).
-            _SAFE_PREEMIT_OPS = frozenset({
-                "tt.make_range", "tt.splat", "tt.broadcast", "tt.expand_dims",
-                "arith.constant",
-            })
+            _SAFE_PREEMIT_OPS = frozenset(
+                {
+                    "tt.make_range",
+                    "tt.splat",
+                    "tt.broadcast",
+                    "tt.expand_dims",
+                    "arith.constant",
+                }
+            )
+
             # _find_op: recursive op lookup by id across nested regions.
             # Defined once here (not inside the loop) to avoid re-creation per
             # iteration.
@@ -269,16 +275,19 @@ class _ControlFlowMixin:
                         return _o
                     if _o.region_ops:
                         r = _find_op(_o.region_ops, target)
-                        if r: return r
+                        if r:
+                            return r
                     if _o.else_ops:
                         r = _find_op(_o.else_ops, target)
-                        if r: return r
+                        if r:
+                            return r
                 return None
+
             # Collect referenced external safe ops (BFS over body op inputs)
             _ext_needed = []
             _ext_seen = set()
             for _bop in ssa.region_ops:
-                for _oid in (_bop.operand_ids or []):
+                for _oid in _bop.operand_ids or []:
                     if _oid in _body_ids or _oid in _ext_seen:
                         continue
                     if self.env.get(_oid) is not None:
@@ -286,9 +295,7 @@ class _ControlFlowMixin:
                     _ext_seen.add(_oid)
                     # Find the producing op
                     _prod = _find_op(self.graph.ops, _oid)
-                    if (_prod is not None
-                            and _prod.op in _SAFE_PREEMIT_OPS
-                            and _prod.is_tensor):
+                    if _prod is not None and _prod.op in _SAFE_PREEMIT_OPS and _prod.is_tensor:
                         _ext_needed.append(_prod)
             # Emit missing safe external ops before the body starts
             for _ext_op in _ext_needed:
@@ -310,23 +317,18 @@ class _ControlFlowMixin:
                                     # Check if the yield value has a shared_mem_desc
                                     # pointing to a DIFFERENT array (e.g. the dot
                                     # wrote to smem_dot_X).  If so, copy it over.
-                                    yield_smem = getattr(self, '_shared_mem_descs', {}).get(yield_id)
+                                    yield_smem = getattr(self, "_shared_mem_descs", {}).get(yield_id)
                                     if yield_smem and yield_smem[0] != iter_vars[i]:
                                         src_smem = yield_smem[0]
                                         dst_smem = iter_vars[i]
-                                        init_shape = self.env_shapes.get(
-                                            init_ids[i], ()) if i < len(init_ids) else ()
+                                        init_shape = self.env_shapes.get(init_ids[i], ()) if i < len(init_ids) else ()
                                         sz = 1
                                         for d in init_shape:
                                             sz *= d
-                                        self.kb.raw_line(
-                                            f"    for (uint _cp = lid; _cp < {sz}u; "
-                                            f"_cp += {bs}u) {{")
-                                        self.kb.raw_line(
-                                            f"        {dst_smem}[_cp] = {src_smem}[_cp];")
+                                        self.kb.raw_line(f"    for (uint _cp = lid; _cp < {sz}u; _cp += {bs}u) {{")
+                                        self.kb.raw_line(f"        {dst_smem}[_cp] = {src_smem}[_cp];")
                                         self.kb.raw_line(f"    }}")
-                                        self.kb.raw_line(
-                                            f"    threadgroup_barrier(mem_flags::mem_threadgroup);")
+                                        self.kb.raw_line(f"    threadgroup_barrier(mem_flags::mem_threadgroup);")
                                     continue
                                 # MEPT register-array iter-arg: update v[e] per
                                 # element. The yielded value is itself an env_array
@@ -341,27 +343,22 @@ class _ControlFlowMixin:
                                         # yielded array must match the iter-arg
                                         # width, else iter_N[e]=ysrc[e] reads OOB.
                                         if _yn != n_arr:
-                                            from triton_msl.errors import (
-                                                MetalNonRecoverableError)
+                                            from triton_msl.errors import MetalNonRecoverableError
+
                                             raise MetalNonRecoverableError(
                                                 f"MEPT iter-arg yield width mismatch: "
                                                 f"yielded {_yn}, iter-arg {n_arr} "
-                                                f"(yield_id={yield_id})")
+                                                f"(yield_id={yield_id})"
+                                            )
                                         for e in range(n_arr):
-                                            self.kb.raw_line(
-                                                f"        {iter_vars[i]}[{e}] = "
-                                                f"{ysrc}[{e}];")
+                                            self.kb.raw_line(f"        {iter_vars[i]}[{e}] = {ysrc}[{e}];")
                                     else:
                                         yval = self._lookup(yield_id)
                                         for e in range(n_arr):
-                                            self.kb.raw_line(
-                                                f"        {iter_vars[i]}[{e}] = "
-                                                f"{yval};")
+                                            self.kb.raw_line(f"        {iter_vars[i]}[{e}] = {yval};")
                                     continue
                                 yield_val = self._lookup(yield_id)
-                                self.kb.raw_line(
-                                    f"        {iter_vars[i]} = {yield_val};"
-                                )
+                                self.kb.raw_line(f"        {iter_vars[i]} = {yield_val};")
                     else:
                         self._lower_op(body_op)
         finally:
@@ -387,9 +384,8 @@ class _ControlFlowMixin:
                         self.env_n_elems[rid] = n_arr
                     # Propagate shared_mem_desc for oversized iter_args
                     if i in smem_iter_indices:
-                        init_shape = self.env_shapes.get(
-                            init_ids[i], ()) if i < len(init_ids) else ()
-                        if not hasattr(self, '_shared_mem_descs'):
+                        init_shape = self.env_shapes.get(init_ids[i], ()) if i < len(init_ids) else ()
+                        if not hasattr(self, "_shared_mem_descs"):
                             self._shared_mem_descs = {}
                         self._shared_mem_descs[rid] = (var, init_shape, "fp32")
                     # Propagate broadcast-layout from the yielded value. The
@@ -444,10 +440,7 @@ class _ControlFlowMixin:
 
         # Check both then and else for yield with operands
         all_body_ops = list(ssa.region_ops or []) + list(ssa.else_ops or [])
-        has_results = any(
-            body_op.op == "scf.yield" and body_op.operand_ids
-            for body_op in all_body_ops
-        )
+        has_results = any(body_op.op == "scf.yield" and body_op.operand_ids for body_op in all_body_ops)
 
         # For scf.if with results, declare result variables before the if/else
         result_vars = []
@@ -463,11 +456,14 @@ class _ControlFlowMixin:
                         # cryptic crash, not a clean refusal (re-audit #14). Refuse loudly.
                         if getattr(self, "env_n_elems", {}).get(yid, 1) > 1:
                             from triton_msl.errors import MetalNonRecoverableError
+
                             raise MetalNonRecoverableError(
                                 "scf.if returning a multi-element-per-thread register "
                                 "array (block > num_threads) is not supported. Refusing "
                                 "rather than emit a cryptic MSL compile error. Use "
-                                "BLOCK <= num_threads or restructure.", op_name="scf.if")
+                                "BLOCK <= num_threads or restructure.",
+                                op_name="scf.if",
+                            )
                         # A value yielded from INSIDE the then/else body (e.g. an inner
                         # scf.for accumulator) is not in env_types yet — the bodies are
                         # lowered AFTER this type-inference pass. Defaulting to fp32 here
@@ -481,11 +477,14 @@ class _ControlFlowMixin:
                             yt = _mlir_to_triton_dtype(_et) if _et else None
                         if yt is None:
                             from triton_msl.errors import MetalNonRecoverableError
+
                             raise MetalNonRecoverableError(
                                 "scf.if result dtype is undeterminable (a value yielded "
                                 "from inside the branch with no inferable type). Refusing "
                                 "rather than default to float, which would silently "
-                                "corrupt an integer result.", op_name="scf.if")
+                                "corrupt an integer result.",
+                                op_name="scf.if",
+                            )
                         yield_types.append(yt)
                     break
 
@@ -587,7 +586,7 @@ class _ControlFlowMixin:
                 self.env_types[before_block_args[i]] = iter_dtypes[i]
 
         # Lower "before" region (condition evaluation)
-        for body_op in (ssa.region_ops or []):
+        for body_op in ssa.region_ops or []:
             if body_op.op == "scf.condition":
                 # First operand is the condition
                 if body_op.operand_ids:
@@ -613,7 +612,7 @@ class _ControlFlowMixin:
                 self.env_types[after_block_args[i]] = iter_dtypes[i]
 
         # Lower "after" region (loop body)
-        for body_op in (ssa.else_ops or []):
+        for body_op in ssa.else_ops or []:
             if body_op.op == "scf.yield":
                 # Update iter_arg variables from yield operands
                 for j, yield_id in enumerate(body_op.operand_ids):
@@ -638,8 +637,7 @@ class _ControlFlowMixin:
             self.env[ssa.id] = iter_vars[0]
             self.env_types[ssa.id] = iter_dtypes[0] if iter_dtypes else "i32"
 
-    def _emit_atomic_rmw_16bit(self, base_ptr, offsets, val_var, rmw_op,
-                               half_type, result_var, indent, n):
+    def _emit_atomic_rmw_16bit(self, base_ptr, offsets, val_var, rmw_op, half_type, result_var, indent, n):
         """Neighbor-preserving 16-bit float atomic RMW via a 32-bit word CAS.
 
         ``half_type`` is "half" (fp16) or "bfloat" (bf16). The element lives in
@@ -653,42 +651,34 @@ class _ControlFlowMixin:
         winning CAS. max/min/exch are forward-compatible: Triton's frontend
         currently restricts 16-bit-float atomics to ``add`` only."""
         op_expr = {
-            "add":  f"({half_type})((float)oldh_{n} + (float){val_var})",
+            "add": f"({half_type})((float)oldh_{n} + (float){val_var})",
             "fadd": f"({half_type})((float)oldh_{n} + (float){val_var})",
             # fmax/fmin (not max/min): IEEE maxNum/minNum NaN semantics.
-            "max":  f"({half_type})fmax((float)oldh_{n}, (float){val_var})",
-            "min":  f"({half_type})fmin((float)oldh_{n}, (float){val_var})",
+            "max": f"({half_type})fmax((float)oldh_{n}, (float){val_var})",
+            "min": f"({half_type})fmin((float)oldh_{n}, (float){val_var})",
             "exch": f"({half_type})((float){val_var})",
         }.get(rmw_op)
         if op_expr is None:
-            raise ValueError(
-                f"_emit_atomic_rmw_16bit: unsupported op '{rmw_op}'")
+            raise ValueError(f"_emit_atomic_rmw_16bit: unsupported op '{rmw_op}'")
         kb = self.kb
         kb.raw_line(f"{indent}uint _eidx_{n} = (uint)({offsets});")
         # base_ptr is typed `device half*`/`device bfloat*` in the emitted MSL,
         # so casting to atomic_uint* and adding (_eidx>>1) yields the 4-byte word
         # containing element _eidx (always 4-byte aligned: buffer bindings are
         # >=16-byte aligned).
-        kb.raw_line(f"{indent}device atomic_uint* wptr_{n} = "
-                    f"(device atomic_uint*)({base_ptr}) + (_eidx_{n} >> 1);")
+        kb.raw_line(f"{indent}device atomic_uint* wptr_{n} = (device atomic_uint*)({base_ptr}) + (_eidx_{n} >> 1);")
         # little-endian: even idx -> low half (shift 0), odd idx -> high half (16).
         kb.raw_line(f"{indent}uint _sh_{n} = 16u * (_eidx_{n} & 1u);")
-        kb.raw_line(f"{indent}uint _w_{n} = "
-                    f"atomic_load_explicit(wptr_{n}, memory_order_relaxed);")
+        kb.raw_line(f"{indent}uint _w_{n} = atomic_load_explicit(wptr_{n}, memory_order_relaxed);")
         kb.raw_line(f"{indent}ushort cur_bits_{n};")
         kb.raw_line(f"{indent}while (true) {{")
-        kb.raw_line(f"{indent}    cur_bits_{n} = "
-                    f"(ushort)((_w_{n} >> _sh_{n}) & 0xFFFFu);")
-        kb.raw_line(f"{indent}    {half_type} oldh_{n} = "
-                    f"as_type<{half_type}>(cur_bits_{n});")
+        kb.raw_line(f"{indent}    cur_bits_{n} = (ushort)((_w_{n} >> _sh_{n}) & 0xFFFFu);")
+        kb.raw_line(f"{indent}    {half_type} oldh_{n} = as_type<{half_type}>(cur_bits_{n});")
         kb.raw_line(f"{indent}    {half_type} new_{n} = {op_expr};")
         kb.raw_line(f"{indent}    ushort nb_{n} = as_type<ushort>(new_{n});")
-        kb.raw_line(f"{indent}    uint wn_{n} = (_w_{n} & ~(0xFFFFu << _sh_{n})) | "
-                    f"((uint)nb_{n} << _sh_{n});")
-        kb.raw_line(f"{indent}    if (atomic_compare_exchange_weak_explicit("
-                    f"wptr_{n}, &_w_{n}, wn_{n},")
-        kb.raw_line(f"{indent}            memory_order_relaxed, "
-                    f"memory_order_relaxed)) break;")
+        kb.raw_line(f"{indent}    uint wn_{n} = (_w_{n} & ~(0xFFFFu << _sh_{n})) | ((uint)nb_{n} << _sh_{n});")
+        kb.raw_line(f"{indent}    if (atomic_compare_exchange_weak_explicit(wptr_{n}, &_w_{n}, wn_{n},")
+        kb.raw_line(f"{indent}            memory_order_relaxed, memory_order_relaxed)) break;")
         kb.raw_line(f"{indent}}}")
         kb.raw_line(f"{indent}{result_var} = as_type<{half_type}>(cur_bits_{n});")
 
@@ -739,27 +729,30 @@ class _ControlFlowMixin:
         # Refuse loudly rather than mis-compute.
         if val_dtype in ("i64", "u64", "ui64") or store_dtype in ("i64", "u64", "ui64"):
             from triton_msl.errors import MetalNonRecoverableError
+
             raise MetalNonRecoverableError(
                 "64-bit atomic (i64/u64) is not supported: Metal has no 64-bit device "
                 "atomic, and emitting a 32-bit atomic would silently truncate the value. "
-                "Refusing.", op_name="tt.atomic_rmw")
+                "Refusing.",
+                op_name="tt.atomic_rmw",
+            )
 
         # Use float detection: if either the value or the pointer is float
         is_float = is_float or is_float_ptr
 
         # 16-bit float atomics: no native Metal 16-bit atomic, but a
         # neighbor-preserving 32-bit word-CAS is correct (Phase 3 feature 1).
-        is_16bit_float = (val_dtype in ("fp16", "bf16", "f16")
-                          or store_dtype in ("fp16", "bf16", "f16"))
+        is_16bit_float = val_dtype in ("fp16", "bf16", "f16") or store_dtype in ("fp16", "bf16", "f16")
         half_type = None
         if is_16bit_float:
-            _bf = (val_dtype == "bf16" or store_dtype == "bf16")
+            _bf = val_dtype == "bf16" or store_dtype == "bf16"
             half_type = "bfloat" if _bf else "half"
             if rmw_op not in ("add", "fadd", "max", "min", "exch"):
                 from triton_msl.errors import MetalNonRecoverableError
+
                 raise MetalNonRecoverableError(
-                    f"atomic_rmw '{rmw_op}' on 16-bit float not supported "
-                    "(only add/max/min/exch via word-CAS).")
+                    f"atomic_rmw '{rmw_op}' on 16-bit float not supported (only add/max/min/exch via word-CAS)."
+                )
 
         # Check for mask
         mask_var = None
@@ -838,18 +831,22 @@ class _ControlFlowMixin:
         # regime and _loop_e-wrapped emission.
         _val_shape = self.env_shapes.get(val_id)
         _num_threads = self.kb.block_size
-        if (not self._mept_single_pass
-                and not self._needs_wrapping
-                and _val_shape is not None
-                and len(_val_shape) >= 1
-                and _val_shape[0] > _num_threads):
+        if (
+            not self._mept_single_pass
+            and not self._needs_wrapping
+            and _val_shape is not None
+            and len(_val_shape) >= 1
+            and _val_shape[0] > _num_threads
+        ):
             from triton_msl.errors import MetalNonRecoverableError
+
             raise MetalNonRecoverableError(
                 f"Refusing a {_val_shape[0]}-element atomic with only "
                 f"{_num_threads} threads: the base path scatters one element "
                 f"per thread, so a tile wider than the threadgroup would "
                 f"silently drop the rest. Launch with num_warps = BLOCK/32 "
-                f"(so num_threads == BLOCK), or reduce BLOCK.")
+                f"(so num_threads == BLOCK), or reduce BLOCK."
+            )
 
         # Backstop (B3): a SCALAR (per-program) NON-IDEMPOTENT atomic RMW
         # (add/sub/fadd/xor — value-accumulating) emitted while a wrap loop is
@@ -863,13 +860,16 @@ class _ControlFlowMixin:
         _non_idempotent = rmw_op in ("add", "fadd", "sub", "xor")
         if is_scalar and _non_idempotent and self._needs_wrapping:
             from triton_msl.errors import MetalNonRecoverableError
+
             raise MetalNonRecoverableError(
                 f"Refusing a scalar non-idempotent atomic_{rmw_op} emitted inside a "
                 f"multi-element wrap loop (BLOCK > num_threads): thread 0 would apply "
                 f"the RMW once per wrap iteration, over-counting by BLOCK/num_threads "
                 f"(e.g. tl.atomic_add(out, tl.sum(x)) returned 8x). Launch with "
                 f"num_warps = BLOCK/32 so num_threads == BLOCK (no wrap loop), or "
-                f"reduce BLOCK.", op_name="tt.atomic_rmw")
+                f"reduce BLOCK.",
+                op_name="tt.atomic_rmw",
+            )
 
         # Backstop (re-audit silent-wrong #4): a scalar non-idempotent atomic whose value is
         # accumulated by an IN-LOOP reduce (a tt.reduce inside an scf.for, e.g.
@@ -879,9 +879,9 @@ class _ControlFlowMixin:
         # single NON-looped reduce; this looped form re-adds. Refuse loudly until the scalar
         # accumulation is threaded out of the wrap loop. The single-pass / num_threads==BLOCK
         # regime (_mept_single_pass) has no wrap, so it is exempt (the suggested workaround).
-        if (is_scalar and _non_idempotent and not self._mept_single_pass
-                and val_id is not None):
+        if is_scalar and _non_idempotent and not self._mept_single_pass and val_id is not None:
             _byid_c = {}
+
             def _coll(ops):
                 for s in ops:
                     _byid_c[s.id] = s
@@ -889,7 +889,9 @@ class _ControlFlowMixin:
                         _coll(s.region_ops)
                     if s.else_ops:
                         _coll(s.else_ops)
+
             _coll(self.graph.ops)
+
             def _region_has_reduce(ops):
                 for s in ops:
                     if s.op == "tt.reduce":
@@ -899,6 +901,7 @@ class _ControlFlowMixin:
                     if s.else_ops and _region_has_reduce(s.else_ops):
                         return True
                 return False
+
             def _traces_to_inloop_reduce(vid, depth=0, seen=None):
                 if seen is None:
                     seen = set()
@@ -910,17 +913,20 @@ class _ControlFlowMixin:
                     return False
                 if o.op == "scf.for" and o.region_ops and _region_has_reduce(o.region_ops):
                     return True
-                return any(_traces_to_inloop_reduce(oid, depth + 1, seen)
-                           for oid in (o.operand_ids or []))
+                return any(_traces_to_inloop_reduce(oid, depth + 1, seen) for oid in (o.operand_ids or []))
+
             if _traces_to_inloop_reduce(val_id):
                 from triton_msl.errors import MetalNonRecoverableError
+
                 raise MetalNonRecoverableError(
                     f"scalar non-idempotent atomic_{rmw_op} whose value is accumulated by "
                     f"an IN-LOOP reduce (a tt.reduce inside an scf.for) over-counts by "
                     f"BLOCK/num_threads in the wrap regime (the per-program accumulation is "
                     f"replayed once per wrap iteration). Launch with num_warps = BLOCK/32 "
                     f"(num_threads == BLOCK, no wrap), or accumulate without an in-loop "
-                    f"reduce.", op_name="tt.atomic_rmw")
+                    f"reduce.",
+                    op_name="tt.atomic_rmw",
+                )
 
         # Always declare result variable first (needed for mask or not)
         self.kb.raw_line(f"    {result_msl_type} {result_var} = {result_zero};")
@@ -944,8 +950,7 @@ class _ControlFlowMixin:
             self.kb.raw_line(f"    if ({guard_cond}) {{")
 
         if is_16bit_float:
-            self._emit_atomic_rmw_16bit(base_ptr, offsets, val_var, rmw_op,
-                                        half_type, result_var, indent, n)
+            self._emit_atomic_rmw_16bit(base_ptr, offsets, val_var, rmw_op, half_type, result_var, indent, n)
         elif is_float and rmw_op in ("fadd", "add"):
             # Float atomic add via CAS loop
             self.kb.raw_line(f"{indent}device atomic_uint* aptr_{n} = (device atomic_uint*)({base_ptr} + {offsets});")
@@ -954,7 +959,9 @@ class _ControlFlowMixin:
             self.kb.raw_line(f"{indent}    float old_val_{n} = as_type<float>(old_bits_{n});")
             self.kb.raw_line(f"{indent}    float new_val_{n} = old_val_{n} + {val_var};")
             self.kb.raw_line(f"{indent}    uint new_bits_{n} = as_type<uint>(new_val_{n});")
-            self.kb.raw_line(f"{indent}    if (atomic_compare_exchange_weak_explicit(aptr_{n}, &old_bits_{n}, new_bits_{n},")
+            self.kb.raw_line(
+                f"{indent}    if (atomic_compare_exchange_weak_explicit(aptr_{n}, &old_bits_{n}, new_bits_{n},"
+            )
             self.kb.raw_line(f"{indent}            memory_order_relaxed, memory_order_relaxed)) break;")
             self.kb.raw_line(f"{indent}}}")
             self.kb.raw_line(f"{indent}{result_var} = as_type<float>(old_bits_{n});")
@@ -962,7 +969,9 @@ class _ControlFlowMixin:
             # Float atomic exchange via reinterpret as uint
             self.kb.raw_line(f"{indent}device atomic_uint* aptr_{n} = (device atomic_uint*)({base_ptr} + {offsets});")
             self.kb.raw_line(f"{indent}uint exch_bits_{n} = as_type<uint>((float){val_var});")
-            self.kb.raw_line(f"{indent}uint old_bits_{n} = atomic_exchange_explicit(aptr_{n}, exch_bits_{n}, memory_order_relaxed);")
+            self.kb.raw_line(
+                f"{indent}uint old_bits_{n} = atomic_exchange_explicit(aptr_{n}, exch_bits_{n}, memory_order_relaxed);"
+            )
             self.kb.raw_line(f"{indent}{result_var} = as_type<float>(old_bits_{n});")
         elif is_unsigned:
             # Unsigned integer atomics
@@ -1021,10 +1030,12 @@ class _ControlFlowMixin:
         # (re-audit #10), mirroring _lower_atomic_rmw.
         if val_dtype in ("i64", "u64", "ui64") or store_dtype in ("i64", "u64", "ui64"):
             from triton_msl.errors import MetalNonRecoverableError
+
             raise MetalNonRecoverableError(
                 "64-bit atomic CAS (i64/u64) is not supported: Metal has no 64-bit "
                 "device atomic, and a 32-bit CAS would silently truncate. Refusing.",
-                op_name="tt.atomic_cas")
+                op_name="tt.atomic_cas",
+            )
 
         # Scalar CAS: only thread 0 per threadgroup should execute
         is_scalar = not ssa.is_tensor
@@ -1053,18 +1064,22 @@ class _ControlFlowMixin:
         # shares that shape, so either resolves the same refusal.
         _val_shape = self.env_shapes.get(val_id)
         _num_threads = self.kb.block_size
-        if (not self._mept_single_pass
-                and not self._needs_wrapping
-                and _val_shape is not None
-                and len(_val_shape) >= 1
-                and _val_shape[0] > _num_threads):
+        if (
+            not self._mept_single_pass
+            and not self._needs_wrapping
+            and _val_shape is not None
+            and len(_val_shape) >= 1
+            and _val_shape[0] > _num_threads
+        ):
             from triton_msl.errors import MetalNonRecoverableError
+
             raise MetalNonRecoverableError(
                 f"Refusing a {_val_shape[0]}-element atomic with only "
                 f"{_num_threads} threads: the base path scatters one element "
                 f"per thread, so a tile wider than the threadgroup would "
                 f"silently drop the rest. Launch with num_warps = BLOCK/32 "
-                f"(so num_threads == BLOCK), or reduce BLOCK.")
+                f"(so num_threads == BLOCK), or reduce BLOCK."
+            )
 
         self.kb.raw_line(f"    {result_msl_type} {result_var} = {result_zero};")
 
@@ -1105,4 +1120,3 @@ class _ControlFlowMixin:
         Replaces dots and other invalid chars with underscores.
         """
         return name.replace(".", "_")
-

@@ -59,8 +59,7 @@ class MLXLauncher:
         needs_2d_grid: Whether the kernel uses multi-axis program_id.
     """
 
-    def __init__(self, extraction: MSLExtraction, block_size: int = 256,
-                 needs_2d_grid: bool = False):
+    def __init__(self, extraction: MSLExtraction, block_size: int = 256, needs_2d_grid: bool = False):
         self.ext = extraction
         self.block_size = min(block_size, 1024)
         self.needs_2d_grid = needs_2d_grid
@@ -117,10 +116,7 @@ class MLXLauncher:
                             "output shape and dtype."
                         )
                     else:
-                        raise TypeError(
-                            f"Output arg at position {ptr_idx} must be an MLX array, "
-                            f"got {type(arg)}"
-                        )
+                        raise TypeError(f"Output arg at position {ptr_idx} must be an MLX array, got {type(arg)}")
                 else:
                     # Input pointer — pass to metal_kernel
                     input_arrays.append(arg)

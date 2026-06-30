@@ -6,6 +6,7 @@ existing _loop_e re-execution loop), or 'array' (T name[n_elems], the only
 correct form when per-element state crosses data-dependent control flow).
 See docs/superpowers/specs/2026-06-11-mept-register-array-spine-design.md.
 """
+
 from dataclasses import dataclass
 
 _CONTROL_OPS = ("scf.for", "scf.while", "scf.if")
@@ -73,7 +74,7 @@ def region_needs_arrays(ops, multi_elem_ids) -> bool:
                     return True
                 if getattr(b, "id", None) in multi:
                     return True
-                for rid in (getattr(b, "result_ids", None) or []):
+                for rid in getattr(b, "result_ids", None) or []:
                     if rid in multi:
                         return True
             if region_needs_arrays(body, multi):

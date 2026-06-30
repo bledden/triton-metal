@@ -21,50 +21,55 @@ from typing import Any, Dict, List, Optional, Tuple
 # Data structures
 # ---------------------------------------------------------------------------
 
+
 @dataclass
 class SSAValue:
     """A single SSA value produced by an MLIR operation."""
-    id: int                       # Unique ID from value.id() (first result)
-    name: str                     # Generated MSL name: "v0", "v1", ...
-    op: str                       # MLIR op name: "tt.load", "arith.addf"
-    operand_ids: List[int]        # IDs of input SSA values
-    attrs: Dict[str, Any]         # Attributes: {"start": 0, "end": 256, ...}
-    type_str: str                 # Full type string: "tensor<256xf32>"
-    elem_type: str                # Scalar element type: "f32", "i32"
-    is_tensor: bool               # True for tensor values
-    region_ops: Optional[List['SSAValue']] = None  # Body ops for reduce/for (or "then" for scf.if)
-    else_ops: Optional[List['SSAValue']] = None  # "else" body ops for scf.if
+
+    id: int  # Unique ID from value.id() (first result)
+    name: str  # Generated MSL name: "v0", "v1", ...
+    op: str  # MLIR op name: "tt.load", "arith.addf"
+    operand_ids: List[int]  # IDs of input SSA values
+    attrs: Dict[str, Any]  # Attributes: {"start": 0, "end": 256, ...}
+    type_str: str  # Full type string: "tensor<256xf32>"
+    elem_type: str  # Scalar element type: "f32", "i32"
+    is_tensor: bool  # True for tensor values
+    region_ops: Optional[List["SSAValue"]] = None  # Body ops for reduce/for (or "then" for scf.if)
+    else_ops: Optional[List["SSAValue"]] = None  # "else" body ops for scf.if
     result_ids: Optional[List[int]] = None  # IDs of ALL results (multi-result ops)
 
 
 @dataclass
 class FuncArg:
     """A function argument (pointer or scalar)."""
-    id: int           # SSA value ID
-    name: str         # Argument name from MLIR (e.g., "x_ptr")
-    type_str: str     # Full type string
-    elem_type: str    # Element type: "f32", "f16", "i32"
-    is_ptr: bool      # True for !tt.ptr types
-    index: int        # Position in argument list
+
+    id: int  # SSA value ID
+    name: str  # Argument name from MLIR (e.g., "x_ptr")
+    type_str: str  # Full type string
+    elem_type: str  # Element type: "f32", "f16", "i32"
+    is_ptr: bool  # True for !tt.ptr types
+    index: int  # Position in argument list
 
 
 @dataclass
 class CalledFunc:
     """A non-entry (noinline) function called via tt.call."""
-    name: str                     # Mangled function name (e.g., "__main__.add_fn__fp32_fp32")
-    args: List[FuncArg]           # Function arguments
-    ops: List[SSAValue]           # Body ops in topological order
-    return_types: List[str]       # Return types (e.g., ["f32"] or ["f32", "f32"])
+
+    name: str  # Mangled function name (e.g., "__main__.add_fn__fp32_fp32")
+    args: List[FuncArg]  # Function arguments
+    ops: List[SSAValue]  # Body ops in topological order
+    return_types: List[str]  # Return types (e.g., ["f32"] or ["f32", "f32"])
 
 
 @dataclass
 class IRGraph:
     """Structured representation of a TTGIR kernel."""
+
     func_name: str
     args: List[FuncArg]
-    ops: List[SSAValue]           # Top-level ops in topological order
-    block_size: int = 256         # From tt.make_range end attribute
-    num_warps: int = 4            # From module attribute
+    ops: List[SSAValue]  # Top-level ops in topological order
+    block_size: int = 256  # From tt.make_range end attribute
+    num_warps: int = 4  # From module attribute
     called_funcs: Optional[List[CalledFunc]] = None  # Noinline function defs
     size_per_thread: Optional[List[int]] = None  # From #ttg.blocked layout
     # Module text — kept around so the lowerer can parse layout attributes
@@ -76,6 +81,7 @@ class IRGraph:
 # ---------------------------------------------------------------------------
 # Type helpers
 # ---------------------------------------------------------------------------
+
 
 def _extract_elem_type(type_str: str) -> str:
     """Extract scalar element type from an MLIR type string.
@@ -145,6 +151,7 @@ def _extract_shape(type_str: str) -> tuple:
 # Module text parsing (for info not exposed by bindings)
 # ---------------------------------------------------------------------------
 
+
 def _parse_blocked_layout(mod_text: str) -> Optional[Dict[str, List[int]]]:
     """Extract sizePerThread, threadsPerWarp, warpsPerCTA from TTGIR text.
 
@@ -193,10 +200,7 @@ class _ModuleTextIndex:
         self.extern_elementwise_ops = self._parse_extern_elementwise_ops()
 
     def _parse_func_name(self) -> str:
-        m = re.search(
-            r"(?:tt\.func|func\.func)\s+(?:public\s+)?@(\w+)",
-            self.text
-        )
+        m = re.search(r"(?:tt\.func|func\.func)\s+(?:public\s+)?@(\w+)", self.text)
         return m.group(1) if m else "kernel"
 
     def _parse_arg_names(self, func_name: str = None) -> List[str]:
@@ -214,12 +218,12 @@ class _ModuleTextIndex:
         depth = 1
         i = start
         while i < len(self.text) and depth > 0:
-            if self.text[i] == '(':
+            if self.text[i] == "(":
                 depth += 1
-            elif self.text[i] == ')':
+            elif self.text[i] == ")":
                 depth -= 1
             i += 1
-        args_text = self.text[start:i - 1]  # Exclude the closing ')'
+        args_text = self.text[start : i - 1]  # Exclude the closing ')'
         # Arg names may contain '.' (e.g. tuple-flattened names like "Ptrs.0").
         return [am.group(1) for am in re.finditer(r"%([\w.]+)\s*:", args_text)]
 
@@ -232,16 +236,10 @@ class _ModuleTextIndex:
         """
         result = {}
         # With result(s):
-        for m in re.finditer(
-            r"%(\w+(?::\d+)?)\s*=\s*tt\.call\s+@([^\s(]+)",
-            self.text
-        ):
+        for m in re.finditer(r"%(\w+(?::\d+)?)\s*=\s*tt\.call\s+@([^\s(]+)", self.text):
             result[m.group(1)] = m.group(2)
         # Void calls (no result):
-        for m in re.finditer(
-            r"^\s*tt\.call\s+@([^\s(]+)",
-            self.text, re.MULTILINE
-        ):
+        for m in re.finditer(r"^\s*tt\.call\s+@([^\s(]+)", self.text, re.MULTILINE):
             # Use function name as key for void calls
             result[f"_void_call_{m.group(1)}"] = m.group(1)
         return result
@@ -257,10 +255,7 @@ class _ModuleTextIndex:
         }
         """
         result = {}
-        for m in re.finditer(
-            r"tt\.func\s+(public|private)\s+@(\S+)\s*\(",
-            self.text
-        ):
+        for m in re.finditer(r"tt\.func\s+(public|private)\s+@(\S+)\s*\(", self.text):
             visibility = m.group(1)
             func_name = m.group(2)
 
@@ -269,12 +264,12 @@ class _ModuleTextIndex:
             depth = 1
             i = start
             while i < len(self.text) and depth > 0:
-                if self.text[i] == '(':
+                if self.text[i] == "(":
                     depth += 1
-                elif self.text[i] == ')':
+                elif self.text[i] == ")":
                     depth -= 1
                 i += 1
-            args_text = self.text[start:i - 1]
+            args_text = self.text[start : i - 1]
 
             # Extract arg names and types. Arg names may contain '.'
             # (e.g. tuple-flattened names like "Ptrs.0").
@@ -286,7 +281,7 @@ class _ModuleTextIndex:
                 arg_types.append(am.group(1))
 
             # Parse return types: ) -> TYPE or ) -> (TYPE, TYPE)
-            after_args = self.text[i:i+200]  # look at text after closing paren
+            after_args = self.text[i : i + 200]  # look at text after closing paren
             return_types = []
             rm = re.match(r"\s*->\s*\(([^)]+)\)", after_args)
             if rm:
@@ -299,10 +294,10 @@ class _ModuleTextIndex:
                     return_types.append(rm.group(1))
 
             result[func_name] = {
-                'is_public': visibility == 'public',
-                'arg_names': arg_names,
-                'arg_types': arg_types,
-                'return_types': return_types,
+                "is_public": visibility == "public",
+                "arg_names": arg_names,
+                "arg_types": arg_types,
+                "return_types": return_types,
             }
 
         return result
@@ -321,8 +316,7 @@ class _ModuleTextIndex:
         # SSA names may contain `-`, `.`, and `$` in addition to \w — MLIR
         # constants with negative values often get printed as e.g. `%c-123_i32`.
         for m in re.finditer(
-            r"%([\w.$-]+(?::\d+)?)\s*=\s*arith\.constant\s+(.+?)(?:\s+loc\(|$)",
-            self.text, re.MULTILINE
+            r"%([\w.$-]+(?::\d+)?)\s*=\s*arith\.constant\s+(.+?)(?:\s+loc\(|$)", self.text, re.MULTILINE
         ):
             ssa_name = m.group(1)
             rest = m.group(2).strip()
@@ -358,8 +352,7 @@ class _ModuleTextIndex:
         # SSA names may contain `-`, `.`, and `$` in addition to \w — MLIR
         # constants with negative values often get printed as e.g. `%c-123_i32`.
         for m in re.finditer(
-            r"%([\w.$-]+(?::\d+)?)\s*=\s*arith\.constant\s+(.+?)(?:\s+loc\(|$)",
-            self.text, re.MULTILINE
+            r"%([\w.$-]+(?::\d+)?)\s*=\s*arith\.constant\s+(.+?)(?:\s+loc\(|$)", self.text, re.MULTILINE
         ):
             rest = m.group(2).strip()
 
@@ -385,10 +378,7 @@ class _ModuleTextIndex:
     def _parse_predicates(self) -> Dict[str, str]:
         """Parse comparison predicate names: SSA name -> predicate."""
         result = {}
-        for m in re.finditer(
-            r"%(\w+(?::\d+)?)\s*=\s*arith\.cmp[if]\s+(\w+)",
-            self.text
-        ):
+        for m in re.finditer(r"%(\w+(?::\d+)?)\s*=\s*arith\.cmp[if]\s+(\w+)", self.text):
             result[m.group(1)] = m.group(2)
         return result
 
@@ -404,20 +394,14 @@ class _ModuleTextIndex:
         """
         result = {}
         # tt.atomic_rmw: %name = tt.atomic_rmw OP, SEM, SCOPE, ...
-        for m in re.finditer(
-            r"%(\w+(?::\d+)?)\s*=\s*tt\.atomic_rmw\s+(\w+),\s*(\w+),\s*(\w+)",
-            self.text
-        ):
+        for m in re.finditer(r"%(\w+(?::\d+)?)\s*=\s*tt\.atomic_rmw\s+(\w+),\s*(\w+),\s*(\w+)", self.text):
             result[m.group(1)] = {
                 "rmw_op": m.group(2),
                 "sem": m.group(3),
                 "scope": m.group(4),
             }
         # tt.atomic_cas: %name = tt.atomic_cas SEM, SCOPE, ...
-        for m in re.finditer(
-            r"%(\w+(?::\d+)?)\s*=\s*tt\.atomic_cas\s+(\w+),\s*(\w+)",
-            self.text
-        ):
+        for m in re.finditer(r"%(\w+(?::\d+)?)\s*=\s*tt\.atomic_cas\s+(\w+),\s*(\w+)", self.text):
             result[m.group(1)] = {
                 "sem": m.group(2),
                 "scope": m.group(3),
@@ -434,10 +418,7 @@ class _ModuleTextIndex:
         suitable for walk-order matching.
         """
         results = []
-        for m in re.finditer(
-            r'tt\.extern_elementwise\b[^{]*\{([^}]*)\}',
-            self.text
-        ):
+        for m in re.finditer(r"tt\.extern_elementwise\b[^{]*\{([^}]*)\}", self.text):
             attrs_text = m.group(1)
             info = {}
             # Extract symbol = "..."
@@ -449,7 +430,7 @@ class _ModuleTextIndex:
             if lm:
                 info["libname"] = lm.group(1)
             # Extract pure = true/false
-            pm = re.search(r'pure\s*=\s*(true|false)', attrs_text)
+            pm = re.search(r"pure\s*=\s*(true|false)", attrs_text)
             if pm:
                 info["pure"] = pm.group(1) == "true"
             results.append(info)
@@ -462,12 +443,12 @@ class _ModuleTextIndex:
         Used to split cf.cond_br operand_ids into condition, true args, false args.
         """
         results = []
-        pattern = r'cf\.cond_br\s+%[^\s,]+\s*,\s*\^\w+(\([^)]*\))?\s*,\s*\^\w+(\([^)]*\))?'
+        pattern = r"cf\.cond_br\s+%[^\s,]+\s*,\s*\^\w+(\([^)]*\))?\s*,\s*\^\w+(\([^)]*\))?"
         for m in re.finditer(pattern, self.text):
             true_args_str = m.group(1) or ""
             false_args_str = m.group(2) or ""
-            n_true = true_args_str.count('%')
-            n_false = false_args_str.count('%')
+            n_true = true_args_str.count("%")
+            n_false = false_args_str.count("%")
             results.append((n_true, n_false))
         return results
 
@@ -497,6 +478,7 @@ def _try_parse_number(s: str) -> Any:
 # SSA name extraction from module text
 # ---------------------------------------------------------------------------
 
+
 def _build_result_id_to_ssa_name(module_text: str) -> Dict[str, str]:
     """Map result SSA names to their position for cross-referencing.
 
@@ -512,6 +494,7 @@ def _build_result_id_to_ssa_name(module_text: str) -> Dict[str, str]:
 # MLIR Walker
 # ---------------------------------------------------------------------------
 
+
 class MLIRWalker:
     """Walk a TTGIR MLIR module and produce an IRGraph."""
 
@@ -519,10 +502,10 @@ class MLIRWalker:
         self.module = module
         self.options = options
         self._var_counter = 0
-        self._value_map = {}      # value.id() -> SSAValue
-        self._func_args = []      # FuncArg list
+        self._value_map = {}  # value.id() -> SSAValue
+        self._func_args = []  # FuncArg list
         self._block_size = 256
-        self._num_warps = getattr(options, 'num_warps', 4) if options else 4
+        self._num_warps = getattr(options, "num_warps", 4) if options else 4
 
         # Parse module text once for supplementary info
         self._mod_text = str(module)
@@ -561,17 +544,11 @@ class MLIRWalker:
         SSA names may contain `-`, `.`, and `$` in addition to \w — MLIR
         constants with negative values often get printed as `%c-123_i32`.
         """
-        return [m.group(1) for m in re.finditer(
-            r"%([\w.$-]+(?::\d+)?)\s*=\s*arith\.constant",
-            self._mod_text
-        )]
+        return [m.group(1) for m in re.finditer(r"%([\w.$-]+(?::\d+)?)\s*=\s*arith\.constant", self._mod_text)]
 
     def _get_predicate_ssa_names_in_order(self) -> List[str]:
         """Get arith.cmp* SSA names in text order."""
-        return [m.group(1) for m in re.finditer(
-            r"%(\w+(?::\d+)?)\s*=\s*arith\.cmp[if]",
-            self._mod_text
-        )]
+        return [m.group(1) for m in re.finditer(r"%(\w+(?::\d+)?)\s*=\s*arith\.cmp[if]", self._mod_text)]
 
     def _get_predicates_in_order(self) -> List[str]:
         """Get arith.cmp* PREDICATES in text order, parallel to the SSA-name
@@ -580,17 +557,11 @@ class MLIRWalker:
         and after), so a name->predicate dict collides and the later region
         overwrites the earlier one — corrupting the loop condition. Same anchored
         regex as the name list so the two stay index-aligned."""
-        return [m.group(2) for m in re.finditer(
-            r"%(\w+(?::\d+)?)\s*=\s*arith\.cmp[if]\s+(\w+)",
-            self._mod_text
-        )]
+        return [m.group(2) for m in re.finditer(r"%(\w+(?::\d+)?)\s*=\s*arith\.cmp[if]\s+(\w+)", self._mod_text)]
 
     def _get_atomic_rmw_ssa_names_in_order(self) -> List[str]:
         """Get tt.atomic_rmw SSA names in text order."""
-        return [m.group(1) for m in re.finditer(
-            r"%(\w+(?::\d+)?)\s*=\s*tt\.atomic_rmw",
-            self._mod_text
-        )]
+        return [m.group(1) for m in re.finditer(r"%(\w+(?::\d+)?)\s*=\s*tt\.atomic_rmw", self._mod_text)]
 
     def _get_call_targets_in_order(self) -> List[str]:
         """Get tt.call callee names in text order.
@@ -606,10 +577,7 @@ class MLIRWalker:
 
     def _get_atomic_cas_ssa_names_in_order(self) -> List[str]:
         """Get tt.atomic_cas SSA names in text order."""
-        return [m.group(1) for m in re.finditer(
-            r"%(\w+(?::\d+)?)\s*=\s*tt\.atomic_cas",
-            self._mod_text
-        )]
+        return [m.group(1) for m in re.finditer(r"%(\w+(?::\d+)?)\s*=\s*tt\.atomic_cas", self._mod_text)]
 
     def _next_var(self) -> str:
         name = f"v{self._var_counter}"
@@ -682,8 +650,8 @@ class MLIRWalker:
                         after_bid = block_ids_seen[1]
                         before_ops = [c for c in all_ops if c.attrs.get("_block_id") == before_bid]
                         after_ops = [c for c in all_ops if c.attrs.get("_block_id") == after_bid]
-                        ssa.region_ops = before_ops   # "before" region (condition)
-                        ssa.else_ops = after_ops      # "after" region (body)
+                        ssa.region_ops = before_ops  # "before" region (condition)
+                        ssa.else_ops = after_ops  # "after" region (body)
                         # Block args for "before" region
                         before_args = block_args_map.get(before_bid, [])
                         if before_args:
@@ -734,6 +702,7 @@ class MLIRWalker:
         boundaries to separate entry function ops from callee function ops.
         """
         import os as _os
+
         top_level = []
         pending_stack = [[]]
         nested = {}
@@ -759,10 +728,10 @@ class MLIRWalker:
         current_callee_ops = [[]]
         # Per-callee nesting state (mirrors entry function nesting logic)
         callee_pending_stack = [[[]]]  # stack of pending op lists
-        callee_nested = [{}]           # parent_id -> children ops
-        callee_entry_block_id = [None] # entry block of current callee
-        callee_block_first_seen = [{}] # block_id -> walk order
-        callee_block_parent_region = [{}] # block_id -> parent region id
+        callee_nested = [{}]  # parent_id -> children ops
+        callee_entry_block_id = [None]  # entry block of current callee
+        callee_block_first_seen = [{}]  # block_id -> walk order
+        callee_block_parent_region = [{}]  # block_id -> parent region id
 
         def walk_fn(op):
             name = op.get_name()
@@ -780,11 +749,13 @@ class MLIRWalker:
                     callee_block_ids = set(current_callee_block_ids[0])
                     callee_nested_copy = dict(callee_nested[0])
 
-                    callee_funcs_raw.append({
-                        'ops': callee_ops,
-                        'block_ids': callee_block_ids,
-                        'nested': callee_nested_copy,
-                    })
+                    callee_funcs_raw.append(
+                        {
+                            "ops": callee_ops,
+                            "block_ids": callee_block_ids,
+                            "nested": callee_nested_copy,
+                        }
+                    )
 
                     # Reset for next callee
                     current_callee_ops[0] = []
@@ -845,8 +816,7 @@ class MLIRWalker:
                     walk_counter[0] += 1
                     return
 
-                callee_is_nested = (block_id is not None and
-                                    block_id != callee_entry_block_id[0])
+                callee_is_nested = block_id is not None and block_id != callee_entry_block_id[0]
 
                 if name in ("scf.yield", "scf.condition", "tt.scan.return"):
                     ssa = self._make_ssa_value(op, name)
@@ -911,7 +881,7 @@ class MLIRWalker:
                 return
 
             # Entry function op processing (original logic)
-            is_nested = (block_id is not None and block_id != entry_block_id[0])
+            is_nested = block_id is not None and block_id != entry_block_id[0]
             if is_nested:
                 entry_func_block_ids.add(block_id)
 
@@ -1022,10 +992,7 @@ class MLIRWalker:
 
         # Get non-public function names from text parsing
         func_defs = self._text_index.func_defs
-        private_funcs = [
-            (name, info) for name, info in func_defs.items()
-            if not info['is_public']
-        ]
+        private_funcs = [(name, info) for name, info in func_defs.items() if not info["is_public"]]
 
         called_funcs = []
         for i, raw in enumerate(callee_funcs_raw):
@@ -1033,14 +1000,14 @@ class MLIRWalker:
                 break
 
             func_name, func_info = private_funcs[i]
-            ops = raw['ops']
-            callee_block_ids = raw['block_ids']
+            ops = raw["ops"]
+            callee_block_ids = raw["block_ids"]
 
             # Build function arguments from block_args_map
             # The callee's entry block is the first block in callee_block_ids
             args = []
-            arg_names = func_info.get('arg_names', [])
-            arg_types = func_info.get('arg_types', [])
+            arg_names = func_info.get("arg_names", [])
+            arg_types = func_info.get("arg_types", [])
 
             # Find the callee's entry block (the one with block args)
             for bid in callee_block_ids:
@@ -1075,17 +1042,19 @@ class MLIRWalker:
 
             # Attach nested ops to parent ops within callee (for scf.if/for inside callees)
             # Use the callee's own nested dict, not the entry function's
-            callee_nested_ops = raw.get('nested', {})
+            callee_nested_ops = raw.get("nested", {})
             self._attach_nested_ops(ops, callee_nested_ops, block_args_map)
 
-            return_types = func_info.get('return_types', [])
+            return_types = func_info.get("return_types", [])
 
-            called_funcs.append(CalledFunc(
-                name=func_name,
-                args=args,
-                ops=ops,
-                return_types=return_types,
-            ))
+            called_funcs.append(
+                CalledFunc(
+                    name=func_name,
+                    args=args,
+                    ops=ops,
+                    return_types=return_types,
+                )
+            )
 
         return called_funcs
 
@@ -1355,6 +1324,7 @@ class MLIRWalker:
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
+
 
 def walk_ttgir(module, options=None) -> IRGraph:
     """Walk a TTGIR MLIR module and return an IRGraph.

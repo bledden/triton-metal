@@ -105,8 +105,7 @@ class _DeviceFuncLowerer:
             self._emit_passthrough(ssa)
             if ssa.elem_type:
                 self.env_types[ssa.id] = _mlir_to_triton_dtype(ssa.elem_type)
-        elif op.startswith("ttg.") or op in ("tt.reshape", "tt.expand_dims",
-                                               "tt.unsplat", "tt.make_range"):
+        elif op.startswith("ttg.") or op in ("tt.reshape", "tt.expand_dims", "tt.unsplat", "tt.make_range"):
             self._emit_passthrough(ssa)
         else:
             self._emit(f"// UNSUPPORTED in device func: {op}")
@@ -245,17 +244,31 @@ class _DeviceFuncLowerer:
         ids = ssa.operand_ids
 
         arith_map = {
-            "arith.addf": "+", "arith.subf": "-",
-            "arith.mulf": "*", "arith.divf": "/",
-            "arith.addi": "+", "arith.subi": "-",
-            "arith.muli": "*", "arith.divsi": "/", "arith.divui": "/",
-            "arith.remsi": "%", "arith.remui": "%",
-            "arith.andi": "&", "arith.ori": "|", "arith.xori": "^",
-            "arith.maxnumf": "max", "arith.minnumf": "min",
-            "arith.maximumf": "max", "arith.minimumf": "min",
-            "arith.maxsi": "max", "arith.minsi": "min",
-            "arith.maxui": "max", "arith.minui": "min",
-            "arith.shrsi": ">>", "arith.shrui": ">>", "arith.shli": "<<",
+            "arith.addf": "+",
+            "arith.subf": "-",
+            "arith.mulf": "*",
+            "arith.divf": "/",
+            "arith.addi": "+",
+            "arith.subi": "-",
+            "arith.muli": "*",
+            "arith.divsi": "/",
+            "arith.divui": "/",
+            "arith.remsi": "%",
+            "arith.remui": "%",
+            "arith.andi": "&",
+            "arith.ori": "|",
+            "arith.xori": "^",
+            "arith.maxnumf": "max",
+            "arith.minnumf": "min",
+            "arith.maximumf": "max",
+            "arith.minimumf": "min",
+            "arith.maxsi": "max",
+            "arith.minsi": "min",
+            "arith.maxui": "max",
+            "arith.minui": "min",
+            "arith.shrsi": ">>",
+            "arith.shrui": ">>",
+            "arith.shli": "<<",
         }
 
         if op in arith_map and len(ids) >= 2:
@@ -307,10 +320,20 @@ class _DeviceFuncLowerer:
             self.env_types[ssa.id] = "fp32"
             return
 
-        if op in ("arith.extf", "arith.truncf", "arith.sitofp", "arith.fptosi",
-                   "arith.extsi", "arith.extui", "arith.trunci", "arith.uitofp",
-                   "arith.fptoui", "arith.index_cast", "arith.index_castui",
-                   "arith.bitcast"):
+        if op in (
+            "arith.extf",
+            "arith.truncf",
+            "arith.sitofp",
+            "arith.fptosi",
+            "arith.extsi",
+            "arith.extui",
+            "arith.trunci",
+            "arith.uitofp",
+            "arith.fptoui",
+            "arith.index_cast",
+            "arith.index_castui",
+            "arith.bitcast",
+        ):
             self._emit_passthrough(ssa)
             if ssa.elem_type:
                 self.env_types[ssa.id] = _mlir_to_triton_dtype(ssa.elem_type)
@@ -324,13 +347,22 @@ class _DeviceFuncLowerer:
         ids = ssa.operand_ids
 
         math_map = {
-            "math.exp": "exp", "math.exp2": "exp2",
-            "math.log": "log", "math.log2": "log2",
+            "math.exp": "exp",
+            "math.exp2": "exp2",
+            "math.log": "log",
+            "math.log2": "log2",
             "math.sqrt": "sqrt",
-            "math.rsqrt": "rsqrt", "math.abs": "abs", "math.absf": "abs",
-            "math.ceil": "ceil", "math.floor": "floor",
-            "math.sin": "sin", "math.cos": "cos", "math.tanh": "tanh",
-            "math.round": "round", "math.roundeven": "rint", "math.trunc": "trunc",
+            "math.rsqrt": "rsqrt",
+            "math.abs": "abs",
+            "math.absf": "abs",
+            "math.ceil": "ceil",
+            "math.floor": "floor",
+            "math.sin": "sin",
+            "math.cos": "cos",
+            "math.tanh": "tanh",
+            "math.round": "round",
+            "math.roundeven": "rint",
+            "math.trunc": "trunc",
             "math.fma": "fma",
         }
 
@@ -445,10 +477,7 @@ class _DeviceFuncLowerer:
         loop_type = "long" if is_i64 else "int"
         loop_var = self._next_var("k")
 
-        self._emit(
-            f"for ({loop_type} {loop_var} = {start_var}; "
-            f"{loop_var} < {end_var}; {loop_var} += {step_var}) {{"
-        )
+        self._emit(f"for ({loop_type} {loop_var} = {start_var}; {loop_var} < {end_var}; {loop_var} += {step_var}) {{")
 
         # Map block args to MSL variables
         block_arg_ids = ssa.attrs.get("block_arg_ids", [])
@@ -557,4 +586,3 @@ class _DeviceFuncLowerer:
             # Propagate shape through passthrough
             if src_id in self.env_shapes:
                 self.env_shapes[ssa.id] = self.env_shapes[src_id]
-

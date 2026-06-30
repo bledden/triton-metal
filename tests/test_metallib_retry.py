@@ -6,6 +6,7 @@ Covers:
 3. Simulated transient: metal -c exits 0 but writes no .air on the first 2
    calls, succeeds on the 3rd — compile ultimately succeeds via retry.
 """
+
 import os
 import platform
 import subprocess
@@ -114,9 +115,7 @@ def test_make_metallib_real_error_raises_promptly(tmp_path, monkeypatch):
 
     # Must be prompt — not after retrying 3 times with sleeps (max ~0.3 s + compiler time).
     # Allow 30 s for the compiler itself; if we're retrying 3× it would be much longer.
-    assert elapsed < 30.0, (
-        f"make_metallib took {elapsed:.1f}s for an invalid MSL — suggests unwanted retrying"
-    )
+    assert elapsed < 30.0, f"make_metallib took {elapsed:.1f}s for an invalid MSL — suggests unwanted retrying"
 
 
 @requires_metal_compiler
@@ -157,6 +156,7 @@ def test_make_metallib_retries_on_missing_air(tmp_path, monkeypatch):
                     stdout = b""
                     stderr = b""
                     args = cmd
+
                 return _FakeResult()
             # 3rd call: let the real compiler run.
         return real_run(cmd, **kwargs)
@@ -197,20 +197,16 @@ def test_make_metallib_retries_on_transient_compile_exit(tmp_path, monkeypatch):
     call_count = {"metal_c": 0}
 
     def fake_run(cmd, **kwargs):
-        if (
-            isinstance(cmd, list)
-            and len(cmd) >= 3
-            and "metal" in cmd
-            and "-c" in cmd
-            and "metallib" not in cmd[2]
-        ):
+        if isinstance(cmd, list) and len(cmd) >= 3 and "metal" in cmd and "-c" in cmd and "metallib" not in cmd[2]:
             call_count["metal_c"] += 1
             if call_count["metal_c"] <= 2:
                 # Transient: nonzero exit, NO `file:line:col: error:` diagnostic
                 # (a toolchain-level failure — note " error:" present but not a
                 # source location, so it must NOT be classified as a real error).
                 raise subprocess.CalledProcessError(
-                    returncode=1, cmd=cmd, output=b"",
+                    returncode=1,
+                    cmd=cmd,
+                    output=b"",
                     stderr=b"clang: error: unable to execute command: Segmentation fault: 11\n",
                 )
             # 3rd call: let the real compiler run.
@@ -246,16 +242,12 @@ def test_make_metallib_real_compile_error_no_retry(tmp_path, monkeypatch):
     call_count = {"metal_c": 0}
 
     def fake_run(cmd, **kwargs):
-        if (
-            isinstance(cmd, list)
-            and len(cmd) >= 3
-            and "metal" in cmd
-            and "-c" in cmd
-            and "metallib" not in cmd[2]
-        ):
+        if isinstance(cmd, list) and len(cmd) >= 3 and "metal" in cmd and "-c" in cmd and "metallib" not in cmd[2]:
             call_count["metal_c"] += 1
             raise subprocess.CalledProcessError(
-                returncode=1, cmd=cmd, output=b"",
+                returncode=1,
+                cmd=cmd,
+                output=b"",
                 stderr=b"program_source.metal:3:95: error: use of undeclared identifier 'foo'\n",
             )
         return real_run(cmd, **kwargs)

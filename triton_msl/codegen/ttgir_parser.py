@@ -29,6 +29,7 @@ from triton_msl.codegen.msl_emitter import KernelBuilder
 # MLIR preprocessing
 # ---------------------------------------------------------------------------
 
+
 def _strip_loc_annotations(text):
     """Remove all loc(...) annotations from MLIR text.
 
@@ -40,27 +41,27 @@ def _strip_loc_annotations(text):
     n = len(text)
     while i < n:
         # Look for 'loc(' preceded by whitespace or start
-        if text[i:i+4] == 'loc(' and (i == 0 or text[i-1] in ' \t\n,'):
+        if text[i : i + 4] == "loc(" and (i == 0 or text[i - 1] in " \t\n,"):
             # Skip balanced parentheses
             depth = 0
             j = i + 3  # points at '('
             while j < n:
-                if text[j] == '(':
+                if text[j] == "(":
                     depth += 1
-                elif text[j] == ')':
+                elif text[j] == ")":
                     depth -= 1
                     if depth == 0:
                         j += 1
                         break
                 j += 1
             # Also skip any trailing whitespace
-            while j < n and text[j] in ' \t':
+            while j < n and text[j] in " \t":
                 j += 1
             i = j
         else:
             result.append(text[i])
             i += 1
-    return ''.join(result)
+    return "".join(result)
 
 
 def _strip_layout_annotations(text):
@@ -76,18 +77,19 @@ def _strip_layout_annotations(text):
     ', #identifier' from tensor types.
     """
     # Remove definition lines: #name = #ttg.blocked<{...}>
-    text = re.sub(r'^#\w+\s*=\s*#ttg\.\w+<\{[^}]*\}>.*$', '', text, flags=re.MULTILINE)
+    text = re.sub(r"^#\w+\s*=\s*#ttg\.\w+<\{[^}]*\}>.*$", "", text, flags=re.MULTILINE)
     # Remove layout reference in tensor types.
     # Must handle nested angle brackets (e.g., tensor<256x!tt.ptr<f32>, #blocked>).
-    text = re.sub(r',\s*#\w+>', '>', text)
+    text = re.sub(r",\s*#\w+>", ">", text)
     # Remove residual #loc lines left after loc() stripping.
-    text = re.sub(r'^#\w+\s*=\s*$', '', text, flags=re.MULTILINE)
+    text = re.sub(r"^#\w+\s*=\s*$", "", text, flags=re.MULTILINE)
     return text
 
 
 # ---------------------------------------------------------------------------
 # MLIR type mapping
 # ---------------------------------------------------------------------------
+
 
 def _mlir_type_to_triton_dtype(mlir_type):
     """Convert MLIR type string to Triton dtype string.
@@ -149,6 +151,7 @@ def _extract_block_size(ir_text):
 # TTGIR Parser
 # ---------------------------------------------------------------------------
 
+
 class TTGIRParser:
     """Parse TTGIR MLIR text and build a KernelBuilder.
 
@@ -167,10 +170,10 @@ class TTGIRParser:
         self.lines = ir_text.strip().split("\n")
 
         # SSA value tracking
-        self.ssa_values = {}      # %name -> role info
-        self.ssa_types = {}       # %name -> MLIR type string
-        self.ptr_args = OrderedDict()    # arg_name -> (index, dtype, is_output)
-        self.scalar_args = OrderedDict() # arg_name -> (index, dtype)
+        self.ssa_values = {}  # %name -> role info
+        self.ssa_types = {}  # %name -> MLIR type string
+        self.ptr_args = OrderedDict()  # arg_name -> (index, dtype, is_output)
+        self.scalar_args = OrderedDict()  # arg_name -> (index, dtype)
         self.kernel_name = "triton_kernel"
         self.block_size = _extract_block_size(ir_text)
 
@@ -179,7 +182,7 @@ class TTGIRParser:
         self.offsets_var = None
         self.mask_var = None
         self.loaded_values = {}  # %ssa -> (ptr_arg_name, msl_var_name)
-        self.computed_values = {} # %ssa -> msl_var_name
+        self.computed_values = {}  # %ssa -> msl_var_name
 
         # Reduction tracking
         self.reduce_ops = []  # [(result_ssa, input_ssa, op_kind, axis)]
@@ -203,15 +206,9 @@ class TTGIRParser:
         """Extract kernel name and argument types from the function signature."""
         # Match: tt.func @name(%arg0: TYPE, %arg1: TYPE, ...)
         # or: tt.func public @name(%arg0: TYPE, %arg1: TYPE, ...)
-        sig_match = re.search(
-            r"tt\.func\s+(?:public\s+)?@(\w+)\s*\(([^)]*)\)",
-            self.ir_text, re.DOTALL
-        )
+        sig_match = re.search(r"tt\.func\s+(?:public\s+)?@(\w+)\s*\(([^)]*)\)", self.ir_text, re.DOTALL)
         if not sig_match:
-            sig_match = re.search(
-                r"func\.func\s+@(\w+)\s*\(([^)]*)\)",
-                self.ir_text, re.DOTALL
-            )
+            sig_match = re.search(r"func\.func\s+@(\w+)\s*\(([^)]*)\)", self.ir_text, re.DOTALL)
         if not sig_match:
             return
 
@@ -220,9 +217,7 @@ class TTGIRParser:
 
         # Parse each argument
         # Format: %argN: TYPE {optional attributes}
-        arg_pattern = re.compile(
-            r"%(\w+)\s*:\s*([^,{}]+(?:\{[^}]*\})?)"
-        )
+        arg_pattern = re.compile(r"%(\w+)\s*:\s*([^,{}]+(?:\{[^}]*\})?)")
         for i, match in enumerate(arg_pattern.finditer(args_text)):
             arg_name = match.group(1)
             arg_type = match.group(2).strip()
@@ -257,9 +252,9 @@ class TTGIRParser:
         """
         # Match scf.for with iter_args
         loop_pattern = re.compile(
-            r'(?:%(\w+)(?::\d+)?\s*=\s*)?'  # optional result SSA
-            r'scf\.for\s+%(\w+)\s*=\s*(%\w+)\s+to\s+(%\w+)\s+step\s+(%\w+)'
-            r'(?:\s+iter_args\(([^)]*)\))?'  # optional iter_args
+            r"(?:%(\w+)(?::\d+)?\s*=\s*)?"  # optional result SSA
+            r"scf\.for\s+%(\w+)\s*=\s*(%\w+)\s+to\s+(%\w+)\s+step\s+(%\w+)"
+            r"(?:\s+iter_args\(([^)]*)\))?"  # optional iter_args
         )
         for m in loop_pattern.finditer(self.ir_text):
             result_ssa = f"%{m.group(1)}" if m.group(1) else None
@@ -272,17 +267,19 @@ class TTGIRParser:
             # Parse iter_args if present
             iter_args = []
             if iter_args_str:
-                for ia_match in re.finditer(r'%(\w+)\s*=\s*(%\w+)', iter_args_str):
+                for ia_match in re.finditer(r"%(\w+)\s*=\s*(%\w+)", iter_args_str):
                     iter_args.append((ia_match.group(1), ia_match.group(2)))
 
-            self.scf_for_loops.append({
-                'result_ssa': result_ssa,
-                'iv': iv_name,
-                'lb': lb_ssa,
-                'ub': ub_ssa,
-                'step': step_ssa,
-                'iter_args': iter_args,
-            })
+            self.scf_for_loops.append(
+                {
+                    "result_ssa": result_ssa,
+                    "iv": iv_name,
+                    "lb": lb_ssa,
+                    "ub": ub_ssa,
+                    "step": step_ssa,
+                    "iter_args": iter_args,
+                }
+            )
 
             # Record the loop variable in SSA tracking
             self.ssa_values[f"%{iv_name}"] = ("loop_iv", lb_ssa, ub_ssa, step_ssa)
@@ -309,16 +306,16 @@ class TTGIRParser:
         # Triton 3.6+: axis in <{...}> before the body
         reduce_pattern_new = re.compile(
             r'%(\w+)\s*=\s*"tt\.reduce"\s*\((%\w+)\)\s*<\{axis\s*=\s*(\d+)\s*:\s*i32\}>\s*\(\{'
-            r'(.*?)'
-            r'\}\)\s*:',
-            re.DOTALL
+            r"(.*?)"
+            r"\}\)\s*:",
+            re.DOTALL,
         )
         # Older format: axis in {...} after the body
         reduce_pattern_old = re.compile(
             r'%(\w+)\s*=\s*"tt\.reduce"\s*\((%\w+)\)\s*\(\{'
-            r'(.*?)'
-            r'\}\)\s*\{axis\s*=\s*(\d+)',
-            re.DOTALL
+            r"(.*?)"
+            r"\}\)\s*\{axis\s*=\s*(\d+)",
+            re.DOTALL,
         )
         for m in reduce_pattern_new.finditer(self.ir_text):
             result_ssa = f"%{m.group(1)}"
@@ -366,13 +363,9 @@ class TTGIRParser:
             %result = "tt.dot"(%lhs, %rhs, %acc) {options} : (types) -> type
         """
         # Quoted form
-        dot_pattern1 = re.compile(
-            r'%(\w+)\s*=\s*"tt\.dot"\s*\((%\w+)\s*,\s*(%\w+)\s*,\s*(%\w+)\)'
-        )
+        dot_pattern1 = re.compile(r'%(\w+)\s*=\s*"tt\.dot"\s*\((%\w+)\s*,\s*(%\w+)\s*,\s*(%\w+)\)')
         # Unquoted form
-        dot_pattern2 = re.compile(
-            r'%(\w+)\s*=\s*tt\.dot\s+(%\w+)\s*,\s*(%\w+)\s*,\s*(%\w+)'
-        )
+        dot_pattern2 = re.compile(r"%(\w+)\s*=\s*tt\.dot\s+(%\w+)\s*,\s*(%\w+)\s*,\s*(%\w+)")
         for pattern in [dot_pattern1, dot_pattern2]:
             for m in pattern.finditer(self.ir_text):
                 result_ssa = f"%{m.group(1)}"
@@ -549,13 +542,9 @@ class TTGIRParser:
                 continue
 
             # Binary float ops: arith.addf, arith.subf, arith.mulf, arith.divf
-            for op_name, op_key in [("addf", "add"), ("subf", "sub"),
-                                     ("mulf", "mul"), ("divf", "div")]:
+            for op_name, op_key in [("addf", "add"), ("subf", "sub"), ("mulf", "mul"), ("divf", "div")]:
                 if f"arith.{op_name}" in line:
-                    m = re.match(
-                        rf"%(\w+)\s*=\s*arith\.{op_name}\s+(%\w+)\s*,\s*(%\w+)",
-                        line
-                    )
+                    m = re.match(rf"%(\w+)\s*=\s*arith\.{op_name}\s+(%\w+)\s*,\s*(%\w+)", line)
                     if m:
                         result = f"%{m.group(1)}"
                         self.ssa_values[result] = (op_key, m.group(2), m.group(3))
@@ -563,25 +552,25 @@ class TTGIRParser:
 
             # math.fma (fused multiply-add: a*b + c)
             if "math.fma" in line:
-                m = re.match(
-                    r"%(\w+)\s*=\s*math\.fma\s+(%\w+)\s*,\s*(%\w+)\s*,\s*(%\w+)",
-                    line
-                )
+                m = re.match(r"%(\w+)\s*=\s*math\.fma\s+(%\w+)\s*,\s*(%\w+)\s*,\s*(%\w+)", line)
                 if m:
                     result = f"%{m.group(1)}"
                     self.ssa_values[result] = ("fma", m.group(2), m.group(3), m.group(4))
                 continue
 
             # Unary math ops
-            for op_name, op_key in [("math.exp", "exp"), ("math.log", "log"),
-                                     ("math.sqrt", "sqrt"), ("math.rsqrt", "rsqrt"),
-                                     ("math.absf", "abs"), ("math.sin", "sin"),
-                                     ("math.cos", "cos"), ("math.tanh", "tanh")]:
+            for op_name, op_key in [
+                ("math.exp", "exp"),
+                ("math.log", "log"),
+                ("math.sqrt", "sqrt"),
+                ("math.rsqrt", "rsqrt"),
+                ("math.absf", "abs"),
+                ("math.sin", "sin"),
+                ("math.cos", "cos"),
+                ("math.tanh", "tanh"),
+            ]:
                 if op_name in line:
-                    m = re.match(
-                        rf"%(\w+)\s*=\s*{re.escape(op_name)}\s+(%\w+)",
-                        line
-                    )
+                    m = re.match(rf"%(\w+)\s*=\s*{re.escape(op_name)}\s+(%\w+)", line)
                     if m:
                         result = f"%{m.group(1)}"
                         self.ssa_values[result] = (op_key, m.group(2))
@@ -752,8 +741,7 @@ class TTGIRParser:
         # through to a no-op (empty-body) kernel that the runtime will fail
         # on, making the unsupported case visible rather than silent.
         if self.reduce_ops and self._is_bitonic_sort_pattern():
-            kb.comment(
-                "Unsupported: bitonic sort / top-k with > 1024 elements")
+            kb.comment("Unsupported: bitonic sort / top-k with > 1024 elements")
             return kb
         if self.reduce_ops:
             return self._build_reduction_kernel(kb, n_arg, primary_dtype)
@@ -1020,9 +1008,8 @@ class TTGIRParser:
             return False
         # Softmax has exp(x - max) between the max reduce and sum reduce.
         # Sort's xor reduces have no exp.
-        has_exp = ("math.exp" in self.ir_text
-                   or "math.exp2" in self.ir_text)
-        has_sub = ("arith.subf" in self.ir_text)
+        has_exp = "math.exp" in self.ir_text or "math.exp2" in self.ir_text
+        has_sub = "arith.subf" in self.ir_text
         return has_exp and has_sub
 
     def _is_bitonic_sort_pattern(self):
@@ -1040,13 +1027,10 @@ class TTGIRParser:
         xor_count = self.ir_text.count("arith.xori")
         if xor_count < len(self.reduce_ops):
             return False
-        if ("arith.cmpf" not in self.ir_text
-                or "arith.select" not in self.ir_text):
+        if "arith.cmpf" not in self.ir_text or "arith.select" not in self.ir_text:
             return False
         # Soft negative checks: not softmax / layer-norm
-        if ("math.exp" in self.ir_text
-                or "arith.divf" in self.ir_text
-                or "math.rsqrt" in self.ir_text):
+        if "math.exp" in self.ir_text or "arith.divf" in self.ir_text or "math.rsqrt" in self.ir_text:
             return False
         return True
 
@@ -1063,9 +1047,7 @@ class TTGIRParser:
         if ops.count("sum") >= 2 and "max" not in ops:
             ssa_ops = {v[0] for v in self.ssa_values.values()}
             # Check for subtract or rsqrt/sqrt (normalization step)
-            return ("sub" in ssa_ops
-                    or "rsqrt" in ssa_ops
-                    or "sqrt" in ssa_ops)
+            return "sub" in ssa_ops or "rsqrt" in ssa_ops or "sqrt" in ssa_ops
         return False
 
     def _build_softmax_kernel(self, kb, n_arg, primary_dtype):
@@ -1184,6 +1166,7 @@ class TTGIRParser:
         for ssa, val in self.ssa_values.items():
             if val[0] == "constant":
                 import re as _re
+
                 m = _re.search(r"([\d.e+-]+)\s*:\s*f32", val[1])
                 if m:
                     v = float(m.group(1))
@@ -1235,9 +1218,13 @@ class TTGIRParser:
         kb.raw_line(f"for (uint i = lid; i < {n_arg}; i += {kb.block_size}u) {{")
         kb.indent()
         if gamma_arg and beta_arg:
-            kb.raw_line(f"{output_arg}[row_start + i] = ({input_arg}[row_start + i] - mean_val) * inv_std * {gamma_arg}[i] + {beta_arg}[i];")
+            kb.raw_line(
+                f"{output_arg}[row_start + i] = ({input_arg}[row_start + i] - mean_val) * inv_std * {gamma_arg}[i] + {beta_arg}[i];"
+            )
         elif gamma_arg:
-            kb.raw_line(f"{output_arg}[row_start + i] = ({input_arg}[row_start + i] - mean_val) * inv_std * {gamma_arg}[i];")
+            kb.raw_line(
+                f"{output_arg}[row_start + i] = ({input_arg}[row_start + i] - mean_val) * inv_std * {gamma_arg}[i];"
+            )
         else:
             kb.raw_line(f"{output_arg}[row_start + i] = ({input_arg}[row_start + i] - mean_val) * inv_std;")
         kb.dedent()
@@ -1258,8 +1245,7 @@ class TTGIRParser:
         # Check for exp in the SSA values (used in softmax between dots)
         has_exp = any(v[0] == "exp" for v in self.ssa_values.values())
         # Check for max reduction or explicit max
-        has_max = (any(r[2] == "max" for r in self.reduce_ops) or
-                   any(v[0] == "fmax" for v in self.ssa_values.values()))
+        has_max = any(r[2] == "max" for r in self.reduce_ops) or any(v[0] == "fmax" for v in self.ssa_values.values())
         return has_exp and has_max
 
     def _build_flash_attention_kernel(self, kb, primary_dtype):
@@ -1278,12 +1264,11 @@ class TTGIRParser:
         # Check for causal masking: look for cmpi or "causal" in IR
         causal = "causal" in self.ir_text.lower() or any(
             v[0] == "mask" and "slt" in str(self.ssa_values.get(v[1], ""))
-            for v in self.ssa_values.values() if v[0] == "select"
+            for v in self.ssa_values.values()
+            if v[0] == "select"
         )
 
-        kb.set_prebuilt_msl(make_flash_attention_kernel(
-            head_dim=head_dim, causal=causal
-        ))
+        kb.set_prebuilt_msl(make_flash_attention_kernel(head_dim=head_dim, causal=causal))
         return kb
 
     def _build_matmul_kernel(self, kb, primary_dtype):
@@ -1334,6 +1319,7 @@ class TTGIRParser:
         Delegates to the pre-built cross-entropy kernel.
         """
         from triton_msl.codegen.msl_emitter import make_cross_entropy_kernel
+
         kb.set_prebuilt_msl(make_cross_entropy_kernel())
         return kb
 
@@ -1353,9 +1339,8 @@ class TTGIRParser:
             return False
         # Must have both add and (sub or rsqrt) for residual + norm
         has_add = any(v[0] == "add" for v in self.ssa_values.values())
-        has_sub_or_rsqrt = (
-            any(v[0] == "sub" for v in self.ssa_values.values()) or
-            any(v[0] == "rsqrt" for v in self.ssa_values.values())
+        has_sub_or_rsqrt = any(v[0] == "sub" for v in self.ssa_values.values()) or any(
+            v[0] == "rsqrt" for v in self.ssa_values.values()
         )
         if not (has_add and has_sub_or_rsqrt):
             return False
@@ -1399,6 +1384,7 @@ class TTGIRParser:
         addition with layer normalization in a single pass.
         """
         from triton_msl.codegen.msl_emitter import make_fused_residual_norm_kernel
+
         kb.set_prebuilt_msl(make_fused_residual_norm_kernel())
         return kb
 
@@ -1428,6 +1414,7 @@ class TTGIRParser:
     def _build_variance_kernel(self, kb, n_arg, primary_dtype):
         """Generate a variance kernel from the pattern."""
         from triton_msl.codegen.msl_emitter import make_variance_kernel
+
         kb.set_prebuilt_msl(make_variance_kernel())
         return kb
 
@@ -1450,6 +1437,7 @@ class TTGIRParser:
         Delegates to the pre-built RoPE kernel.
         """
         from triton_msl.codegen.msl_emitter import make_rope_kernel
+
         kb.set_prebuilt_msl(make_rope_kernel())
         return kb
 
@@ -1473,6 +1461,7 @@ class TTGIRParser:
         related constants, could be INT4, but INT8 is the safer default.
         """
         from triton_msl.codegen.msl_emitter import make_int8_matmul_kernel
+
         kb.set_prebuilt_msl(make_int8_matmul_kernel())
         return kb
 
@@ -1504,6 +1493,7 @@ class TTGIRParser:
         output = silu(gate) * up
         """
         from triton_msl.codegen.msl_emitter import make_fused_mlp_kernel
+
         kb.set_prebuilt_msl(make_fused_mlp_kernel())
         return kb
 
@@ -1527,6 +1517,7 @@ class TTGIRParser:
     def _build_paged_attention_kernel(self, kb, primary_dtype):
         """Generate a paged attention kernel from the pattern."""
         from triton_msl.codegen.msl_emitter import make_paged_attention_kernel
+
         kb.set_prebuilt_msl(make_paged_attention_kernel())
         return kb
 
@@ -1547,6 +1538,7 @@ class TTGIRParser:
     def _build_top_k_kernel(self, kb, primary_dtype):
         """Generate a top-k sampling kernel from the pattern."""
         from triton_msl.codegen.msl_emitter import make_top_k_kernel
+
         kb.set_prebuilt_msl(make_top_k_kernel())
         return kb
 
@@ -1569,6 +1561,7 @@ class TTGIRParser:
     def _build_speculative_decode_kernel(self, kb, primary_dtype):
         """Generate a speculative decoding kernel from the pattern."""
         from triton_msl.codegen.msl_emitter import make_speculative_decode_kernel
+
         kb.set_prebuilt_msl(make_speculative_decode_kernel())
         return kb
 
@@ -1591,6 +1584,7 @@ class TTGIRParser:
     def _build_beam_search_kernel(self, kb, primary_dtype):
         """Generate a beam search kernel from the pattern."""
         from triton_msl.codegen.msl_emitter import make_beam_search_kernel
+
         kb.set_prebuilt_msl(make_beam_search_kernel())
         return kb
 
@@ -1613,9 +1607,26 @@ class TTGIRParser:
 
         ssa_ops = {v[0] for v in self.ssa_values.values()}
         # Count arithmetic SSA values (excluding constants and loads).
-        arith_ops = {"neg", "exp", "add", "sub", "mul", "div", "fma",
-                     "tanh", "rsqrt", "sqrt", "log", "sin", "cos", "abs",
-                     "max", "min", "select", "mask"}
+        arith_ops = {
+            "neg",
+            "exp",
+            "add",
+            "sub",
+            "mul",
+            "div",
+            "fma",
+            "tanh",
+            "rsqrt",
+            "sqrt",
+            "log",
+            "sin",
+            "cos",
+            "abs",
+            "max",
+            "min",
+            "select",
+            "mask",
+        }
         n_arith = sum(1 for v in self.ssa_values.values() if v[0] in arith_ops)
 
         # tanh: explicit tanh op
@@ -1624,8 +1635,7 @@ class TTGIRParser:
         # silu (x * sigmoid(x)): exp + div + mul, no tanh, no select
         # Guard: SiLU has exactly 5 arithmetic ops (neg, exp, add, div, mul).
         # More complex patterns (GELU etc.) have 8+ and should use generic codegen.
-        if ("exp" in ssa_ops and "div" in ssa_ops and "mul" in ssa_ops
-                and "select" not in ssa_ops and n_arith <= 7):
+        if "exp" in ssa_ops and "div" in ssa_ops and "mul" in ssa_ops and "select" not in ssa_ops and n_arith <= 7:
             return "silu"
         # sigmoid: exp + div, no mul (pure sigmoid has no final multiply)
         if "exp" in ssa_ops and "div" in ssa_ops and "select" not in ssa_ops and n_arith <= 5:
@@ -1645,6 +1655,7 @@ class TTGIRParser:
     def _build_activation_kernel(self, kb, activation, primary_dtype):
         """Generate an activation kernel from the classified pattern."""
         from triton_msl.codegen.msl_emitter import make_activation_kernel
+
         kb.set_prebuilt_msl(make_activation_kernel(activation=activation))
         return kb
 
@@ -1672,6 +1683,7 @@ class TTGIRParser:
     def _build_rms_norm_kernel(self, kb, n_arg, primary_dtype):
         """Generate an RMS norm kernel from the pattern."""
         from triton_msl.codegen.msl_emitter import make_rms_norm_kernel
+
         kb.set_prebuilt_msl(make_rms_norm_kernel())
         return kb
 
@@ -1699,6 +1711,7 @@ class TTGIRParser:
     def _build_group_norm_kernel(self, kb, primary_dtype):
         """Generate a group norm kernel from the pattern."""
         from triton_msl.codegen.msl_emitter import make_group_norm_kernel
+
         kb.set_prebuilt_msl(make_group_norm_kernel())
         return kb
 
@@ -1725,6 +1738,7 @@ class TTGIRParser:
     def _build_instance_norm_kernel(self, kb, primary_dtype):
         """Generate an instance norm kernel from the pattern."""
         from triton_msl.codegen.msl_emitter import make_instance_norm_kernel
+
         kb.set_prebuilt_msl(make_instance_norm_kernel())
         return kb
 
@@ -1757,6 +1771,7 @@ class TTGIRParser:
     def _build_residual_add_kernel(self, kb, primary_dtype):
         """Generate a residual add kernel from the pattern."""
         from triton_msl.codegen.msl_emitter import make_residual_add_kernel
+
         n_inputs = sum(1 for _, (_, _, is_out) in self.ptr_args.items() if not is_out)
         has_bias = n_inputs >= 3
         kb.set_prebuilt_msl(make_residual_add_kernel(has_bias=has_bias))
@@ -1779,13 +1794,9 @@ class TTGIRParser:
         if n_inputs != 2 or n_outputs != 1:
             return False
         # Must have one int input and one float input
-        int_inputs = sum(
-            1 for _, (_, dtype, is_out) in self.ptr_args.items()
-            if not is_out and dtype in ("i32", "i64")
-        )
+        int_inputs = sum(1 for _, (_, dtype, is_out) in self.ptr_args.items() if not is_out and dtype in ("i32", "i64"))
         float_inputs = sum(
-            1 for _, (_, dtype, is_out) in self.ptr_args.items()
-            if not is_out and dtype in ("fp32", "fp16", "bf16")
+            1 for _, (_, dtype, is_out) in self.ptr_args.items() if not is_out and dtype in ("fp32", "fp16", "bf16")
         )
         if int_inputs != 1 or float_inputs != 1:
             return False
@@ -1795,6 +1806,7 @@ class TTGIRParser:
     def _build_embedding_kernel(self, kb, primary_dtype):
         """Generate an embedding lookup kernel from the pattern."""
         from triton_msl.codegen.msl_emitter import make_embedding_kernel
+
         kb.set_prebuilt_msl(make_embedding_kernel())
         return kb
 
@@ -1816,8 +1828,22 @@ class TTGIRParser:
             return False
         # No math ops
         ssa_ops = {v[0] for v in self.ssa_values.values()}
-        math_ops = {"add", "sub", "mul", "div", "exp", "log", "sqrt", "rsqrt",
-                    "tanh", "sin", "cos", "abs", "fma", "neg"}
+        math_ops = {
+            "add",
+            "sub",
+            "mul",
+            "div",
+            "exp",
+            "log",
+            "sqrt",
+            "rsqrt",
+            "tanh",
+            "sin",
+            "cos",
+            "abs",
+            "fma",
+            "neg",
+        }
         if ssa_ops & math_ops:
             return False
         # All inputs must be same type (no int/float mix like gather/embedding)
@@ -1830,6 +1856,7 @@ class TTGIRParser:
     def _build_concat_kernel(self, kb, primary_dtype):
         """Generate a concat kernel from the pattern."""
         from triton_msl.codegen.msl_emitter import make_concat_kernel
+
         n_inputs = sum(1 for _, (_, _, is_out) in self.ptr_args.items() if not is_out)
         kb.set_prebuilt_msl(make_concat_kernel(n_inputs=n_inputs))
         return kb
@@ -1856,13 +1883,28 @@ class TTGIRParser:
         if len(all_ptr_types) != 1:
             return False
         ssa_ops = {v[0] for v in self.ssa_values.values()}
-        math_ops = {"add", "sub", "mul", "div", "exp", "log", "sqrt", "rsqrt",
-                    "tanh", "sin", "cos", "abs", "fma", "neg"}
+        math_ops = {
+            "add",
+            "sub",
+            "mul",
+            "div",
+            "exp",
+            "log",
+            "sqrt",
+            "rsqrt",
+            "tanh",
+            "sin",
+            "cos",
+            "abs",
+            "fma",
+            "neg",
+        }
         return not (ssa_ops & math_ops)
 
     def _build_split_kernel(self, kb, primary_dtype):
         """Generate a split kernel from the pattern."""
         from triton_msl.codegen.msl_emitter import make_split_kernel
+
         n_outputs = sum(1 for _, (_, _, is_out) in self.ptr_args.items() if is_out)
         kb.set_prebuilt_msl(make_split_kernel(n_outputs=n_outputs))
         return kb
@@ -1887,16 +1929,15 @@ class TTGIRParser:
         # Must have integer div or mod (for index remapping h // n_rep)
         ssa_ops = {v[0] for v in self.ssa_values.values()}
         has_div = "div" in ssa_ops
-        has_mod = any(v[0] == "mod" for v in self.ssa_values.values()
-                      if isinstance(v, tuple) and len(v) > 0)
+        has_mod = any(v[0] == "mod" for v in self.ssa_values.values() if isinstance(v, tuple) and len(v) > 0)
         # Check for arith.divui or arith.remui patterns
-        has_int_div = any("arith.divui" in str(v) or "arith.remui" in str(v)
-                         for v in self.ssa_values.values())
+        has_int_div = any("arith.divui" in str(v) or "arith.remui" in str(v) for v in self.ssa_values.values())
         return has_div or has_int_div or len(self.scalar_args) >= 4
 
     def _build_repeat_kv_kernel(self, kb, primary_dtype):
         """Generate a repeat-KV kernel from the pattern."""
         from triton_msl.codegen.msl_emitter import make_repeat_kv_kernel
+
         kb.set_prebuilt_msl(make_repeat_kv_kernel())
         return kb
 
@@ -1928,6 +1969,7 @@ class TTGIRParser:
     def _build_where_kernel(self, kb, primary_dtype):
         """Generate a where kernel from the pattern."""
         from triton_msl.codegen.msl_emitter import make_where_kernel
+
         kb.set_prebuilt_msl(make_where_kernel(dtype=primary_dtype))
         return kb
 
@@ -1958,6 +2000,7 @@ class TTGIRParser:
     def _build_clamp_kernel(self, kb, primary_dtype):
         """Generate a clamp kernel from the pattern."""
         from triton_msl.codegen.msl_emitter import make_clamp_kernel
+
         kb.set_prebuilt_msl(make_clamp_kernel(dtype=primary_dtype))
         return kb
 
@@ -1980,7 +2023,7 @@ class TTGIRParser:
             return False
         # Check that a loop has iter_args (sequential dependency)
         for loop_info in self.scf_for_loops:
-            if loop_info.get('iter_args'):
+            if loop_info.get("iter_args"):
                 # The loop has a running accumulator — likely cumsum
                 # Also verify arith.addf appears in the IR near this loop
                 if "arith.addf" in self.ir_text:
@@ -1990,6 +2033,7 @@ class TTGIRParser:
     def _build_cumsum_kernel(self, kb, primary_dtype):
         """Generate a cumsum kernel from the pattern."""
         from triton_msl.codegen.msl_emitter import make_cumsum_kernel
+
         kb.set_prebuilt_msl(make_cumsum_kernel(dtype=primary_dtype))
         return kb
 
@@ -2013,15 +2057,13 @@ class TTGIRParser:
         # Gather has no comparison/select (distinguishes from dropout)
         has_select = "select" in ssa_ops
         # Check if one input has integer type
-        has_int_input = any(
-            dtype in ("i32", "i64") for _, (_, dtype, is_out) in self.ptr_args.items()
-            if not is_out
-        )
+        has_int_input = any(dtype in ("i32", "i64") for _, (_, dtype, is_out) in self.ptr_args.items() if not is_out)
         return not has_select and has_int_input
 
     def _build_gather_kernel(self, kb, primary_dtype):
         """Generate a gather kernel from the pattern."""
         from triton_msl.codegen.msl_emitter import make_gather_kernel
+
         kb.set_prebuilt_msl(make_gather_kernel())
         return kb
 
@@ -2042,10 +2084,7 @@ class TTGIRParser:
         n_outputs = sum(1 for _, (_, _, is_out) in self.ptr_args.items() if is_out)
         if n_inputs != 2 or n_outputs != 1:
             return False
-        has_int_input = any(
-            dtype in ("i32", "i64") for _, (_, dtype, is_out) in self.ptr_args.items()
-            if not is_out
-        )
+        has_int_input = any(dtype in ("i32", "i64") for _, (_, dtype, is_out) in self.ptr_args.items() if not is_out)
         if not has_int_input:
             return False
         # Distinguish from gather: in scatter the store target uses loaded indices.
@@ -2065,6 +2104,7 @@ class TTGIRParser:
     def _build_scatter_kernel(self, kb, primary_dtype):
         """Generate a scatter kernel from the pattern."""
         from triton_msl.codegen.msl_emitter import make_scatter_kernel
+
         kb.set_prebuilt_msl(make_scatter_kernel())
         return kb
 
@@ -2095,6 +2135,7 @@ class TTGIRParser:
     def _build_transpose_kernel(self, kb, primary_dtype):
         """Generate a transpose kernel from the pattern."""
         from triton_msl.codegen.msl_emitter import make_transpose_kernel
+
         kb.set_prebuilt_msl(make_transpose_kernel())
         return kb
 
@@ -2122,6 +2163,7 @@ class TTGIRParser:
     def _build_dropout_kernel(self, kb, primary_dtype):
         """Generate a dropout kernel from the pattern."""
         from triton_msl.codegen.msl_emitter import make_fused_dropout_kernel
+
         kb.set_prebuilt_msl(make_fused_dropout_kernel())
         return kb
 
@@ -2149,6 +2191,7 @@ class TTGIRParser:
     def _build_batch_norm_kernel(self, kb, primary_dtype):
         """Generate a batch norm (eval mode) kernel from the pattern."""
         from triton_msl.codegen.msl_emitter import make_batch_norm_kernel
+
         kb.set_prebuilt_msl(make_batch_norm_kernel())
         return kb
 
@@ -2172,6 +2215,7 @@ class TTGIRParser:
     def _build_online_softmax_kernel(self, kb, primary_dtype):
         """Generate an online softmax kernel from the pattern."""
         from triton_msl.codegen.msl_emitter import make_online_softmax_kernel
+
         kb.set_prebuilt_msl(make_online_softmax_kernel())
         return kb
 
@@ -2251,8 +2295,13 @@ class TTGIRParser:
         # for both; the implicit conversion to float is harmless in this
         # emission context.
         _BIN_OP_ALIAS = {
-            "add": "add", "sub": "sub", "mul": "mul", "div": "div",
-            "addi": "add", "subi": "sub", "muli": "mul",
+            "add": "add",
+            "sub": "sub",
+            "mul": "mul",
+            "div": "div",
+            "addi": "add",
+            "subi": "sub",
+            "muli": "mul",
         }
         if op in _BIN_OP_ALIAS:
             lhs_var = self._emit_ssa_value(kb, val_info[1], input_vars, dtype, emitted)
@@ -2303,10 +2352,18 @@ class TTGIRParser:
             lhs_var = self._emit_ssa_value(kb, val_info[2], input_vars, dtype, emitted)
             rhs_var = self._emit_ssa_value(kb, val_info[3], input_vars, dtype, emitted)
             pred_map = {
-                "ogt": ">", "oge": ">=", "olt": "<", "ole": "<=",
-                "oeq": "==", "one": "!=",
-                "slt": "<", "sle": "<=", "sgt": ">", "sge": ">=",
-                "eq": "==", "ne": "!=",
+                "ogt": ">",
+                "oge": ">=",
+                "olt": "<",
+                "ole": "<=",
+                "oeq": "==",
+                "one": "!=",
+                "slt": "<",
+                "sle": "<=",
+                "sgt": ">",
+                "sge": ">=",
+                "eq": "==",
+                "ne": "!=",
             }
             msl_op = pred_map.get(pred, ">")
             var_name = f"r_{len(self.computed_values)}"
@@ -2371,6 +2428,7 @@ class TTGIRParser:
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
+
 
 def parse_ttgir(ir_text, options):
     """Parse TTGIR MLIR text and return a KernelBuilder.

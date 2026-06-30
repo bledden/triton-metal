@@ -38,9 +38,7 @@ def _dump_dir() -> str:
     """
     global _cached_dump_dir
     if _cached_dump_dir is _UNSET:
-        _cached_dump_dir = os.environ.get(
-            "TRITON_MSL_DUMP_DIR", "/tmp/triton_msl_debug"
-        )
+        _cached_dump_dir = os.environ.get("TRITON_MSL_DUMP_DIR", "/tmp/triton_msl_debug")
     return _cached_dump_dir
 
 

@@ -83,10 +83,10 @@ class MetalUtils:
         self._command_queue = None
         self._buffer_pool = None
         # Batched dispatch state
-        self._batch_cb = None       # Active MTLCommandBuffer (None = no batch)
-        self._batch_count = 0       # Dispatches encoded in current batch
-        self._batch_max = 16        # Max dispatches per command buffer
-        self._batch_mode = False    # True = defer commit until flush()
+        self._batch_cb = None  # Active MTLCommandBuffer (None = no batch)
+        self._batch_count = 0  # Dispatches encoded in current batch
+        self._batch_max = 16  # Max dispatches per command buffer
+        self._batch_mode = False  # True = defer commit until flush()
         # Deferred copy-backs waiting on current batch
         self._deferred_copies = []  # [(metal_buf, tensor, nbytes, cpu_tensor)]
         self._deferred_releases = []  # [(metal_buf, aligned_mem, size_class) or ("scalar", buf, sz)]
@@ -129,6 +129,7 @@ class MetalUtils:
     def buffer_pool(self):
         if self._buffer_pool is None:
             from triton_msl.buffer_pool import MetalBufferPool
+
             self._buffer_pool = MetalBufferPool(self.device)
         return self._buffer_pool
 
@@ -183,17 +184,10 @@ class MetalUtils:
 
         function = library.newFunctionWithName_(name)
         if function is None:
-            available = [
-                library.functionNames().objectAtIndex_(i)
-                for i in range(library.functionNames().count())
-            ]
-            raise RuntimeError(
-                f"Kernel '{name}' not found in metallib. Available: {available}"
-            )
+            available = [library.functionNames().objectAtIndex_(i) for i in range(library.functionNames().count())]
+            raise RuntimeError(f"Kernel '{name}' not found in metallib. Available: {available}")
 
-        pipeline_state, error = (
-            self.device.newComputePipelineStateWithFunction_error_(function, None)
-        )
+        pipeline_state, error = self.device.newComputePipelineStateWithFunction_error_(function, None)
         if error is not None:
             # Pipeline-state creation can fail for resource reasons
             # (threadgroup memory > 32 KB, register pressure, compiler
@@ -206,7 +200,7 @@ class MetalUtils:
             # the autotuner can continue.
             err_str = str(error).lower()
             resource_markers = (
-                "internal error",          # AGXMetalG16X Code=3
+                "internal error",  # AGXMetalG16X Code=3
                 "threadgroup memory",
                 "out of memory",
                 "register",
@@ -216,6 +210,7 @@ class MetalUtils:
             if any(m in err_str for m in resource_markers):
                 try:
                     from triton.runtime.errors import OutOfResources
+
                     raise OutOfResources(0, 0, f"pipeline state: {error}")
                 except ImportError:
                     raise RuntimeError(f"Failed to create pipeline state: {error}")
@@ -237,9 +232,7 @@ class MetalUtils:
         try:
             direct_fn = library.newFunctionWithName_(name + "__mmdirect")
             if direct_fn is not None:
-                direct_ps, derr = (
-                    self.device.newComputePipelineStateWithFunction_error_(
-                        direct_fn, None))
+                direct_ps, derr = self.device.newComputePipelineStateWithFunction_error_(direct_fn, None)
                 if derr is None and direct_ps is not None:
                     _MM_DIRECT_PIPELINES[id(pipeline_state)] = direct_ps
         except Exception:
@@ -352,6 +345,7 @@ class MetalUtils:
             cpu_tensor = entry[3] if len(entry) > 3 else None
 
             import torch as _torch
+
             is_f64_downcast = (
                 cpu_tensor is not None
                 and hasattr(tensor, "dtype")
@@ -404,18 +398,14 @@ class MetalUtils:
             None,
         )
         if buf is None:
-            raise RuntimeError(
-                f"Failed to create Metal buffer from pointer {ptr:#x} ({nbytes} bytes)"
-            )
+            raise RuntimeError(f"Failed to create Metal buffer from pointer {ptr:#x} ({nbytes} bytes)")
         return buf
 
     def make_buffer(self, nbytes):
         """Allocate a new Metal buffer."""
         import Metal
 
-        buf = self.device.newBufferWithLength_options_(
-            nbytes, Metal.MTLResourceStorageModeShared
-        )
+        buf = self.device.newBufferWithLength_options_(nbytes, Metal.MTLResourceStorageModeShared)
         if buf is None:
             raise RuntimeError(f"Failed to allocate Metal buffer ({nbytes} bytes)")
         return buf
@@ -424,13 +414,9 @@ class MetalUtils:
         """Create a Metal buffer by copying data (single-copy via Metal API)."""
         import Metal
 
-        buf = self.device.newBufferWithBytes_length_options_(
-            data, nbytes, Metal.MTLResourceStorageModeShared
-        )
+        buf = self.device.newBufferWithBytes_length_options_(data, nbytes, Metal.MTLResourceStorageModeShared)
         if buf is None:
-            raise RuntimeError(
-                f"Failed to create Metal buffer with data ({nbytes} bytes)"
-            )
+            raise RuntimeError(f"Failed to create Metal buffer with data ({nbytes} bytes)")
         return buf
 
     def get_device_properties(self, device=0):
@@ -486,6 +472,7 @@ def _get_compile_shader_runtime():
     global _COMPILE_SHADER_RUNTIME
     if _COMPILE_SHADER_RUNTIME is None:
         from triton_msl.backend.compile_shader_runtime import CompileShaderRuntime
+
         _COMPILE_SHADER_RUNTIME = CompileShaderRuntime()
     return _COMPILE_SHADER_RUNTIME
 
@@ -502,9 +489,20 @@ def _get_compile_shader_runtime():
 #           fp32/fp64 bytes into a 2-byte half/bfloat slot -> garbage). These
 #           are excluded so such kernels fall back to the existing path.
 # Anything not in this set (or unresolvable) -> NOT ok -> fall back. Conservative.
-_COMPILE_SHADER_SAFE_SCALAR_SIGS = frozenset({
-    "i1", "i8", "i16", "i32", "i64", "u8", "u16", "u32", "u64", "fp32",
-})
+_COMPILE_SHADER_SAFE_SCALAR_SIGS = frozenset(
+    {
+        "i1",
+        "i8",
+        "i16",
+        "i32",
+        "i64",
+        "u8",
+        "u16",
+        "u32",
+        "u64",
+        "fp32",
+    }
+)
 
 
 def _compile_shader_scalars_ok(launcher, kargs) -> bool:
@@ -521,8 +519,7 @@ def _compile_shader_scalars_ok(launcher, kargs) -> bool:
         # Original arg indices of the non-constexpr args, in kargs order.
         # __call__ builds kargs as [a for i,a in enumerate(args)
         # if i not in constexpr_indices]; mirror that index mapping here.
-        orig_idx = [i for i in range(len(launcher.arg_names))
-                    if i not in launcher.constexpr_indices]
+        orig_idx = [i for i in range(len(launcher.arg_names)) if i not in launcher.constexpr_indices]
         if len(orig_idx) < len(kargs):
             return False  # can't resolve every karg's declared type -> fall back
         for j, a in enumerate(kargs):
@@ -580,6 +577,7 @@ class MetalLauncher:
             # is the only thing that fills the in-memory _MSL_BY_KEY). Keyed by the
             # content-unique cache_key, so a hit is the exact MSL for this kernel.
             from triton_msl.backend.compiler import _load_stashed_msl
+
             msl_key = getattr(metadata, "msl_hash", None)
             _stashed = _load_stashed_msl(msl_key)
             if _stashed is not None:
@@ -630,10 +628,11 @@ class MetalLauncher:
         # one try/except: on ANY exception we fall through to the existing path,
         # marking the MSL unsupported only when it is known.
         import os as _os
-        fast_matmul = (kernel_metadata[7]
-                       if (kernel_metadata and len(kernel_metadata) > 7) else None)
-        if ((self._msl is not None or fast_matmul is not None)
-                and _os.environ.get("TRITON_MSL_COMPILE_SHADER", "1") != "0"):
+
+        fast_matmul = kernel_metadata[7] if (kernel_metadata and len(kernel_metadata) > 7) else None
+        if (self._msl is not None or fast_matmul is not None) and _os.environ.get(
+            "TRITON_MSL_COMPILE_SHADER", "1"
+        ) != "0":
             try:
                 _rt = _get_compile_shader_runtime()
                 if _rt.available():
@@ -641,22 +640,20 @@ class MetalLauncher:
                     kargs = [a for i, a in enumerate(args) if i not in self.constexpr_indices]
                     tensors = [a for a in kargs if hasattr(a, "data_ptr")]
                     all_mps = bool(tensors) and all(
-                        getattr(a, "device", None) is not None
-                        and str(a.device).startswith("mps") for a in tensors)
+                        getattr(a, "device", None) is not None and str(a.device).startswith("mps") for a in tensors
+                    )
 
                     # --- Fast-matmul runtime dispatch (Phase 4) ---
                     # Dispatch the proven simdgroup fast template ONLY for MPS
                     # tensors with aligned runtime dims.  Logic lives in
                     # triton_msl.autotuning._fast_matmul_dispatch so it can be
                     # unit-tested without triggering Triton backend discovery.
-                    if (fast_matmul is not None and all_mps
-                            and _os.environ.get("TRITON_MSL_FAST_MATMUL", "1") != "0"):
-                        from triton_msl.autotuning._fast_matmul_dispatch import (
-                            dispatch_fast_matmul)
+                    if fast_matmul is not None and all_mps and _os.environ.get("TRITON_MSL_FAST_MATMUL", "1") != "0":
+                        from triton_msl.autotuning._fast_matmul_dispatch import dispatch_fast_matmul
+
                         if dispatch_fast_matmul(
-                                _rt, fast_matmul, kargs,
-                                launch_exit_hook=launch_exit_hook,
-                                launch_metadata=launch_metadata):
+                            _rt, fast_matmul, kargs, launch_exit_hook=launch_exit_hook, launch_metadata=launch_metadata
+                        ):
                             return
 
                     # --- Existing elementwise 1-D-grid fast path (needs self._msl) ---
@@ -666,8 +663,7 @@ class MetalLauncher:
                         scalars_ok = _compile_shader_scalars_ok(self, kargs)
                         # 1-D-grid only: anything needing a 2-D grid (or gridY/gridZ > 1)
                         # falls back to the existing path (correct, just slower).
-                        if (all_mps and scalars_ok and not needs_2d_grid
-                                and gridY == 1 and gridZ == 1):
+                        if all_mps and scalars_ok and not needs_2d_grid and gridY == 1 and gridZ == 1:
                             # The stashed MSL's OWN threadgroup size — NOT the
                             # metadata block_size, which the C++ LLVM path may have
                             # clobbered with a value meant for its host metallib
@@ -675,8 +671,7 @@ class MetalLauncher:
                             tg = min(self._msl_block_size or block_size, 1024)
                             threads, group_size = gridX * tg, tg
                             lib = _rt.get_library(self._msl)
-                            _rt.dispatch(lib, self.kernel_name, kargs,
-                                         threads=threads, group_size=group_size)
+                            _rt.dispatch(lib, self.kernel_name, kargs, threads=threads, group_size=group_size)
                             if launch_exit_hook:
                                 launch_exit_hook(launch_metadata)
                             return
@@ -722,27 +717,21 @@ class MetalLauncher:
                 # Signature may be a tuple of per-element sigs; else None.
                 sig_tuple = sig if isinstance(sig, tuple) else None
                 for i, elem in enumerate(arg):
-                    elem_sig = sig_tuple[i] if (
-                        sig_tuple is not None and i < len(sig_tuple)
-                    ) else None
+                    elem_sig = sig_tuple[i] if (sig_tuple is not None and i < len(sig_tuple)) else None
                     yield from _flatten_arg(elem, elem_sig)
             else:
                 yield arg, sig
 
-        flat_args = []       # list of leaf args in flattened order
-        flat_sigs = []       # parallel list of per-leaf signature strings
-        flat_origin = []     # original top-level arg index for each leaf
+        flat_args = []  # list of leaf args in flattened order
+        flat_sigs = []  # parallel list of per-leaf signature strings
+        flat_origin = []  # original top-level arg index for each leaf
         for orig_idx, arg in enumerate(args):
             sig_ty = None
             if orig_idx < len(self.arg_names):
                 sig_ty = self.signature.get(self.arg_names[orig_idx])
             # Fully-constexpr tuple (e.g. `('constexpr',)`) is compiled
             # into the kernel — skip it entirely.
-            if (
-                isinstance(arg, tuple)
-                and isinstance(sig_ty, tuple)
-                and all(s == "constexpr" for s in sig_ty)
-            ):
+            if isinstance(arg, tuple) and isinstance(sig_ty, tuple) and all(s == "constexpr" for s in sig_ty):
                 continue
             if orig_idx in self.constexpr_indices:
                 continue
@@ -768,13 +757,14 @@ class MetalLauncher:
                 continue
             if hasattr(arg, "data_ptr"):
                 import torch as _torch
+
                 is_mps = hasattr(arg, "device") and str(arg.device).startswith("mps")
                 # Metal has no float64 — downcast to float32 transparently.
                 is_f64 = hasattr(arg, "dtype") and arg.dtype == _torch.float64
                 if is_f64:
                     arg_f32 = arg.float()  # float64 → float32
                     nbytes = arg_f32.nelement() * arg_f32.element_size()
-                    is_output = (output_arg_indices is None or arg_idx in output_arg_indices)
+                    is_output = output_arg_indices is None or arg_idx in output_arg_indices
                     metal_buf, aligned_mem, size_class = pool.acquire(nbytes)
                     src = (ctypes.c_char * nbytes).from_address(arg_f32.data_ptr())
                     dst_view = metal_buf.contents().as_buffer(nbytes)
@@ -786,19 +776,21 @@ class MetalLauncher:
                         tensor_copies.append((metal_buf, arg, nbytes, arg_f32, None))
                     continue
                 # TensorWrapper (unsigned int tensors) may lack nelement()
-                if hasattr(arg, 'nelement'):
+                if hasattr(arg, "nelement"):
                     nbytes = arg.nelement() * arg.element_size()
-                elif hasattr(arg, 'numel'):
+                elif hasattr(arg, "numel"):
                     nbytes = arg.numel() * arg.element_size()
                 else:
                     import functools, operator
+
                     nbytes = functools.reduce(operator.mul, arg.shape, 1) * arg.element_size()
-                is_output = (output_arg_indices is None or arg_idx in output_arg_indices)
+                is_output = output_arg_indices is None or arg_idx in output_arg_indices
 
                 if is_mps:
                     # MPS tensors: copy via CPU intermediate to avoid
                     # ctypes.memmove corruption of MPS buffer tracking.
                     import torch
+
                     torch.mps.synchronize()
                     # A kernel addresses each operand with the user-passed RUNTIME
                     # stride args, which describe the tensor's actual (possibly
@@ -828,8 +820,7 @@ class MetalLauncher:
                     _faithful_src = None
                     if (not arg.is_contiguous()) and copy_bytes > nbytes:
                         try:
-                            flat = arg.as_strided((reach_elems,), (1,),
-                                                  arg.storage_offset())
+                            flat = arg.as_strided((reach_elems,), (1,), arg.storage_offset())
                             _cand = flat.cpu().contiguous()
                             if _cand.numel() * _cand.element_size() >= copy_bytes:
                                 _faithful_src = _cand
@@ -856,9 +847,14 @@ class MetalLauncher:
                             # is written correctly. Most callers pass output indices
                             # so inputs never reach here at all.)
                             tensor_copies.append(
-                                (metal_buf, arg, nbytes, cpu_tensor,
-                                 ("faithful_strided", reach_elems,
-                                  arg.element_size())))
+                                (
+                                    metal_buf,
+                                    arg,
+                                    nbytes,
+                                    cpu_tensor,
+                                    ("faithful_strided", reach_elems, arg.element_size()),
+                                )
+                            )
                     else:
                         # Use buffer pool for page-aligned zero-copy
                         metal_buf, aligned_mem, size_class = pool.acquire(nbytes)
@@ -936,9 +932,13 @@ class MetalLauncher:
                     # Using torch's conversion keeps nan/inf/denorm handling
                     # consistent with the rest of the backend.
                     import torch as _torch_bf16
-                    bf16_bits = _torch_bf16.tensor(
-                        [arg], dtype=_torch_bf16.float32
-                    ).to(_torch_bf16.bfloat16).view(_torch_bf16.int16).item()
+
+                    bf16_bits = (
+                        _torch_bf16.tensor([arg], dtype=_torch_bf16.float32)
+                        .to(_torch_bf16.bfloat16)
+                        .view(_torch_bf16.int16)
+                        .item()
+                    )
                     struct.pack_into("h", view, 0, bf16_bits)
                     buffers.append((buf, 0))
                     pool_releases.append(("scalar", buf, 2))
@@ -958,7 +958,7 @@ class MetalLauncher:
             elif isinstance(arg, str):
                 # Constexpr string argument — already compiled into kernel.
                 continue
-            elif hasattr(arg, '__module__') and 'triton' in str(type(arg)):
+            elif hasattr(arg, "__module__") and "triton" in str(type(arg)):
                 # tl.dtype or similar constexpr type — skip.
                 continue
             else:
@@ -979,8 +979,7 @@ class MetalLauncher:
         # uncertainty (different size, non-aligned, read error). Other kernels
         # have no descriptor and are unaffected.
         dispatch_fn = function
-        mm_two = kernel_metadata[6] if (
-            kernel_metadata and len(kernel_metadata) > 6) else None
+        mm_two = kernel_metadata[6] if (kernel_metadata and len(kernel_metadata) > 6) else None
         if mm_two is not None:
             direct_ps = _MM_DIRECT_PIPELINES.get(id(function))
             if direct_ps is not None:
@@ -988,8 +987,7 @@ class MetalLauncher:
                     _M = int(flat_args[mm_two["m_idx"]])
                     _N = int(flat_args[mm_two["n_idx"]])
                     _K = int(flat_args[mm_two["k_idx"]])
-                    if (_M % mm_two["block_m"] == 0 and _N % mm_two["block_n"] == 0
-                            and _K % 8 == 0):
+                    if _M % mm_two["block_m"] == 0 and _N % mm_two["block_n"] == 0 and _K % 8 == 0:
                         dispatch_fn = direct_ps
                 except Exception:
                     dispatch_fn = function
@@ -1024,7 +1022,9 @@ class MetalLauncher:
                     flat_cpu = _torch.empty(_reach, dtype=tensor.dtype)
                     ctypes.memmove(
                         (ctypes.c_char * _rbytes).from_address(flat_cpu.data_ptr()),
-                        (ctypes.c_char * _rbytes).from_buffer(src_view), _rbytes)
+                        (ctypes.c_char * _rbytes).from_buffer(src_view),
+                        _rbytes,
+                    )
                     # Index the flat buffer by the tensor's own strides so each logical
                     # [i,j,...] reads flat[i*s0 + j*s1 + ...]. ``flat_cpu`` was built from
                     # ``arg.as_strided((reach,),(1,),storage_offset)`` (dispatch), so it is
@@ -1033,8 +1033,7 @@ class MetalLauncher:
                     # the view out of bounds for any non-zero-offset output and silently
                     # drop the write). Failure here is a silent-wrong (output not written),
                     # so do NOT swallow it — raise loudly.
-                    strided_logical = flat_cpu.as_strided(
-                        tuple(tensor.shape), tuple(tensor.stride()), 0)
+                    strided_logical = flat_cpu.as_strided(tuple(tensor.shape), tuple(tensor.stride()), 0)
                     tensor.copy_(strided_logical.to(tensor.device))
                     _torch.mps.synchronize()
                     continue
@@ -1102,8 +1101,10 @@ class _MetalTimerEvent:
 
     def record(self, stream=None):
         import torch
+
         torch.mps.synchronize()
         import time
+
         self._time = time.perf_counter()
 
     def elapsed_time(self, end_event):
@@ -1119,6 +1120,7 @@ class _MetalDeviceInterface:
     @staticmethod
     def synchronize(device=None):
         import torch
+
         torch.mps.synchronize()
 
     @staticmethod
@@ -1127,7 +1129,6 @@ class _MetalDeviceInterface:
 
 
 class MetalDriver(DriverBase):
-
     def __init__(self):
         super().__init__()
         self.utils = MetalUtils()
@@ -1146,6 +1147,7 @@ class MetalDriver(DriverBase):
             )
         except (subprocess.CalledProcessError, FileNotFoundError):
             import warnings
+
             warnings.warn(
                 "triton-msl requires Xcode Command Line Tools for MSL compilation. "
                 "Install with: xcode-select --install",

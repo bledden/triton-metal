@@ -274,13 +274,13 @@ inline uchar float_to_fp8e5m2b16(float x) {
 
 # Mapping from Triton dtype string to (to_float_func, from_float_func, to_float_src, from_float_src)
 FP8_CONVERSION_MAP = {
-    "fp8e4nv":  ("fp8e4m3_to_float",   "float_to_fp8e4m3",   FP8_E4M3_TO_FLOAT,   FP8_FLOAT_TO_E4M3),
-    "fp8_e4m3": ("fp8e4m3_to_float",   "float_to_fp8e4m3",   FP8_E4M3_TO_FLOAT,   FP8_FLOAT_TO_E4M3),
-    "fp8e5":    ("fp8e5m2_to_float",   "float_to_fp8e5m2",   FP8_E5M2_TO_FLOAT,   FP8_FLOAT_TO_E5M2),
-    "fp8_e5m2": ("fp8e5m2_to_float",   "float_to_fp8e5m2",   FP8_E5M2_TO_FLOAT,   FP8_FLOAT_TO_E5M2),
-    "fp8e4b15": ("fp8e4m3b15_to_float","float_to_fp8e4m3b15", FP8_E4M3B15_TO_FLOAT, FP8_FLOAT_TO_E4M3B15),
-    "fp8e4b8":  ("fp8e4m3b8_to_float", "float_to_fp8e4m3b8",  FP8_E4M3B8_TO_FLOAT,  FP8_FLOAT_TO_E4M3B8),
-    "fp8e5b16": ("fp8e5m2b16_to_float","float_to_fp8e5m2b16", FP8_E5M2B16_TO_FLOAT, FP8_FLOAT_TO_E5M2B16),
+    "fp8e4nv": ("fp8e4m3_to_float", "float_to_fp8e4m3", FP8_E4M3_TO_FLOAT, FP8_FLOAT_TO_E4M3),
+    "fp8_e4m3": ("fp8e4m3_to_float", "float_to_fp8e4m3", FP8_E4M3_TO_FLOAT, FP8_FLOAT_TO_E4M3),
+    "fp8e5": ("fp8e5m2_to_float", "float_to_fp8e5m2", FP8_E5M2_TO_FLOAT, FP8_FLOAT_TO_E5M2),
+    "fp8_e5m2": ("fp8e5m2_to_float", "float_to_fp8e5m2", FP8_E5M2_TO_FLOAT, FP8_FLOAT_TO_E5M2),
+    "fp8e4b15": ("fp8e4m3b15_to_float", "float_to_fp8e4m3b15", FP8_E4M3B15_TO_FLOAT, FP8_FLOAT_TO_E4M3B15),
+    "fp8e4b8": ("fp8e4m3b8_to_float", "float_to_fp8e4m3b8", FP8_E4M3B8_TO_FLOAT, FP8_FLOAT_TO_E4M3B8),
+    "fp8e5b16": ("fp8e5m2b16_to_float", "float_to_fp8e5m2b16", FP8_E5M2B16_TO_FLOAT, FP8_FLOAT_TO_E5M2B16),
 }
 
 # All FP8 dtype strings (Triton convention)

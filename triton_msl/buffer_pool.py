@@ -81,6 +81,7 @@ class MetalBufferPool:
 
         # Wrap with newBufferWithBytesNoCopy (zero-copy)
         import Metal
+
         metal_buf = self._device.newBufferWithBytesNoCopy_length_options_deallocator_(
             buf_from_mem,
             size_class,
@@ -90,9 +91,7 @@ class MetalBufferPool:
         if metal_buf is None:
             # Fallback: allocate via Metal API (loses zero-copy benefit)
             aligned_mem.close()
-            metal_buf = self._device.newBufferWithLength_options_(
-                size_class, Metal.MTLResourceStorageModeShared
-            )
+            metal_buf = self._device.newBufferWithLength_options_(size_class, Metal.MTLResourceStorageModeShared)
             return metal_buf, None, size_class
 
         return metal_buf, aligned_mem, size_class
@@ -120,9 +119,8 @@ class MetalBufferPool:
             return free_list.pop()
 
         import Metal
-        buf = self._device.newBufferWithLength_options_(
-            max(nbytes, 4), Metal.MTLResourceStorageModeShared
-        )
+
+        buf = self._device.newBufferWithLength_options_(max(nbytes, 4), Metal.MTLResourceStorageModeShared)
         return buf
 
     def release_scalar(self, buf, nbytes):

@@ -3,8 +3,10 @@ from triton_msl.codegen.regval import RegVal, region_needs_arrays, tensor_value_
 
 class FakeOp:
     def __init__(self, op, operand_ids=(), region_ops=None, id=None):
-        self.op = op; self.operand_ids = list(operand_ids)
-        self.region_ops = region_ops; self.id = id
+        self.op = op
+        self.operand_ids = list(operand_ids)
+        self.region_ops = region_ops
+        self.id = id
 
 
 def test_regval_scalar_defaults():
@@ -37,9 +39,12 @@ def test_region_needs_arrays_for_without_multielem_false():
 def test_lookup_regval_scalar_and_array():
     import triton  # noqa: F401
     from triton_msl.codegen.generic_lowerer import GenericLowerer
+
     lo = GenericLowerer.__new__(GenericLowerer)
-    lo.env = {5: "v5"}; lo.env_array = {6: ("a6", 4, "float")}
-    lo.env_n_elems = {5: 1, 6: 4}; lo.env_types = {5: "i32", 6: "f32"}
+    lo.env = {5: "v5"}
+    lo.env_array = {6: ("a6", 4, "float")}
+    lo.env_n_elems = {5: 1, 6: 4}
+    lo.env_types = {5: "i32", 6: "f32"}
     s = lo._lookup_regval(5)
     assert s.name == "v5" and s.n_elems == 1 and s.is_scalar
     a = lo._lookup_regval(6)
@@ -52,13 +57,16 @@ def test_materialize_scalar_collapses_to_plain_var():
     from triton_msl.codegen.regval import RegVal
 
     class _KB:
-        def __init__(self): self.lines = []
-        def raw_line(self, s): self.lines.append(s)
+        def __init__(self):
+            self.lines = []
+
+        def raw_line(self, s):
+            self.lines.append(s)
 
     lo = GenericLowerer.__new__(GenericLowerer)
-    lo.kb = _KB(); lo._var_counter = 0
-    rv = lo._materialize(RegVal(name="", n_elems=1, ty="float", form="scalar"),
-                         lambda e: "a + b", base="m")
+    lo.kb = _KB()
+    lo._var_counter = 0
+    rv = lo._materialize(RegVal(name="", n_elems=1, ty="float", form="scalar"), lambda e: "a + b", base="m")
     assert rv.n_elems == 1 and rv.is_scalar
     joined = "\n".join(lo.kb.lines)
     assert "float m_0 = a + b;" in joined and "for (" not in joined
@@ -70,13 +78,16 @@ def test_materialize_array_emits_indexed_loop():
     from triton_msl.codegen.regval import RegVal
 
     class _KB:
-        def __init__(self): self.lines = []
-        def raw_line(self, s): self.lines.append(s)
+        def __init__(self):
+            self.lines = []
+
+        def raw_line(self, s):
+            self.lines.append(s)
 
     lo = GenericLowerer.__new__(GenericLowerer)
-    lo.kb = _KB(); lo._var_counter = 0
-    rv = lo._materialize(RegVal(name="", n_elems=2, ty="float", form="array"),
-                         lambda e: "x[%d]" % e, base="m")
+    lo.kb = _KB()
+    lo._var_counter = 0
+    rv = lo._materialize(RegVal(name="", n_elems=2, ty="float", form="array"), lambda e: "x[%d]" % e, base="m")
     assert rv.form == "array" and rv.n_elems == 2
 
 
@@ -85,9 +96,9 @@ def test_materialize_array_emits_indexed_loop():
 # Use distinct names (_TVOp / _tv_is_multi) to avoid shadowing FakeOp above.
 # ---------------------------------------------------------------------------
 
+
 class _TVOp:
-    def __init__(self, op, id=None, operand_ids=None, result_ids=None,
-                 region_ops=None, else_ops=None, multi=False):
+    def __init__(self, op, id=None, operand_ids=None, result_ids=None, region_ops=None, else_ops=None, multi=False):
         self.op = op
         self.id = id
         self.operand_ids = operand_ids or []
@@ -110,8 +121,7 @@ def test_tensor_value_ids_collects_multi_top_level():
 
 def test_tensor_value_ids_recurses_into_control_flow():
     body_load = _TVOp("tt.load", id="v", result_ids=["v"], multi=True)
-    loop = _TVOp("scf.for", id="loop", result_ids=["loop"],
-                 region_ops=[body_load], multi=False)
+    loop = _TVOp("scf.for", id="loop", result_ids=["loop"], region_ops=[body_load], multi=False)
     ids = tensor_value_ids([loop], _tv_is_multi)
     assert ids == {"v"}
 
@@ -125,27 +135,26 @@ def test_tensor_value_ids_empty_when_no_multi():
 def test_tensor_value_ids_recurses_into_else_ops():
     # scf.while: loop body lives in else_ops, not region_ops
     body_load = _TVOp("tt.load", id="v", result_ids=["v"], multi=True)
-    wh = _TVOp("scf.while", id="wh", result_ids=["wh"],
-               region_ops=[], else_ops=[body_load], multi=False)
+    wh = _TVOp("scf.while", id="wh", result_ids=["wh"], region_ops=[], else_ops=[body_load], multi=False)
     ids = tensor_value_ids([wh], _tv_is_multi)
     assert ids == {"v"}
 
 
 def test_region_needs_arrays_detects_multi_in_else_ops():
     from triton_msl.codegen.regval import region_needs_arrays
+
     # a multi value referenced by an op in the scf.while body (else_ops)
     use = _TVOp("tt.addptr", id="idx", operand_ids=["offs"], result_ids=["idx"])
-    wh = _TVOp("scf.while", id="wh", operand_ids=[],
-               region_ops=[], else_ops=[use])
+    wh = _TVOp("scf.while", id="wh", operand_ids=[], region_ops=[], else_ops=[use])
     assert region_needs_arrays([wh], {"offs"}) is True
 
 
 def test_region_needs_arrays_matches_result_ids_not_just_id():
     from triton_msl.codegen.regval import region_needs_arrays
+
     # A body op whose multi-element value is its result_ids[0]=200, while its
     # .id is a different number (300). tensor_value_ids would add 200 to the
     # multi set; region_needs_arrays must detect that 200 is produced here.
     producer = _TVOp("tt.load", id=300, operand_ids=[], result_ids=[200])
-    loop = _TVOp("scf.for", id=1, operand_ids=[], result_ids=[],
-                 region_ops=[producer])
+    loop = _TVOp("scf.for", id=1, operand_ids=[], result_ids=[], region_ops=[producer])
     assert region_needs_arrays([loop], {200}) is True

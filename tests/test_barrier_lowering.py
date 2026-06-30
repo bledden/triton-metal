@@ -5,6 +5,7 @@ lowerer only knew the old spelling, so `tl.debug_barrier()` compiled to MSL with
 NO barrier — racy cross-SIMD-group kernels with no error (downstream tridec bug
 1, 2026-06-10). This pins the new spelling emits the barrier.
 """
+
 import os
 import pytest
 
@@ -27,15 +28,18 @@ def emit(monkeypatch):
 
     def _emit(fn, sig, cst):
         t = GPUTarget("metal", "apple-m4", 32)
-        be = MetalBackend(t); o = be.parse_options({})
+        be = MetalBackend(t)
+        o = be.parse_options({})
         src = ASTSource(fn=fn, signature=sig, constexprs=cst)
-        ctx = ir.context(); ir.load_dialects(ctx)
-        mod = src.make_ir(t, o, be.get_codegen_implementation(o),
-                          be.get_module_map(), ctx)
+        ctx = ir.context()
+        ir.load_dialects(ctx)
+        mod = src.make_ir(t, o, be.get_codegen_implementation(o), be.get_module_map(), ctx)
         meta = {}
-        mod = be.make_ttir(mod, meta, o); mod = be.make_ttgir(mod, meta, o)
+        mod = be.make_ttir(mod, meta, o)
+        mod = be.make_ttgir(mod, meta, o)
         assert "ttg.barrier" in str(mod), "expected ttg.barrier in TTGIR"
         return emit_msl(mod, meta, o)
+
     return _emit
 
 
@@ -56,9 +60,7 @@ def test_debug_barrier_emits_threadgroup_barrier(emit):
 import torch  # noqa: E402
 
 
-@pytest.mark.skipif(
-    not __import__("Metal").MTLCreateSystemDefaultDevice(),
-    reason="Metal device needed")
+@pytest.mark.skipif(not __import__("Metal").MTLCreateSystemDefaultDevice(), reason="Metal device needed")
 def test_barrier_orders_cross_lane_gather_deterministic():
     """The barrier must make a write->gather across SIMD groups (BLOCK=128 =
     4 groups) correct and deterministic; without it the kernel is racy."""
@@ -76,7 +78,8 @@ def test_barrier_orders_cross_lane_gather_deterministic():
     ref = ((np.arange(N) + 1) % N).astype(np.float32)
     outs = []
     for _ in range(5):
-        s = torch.zeros(N); o = torch.zeros(N)
+        s = torch.zeros(N)
+        o = torch.zeros(N)
         race[(1,)](s, o, N=N)
         outs.append(o.numpy().copy())
     assert all(np.array_equal(o, ref) for o in outs)

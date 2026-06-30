@@ -21,11 +21,19 @@ from triton_msl.codegen._lowerer_helpers import _mlir_to_triton_dtype
 # round the representation. In the per-element fused-epilogue loop they resolve
 # to their operand's expression (no emitted statement). Output dtype casts are
 # absorbed by the final store's cast. #158.
-_EPI_PASSTHROUGH = frozenset({
-    "tt.splat", "tt.broadcast", "tt.expand_dims", "tt.reshape",
-    "ttg.convert_layout", "arith.truncf", "arith.extf",
-    "arith.sitofp", "arith.fptosi",
-})
+_EPI_PASSTHROUGH = frozenset(
+    {
+        "tt.splat",
+        "tt.broadcast",
+        "tt.expand_dims",
+        "tt.reshape",
+        "ttg.convert_layout",
+        "arith.truncf",
+        "arith.extf",
+        "arith.sitofp",
+        "arith.fptosi",
+    }
+)
 
 
 class _DetectionMixin:
@@ -46,6 +54,7 @@ class _DetectionMixin:
         """
         if op_by_id is None:
             op_by_id = {}
+
             def _collect(ops):
                 for s in ops:
                     op_by_id[s.id] = s
@@ -53,6 +62,7 @@ class _DetectionMixin:
                         _collect(s.region_ops)
                     if s.else_ops:
                         _collect(s.else_ops)
+
             _collect(self.graph.ops)
         if depth > 32:
             return None
@@ -82,6 +92,7 @@ class _DetectionMixin:
             return None
         # Build op index once.
         op_by_id = {}
+
         def _collect(ops):
             for s in ops:
                 op_by_id[s.id] = s
@@ -89,6 +100,7 @@ class _DetectionMixin:
                     _collect(s.region_ops)
                 if s.else_ops:
                     _collect(s.else_ops)
+
         _collect(self.graph.ops)
         a_arg = self._trace_ptr_source(dot_ssa.operand_ids[0], op_by_id)
         b_arg = self._trace_ptr_source(dot_ssa.operand_ids[1], op_by_id)
@@ -125,8 +137,7 @@ class _DetectionMixin:
         _seen = set()
         while _op is not None and _op.id not in _seen:
             _seen.add(_op.id)
-            if _op.op in ("tt.splat", "tt.broadcast", "ttg.convert_layout",
-                          "tt.reshape", "tt.expand_dims"):
+            if _op.op in ("tt.splat", "tt.broadcast", "ttg.convert_layout", "tt.reshape", "tt.expand_dims"):
                 _op = by_id.get(_op.operand_ids[0]) if _op.operand_ids else None
                 continue
             break
@@ -162,6 +173,7 @@ class _DetectionMixin:
         layout-agnostically (so a transposed/strided operand is read correctly).
         """
         op_by_id = {}
+
         def _collect(ops):
             for s in ops:
                 op_by_id[s.id] = s
@@ -169,6 +181,7 @@ class _DetectionMixin:
                     _collect(s.region_ops)
                 if s.else_ops:
                     _collect(s.else_ops)
+
         _collect(self.graph.ops)
         arg_by_id = {a.id: a for a in self.graph.args}
 
@@ -187,12 +200,16 @@ class _DetectionMixin:
         def _skip(o):
             # Follow operand 0 through layout-only wrappers to the real op.
             seen = 0
-            while o is not None and seen < 16 and o.op in (
-                    "tt.broadcast", "ttg.convert_layout", "tt.reshape",
-                    "arith.sitofp", "arith.extsi", "arith.trunci"):
+            while (
+                o is not None
+                and seen < 16
+                and o.op
+                in ("tt.broadcast", "ttg.convert_layout", "tt.reshape", "arith.sitofp", "arith.extsi", "arith.trunci")
+            ):
                 if not o.operand_ids:
                     return o
-                o = op_by_id.get(o.operand_ids[0]); seen += 1
+                o = op_by_id.get(o.operand_ids[0])
+                seen += 1
             return o
 
         def _addptr_for(ptr_arg):
@@ -225,9 +242,13 @@ class _DetectionMixin:
             seen_ids = set()
             cur = addptr
             depth = 0
-            while (cur is not None and cur.op == "tt.addptr"
-                   and len(cur.operand_ids) >= 2 and cur.id not in seen_ids
-                   and depth < 16):
+            while (
+                cur is not None
+                and cur.op == "tt.addptr"
+                and len(cur.operand_ids) >= 2
+                and cur.id not in seen_ids
+                and depth < 16
+            ):
                 seen_ids.add(cur.id)
                 depth += 1
                 _flatten_addi(op_by_id.get(cur.operand_ids[1]), acc)
@@ -256,7 +277,7 @@ class _DetectionMixin:
             if srcop is None or srcop.op != "arith.constant":
                 return None
             raw = str(srcop.attrs.get("value", "")).strip()
-            tok = raw.split(":")[0].strip()    # "32 : i32" -> "32"
+            tok = raw.split(":")[0].strip()  # "32 : i32" -> "32"
             try:
                 return str(int(float(tok)))
             except (TypeError, ValueError):
@@ -273,8 +294,7 @@ class _DetectionMixin:
             if term.op in ("arith.muli", "arith.mul") and len(term.operand_ids) == 2:
                 o0 = _skip(op_by_id.get(term.operand_ids[0]))
                 o1 = _skip(op_by_id.get(term.operand_ids[1]))
-                ed = o0 if (o0 and o0.op == "tt.expand_dims") else (
-                     o1 if (o1 and o1.op == "tt.expand_dims") else None)
+                ed = o0 if (o0 and o0.op == "tt.expand_dims") else (o1 if (o1 and o1.op == "tt.expand_dims") else None)
                 other = o1 if ed is o0 else o0
                 if ed is None:
                     return (None, None)
@@ -284,7 +304,7 @@ class _DetectionMixin:
                     if src in arg_by_id:
                         stride = arg_by_id[src].name
                     else:
-                        stride = _const_stride(op_by_id.get(src))   # constexpr dim or None
+                        stride = _const_stride(op_by_id.get(src))  # constexpr dim or None
                 elif sp is not None and sp.op == "arith.constant":
                     stride = _const_stride(sp)
                 else:
@@ -368,6 +388,7 @@ class _DetectionMixin:
         otherwise un-modeled) pointer advance -> refuse.
         """
         op_by_id = {}
+
         def _collect(ops):
             for s in ops:
                 op_by_id[s.id] = s
@@ -375,15 +396,15 @@ class _DetectionMixin:
                     _collect(s.region_ops)
                 if s.else_ops:
                     _collect(s.else_ops)
+
         _collect(self.graph.ops)
 
         all_ptr_args = [a for a in self.graph.args if a.is_ptr]
         dots = [s for s in op_by_id.values() if s.op == "tt.dot"]
         if len(dots) != 1 or len(all_ptr_args) < 3:
-            return     # only guard the single-dot matmul shape we route here
+            return  # only guard the single-dot matmul shape we route here
         roles = self._resolve_dot_ptr_roles(dots[0], all_ptr_args)
-        ptrs = roles[:3] if (roles and len(roles) >= 3) else (
-            [all_ptr_args[0], all_ptr_args[1], all_ptr_args[-1]])
+        ptrs = roles[:3] if (roles and len(roles) >= 3) else ([all_ptr_args[0], all_ptr_args[1], all_ptr_args[-1]])
         ptr_names = {p.name for p in ptrs}
 
         def _depends_on_pid(start_id, depth=0, seen=None):
@@ -395,21 +416,23 @@ class _DetectionMixin:
             o = op_by_id.get(start_id)
             if o is None:
                 return False
-            if o.op in ("tt.get_program_id", "tt.program_id",
-                        "tt.get_num_programs"):
+            if o.op in ("tt.get_program_id", "tt.program_id", "tt.get_num_programs"):
                 return True
-            return any(_depends_on_pid(oid, depth + 1, seen)
-                       for oid in (o.operand_ids or []))
+            return any(_depends_on_pid(oid, depth + 1, seen) for oid in (o.operand_ids or []))
 
         def _skip_wrap(o):
             # Follow operand 0 through layout-only wrappers to the real op.
             seen = 0
-            while o is not None and seen < 16 and o.op in (
-                    "tt.broadcast", "ttg.convert_layout", "tt.reshape",
-                    "arith.sitofp", "arith.extsi", "arith.trunci"):
+            while (
+                o is not None
+                and seen < 16
+                and o.op
+                in ("tt.broadcast", "ttg.convert_layout", "tt.reshape", "arith.sitofp", "arith.extsi", "arith.trunci")
+            ):
                 if not o.operand_ids:
                     return o
-                o = op_by_id.get(o.operand_ids[0]); seen += 1
+                o = op_by_id.get(o.operand_ids[0])
+                seen += 1
             return o
 
         def _flatten_add(o, acc, depth=0):
@@ -430,8 +453,7 @@ class _DetectionMixin:
                 return False
             if o.op in ("tt.make_range", "tt.expand_dims"):
                 return True
-            return any(_term_has_range(op_by_id.get(oid), depth + 1)
-                       for oid in (o.operand_ids or []))
+            return any(_term_has_range(op_by_id.get(oid), depth + 1) for oid in (o.operand_ids or []))
 
         # 2-D stride arg names (address-traced). The CANONICAL tiled matmul advances an
         # A/B/C base by ``pid_m*BM*stride_row`` — a valid 2-D tiling whose multiplier is the
@@ -452,6 +474,7 @@ class _DetectionMixin:
                     if _s and _s != "1":
                         _2d_strides.add(_s)
         _arg_name_by_id = {a.id: a.name for a in self.graph.args}
+
         def _argnames(start_id, depth=0, seen=None):
             if seen is None:
                 seen = set()
@@ -463,9 +486,10 @@ class _DetectionMixin:
                 names.add(_arg_name_by_id[start_id])
             o = op_by_id.get(start_id)
             if o:
-                for oid in (o.operand_ids or []):
+                for oid in o.operand_ids or []:
                     names |= _argnames(oid, depth + 1, seen)
             return names
+
         # tt.make_range extents = the tile sizes (BM/BN/BK). A folded contiguous tile advance
         # is pid*BM (col stride folded to 1), so its constant multiplier IS a tile extent; a
         # batch advance is pid*(M*K), whose constant is NOT a tile extent.
@@ -492,7 +516,7 @@ class _DetectionMixin:
                 return 1
             if o.op in ("arith.muli", "arith.mul"):
                 p = 1
-                for oid in (o.operand_ids or []):
+                for oid in o.operand_ids or []:
                     m = _const_mult(op_by_id.get(oid), depth + 1)
                     if m is None:
                         return None
@@ -520,12 +544,12 @@ class _DetectionMixin:
                     continue
                 _names = _argnames(t.id)
                 if _names and not (_names - _2d_strides):
-                    continue   # runtime 2-D-stride tile advance -> allow
+                    continue  # runtime 2-D-stride tile advance -> allow
                 if not _names:
                     _m = _const_mult(t)
                     if _m is not None and _m in _extents:
-                        continue   # folded tile advance (multiplier == a tile extent) -> allow
-                return True        # batch / ambiguous -> refuse
+                        continue  # folded tile advance (multiplier == a tile extent) -> allow
+                return True  # batch / ambiguous -> refuse
             return False
 
         for o in op_by_id.values():
@@ -542,6 +566,7 @@ class _DetectionMixin:
             # and refuses any uniform pid term that is not a provable 2-D tile advance.
             if _is_batch_advance(o.operand_ids[1]):
                 from triton_msl.errors import MetalNonRecoverableError
+
                 raise MetalNonRecoverableError(
                     "batched matmul (an A/B/C base pointer advanced by a "
                     "program_id-derived batch offset, e.g. a += pid*stride_batch on "
@@ -551,7 +576,8 @@ class _DetectionMixin:
                     "compute batch 0's region for every batch. Batched MMA is not "
                     "implemented. Refusing rather than mis-compute. Loop the batch "
                     "dimension on the host, or use a separate kernel per batch.",
-                    op_name="tt.dot")
+                    op_name="tt.dot",
+                )
 
     def _template_output_mask_nontrivial(self, is_fa):
         """True iff a dot-bearing kernel carries an output ``tt.store`` mask that
@@ -589,6 +615,7 @@ class _DetectionMixin:
         bound, a value comparison, OR / XOR, an un-modelled expression) is NOT
         provably-trivial -> returns True.
         """
+
         def _flatten(ops):
             for s in ops:
                 yield s
@@ -604,8 +631,7 @@ class _DetectionMixin:
 
         # Only the stores that could route to a template matter, and a template only
         # fires for a dot kernel. Classify every masked output store in such a kernel.
-        masked_stores = [s for s in allops
-                         if s.op == "tt.store" and len(s.operand_ids or []) >= 3]
+        masked_stores = [s for s in allops if s.op == "tt.store" and len(s.operand_ids or []) >= 3]
         if not masked_stores:
             return False  # no output mask -> nothing dropped
 
@@ -616,8 +642,16 @@ class _DetectionMixin:
         ok_row_names = {"N_CTX"} if is_fa else {"M"}
         ok_col_names = set() if is_fa else {"N"}
 
-        _IDX_WRAP = ("arith.addi", "arith.subi", "arith.muli", "tt.broadcast",
-                     "ttg.convert_layout", "tt.reshape", "tt.splat", "tt.expand_dims")
+        _IDX_WRAP = (
+            "arith.addi",
+            "arith.subi",
+            "arith.muli",
+            "tt.broadcast",
+            "ttg.convert_layout",
+            "tt.reshape",
+            "tt.splat",
+            "tt.expand_dims",
+        )
 
         def _index_info(start_id):
             """Trace an SSA value back toward a ``tt.make_range`` (a tile-position
@@ -646,9 +680,8 @@ class _DetectionMixin:
                     except (TypeError, ValueError):
                         extent = None
                     continue
-                if o.op in ("tt.get_program_id", "tt.program_id",
-                            "tt.get_num_programs"):
-                    has_pid = True       # multi-block tile offset pid*BLOCK+range
+                if o.op in ("tt.get_program_id", "tt.program_id", "tt.get_num_programs"):
+                    has_pid = True  # multi-block tile offset pid*BLOCK+range
                     continue
                 if o.op == "tt.expand_dims":
                     try:
@@ -671,10 +704,12 @@ class _DetectionMixin:
             seen = set()
             cur = bound_id
             o = by_id.get(cur)
-            while (o is not None and o.id not in seen
-                   and o.op in ("tt.splat", "tt.broadcast", "ttg.convert_layout",
-                                "tt.reshape")
-                   and o.operand_ids):
+            while (
+                o is not None
+                and o.id not in seen
+                and o.op in ("tt.splat", "tt.broadcast", "ttg.convert_layout", "tt.reshape")
+                and o.operand_ids
+            ):
                 seen.add(o.id)
                 cur = o.operand_ids[0]
                 o = by_id.get(cur)
@@ -712,8 +747,9 @@ class _DetectionMixin:
                 return False  # neither (or both) is a tile index -> can't prove trivial
             # Must be an UPPER bound on the index (idx < bound):
             #   slt/ult/sle/ule with idx on the LEFT, or sgt/ugt/sge/uge with idx RIGHT.
-            upper = ((pred in ("slt", "ult", "sle", "ule") and idx_left)
-                     or (pred in ("sgt", "ugt", "sge", "uge") and not idx_left))
+            upper = (pred in ("slt", "ult", "sle", "ule") and idx_left) or (
+                pred in ("sgt", "ugt", "sge", "uge") and not idx_left
+            )
             if not upper:
                 return False
             extent, axis, has_pid = idx_info
@@ -729,8 +765,7 @@ class _DetectionMixin:
             if o.op == "arith.andi":
                 ops = o.operand_ids or []
                 return bool(ops) and all(_mask_is_trivial(c, depth + 1) for c in ops)
-            if o.op in ("tt.broadcast", "ttg.convert_layout", "tt.reshape",
-                        "tt.expand_dims"):
+            if o.op in ("tt.broadcast", "ttg.convert_layout", "tt.reshape", "tt.expand_dims"):
                 return bool(o.operand_ids) and _mask_is_trivial(o.operand_ids[0], depth + 1)
             if o.op == "arith.cmpi":
                 return _leaf_is_trivial(o)
@@ -761,6 +796,7 @@ class _DetectionMixin:
         using the SAME shared triviality check (``_template_output_mask_nontrivial``) so
         the two cannot diverge. The no-mask / provable tile-boundary cases are untouched.
         """
+
         def _flatten(ops):
             for s in ops:
                 yield s
@@ -779,14 +815,14 @@ class _DetectionMixin:
         # honoring path, or the head_dim=128 template self-refuses at emission).
         def _is_exp(op):
             return op in ("math.exp", "math.exp2", "tt.exp")
-        is_fa = (len(dots) >= 2
-                 and any(_is_exp(s.op) for s in allops)
-                 and any("max" in (s.op or "") for s in allops))
+
+        is_fa = len(dots) >= 2 and any(_is_exp(s.op) for s in allops) and any("max" in (s.op or "") for s in allops)
         if is_fa:
             return
 
         if self._template_output_mask_nontrivial(is_fa=False):
             from triton_msl.errors import MetalNonRecoverableError
+
             raise MetalNonRecoverableError(
                 "matmul with a non-tile-boundary output store mask is not supported: "
                 "the simdgroup / K-loop / strided / matmul+softmax templates compute the "
@@ -799,7 +835,8 @@ class _DetectionMixin:
                 "tile-boundary mask (rm < M) & (rn < N) is honored automatically by the "
                 "template boundary), or apply the partial-output mask in a separate "
                 "elementwise kernel.",
-                op_name="tt.dot")
+                op_name="tt.dot",
+            )
 
     def _detect_simple_dot(self):
         """Detect a simple dot kernel: load→local_alloc→local_load→dot→store.
@@ -854,15 +891,15 @@ class _DetectionMixin:
                     yield from _all_ops(s.region_ops)
                 if s.else_ops:
                     yield from _all_ops(s.else_ops)
+
         _all = list(_all_ops(self.graph.ops))
         _dots = [s for s in _all if s.op == "tt.dot"]
         if len(_dots) > 1:
-            return None                       # chain-dot / FA → not a simple dot
+            return None  # chain-dot / FA → not a simple dot
         if _dots:
-            _dshape = _extract_shape(self._find_op_type_str(_dots[0].id)
-                                     or _dots[0].type_str or "")
+            _dshape = _extract_shape(self._find_op_type_str(_dots[0].id) or _dots[0].type_str or "")
             if _dshape and len(_dshape) >= 3:
-                return None                   # 3-D batched-via-strides → prebuilt
+                return None  # 3-D batched-via-strides → prebuilt
 
         # A single-dot matmul with a trailing compute epilogue the fused template
         # didn't claim (looped dot-in-K-loop, etc.) must REFUSE — the inline simdgroup
@@ -873,6 +910,7 @@ class _DetectionMixin:
         if self._has_unhandled_matmul_compute_epilogue():
             from triton_msl.codegen.generic_lowerer import _MATMUL_EPILOGUE_REFUSE_MSG
             from triton_msl.errors import MetalNonRecoverableError
+
             raise MetalNonRecoverableError(_MATMUL_EPILOGUE_REFUSE_MSG, op_name="tt.dot")
 
         # BLOCKER 4: refuse a batched matmul (program_id-derived batch offset on an
@@ -895,11 +933,13 @@ class _DetectionMixin:
             if not scf_op or not scf_op.operand_ids or len(scf_op.operand_ids) < 3:
                 return None
             op_by_id = {s.id: s for s in self.graph.ops}
+
             def _const_val(sid):
                 s = op_by_id.get(sid)
                 if not s or s.op != "arith.constant":
                     return None
                 return s.attrs.get("value")
+
             lo = _const_val(scf_op.operand_ids[0])
             hi = _const_val(scf_op.operand_ids[1])
             step = _const_val(scf_op.operand_ids[2])
@@ -938,11 +978,14 @@ class _DetectionMixin:
             # once after) and mis-computes a tile-loop (re-audit #11). Refuse.
             if has_store_in_loop:
                 from triton_msl.errors import MetalNonRecoverableError
+
                 raise MetalNonRecoverableError(
                     "matmul with a tt.store inside the scf.for loop body is a "
                     "tile-iteration loop, not a K-reduction loop; the inline simdgroup "
                     "template only handles the K-loop form and would mis-compute. "
-                    "Refusing.", op_name="tt.dot")
+                    "Refusing.",
+                    op_name="tt.dot",
+                )
 
             # A non-zero accumulator INIT (a fused bias / tl.full) is NOT seeded into the
             # simdgroup accumulators by the inline template, so it is silently DROPPED
@@ -954,15 +997,17 @@ class _DetectionMixin:
             # or a non-constant load/broadcast bias).
             by_id_all = {s.id: s for s in self.graph.ops}
 
-            for _init_id in (scf_for_ssa.operand_ids[3:]
-                             if len(scf_for_ssa.operand_ids) > 3 else []):
+            for _init_id in scf_for_ssa.operand_ids[3:] if len(scf_for_ssa.operand_ids) > 3 else []:
                 if self._acc_init_is_bias(_init_id, by_id_all):
                     from triton_msl.errors import MetalNonRecoverableError
+
                     raise MetalNonRecoverableError(
                         "K-loop matmul with a non-zero loop-carried accumulator init "
                         "(fused bias / tl.full) is not supported by the inline simdgroup "
                         "template (the init is silently dropped). Refusing. Add the bias "
-                        "as a separate kernel after the matmul.", op_name="tt.dot")
+                        "as a separate kernel after the matmul.",
+                        op_name="tt.dot",
+                    )
 
             # Extract BLOCK_M x BLOCK_K and BLOCK_K x BLOCK_N from dot operands
             a_type = self._find_op_type_str(dot_in_loop.operand_ids[0])
@@ -985,8 +1030,7 @@ class _DetectionMixin:
             # Falling back to function-arg-declaration order gives wrong
             # results when the kernel lists ``(Z, X, Y)`` like
             # ``test_dot_mulbroadcasted``.
-            ptr_args = self._resolve_dot_ptr_roles(
-                dot_in_loop, all_ptr_args) or all_ptr_args
+            ptr_args = self._resolve_dot_ptr_roles(dot_in_loop, all_ptr_args) or all_ptr_args
             if len(ptr_args) < 3:
                 return None
 
@@ -994,8 +1038,11 @@ class _DetectionMixin:
             scalar_arg_map = {a.name: a for a in scalar_args}
 
             return {
-                "BLOCK_M": BLOCK_M, "BLOCK_N": BLOCK_N, "BLOCK_K": BLOCK_K,
-                "ptr_args": ptr_args, "dot_ssa": dot_in_loop,
+                "BLOCK_M": BLOCK_M,
+                "BLOCK_N": BLOCK_N,
+                "BLOCK_K": BLOCK_K,
+                "ptr_args": ptr_args,
+                "dot_ssa": dot_in_loop,
                 "has_k_loop": True,
                 "scalar_args": scalar_arg_map,
                 "all_scalar_args": scalar_args,
@@ -1023,11 +1070,13 @@ class _DetectionMixin:
 
         if self._acc_init_is_bias(dot_ssa.operand_ids[2], _by0):
             from triton_msl.errors import MetalNonRecoverableError
+
             raise MetalNonRecoverableError(
                 "non-looped matmul with a non-zero accumulator init (fused bias / "
                 "tl.full) is silently dropped by the inline simdgroup template. "
                 "Refusing. Add the bias as a separate kernel after the matmul.",
-                op_name="tt.dot")
+                op_name="tt.dot",
+            )
 
         # Detect a post-dot EPILOGUE on the dot result. _lower_simple_dot_inline
         # emits a bare matmul + store; if the dot result feeds any value-changing
@@ -1041,9 +1090,16 @@ class _DetectionMixin:
         # rather than emit wrong numbers. Only layout changes / output dtype
         # casts are value-preserving passthroughs.
         _passthrough = {
-            "ttg.convert_layout", "tt.reshape", "tt.trans",
-            "arith.truncf", "arith.extf", "arith.bitcast",
-            "arith.sitofp", "arith.uitofp", "arith.fptosi", "arith.fptoui",
+            "ttg.convert_layout",
+            "tt.reshape",
+            "tt.trans",
+            "arith.truncf",
+            "arith.extf",
+            "arith.bitcast",
+            "arith.sitofp",
+            "arith.uitofp",
+            "arith.fptosi",
+            "arith.fptoui",
             "tt.fp_to_fp",
         }
         _seen = set()
@@ -1057,17 +1113,19 @@ class _DetectionMixin:
                 if _vid not in (_op.operand_ids or []):
                     continue
                 if _op.op == "tt.store":
-                    continue                      # terminal — fine
+                    continue  # terminal — fine
                 if _op.op in _passthrough:
-                    _frontier.append(_op.id)      # follow representation change
+                    _frontier.append(_op.id)  # follow representation change
                 else:
                     from triton_msl.errors import MetalNonRecoverableError
+
                     raise MetalNonRecoverableError(
                         f"matmul with a fused '{_op.op}' epilogue on the dot "
                         "result is not supported (only softmax is fused). The "
                         "simple-dot path would silently drop it. Split the "
                         "epilogue into a separate kernel, or apply it after a "
-                        "K-loop matmul store.")
+                        "K-loop matmul store."
+                    )
 
         # Verify the dot operands come from loads (not constants)
         # Trace: dot ← local_load ← local_alloc ← tt.load
@@ -1080,9 +1138,7 @@ class _DetectionMixin:
             return None
 
         # Verify there are local_alloc/local_load ops (the shared memory path)
-        has_local_alloc = any(
-            ssa.op == "ttg.local_alloc" for ssa in self.graph.ops
-        )
+        has_local_alloc = any(ssa.op == "ttg.local_alloc" for ssa in self.graph.ops)
         if not has_local_alloc:
             return None
 
@@ -1099,11 +1155,14 @@ class _DetectionMixin:
                     _ax = 0
                 if _ax >= 2:
                     from triton_msl.errors import MetalNonRecoverableError
+
                     raise MetalNonRecoverableError(
                         "batched matmul using program_id(2) (a 3-D grid batch axis) is "
                         "not supported by the simdgroup matmul template, which maps only "
                         "program_id(0/1) to the M/N tiles and would drop the batch "
-                        "offset. Refusing.", op_name="tt.dot")
+                        "offset. Refusing.",
+                        op_name="tt.dot",
+                    )
 
         # (#5 re-audit #14) A masked dot input load signals a PADDED dimension (e.g. K
         # padded to a power of 2 with mask k<K, so the real A row stride is the runtime
@@ -1113,11 +1172,13 @@ class _DetectionMixin:
         for _lop in self.graph.ops:
             if _lop.op == "tt.load" and len(_lop.operand_ids or []) >= 2:
                 from triton_msl.errors import MetalNonRecoverableError
+
                 raise MetalNonRecoverableError(
                     "matmul with a masked input load (a padded M/N/K dimension) is not "
                     "supported by the inline simdgroup template — it ignores the mask and "
                     "strides by the tile width, not the runtime dimension. Refusing.",
-                    op_name="tt.dot")
+                    op_name="tt.dot",
+                )
 
         # Extract shapes from dot operands
         a_type = self._find_op_type_str(dot_ssa.operand_ids[0])
@@ -1147,8 +1208,7 @@ class _DetectionMixin:
         # store target. The function-arg-declaration order can put C
         # ahead of A/B (e.g. ``kernel(Z, X, Y, ...)`` in
         # ``test_dot_mulbroadcasted``).
-        ptr_args = self._resolve_dot_ptr_roles(
-            dot_ssa, all_ptr_args) or all_ptr_args
+        ptr_args = self._resolve_dot_ptr_roles(dot_ssa, all_ptr_args) or all_ptr_args
 
         # Detect whether each dot operand is transposed. ``tl.trans`` before
         # tt.dot can land in TTGIR three ways depending on rank:
@@ -1175,8 +1235,7 @@ class _DetectionMixin:
             n = len(order)
             if n < 2:
                 return False
-            return (order[:n - 2] == list(range(n - 2))
-                    and order[n - 2:] == [n - 1, n - 2])
+            return order[: n - 2] == list(range(n - 2)) and order[n - 2 :] == [n - 1, n - 2]
 
         def _walk_back_to_trans(start_id, max_steps=4):
             """Follow tt.reshape / layout-only ops back from ``start_id``,
@@ -1215,12 +1274,15 @@ class _DetectionMixin:
         trans_b = _is_trans(dot_ssa.operand_ids[1])
 
         return {
-            "M": M, "N": N, "K": K,
-            "ptr_args": ptr_args, "dot_ssa": dot_ssa,
-            "trans_a": trans_a, "trans_b": trans_b,
+            "M": M,
+            "N": N,
+            "K": K,
+            "ptr_args": ptr_args,
+            "dot_ssa": dot_ssa,
+            "trans_a": trans_a,
+            "trans_b": trans_b,
             "batch_size": batch_size,
         }
-
 
     def _detect_matmul_softmax(self):
         """Detect the matmul → row-softmax → store fused kernel pattern.
@@ -1265,8 +1327,7 @@ class _DetectionMixin:
         b_type = self._find_op_type_str(dot_ssa.operand_ids[1])
         a_shape = _extract_shape(a_type) if a_type else None
         b_shape = _extract_shape(b_type) if b_type else None
-        if (not a_shape or not b_shape
-                or len(a_shape) != 2 or len(b_shape) != 2):
+        if not a_shape or not b_shape or len(a_shape) != 2 or len(b_shape) != 2:
             return None  # batched dot not handled by this template
         M, K = a_shape
         K2, N = b_shape
@@ -1383,28 +1444,65 @@ class _DetectionMixin:
         a_row_s, a_col_s, b_row_s, b_col_s, c_row_s, c_col_s = descriptors
 
         return {
-            "M": M, "N": N, "K": K,
-            "a_ptr": a_ptr.name, "b_ptr": b_ptr.name, "c_ptr": c_ptr.name,
-            "a_elem": a_ptr.elem_type, "b_elem": b_ptr.elem_type,
+            "M": M,
+            "N": N,
+            "K": K,
+            "a_ptr": a_ptr.name,
+            "b_ptr": b_ptr.name,
+            "c_ptr": c_ptr.name,
+            "a_elem": a_ptr.elem_type,
+            "b_elem": b_ptr.elem_type,
             "c_elem": c_ptr.elem_type,
-            "a_row_stride": a_row_s, "a_col_stride": a_col_s,
-            "b_row_stride": b_row_s, "b_col_stride": b_col_s,
-            "c_row_stride": c_row_s, "c_col_stride": c_col_s,
+            "a_row_stride": a_row_s,
+            "a_col_stride": a_col_s,
+            "b_row_stride": b_row_s,
+            "b_col_stride": b_col_s,
+            "c_row_stride": c_row_s,
+            "c_col_stride": c_col_s,
         }
 
     # Ops a fused matmul epilogue may apply to the dot result. Pointwise /
     # broadcast / cast / layout only — NO reduce/scan (softmax has its own
     # path; anything else falls through to the #157 refusal). #158.
-    _EPILOGUE_ALLOWED = frozenset({
-        "arith.addf", "arith.subf", "arith.mulf", "arith.divf", "arith.negf",
-        "arith.maximumf", "arith.minimumf", "arith.maxnumf", "arith.minnumf",
-        "math.exp", "math.exp2", "math.log", "math.log2", "math.sqrt",
-        "math.rsqrt", "math.sin", "math.cos", "math.erf", "math.tanh",
-        "math.floor", "math.ceil", "math.fma", "math.absf",
-        "arith.truncf", "arith.extf", "arith.sitofp", "arith.fptosi",
-        "tt.splat", "tt.broadcast", "tt.expand_dims", "tt.reshape",
-        "ttg.convert_layout", "arith.constant", "tt.load", "tt.clampf",
-    })
+    _EPILOGUE_ALLOWED = frozenset(
+        {
+            "arith.addf",
+            "arith.subf",
+            "arith.mulf",
+            "arith.divf",
+            "arith.negf",
+            "arith.maximumf",
+            "arith.minimumf",
+            "arith.maxnumf",
+            "arith.minnumf",
+            "math.exp",
+            "math.exp2",
+            "math.log",
+            "math.log2",
+            "math.sqrt",
+            "math.rsqrt",
+            "math.sin",
+            "math.cos",
+            "math.erf",
+            "math.tanh",
+            "math.floor",
+            "math.ceil",
+            "math.fma",
+            "math.absf",
+            "arith.truncf",
+            "arith.extf",
+            "arith.sitofp",
+            "arith.fptosi",
+            "tt.splat",
+            "tt.broadcast",
+            "tt.expand_dims",
+            "tt.reshape",
+            "ttg.convert_layout",
+            "arith.constant",
+            "tt.load",
+            "tt.clampf",
+        }
+    )
 
     def _detect_matmul_epilogue(self):
         """Detect matmul -> pointwise/broadcast epilogue -> store (#158).
@@ -1433,8 +1531,7 @@ class _DetectionMixin:
         b_type = self._find_op_type_str(dot_ssa.operand_ids[1])
         a_shape = _extract_shape(a_type) if a_type else None
         b_shape = _extract_shape(b_type) if b_type else None
-        if (not a_shape or not b_shape
-                or len(a_shape) != 2 or len(b_shape) != 2):
+        if not a_shape or not b_shape or len(a_shape) != 2 or len(b_shape) != 2:
             return None
         M, K = a_shape
         K2, N = b_shape
@@ -1468,8 +1565,7 @@ class _DetectionMixin:
                 for _ in range(6):
                     if cur is None:
                         break
-                    if cur.op in ("tt.broadcast", "ttg.convert_layout",
-                                  "tt.reshape"):
+                    if cur.op in ("tt.broadcast", "ttg.convert_layout", "tt.reshape"):
                         cur = by_id0.get(cur.operand_ids[0]) if cur.operand_ids else None
                         continue
                     if cur.op == "tt.expand_dims":
@@ -1494,6 +1590,7 @@ class _DetectionMixin:
                     #               adds only a 1-D row/col bias, not a per-element M×N tile.
                     #               (Was previously mislabeled a 'row bias' -> REFUSE accurately.)
                     from triton_msl.errors import MetalNonRecoverableError
+
                     if str(axis) in ("0",):
                         acc_bias_dim = "col"
                     elif str(axis) in ("1",):
@@ -1501,16 +1598,20 @@ class _DetectionMixin:
                             "fused ROW-bias matmul (per-row bias as the dot accumulator) "
                             "is mis-computed and not reliably lowerable. Refusing rather "
                             "than mis-compute. Use a column bias, or add the row bias in a "
-                            "separate kernel after the matmul.", op_name="tt.dot")
+                            "separate kernel after the matmul.",
+                            op_name="tt.dot",
+                        )
                     else:
                         raise MetalNonRecoverableError(
                             "fused 2-D accumulator matmul (C = A@B + C, a full M×N tile as "
                             "the dot's 3rd operand) is not supported: the simdgroup matmul "
                             "epilogue adds only a 1-D row/col bias, not a per-element "
                             "accumulator. Add C in a separate elementwise kernel after the "
-                            "matmul (out = A @ B; out += C).", op_name="tt.dot")
+                            "matmul (out = A @ B; out += C).",
+                            op_name="tt.dot",
+                        )
                 else:
-                    return None   # non-zero, non-bias accumulator: unsupported
+                    return None  # non-zero, non-bias accumulator: unsupported
 
         # Walk BACKWARD from the single tt.store's value, collecting the
         # epilogue input cone and stopping at the dot (the matmul result is the
@@ -1536,7 +1637,7 @@ class _DetectionMixin:
             seen.add(vid)
             if vid == dot_ssa.id:
                 reached_dot = True
-                continue                 # leaf: the matmul result (seeded later)
+                continue  # leaf: the matmul result (seeded later)
             op = by_id.get(vid)
             if op is None:
                 # A non-dot leaf in the VALUE cone is a kernel/block arg the
@@ -1549,26 +1650,24 @@ class _DetectionMixin:
             if op.op == "tt.dot":
                 continue
             if op.op not in self._EPILOGUE_ALLOWED:
-                return None              # unsupported epilogue op
+                return None  # unsupported epilogue op
             epilogue_ids.add(op.id)
-            if op.op not in _EPI_PASSTHROUGH and op.op not in (
-                    "arith.constant", "tt.load"):
+            if op.op not in _EPI_PASSTHROUGH and op.op not in ("arith.constant", "tt.load"):
                 has_compute = True
             frontier.extend(op.operand_ids or [])
         if not reached_dot or not has_compute:
-            return None                  # store doesn't derive from dot, or
-                                         # pure matmul (no real epilogue)
+            return None  # store doesn't derive from dot, or
+            # pure matmul (no real epilogue)
 
         # A bias / extra input enters via a tt.load inside the epilogue. Collect
         # its pointer arg (we index it per element in the template).
         bias_ptr = None
         for eid in epilogue_ids:
             if by_id[eid].op == "tt.load":
-                bptr = self._trace_ptr_source(
-                    by_id[eid].operand_ids[0], by_id) if by_id[eid].operand_ids else None
+                bptr = self._trace_ptr_source(by_id[eid].operand_ids[0], by_id) if by_id[eid].operand_ids else None
                 if bptr is not None:
                     if bias_ptr is not None and bias_ptr.name != bptr.name:
-                        return None       # >1 extra input not supported yet
+                        return None  # >1 extra input not supported yet
                     bias_ptr = bptr
 
         ptr_args = [a for a in self.graph.args if a.is_ptr]
@@ -1594,19 +1693,27 @@ class _DetectionMixin:
         epilogue_ops = [ssa for ssa in self.graph.ops if ssa.id in epilogue_ids]
 
         return {
-            "M": M, "N": N, "K": K,
-            "a_ptr": a_ptr.name, "b_ptr": b_ptr.name, "c_ptr": c_ptr.name,
-            "a_elem": a_ptr.elem_type, "b_elem": b_ptr.elem_type,
+            "M": M,
+            "N": N,
+            "K": K,
+            "a_ptr": a_ptr.name,
+            "b_ptr": b_ptr.name,
+            "c_ptr": c_ptr.name,
+            "a_elem": a_ptr.elem_type,
+            "b_elem": b_ptr.elem_type,
             "c_elem": c_ptr.elem_type,
-            "a_row_stride": a_row_s, "a_col_stride": a_col_s,
-            "b_row_stride": b_row_s, "b_col_stride": b_col_s,
-            "c_row_stride": c_row_s, "c_col_stride": c_col_s,
+            "a_row_stride": a_row_s,
+            "a_col_stride": a_col_s,
+            "b_row_stride": b_row_s,
+            "b_col_stride": b_col_s,
+            "c_row_stride": c_row_s,
+            "c_col_stride": c_col_s,
             # epilogue-specific:
             "epilogue_ops": epilogue_ops,
             "dot_id": dot_ssa.id,
             "bias_ptr": bias_ptr.name if bias_ptr else None,
-            "acc_bias_ptr": acc_bias_ptr,      # bias fused into the dot's init
-            "acc_bias_dim": acc_bias_dim,      # "col" (N,) or "row" (M,1)
+            "acc_bias_ptr": acc_bias_ptr,  # bias fused into the dot's init
+            "acc_bias_dim": acc_bias_dim,  # "col" (N,) or "row" (M,1)
             "store_value_id": store_value_id,
         }
 
@@ -1638,9 +1745,10 @@ class _DetectionMixin:
         if len(stores) != 1 or len(transes) != 1 or len(loads) != 1:
             return None
         # No control flow / programs — single-threadgroup cooperative kernel.
-        if any(s.op in ("scf.for", "scf.while", "scf.if",
-                        "tt.get_num_programs", "tt.get_program_id")
-               for s in self.graph.ops):
+        if any(
+            s.op in ("scf.for", "scf.while", "scf.if", "tt.get_num_programs", "tt.get_program_id")
+            for s in self.graph.ops
+        ):
             return None
         store = stores[0]
         trans = transes[0]
@@ -1658,13 +1766,11 @@ class _DetectionMixin:
         # Skip dtype/layout passthroughs (e.g. the i32->i64 arith.extsi that
         # an int sum promotes to, or a ttg.convert_layout / reshape) between
         # the store value and the reduce chain.
-        _PASS = ("arith.extsi", "arith.extui", "arith.trunci",
-                 "ttg.convert_layout", "tt.reshape", "arith.bitcast")
+        _PASS = ("arith.extsi", "arith.extui", "arith.trunci", "ttg.convert_layout", "tt.reshape", "arith.bitcast")
 
         def _skip_pass(op):
             seen = 0
-            while (op is not None and op.op in _PASS and op.operand_ids
-                   and seen < 8):
+            while op is not None and op.op in _PASS and op.operand_ids and seen < 8:
                 op = op_by_id.get(op.operand_ids[0])
                 seen += 1
             return op
@@ -1675,8 +1781,7 @@ class _DetectionMixin:
             if not _is_sum_reduce(cur):
                 return None
             red_axes.append(cur.attrs.get("axis", 0))
-            cur = _skip_pass(op_by_id.get(cur.operand_ids[0])
-                             if cur.operand_ids else None)
+            cur = _skip_pass(op_by_id.get(cur.operand_ids[0]) if cur.operand_ids else None)
         # ``cur`` should now be the trans; reduces were collected innermost
         # last, so reverse to application (outermost-first) order.
         red_axes = red_axes[::-1]
@@ -1694,13 +1799,11 @@ class _DetectionMixin:
             return None
         if not self._is_contiguous_range_gather(load.operand_ids[0], op_by_id):
             return None
-        if not self._is_contiguous_range_gather(store.operand_ids[0],
-                                                op_by_id):
+        if not self._is_contiguous_range_gather(store.operand_ids[0], op_by_id):
             return None
 
         # 4) Shapes + permutation.
-        in_shape = _extract_shape(self._find_op_type_str(trans.operand_ids[0])
-                                  or "")
+        in_shape = _extract_shape(self._find_op_type_str(trans.operand_ids[0]) or "")
         if not in_shape or len(in_shape) < 2:
             return None
         rank = len(in_shape)
@@ -1755,9 +1858,7 @@ class _DetectionMixin:
             # per surviving output axis k: (input row-major stride of the
             # original axis, that axis's size, output row-major stride)
             "surviving": [
-                (in_strides[surviving[k]], in_shape[surviving[k]],
-                 out_strides[k])
-                for k in range(len(surviving))
+                (in_strides[surviving[k]], in_shape[surviving[k]], out_strides[k]) for k in range(len(surviving))
             ],
         }
 
@@ -1772,8 +1873,11 @@ class _DetectionMixin:
         if isinstance(o, (list, tuple)) and len(o) == rank:
             return list(o)
         mod_text = getattr(self.graph, "mod_text", "") or ""
-        matches = re.findall(r"tt\.trans[^\n]*?order\s*=\s*array<i32:\s*"
-                             r"([0-9,\s]+)>", mod_text)
+        matches = re.findall(
+            r"tt\.trans[^\n]*?order\s*=\s*array<i32:\s*"
+            r"([0-9,\s]+)>",
+            mod_text,
+        )
         for m in matches:
             vals = [int(x) for x in m.split(",") if x.strip()]
             if len(vals) == rank:
@@ -1795,8 +1899,7 @@ class _DetectionMixin:
             if off.op == "tt.make_range":
                 return int(off.attrs.get("start", 0)) == 0
             if off.op in ("tt.reshape", "ttg.convert_layout", "arith.extsi"):
-                off = (op_by_id.get(off.operand_ids[0])
-                       if off.operand_ids else None)
+                off = op_by_id.get(off.operand_ids[0]) if off.operand_ids else None
                 continue
             return False
         return False
@@ -1852,18 +1955,20 @@ class _DetectionMixin:
                         # DIRECT-load case (reduce input traces to a tt.load through
                         # layout-only ops) is validated and kept.
                         _obid = {s.id: s for s in self.graph.ops}
+
                         def _is_direct_load(_sid, _depth=0):
                             _o = _obid.get(_sid)
                             if _o is None or _depth > 16:
                                 return False
                             if _o.op == "tt.load":
                                 return True
-                            if (_o.op in ("tt.reshape", "ttg.convert_layout")
-                                    and _o.operand_ids):
+                            if _o.op in ("tt.reshape", "ttg.convert_layout") and _o.operand_ids:
                                 return _is_direct_load(_o.operand_ids[0], _depth + 1)
                             return False
+
                         if not _is_direct_load(ssa.operand_ids[0]):
                             from triton_msl.errors import MetalNonRecoverableError
+
                             raise MetalNonRecoverableError(
                                 "3D reduce with a pre-reduce elementwise op (e.g. "
                                 "tl.sum(a * s, axis=2), a.to(f32), a + b before the "
@@ -1872,7 +1977,8 @@ class _DetectionMixin:
                                 "the op, and the generic 3D-reduce path mis-computes "
                                 "this shape. Refusing to emit silently-wrong output. "
                                 "Apply the op after the reduce where valid (e.g. "
-                                "s * tl.sum(a, axis=2)) or in a separate kernel.")
+                                "s * tl.sum(a, axis=2)) or in a separate kernel."
+                            )
                         axis = ssa.attrs.get("axis", 0)
                         # Detect argmin/argmax: 2 operands (values, indices)
                         is_argminmax = len(ssa.operand_ids) >= 2
@@ -1881,7 +1987,7 @@ class _DetectionMixin:
                         # by its compare direction (the classifier handles only 1-input combines).
                         if is_argminmax:
                             combine_op = "sum"
-                            for body_op in (ssa.region_ops or []):
+                            for body_op in ssa.region_ops or []:
                                 if body_op.op == "arith.cmpf":
                                     pred = body_op.attrs.get("predicate_name", "")
                                     if "gt" in pred:
@@ -1902,11 +2008,14 @@ class _DetectionMixin:
                         # rather than mis-compute (re-audit #12).
                         if input_type and ("i64" in input_type or "u64" in input_type):
                             from triton_msl.errors import MetalNonRecoverableError
+
                             raise MetalNonRecoverableError(
                                 "3-D reduce / argminmax over a 64-bit integer is not "
                                 "correctly lowered (the template rounds in float32 and the "
                                 "generic path truncates to 32 bits). Refusing. Use a "
-                                "32-bit integer, or reduce in 2-D/1-D.", op_name="tt.reduce")
+                                "32-bit integer, or reduce in 2-D/1-D.",
+                                op_name="tt.reduce",
+                            )
                         total = M * N * K
                         # Use block_size that covers all elements
                         block_size = max(total, self.graph.num_warps * 32)
@@ -1919,7 +2028,6 @@ class _DetectionMixin:
                             "block_size": block_size,
                         }
         return None
-
 
     def _detect_flip(self):
         """Detect tl.flip's reshape+xor-reduce+broadcast pattern.
@@ -1997,11 +2105,9 @@ class _DetectionMixin:
         if len(reshape_ops) == 2:
             # Two reshapes: (M,N,K) -> higher-dim -> (M,N,K)
             rs1, rs2 = reshape_ops
-            rs1_in_shape = _extract_shape(self._find_op_type_str(rs1.operand_ids[0])) \
-                if rs1.operand_ids else None
+            rs1_in_shape = _extract_shape(self._find_op_type_str(rs1.operand_ids[0])) if rs1.operand_ids else None
             rs1_out_shape = _extract_shape(rs1.type_str)
-            rs2_in_shape = _extract_shape(self._find_op_type_str(rs2.operand_ids[0])) \
-                if rs2.operand_ids else None
+            rs2_in_shape = _extract_shape(self._find_op_type_str(rs2.operand_ids[0])) if rs2.operand_ids else None
             rs2_out_shape = _extract_shape(rs2.type_str)
             if tuple(rs1_in_shape or ()) != in_shape:
                 return None
@@ -2018,7 +2124,7 @@ class _DetectionMixin:
                 if dim_size < 2 or (dim_size & (dim_size - 1)) != 0:
                     continue
                 steps = dim_size.bit_length() - 1
-                expected = in_shape[:d] + (2,) * steps + in_shape[d + 1:]
+                expected = in_shape[:d] + (2,) * steps + in_shape[d + 1 :]
                 if out_shape == expected:
                     flip_dim = d
                     num_steps = steps
@@ -2037,8 +2143,7 @@ class _DetectionMixin:
             if red_axis not in (0, 1, 2):
                 return None
             # Verify the reduce input shape equals in_shape
-            red_in_shape = _extract_shape(self._find_op_type_str(red.operand_ids[0])) \
-                if red.operand_ids else None
+            red_in_shape = _extract_shape(self._find_op_type_str(red.operand_ids[0])) if red.operand_ids else None
             if tuple(red_in_shape or ()) != in_shape:
                 return None
             if in_shape[red_axis] != 2:
@@ -2072,7 +2177,6 @@ class _DetectionMixin:
             "block_size": block_size,
         }
 
-
     def _row_stride_is_constexpr(self):
         """True if the kernel's per-row stride (the program_id multiplier in the
         load/store address) is a COMPILE-TIME CONSTANT rather than a runtime scalar.
@@ -2101,7 +2205,6 @@ class _DetectionMixin:
                             return True
         return False
 
-
     def _detect_softmax(self):
         """Detect a row-wise softmax kernel:
             x = tl.load(x_ptr + row * n + offsets, mask, other=-inf)
@@ -2120,8 +2223,7 @@ class _DetectionMixin:
         """
         # No control flow allowed (single-row template only)
         for ssa in self.graph.ops:
-            if ssa.op in ("scf.for", "scf.while", "scf.if",
-                          "tt.get_num_programs"):
+            if ssa.op in ("scf.for", "scf.while", "scf.if", "tt.get_num_programs"):
                 return None
 
         load_ssa = None
@@ -2149,9 +2251,7 @@ class _DetectionMixin:
             elif op == "arith.divf":
                 has_divf = True
 
-        if (load_ssa is None or store_ssa is None
-                or len(reduce_ops) != 2
-                or not (has_exp and has_subf and has_divf)):
+        if load_ssa is None or store_ssa is None or len(reduce_ops) != 2 or not (has_exp and has_subf and has_divf):
             return None
 
         # Reduces must be max then sum (in IR order). The combine op lives in
@@ -2230,8 +2330,7 @@ class _DetectionMixin:
         """
         # No control flow allowed (single-row template only)
         for ssa in self.graph.ops:
-            if ssa.op in ("scf.for", "scf.while", "scf.if",
-                          "tt.get_num_programs"):
+            if ssa.op in ("scf.for", "scf.while", "scf.if", "tt.get_num_programs"):
                 return None
 
         load_ssa = None
@@ -2268,9 +2367,12 @@ class _DetectionMixin:
         # Layer norm: 2 sum reduces, normalization math (rsqrt, sub, mul,
         # add for variance + epsilon). Differs from softmax by lacking exp
         # and having two sum reduces (vs max + sum).
-        if (load_ssa is None or store_ssa is None
-                or len(reduce_ops) != 2
-                or not (has_rsqrt and has_subf and has_mulf and has_addf)):
+        if (
+            load_ssa is None
+            or store_ssa is None
+            or len(reduce_ops) != 2
+            or not (has_rsqrt and has_subf and has_mulf and has_addf)
+        ):
             return None
         red_ops = [self._get_reduce_combine_info(r)[0] for r in reduce_ops]
         if red_ops != ["sum", "sum"]:
@@ -2320,7 +2422,6 @@ class _DetectionMixin:
             "block_size": block_size,
         }
 
-
     def _detect_transpose_via_reshape(self):
         """Detect the ``test_trans_reshape``-style transpose kernel:
 
@@ -2362,12 +2463,10 @@ class _DetectionMixin:
                 if trans_ssa is not None:
                     return None
                 trans_ssa = ssa
-            elif ssa.op in ("scf.for", "scf.while", "scf.if",
-                            "tt.reduce", "tt.scan", "tt.dot"):
+            elif ssa.op in ("scf.for", "scf.while", "scf.if", "tt.reduce", "tt.scan", "tt.dot"):
                 return None  # too complex for this template
 
-        if (load_ssa is None or store_ssa is None or trans_ssa is None
-                or len(reshapes) != 2):
+        if load_ssa is None or store_ssa is None or trans_ssa is None or len(reshapes) != 2:
             return None
 
         # Extract shapes. Load is 2-D, first reshape goes to 4-D, trans
@@ -2379,9 +2478,12 @@ class _DetectionMixin:
 
         # First reshape: (M, N) → (M, m, n, 2) where m*n*2 == N
         first_reshape_shape = _extract_shape(reshapes[0].type_str)
-        if (not first_reshape_shape or len(first_reshape_shape) != 4
-                or first_reshape_shape[0] != M
-                or first_reshape_shape[3] != 2):
+        if (
+            not first_reshape_shape
+            or len(first_reshape_shape) != 4
+            or first_reshape_shape[0] != M
+            or first_reshape_shape[3] != 2
+        ):
             return None
         m, n = first_reshape_shape[1], first_reshape_shape[2]
         if m * n * 2 != N:
@@ -2395,14 +2497,12 @@ class _DetectionMixin:
         # populate ``trans_ssa.attrs["order"]`` reliably, so we check the
         # shape transformation instead.
         trans_shape = _extract_shape(trans_ssa.type_str)
-        if (not trans_shape or len(trans_shape) != 4
-                or trans_shape != (m, n, 2, M)):
+        if not trans_shape or len(trans_shape) != 4 or trans_shape != (m, n, 2, M):
             return None
 
         # Second reshape: must flatten to (M*N,)
         second_reshape_shape = _extract_shape(reshapes[1].type_str)
-        if (not second_reshape_shape or len(second_reshape_shape) != 1
-                or second_reshape_shape[0] != M * N):
+        if not second_reshape_shape or len(second_reshape_shape) != 1 or second_reshape_shape[0] != M * N:
             return None
 
         # Identify ptr args (input and output).
@@ -2421,7 +2521,6 @@ class _DetectionMixin:
             "N": N,
             "block_size": M * N,
         }
-
 
     def _detect_nd_trans(self):
         """Detect a generic N-D transpose: one tt.load of a rank>=3 tensor, one
@@ -2448,8 +2547,7 @@ class _DetectionMixin:
                 trans_ssa = ssa
             elif ssa.op == "tt.reshape":
                 pass  # allowed (descriptor lowering inserts these)
-            elif ssa.op in ("scf.for", "scf.while", "scf.if",
-                            "tt.reduce", "tt.scan", "tt.dot"):
+            elif ssa.op in ("scf.for", "scf.while", "scf.if", "tt.reduce", "tt.scan", "tt.dot"):
                 return None
         if load_ssa is None or store_ssa is None or trans_ssa is None:
             return None
@@ -2479,17 +2577,14 @@ class _DetectionMixin:
                     break
                 seen.add(cur)
                 op = next((s for s in self.graph.ops if s.id == cur), None)
-                if (op is None or op.op not in _VALUE_PRESERVING
-                        or not op.operand_ids):
+                if op is None or op.op not in _VALUE_PRESERVING or not op.operand_ids:
                     break
                 cur = op.operand_ids[0]
             return False
 
-        if (not trans_ssa.operand_ids
-                or not _traces_to(trans_ssa.operand_ids[0], load_ssa.id)):
+        if not trans_ssa.operand_ids or not _traces_to(trans_ssa.operand_ids[0], load_ssa.id):
             return None
-        if (len(store_ssa.operand_ids) < 2
-                or not _traces_to(store_ssa.operand_ids[1], trans_ssa.id)):
+        if len(store_ssa.operand_ids) < 2 or not _traces_to(store_ssa.operand_ids[1], trans_ssa.id):
             return None
         # The transpose operates on its INPUT's shape (the N-D tensor).
         src_shape = _extract_shape(self._find_op_type_str(trans_ssa.operand_ids[0]))
@@ -2513,7 +2608,6 @@ class _DetectionMixin:
             "total": total,
         }
 
-
     def _detect_row_wise_sort(self):
         """Detect tl.sort / tl.topk applied to each row of a 2D tensor.
 
@@ -2534,8 +2628,9 @@ class _DetectionMixin:
         stride_xm, stride_zm, block_size} if detected, None otherwise.
         """
         # Only consider kernels with tt.load + tt.store + multiple tt.reduce
-        if any(op in {"scf.for", "scf.while", "scf.if", "tt.get_num_programs"}
-               for op in (s.op for s in self.graph.ops)):
+        if any(
+            op in {"scf.for", "scf.while", "scf.if", "tt.get_num_programs"} for op in (s.op for s in self.graph.ops)
+        ):
             return None
 
         load_ssa = None
@@ -2626,11 +2721,14 @@ class _DetectionMixin:
         # to the broken generic path. The full sort (K == N) continues normally.
         if K_out < N:
             from triton_msl.errors import MetalNonRecoverableError
+
             raise MetalNonRecoverableError(
                 f"tl.topk (k={K_out} < N={N}) is not correctly lowered — the K<N trim "
                 f"mis-computes (duplicated values, not the K distinct top elements). "
                 f"Refusing rather than return wrong results. Use a full tl.sort and "
-                f"slice the top k, or k == N.", op_name="tt.reduce")
+                f"slice the top k, or k == N.",
+                op_name="tt.reduce",
+            )
 
         total = M * N
         n_dims = total.bit_length() - 1  # log2(total)
@@ -2651,8 +2749,7 @@ class _DetectionMixin:
                 return None
             body_ops = {bop.op for bop in red.region_ops}
             is_xor = any("xori" in op for op in body_ops)
-            is_minmax = any(("max" in op or "min" in op or op == "arith.cmpf")
-                            for op in body_ops)
+            is_minmax = any(("max" in op or "min" in op or op == "arith.cmpf") for op in body_ops)
             if not (is_xor or is_minmax):
                 return None
 
@@ -2742,7 +2839,6 @@ class _DetectionMixin:
             "block_size": block_size,
         }
 
-
     def _detect_dot_epilogue(self) -> str:
         """Detect epilogue pattern from IR around tt.dot.
 
@@ -2766,7 +2862,7 @@ class _DetectionMixin:
             return "none"
 
         # Check ops AFTER the dot
-        after_dot = self.graph.ops[dot_idx + 1:]
+        after_dot = self.graph.ops[dot_idx + 1 :]
         n_dot2 = sum(1 for op in after_dot if op.op == "tt.dot")
         n_reduce = sum(1 for op in after_dot if op.op == "tt.reduce")
 
@@ -2786,7 +2882,6 @@ class _DetectionMixin:
 
         return "none"
 
-
     def _detect_dot_constant_inputs(self):
         """Check if tt.dot inputs are compile-time constants (arith.constant).
 
@@ -2794,6 +2889,7 @@ class _DetectionMixin:
         are constants, or None otherwise.
         """
         import struct as _struct
+
         op_by_id = {ssa.id: ssa for ssa in self.graph.ops}
 
         for ssa in self.graph.ops:
@@ -2817,7 +2913,7 @@ class _DetectionMixin:
                     return v
                 if isinstance(v, int) and op.elem_type in ("f32", "f16", "bf16"):
                     try:
-                        return _struct.unpack('f', _struct.pack('I', v & 0xFFFFFFFF))[0]
+                        return _struct.unpack("f", _struct.pack("I", v & 0xFFFFFFFF))[0]
                     except _struct.error:
                         return 0.0
                 return float(v)
@@ -2833,11 +2929,10 @@ class _DetectionMixin:
             return (const_a, const_b, M, N, K, ssa.elem_type)
         return None
 
-
     def _detect_reduce_direction(self, ssa: SSAValue) -> bool:
         """Detect argmax (True) vs argmin (False) from reduce body comparison ops."""
         # Float values: cmpf determines direction unambiguously
-        for body_op in (ssa.region_ops or []):
+        for body_op in ssa.region_ops or []:
             if body_op.op == "arith.cmpf":
                 # Use predicate_name (string) if available, fall back to int code
                 pred = body_op.attrs.get("predicate_name", "")
@@ -2852,7 +2947,7 @@ class _DetectionMixin:
                 return "gt" in pred  # ogt → max, olt → min
         # Integer values: sgt/ugt means argmax, absence means argmin
         # (slt is always present for index tie-break, so it's not distinctive)
-        for body_op in (ssa.region_ops or []):
+        for body_op in ssa.region_ops or []:
             if body_op.op == "arith.cmpi":
                 pred = body_op.attrs.get("predicate_name", "")
                 if not pred:
@@ -2863,5 +2958,3 @@ class _DetectionMixin:
                 if "sgt" in pred or "ugt" in pred:
                     return True  # argmax
         return False  # default: argmin
-
-

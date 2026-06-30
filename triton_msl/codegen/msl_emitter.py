@@ -27,6 +27,7 @@ from triton_msl.codegen.msl_types import triton_type_to_msl
 # Type helpers
 # ---------------------------------------------------------------------------
 
+
 def _msl_compute_type(dtype):
     """Get the MSL compute type for a Triton dtype.
 
@@ -37,6 +38,7 @@ def _msl_compute_type(dtype):
     if dtype in ("fp16", "bf16"):
         return "float"
     from triton_msl.codegen.msl_builtins import is_fp8_type
+
     if is_fp8_type(dtype):
         return "float"
     return triton_type_to_msl(dtype)
@@ -47,6 +49,7 @@ def _msl_zero(dtype):
     if dtype in ("fp16", "bf16", "fp32", "f32"):
         return "0.0f"
     from triton_msl.codegen.msl_builtins import is_fp8_type
+
     if is_fp8_type(dtype):
         return "0.0f"  # FP8 computes in float
     return "0"
@@ -55,6 +58,7 @@ def _msl_zero(dtype):
 # ---------------------------------------------------------------------------
 # Kernel description API
 # ---------------------------------------------------------------------------
+
 
 class Arg:
     """A kernel argument (buffer pointer or scalar)."""
@@ -90,13 +94,45 @@ def _sanitize_msl_name(name: str) -> str:
     return name
 
 
-_MSL_RESERVED = frozenset({
-    "kernel", "vertex", "fragment", "device", "constant", "threadgroup",
-    "thread", "texture", "sampler", "float", "half", "int", "uint",
-    "bool", "char", "short", "void", "using", "namespace", "metal",
-    "return", "if", "else", "for", "while", "do", "switch", "case",
-    "break", "continue", "struct", "class", "enum", "true", "false",
-})
+_MSL_RESERVED = frozenset(
+    {
+        "kernel",
+        "vertex",
+        "fragment",
+        "device",
+        "constant",
+        "threadgroup",
+        "thread",
+        "texture",
+        "sampler",
+        "float",
+        "half",
+        "int",
+        "uint",
+        "bool",
+        "char",
+        "short",
+        "void",
+        "using",
+        "namespace",
+        "metal",
+        "return",
+        "if",
+        "else",
+        "for",
+        "while",
+        "do",
+        "switch",
+        "case",
+        "break",
+        "continue",
+        "struct",
+        "class",
+        "enum",
+        "true",
+        "false",
+    }
+)
 
 
 class KernelBuilder:
@@ -172,11 +208,11 @@ class KernelBuilder:
         compute_ty = _msl_compute_type(dtype)
         zero = _msl_zero(dtype)
         if mask_var:
-            self._emit(f"{compute_ty} {out_var} = {mask_var} ? "
-                       f"static_cast<{compute_ty}>({ptr_var}[{offsets_var}]) : {zero};")
+            self._emit(
+                f"{compute_ty} {out_var} = {mask_var} ? static_cast<{compute_ty}>({ptr_var}[{offsets_var}]) : {zero};"
+            )
         else:
-            self._emit(f"{compute_ty} {out_var} = "
-                       f"static_cast<{compute_ty}>({ptr_var}[{offsets_var}]);")
+            self._emit(f"{compute_ty} {out_var} = static_cast<{compute_ty}>({ptr_var}[{offsets_var}]);")
         return out_var
 
     def store(self, ptr_var, offsets_var, val_var, mask_var=None, dtype="fp32"):
@@ -186,7 +222,7 @@ class KernelBuilder:
         """
         store_ty = triton_type_to_msl(dtype)
         compute_ty = _msl_compute_type(dtype)
-        needs_cast = (store_ty != compute_ty)
+        needs_cast = store_ty != compute_ty
         cast_val = f"static_cast<{store_ty}>({val_var})" if needs_cast else val_var
         if mask_var:
             self._emit(f"if ({mask_var}) {{ {ptr_var}[{offsets_var}] = {cast_val}; }}")
@@ -196,8 +232,14 @@ class KernelBuilder:
     def binary_op(self, op, a_var, b_var, out_var):
         """Emit a binary operation: out = a op b."""
         op_map = {
-            "add": "+", "sub": "-", "mul": "*", "div": "/",
-            "mod": "%", "and": "&", "or": "|", "xor": "^",
+            "add": "+",
+            "sub": "-",
+            "mul": "*",
+            "div": "/",
+            "mod": "%",
+            "and": "&",
+            "or": "|",
+            "xor": "^",
         }
         if op in op_map:
             self._var(out_var, f"{a_var} {op_map[op]} {b_var}", ty="float")
@@ -287,6 +329,7 @@ class KernelBuilder:
     def barrier(self, kind="threadgroup"):
         """Emit a memory barrier."""
         from triton_msl.codegen.msl_builtins import BARRIERS
+
         self._emit(f"{BARRIERS[kind]};")
 
     # -- Reduction operations --
@@ -298,6 +341,7 @@ class KernelBuilder:
         """
         self._needs_simd_qualifiers = True
         from triton_msl.codegen.msl_builtins import SIMD_REDUCTIONS
+
         intrinsic = SIMD_REDUCTIONS[op]
         self._var(out_var, f"{intrinsic}({val_var})", ty="float")
         return out_var
@@ -325,12 +369,14 @@ class KernelBuilder:
         # Refuse loudly rather than emit a silently-wrong reduction.
         if self.block_size > 32 and self.block_size % 32 != 0:
             from triton_msl.errors import MetalNonRecoverableError
+
             raise MetalNonRecoverableError(
                 f"threadgroup reduction over a {self.block_size}-element tile spans "
                 f"a partial trailing SIMD group (block_size is not a multiple of 32). "
                 f"Apple does not define simd-group reductions over inactive lanes, so "
                 f"the result would be silently wrong; refusing. Pad the reduction tile "
-                f"to a multiple of 32 (the matmul/softmax templates already do this).")
+                f"to a multiple of 32 (the matmul/softmax templates already do this)."
+            )
         self._needs_simd_qualifiers = True
         from triton_msl.codegen.msl_builtins import SIMD_REDUCTIONS
 
@@ -345,8 +391,14 @@ class KernelBuilder:
         # NaN-quiet, so carry an any-NaN flag through both reduction levels below.
         _nan_prop = op in ("nanmax", "nanmin")
         if _is_float:
-            identity = {"sum": "0.0f", "prod": "1.0f", "max": "-INFINITY", "min": "INFINITY",
-                        "nanmax": "-INFINITY", "nanmin": "INFINITY"}[op]
+            identity = {
+                "sum": "0.0f",
+                "prod": "1.0f",
+                "max": "-INFINITY",
+                "min": "INFINITY",
+                "nanmax": "-INFINITY",
+                "nanmin": "INFINITY",
+            }[op]
         else:
             identity = {
                 "sum": f"({reduce_ty})0",
@@ -374,9 +426,11 @@ class KernelBuilder:
             # simd_max/min is NaN-quiet (returns the non-NaN). For NaN-PROPAGATING max/min,
             # force this group's partial result to NaN if ANY lane is NaN (`v != v`).
             _v = f"(({reduce_ty}){val_var})"
-            self._var(simd_var,
-                      f"(simd_max(({_v} != {_v}) ? 1.0f : 0.0f) > 0.0f) "
-                      f"? ({reduce_ty})NAN : {intrinsic}({_v})", ty=reduce_ty)
+            self._var(
+                simd_var,
+                f"(simd_max(({_v} != {_v}) ? 1.0f : 0.0f) > 0.0f) ? ({reduce_ty})NAN : {intrinsic}({_v})",
+                ty=reduce_ty,
+            )
         else:
             self._var(simd_var, f"{intrinsic}(({reduce_ty}){val_var})", ty=reduce_ty)
 
@@ -406,9 +460,12 @@ class KernelBuilder:
         if _nan_prop:
             # Final cross-group level: same NaN-quiet caveat — a per-group partial that is
             # NaN (set above) must make the whole-tile result NaN.
-            self._var(out_var,
-                      f"(simd_max(({read_var} != {read_var}) ? 1.0f : 0.0f) > 0.0f) "
-                      f"? ({reduce_ty})NAN : {intrinsic}({read_var})", ty=reduce_ty)
+            self._var(
+                out_var,
+                f"(simd_max(({read_var} != {read_var}) ? 1.0f : 0.0f) > 0.0f) "
+                f"? ({reduce_ty})NAN : {intrinsic}({read_var})",
+                ty=reduce_ty,
+            )
         else:
             self._var(out_var, f"{intrinsic}({read_var})", ty=reduce_ty)
         return out_var
@@ -433,9 +490,10 @@ class MSLCodeGen:
         if self.builder._prebuilt_msl is not None:
             msl = self.builder._prebuilt_msl
             import re as _re
+
             msl = _re.sub(
-                r'kernel\s+void\s+\w+\s*\(',
-                f'kernel void {self.builder.name}(',
+                r"kernel\s+void\s+\w+\s*\(",
+                f"kernel void {self.builder.name}(",
                 msl,
                 count=1,
             )
@@ -457,7 +515,7 @@ class MSLCodeGen:
             params.append(f"    {arg.msl_param(i)}")
 
         # Thread position qualifiers — Metal requires all position attrs same type
-        used_axes = getattr(self.builder, '_used_pid_axes', {0})
+        used_axes = getattr(self.builder, "_used_pid_axes", {0})
         if used_axes and max(used_axes) > 0:
             params.append("    uint3 pid3 [[threadgroup_position_in_grid]]")
             params.append("    uint3 lid3 [[thread_position_in_threadgroup]]")
@@ -515,10 +573,10 @@ class MSLCodeGen:
         return "\n".join(lines)
 
 
-
 # ---------------------------------------------------------------------------
 # TTGIR integration (requires triton)
 # ---------------------------------------------------------------------------
+
 
 def _mept_path_log(tag, detail):
     """Diagnostic: record which lowering path produced a kernel.
@@ -554,6 +612,7 @@ def emit_msl(mod, metadata, options):
         MSL source code as a string.
     """
     from triton_msl.errors import MetalNonRecoverableError
+
     # Primary path: new walker + generic lowerer
     try:
         from triton_msl.codegen.mlir_walker import walk_ttgir
@@ -563,6 +622,7 @@ def emit_msl(mod, metadata, options):
         metadata["name"] = _sanitize_msl_name(graph.func_name)
 
         from triton_msl.codegen.generic_lowerer import GenericLowerer
+
         lowerer = GenericLowerer(graph, options)
         msl_src = lowerer.lower()
 
@@ -579,19 +639,21 @@ def emit_msl(mod, metadata, options):
         # the register-array spine (roadmap Phase 2). (downstream tridec bug 2)
         if "UNKNOWN_" in msl_src and "UNSUPPORTED" not in msl_src:
             from triton_msl.errors import MetalNonRecoverableError
+
             raise MetalNonRecoverableError(
                 f"codegen left an unresolved value (UNKNOWN_<id>) in kernel "
                 f"'{metadata.get('name', '?')}'. This usually means a value defined "
                 f"outside a runtime-bound loop is used inside it when BLOCK "
                 f"exceeds the threadgroup size (multi-element-per-thread). "
                 f"Use BLOCK <= 128, or restructure the loop, until the "
-                f"register-array spine lands.")
+                f"register-array spine lands."
+            )
 
         # Verify no UNSUPPORTED markers in output
         if "UNSUPPORTED" not in msl_src:
             metadata["output_arg_indices"] = lowerer.get_output_arg_indices()
             # Flag whether the kernel uses multi-axis program_id (needs 2D/3D grid)
-            used_axes = getattr(lowerer, '_used_pid_axes', {0})
+            used_axes = getattr(lowerer, "_used_pid_axes", {0})
             metadata["needs_2d_grid"] = max(used_axes) > 0 if used_axes else False
             # Two-kernel-split matmul descriptor (#159); None for other kernels.
             metadata["mm_two_kernel"] = getattr(lowerer, "_mm_two_kernel", None)
@@ -611,15 +673,14 @@ def emit_msl(mod, metadata, options):
         raise
     except Exception as e:
         import warnings
+
         warnings.warn(
-            f"emit_msl: generic lowerer failed: {e}. "
-            "Falling back to legacy text-based parser.",
+            f"emit_msl: generic lowerer failed: {e}. Falling back to legacy text-based parser.",
             stacklevel=2,
         )
         _mept_path_log("fallback-exception", str(e)[:80])
 
-    return _legacy_fallback(str(mod), metadata, options,
-                            "generic lowerer could not lower this kernel")
+    return _legacy_fallback(str(mod), metadata, options, "generic lowerer could not lower this kernel")
 
 
 def _legacy_fallback(ir_text, metadata, options, reason):
@@ -631,11 +692,14 @@ def _legacy_fallback(ir_text, metadata, options, reason):
     """
     if os.environ.get("TRITON_MSL_LEGACY") != "1":
         from triton_msl.errors import MetalNonRecoverableError
+
         raise MetalNonRecoverableError(
             f"Refusing to emit possibly-wrong output: {reason}, and the legacy "
             "text parser is heuristic (has produced silent-wrongs). Set "
-            "TRITON_MSL_LEGACY=1 to opt in for debugging.")
+            "TRITON_MSL_LEGACY=1 to opt in for debugging."
+        )
     from triton_msl.codegen.ttgir_parser import parse_ttgir
+
     kernel_name = _extract_kernel_name(ir_text)
     metadata["name"] = _sanitize_msl_name(kernel_name)
     kb = parse_ttgir(ir_text, options)
@@ -654,6 +718,7 @@ def _extract_kernel_name(ir_text):
     if match:
         return match.group(1)
     return "triton_kernel"
+
 
 # ---------------------------------------------------------------------------
 # Re-export pre-baked kernel templates from _msl_templates so callers can

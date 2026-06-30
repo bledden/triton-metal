@@ -23,6 +23,7 @@ pytestmark = pytest.mark.skipif(
 
 class FakeOptions:
     """Minimal MetalOptions-like object for testing."""
+
     def __init__(self, num_warps=4):
         self.num_warps = num_warps
 
@@ -355,6 +356,7 @@ module {
 # Tests
 # ---------------------------------------------------------------------------
 
+
 def test_parse_vecadd_name():
     """Parser extracts kernel name correctly."""
     from triton_msl.codegen.ttgir_parser import parse_ttgir
@@ -458,6 +460,7 @@ def test_parse_exp_generates_exp_op():
 # GPU execution tests — verify TTGIR-parsed kernels produce correct results
 # ---------------------------------------------------------------------------
 
+
 @requires_metal
 def test_ttgir_vecadd_gpu(runner):
     """TTGIR vector add: C = A + B, verified on GPU."""
@@ -482,9 +485,7 @@ def test_ttgir_vecadd_gpu(runner):
     result = runner.read_float_buffer(buf_c, n)
     for i in range(n):
         expected = a_data[i] + b_data[i]
-        assert abs(result[i] - expected) < 1e-5, (
-            f"Mismatch at {i}: got {result[i]}, expected {expected}"
-        )
+        assert abs(result[i] - expected) < 1e-5, f"Mismatch at {i}: got {result[i]}, expected {expected}"
 
 
 @requires_metal
@@ -512,9 +513,7 @@ def test_ttgir_vecmul_gpu(runner):
     for i in range(n):
         expected = a_data[i] * b_data[i]
         tol = max(1e-4, abs(expected) * 1e-6)
-        assert abs(result[i] - expected) < tol, (
-            f"Mismatch at {i}: got {result[i]}, expected {expected}"
-        )
+        assert abs(result[i] - expected) < tol, f"Mismatch at {i}: got {result[i]}, expected {expected}"
 
 
 @requires_metal
@@ -540,9 +539,7 @@ def test_ttgir_exp_gpu(runner):
     result = runner.read_float_buffer(buf_b, n)
     for i in range(n):
         expected = math.exp(a_data[i])
-        assert abs(result[i] - expected) < 1e-4, (
-            f"Mismatch at {i}: got {result[i]}, expected {expected}"
-        )
+        assert abs(result[i] - expected) < 1e-4, f"Mismatch at {i}: got {result[i]}, expected {expected}"
 
 
 @requires_metal
@@ -570,14 +567,13 @@ def test_ttgir_vecadd_non_aligned(runner):
     result = runner.read_float_buffer(buf_c, n)
     for i in range(n):
         expected = a_data[i] + b_data[i]
-        assert abs(result[i] - expected) < 1e-5, (
-            f"Mismatch at {i}: got {result[i]}, expected {expected}"
-        )
+        assert abs(result[i] - expected) < 1e-5, f"Mismatch at {i}: got {result[i]}, expected {expected}"
 
 
 # ---------------------------------------------------------------------------
 # Reduction TTGIR tests
 # ---------------------------------------------------------------------------
+
 
 def test_parse_sum_reduce_detects_reduction():
     """Parser detects tt.reduce with arith.addf as a sum reduction."""
@@ -638,9 +634,7 @@ def test_ttgir_sum_reduce_gpu(runner):
 
     result = runner.read_float_buffer(buf_out, 1)
     expected = sum(input_data)
-    assert abs(result[0] - expected) < 0.5, (
-        f"Sum: got {result[0]}, expected {expected}"
-    )
+    assert abs(result[0] - expected) < 0.5, f"Sum: got {result[0]}, expected {expected}"
 
 
 @requires_metal
@@ -666,14 +660,13 @@ def test_ttgir_max_reduce_gpu(runner):
 
     result = runner.read_float_buffer(buf_out, 1)
     expected = max(input_data)
-    assert abs(result[0] - expected) < 1e-3, (
-        f"Max: got {result[0]}, expected {expected}"
-    )
+    assert abs(result[0] - expected) < 1e-3, f"Max: got {result[0]}, expected {expected}"
 
 
 # ---------------------------------------------------------------------------
 # FP16 and extended ops TTGIR tests
 # ---------------------------------------------------------------------------
+
 
 def test_parse_fp16_args():
     """Parser detects fp16 pointer types correctly."""
@@ -720,9 +713,7 @@ def test_ttgir_fp16_vecadd_gpu(runner):
     for i in range(n):
         expected = a_data[i] + b_data[i]
         tol = max(1e-2, abs(expected) * 1e-2)
-        assert abs(result[i] - expected) < tol, (
-            f"[{i}] got {result[i]}, expected {expected}"
-        )
+        assert abs(result[i] - expected) < tol, f"[{i}] got {result[i]}, expected {expected}"
 
 
 @requires_metal
@@ -757,14 +748,13 @@ def test_ttgir_negf_gpu(runner):
     result = runner.read_float_buffer(buf_out, n)
     for i in range(n):
         # x + (-x) should be 0
-        assert abs(result[i]) < 1e-5, (
-            f"[{i}] got {result[i]}, expected 0.0"
-        )
+        assert abs(result[i]) < 1e-5, f"[{i}] got {result[i]}, expected 0.0"
 
 
 # ---------------------------------------------------------------------------
 # Softmax TTGIR tests (multi-reduce pattern)
 # ---------------------------------------------------------------------------
+
 
 def test_parse_softmax_detects_multi_reduce():
     """Parser detects softmax pattern: max reduce + sum reduce."""
@@ -833,9 +823,7 @@ def test_ttgir_softmax_gpu(runner):
 
     for i in range(n):
         tol = max(1e-5, abs(expected[i]) * 1e-4)
-        assert abs(result[i] - expected[i]) < tol, (
-            f"[{i}] got {result[i]}, expected {expected[i]}"
-        )
+        assert abs(result[i] - expected[i]) < tol, f"[{i}] got {result[i]}, expected {expected[i]}"
 
     # Verify outputs sum to 1.0
     total = sum(result)
@@ -865,6 +853,7 @@ def test_ttgir_softmax_multi_row_gpu(runner):
     # Dispatch n_rows threadgroups
     n_groups = n_rows
     import Metal
+
     cmd = runner.queue.commandBuffer()
     enc = cmd.computeCommandEncoder()
     enc.setComputePipelineState_(pipeline)
@@ -884,8 +873,8 @@ def test_ttgir_softmax_multi_row_gpu(runner):
 
     # Verify each row sums to 1.0 and matches reference
     for row in range(n_rows):
-        row_in = input_data[row * n_cols:(row + 1) * n_cols]
-        row_out = result[row * n_cols:(row + 1) * n_cols]
+        row_in = input_data[row * n_cols : (row + 1) * n_cols]
+        row_out = result[row * n_cols : (row + 1) * n_cols]
 
         max_val = max(row_in)
         exps = [math.exp(x - max_val) for x in row_in]
@@ -893,20 +882,17 @@ def test_ttgir_softmax_multi_row_gpu(runner):
         expected = [e / sum_exp for e in exps]
 
         row_sum = sum(row_out)
-        assert abs(row_sum - 1.0) < 1e-3, (
-            f"Row {row}: sum={row_sum}, expected 1.0"
-        )
+        assert abs(row_sum - 1.0) < 1e-3, f"Row {row}: sum={row_sum}, expected 1.0"
 
         for i in range(n_cols):
             tol = max(1e-5, abs(expected[i]) * 1e-3)
-            assert abs(row_out[i] - expected[i]) < tol, (
-                f"Row {row}[{i}] got {row_out[i]}, expected {expected[i]}"
-            )
+            assert abs(row_out[i] - expected[i]) < tol, f"Row {row}[{i}] got {row_out[i]}, expected {expected[i]}"
 
 
 # ---------------------------------------------------------------------------
 # scf.for loop detection tests
 # ---------------------------------------------------------------------------
+
 
 def test_parse_scf_for_detects_loop():
     """Parser detects scf.for loop structures in TTGIR."""
@@ -918,14 +904,14 @@ def test_parse_scf_for_detects_loop():
 
     assert len(parser.scf_for_loops) == 1
     loop = parser.scf_for_loops[0]
-    assert loop['iv'] == 'iv'
-    assert loop['lb'] == '%c0'
-    assert loop['ub'] == '%arg2'
-    assert loop['step'] == '%c256'
+    assert loop["iv"] == "iv"
+    assert loop["lb"] == "%c0"
+    assert loop["ub"] == "%arg2"
+    assert loop["step"] == "%c256"
     # Should have iter_args (accumulator)
-    assert len(loop['iter_args']) == 1
-    assert loop['iter_args'][0][0] == 'acc'  # iter arg name
-    assert loop['iter_args'][0][1] == '%cst_zero'  # init value
+    assert len(loop["iter_args"]) == 1
+    assert loop["iter_args"][0][0] == "acc"  # iter arg name
+    assert loop["iter_args"][0][1] == "%cst_zero"  # init value
 
 
 def test_parse_scf_for_with_reduce():
@@ -1077,6 +1063,7 @@ def test_fp64_downcast_in_emitter():
 # math.fma and math.rsqrt tests
 # ---------------------------------------------------------------------------
 
+
 @requires_metal
 def test_ttgir_fma_compiles(runner):
     """TTGIR math.fma compiles to valid MSL."""
@@ -1115,9 +1102,7 @@ def test_ttgir_fma_gpu(runner):
     for i in range(n):
         expected = a_data[i] * b_data[i] + c_data[i]
         tol = max(1e-4, abs(expected) * 1e-5)
-        assert abs(result[i] - expected) < tol, (
-            f"[{i}] got {result[i]}, expected {expected}"
-        )
+        assert abs(result[i] - expected) < tol, f"[{i}] got {result[i]}, expected {expected}"
 
 
 @requires_metal
@@ -1155,14 +1140,13 @@ def test_ttgir_rsqrt_gpu(runner):
     for i in range(n):
         expected = 1.0 / math.sqrt(input_data[i])
         tol = max(1e-4, abs(expected) * 1e-4)
-        assert abs(result[i] - expected) < tol, (
-            f"[{i}] got {result[i]}, expected {expected}"
-        )
+        assert abs(result[i] - expected) < tol, f"[{i}] got {result[i]}, expected {expected}"
 
 
 # ---------------------------------------------------------------------------
 # Layer norm pattern detection tests
 # ---------------------------------------------------------------------------
+
 
 def test_ttgir_layer_norm_detected():
     """Parser detects layer norm pattern (two sum reductions with sub)."""
@@ -1292,6 +1276,7 @@ def test_ttgir_matmul_gpu(runner):
     k_buf = runner.make_uint_buffer(K)
 
     import Metal
+
     cmd = runner.queue.commandBuffer()
     enc = cmd.computeCommandEncoder()
     enc.setComputePipelineState_(pipeline)
@@ -1313,9 +1298,7 @@ def test_ttgir_matmul_gpu(runner):
         for j in range(N):
             expected = sum(a_data[i * K + k] * b_data[k * N + j] for k in range(K))
             got = result[i * N + j]
-            assert abs(got - expected) < 0.1, (
-                f"C[{i},{j}]: got {got}, expected {expected}"
-            )
+            assert abs(got - expected) < 0.1, f"C[{i},{j}]: got {got}, expected {expected}"
 
 
 # ---------------------------------------------------------------------------
@@ -1905,9 +1888,11 @@ module {
 }
 """
 
+
 def test_ttgir_paged_attention_detected():
     """TTGIR paged attention pattern is detected."""
     from triton_msl.codegen.ttgir_parser import TTGIRParser
+
     parser = TTGIRParser(PAGED_ATTENTION_TTGIR, FakeOptions())
     parser._parse_function_signature()
     parser._parse_body()
@@ -1918,6 +1903,7 @@ def test_ttgir_paged_attention_detected():
 def test_ttgir_paged_attention_not_confused_with_softmax():
     """Paged attention isn't confused with softmax (3+ input ptrs distinguishes it)."""
     from triton_msl.codegen.ttgir_parser import TTGIRParser
+
     parser = TTGIRParser(PAGED_ATTENTION_TTGIR, FakeOptions())
     parser._parse_function_signature()
     parser._parse_body()
@@ -1964,9 +1950,11 @@ module {
 }
 """
 
+
 def test_ttgir_top_k_detected():
     """TTGIR top-k sampling pattern is detected."""
     from triton_msl.codegen.ttgir_parser import TTGIRParser
+
     parser = TTGIRParser(TOP_K_TTGIR, FakeOptions())
     parser._parse_function_signature()
     parser._parse_body()
@@ -1977,6 +1965,7 @@ def test_ttgir_top_k_detected():
 def test_ttgir_top_k_not_confused_with_elementwise():
     """Top-k isn't confused with elementwise (2+ output ptrs distinguishes it)."""
     from triton_msl.codegen.ttgir_parser import TTGIRParser
+
     parser = TTGIRParser(TOP_K_TTGIR, FakeOptions())
     parser._parse_function_signature()
     parser._parse_body()
@@ -2031,9 +2020,11 @@ module {
 }
 """
 
+
 def test_ttgir_speculative_decode_detected():
     """TTGIR speculative decoding pattern is detected."""
     from triton_msl.codegen.ttgir_parser import TTGIRParser
+
     parser = TTGIRParser(SPECULATIVE_DECODE_TTGIR, FakeOptions())
     parser._parse_function_signature()
     parser._parse_body()
@@ -2044,6 +2035,7 @@ def test_ttgir_speculative_decode_detected():
 def test_ttgir_speculative_decode_not_confused():
     """Speculative decode isn't confused with other patterns."""
     from triton_msl.codegen.ttgir_parser import TTGIRParser
+
     parser = TTGIRParser(SPECULATIVE_DECODE_TTGIR, FakeOptions())
     parser._parse_function_signature()
     parser._parse_body()
@@ -2100,9 +2092,11 @@ module {
 }
 """
 
+
 def test_ttgir_beam_search_detected():
     """TTGIR beam search pattern is detected."""
     from triton_msl.codegen.ttgir_parser import TTGIRParser
+
     parser = TTGIRParser(BEAM_SEARCH_TTGIR, FakeOptions())
     parser._parse_function_signature()
     parser._parse_body()
@@ -2113,6 +2107,7 @@ def test_ttgir_beam_search_detected():
 def test_ttgir_beam_search_not_confused():
     """Beam search isn't confused with plain reduction."""
     from triton_msl.codegen.ttgir_parser import TTGIRParser
+
     parser = TTGIRParser(BEAM_SEARCH_TTGIR, FakeOptions())
     parser._parse_function_signature()
     parser._parse_body()
@@ -2167,9 +2162,11 @@ module {
 }
 """
 
+
 def test_ttgir_variance_detected():
     """TTGIR variance pattern is detected."""
     from triton_msl.codegen.ttgir_parser import TTGIRParser
+
     parser = TTGIRParser(VARIANCE_TTGIR, FakeOptions())
     parser._parse_function_signature()
     parser._parse_body()
@@ -2179,6 +2176,7 @@ def test_ttgir_variance_detected():
 def test_ttgir_variance_routed_before_layer_norm():
     """Variance is detected and routed before layer norm (no rsqrt)."""
     from triton_msl.codegen.ttgir_parser import TTGIRParser
+
     parser = TTGIRParser(VARIANCE_TTGIR, FakeOptions())
     parser._parse_function_signature()
     parser._parse_body()
@@ -2356,6 +2354,7 @@ module {
 def test_ttgir_tanh_detected():
     """TTGIR tanh activation pattern is detected."""
     from triton_msl.codegen.ttgir_parser import TTGIRParser
+
     parser = TTGIRParser(TANH_TTGIR, FakeOptions())
     parser._parse_function_signature()
     parser._parse_body()
@@ -2366,6 +2365,7 @@ def test_ttgir_tanh_detected():
 def test_ttgir_sigmoid_detected():
     """TTGIR sigmoid activation pattern is detected."""
     from triton_msl.codegen.ttgir_parser import TTGIRParser
+
     parser = TTGIRParser(SIGMOID_TTGIR, FakeOptions())
     parser._parse_function_signature()
     parser._parse_body()
@@ -2376,6 +2376,7 @@ def test_ttgir_sigmoid_detected():
 def test_ttgir_elu_detected():
     """TTGIR ELU activation pattern is detected."""
     from triton_msl.codegen.ttgir_parser import TTGIRParser
+
     parser = TTGIRParser(ELU_TTGIR, FakeOptions())
     parser._parse_function_signature()
     parser._parse_body()
@@ -2386,6 +2387,7 @@ def test_ttgir_elu_detected():
 def test_ttgir_leaky_relu_detected():
     """TTGIR leaky ReLU activation pattern is detected."""
     from triton_msl.codegen.ttgir_parser import TTGIRParser
+
     parser = TTGIRParser(LEAKY_RELU_TTGIR, FakeOptions())
     parser._parse_function_signature()
     parser._parse_body()
@@ -2396,6 +2398,7 @@ def test_ttgir_leaky_relu_detected():
 def test_ttgir_hardswish_detected():
     """TTGIR hardswish activation pattern is detected."""
     from triton_msl.codegen.ttgir_parser import TTGIRParser
+
     parser = TTGIRParser(HARDSWISH_TTGIR, FakeOptions())
     parser._parse_function_signature()
     parser._parse_body()
@@ -2406,6 +2409,7 @@ def test_ttgir_hardswish_detected():
 def test_ttgir_activation_not_confused_with_fused_mlp():
     """Activation (sigmoid) is NOT confused with fused MLP (needs 2+ inputs)."""
     from triton_msl.codegen.ttgir_parser import TTGIRParser
+
     parser = TTGIRParser(SIGMOID_TTGIR, FakeOptions())
     parser._parse_function_signature()
     parser._parse_body()
@@ -2512,9 +2516,11 @@ module {
 }
 """
 
+
 def test_ttgir_batch_norm_detected():
     """TTGIR batch norm pattern is detected."""
     from triton_msl.codegen.ttgir_parser import TTGIRParser
+
     parser = TTGIRParser(BATCH_NORM_TTGIR, FakeOptions())
     parser._parse_function_signature()
     parser._parse_body()
@@ -2525,6 +2531,7 @@ def test_ttgir_batch_norm_detected():
 def test_ttgir_batch_norm_not_confused_with_layer_norm():
     """Batch norm (4+ input ptrs) is not confused with layer norm (1 input ptr + reductions)."""
     from triton_msl.codegen.ttgir_parser import TTGIRParser
+
     parser = TTGIRParser(BATCH_NORM_TTGIR, FakeOptions())
     parser._parse_function_signature()
     parser._parse_body()
@@ -2588,9 +2595,11 @@ module {
 }
 """
 
+
 def test_ttgir_online_softmax_detected():
     """TTGIR online softmax pattern is detected (scf.for + exp + reduce)."""
     from triton_msl.codegen.ttgir_parser import TTGIRParser
+
     parser = TTGIRParser(ONLINE_SOFTMAX_TTGIR, FakeOptions())
     parser._parse_function_signature()
     parser._parse_body()
@@ -2601,6 +2610,7 @@ def test_ttgir_online_softmax_detected():
 def test_ttgir_online_softmax_not_confused_with_regular_softmax():
     """Online softmax (has scf.for) is not confused with regular softmax."""
     from triton_msl.codegen.ttgir_parser import TTGIRParser
+
     # Regular softmax has no scf.for loop
     parser = TTGIRParser(ONLINE_SOFTMAX_TTGIR, FakeOptions())
     parser._parse_function_signature()
@@ -2659,9 +2669,11 @@ module {
 }
 """
 
+
 def test_ttgir_rms_norm_detected():
     """TTGIR RMS norm pattern is detected (sum + rsqrt + mul, no sub)."""
     from triton_msl.codegen.ttgir_parser import TTGIRParser
+
     parser = TTGIRParser(RMS_NORM_TTGIR, FakeOptions())
     parser._parse_function_signature()
     parser._parse_body()
@@ -2672,6 +2684,7 @@ def test_ttgir_rms_norm_detected():
 def test_ttgir_rms_norm_not_confused_with_layer_norm():
     """RMS norm (no sub) is distinct from layer norm (has sub)."""
     from triton_msl.codegen.ttgir_parser import TTGIRParser
+
     parser = TTGIRParser(RMS_NORM_TTGIR, FakeOptions())
     parser._parse_function_signature()
     parser._parse_body()
@@ -2741,9 +2754,11 @@ module {
 }
 """
 
+
 def test_ttgir_group_norm_detected():
     """TTGIR group norm pattern is detected (reductions + 3 input ptrs + 2 scalar args)."""
     from triton_msl.codegen.ttgir_parser import TTGIRParser
+
     parser = TTGIRParser(GROUP_NORM_TTGIR, FakeOptions())
     parser._parse_function_signature()
     parser._parse_body()
@@ -2754,6 +2769,7 @@ def test_ttgir_group_norm_detected():
 def test_ttgir_group_norm_not_confused_with_layer_norm():
     """Group norm (3 input ptrs) is distinct from layer norm (1-2 input ptrs)."""
     from triton_msl.codegen.ttgir_parser import TTGIRParser
+
     parser = TTGIRParser(GROUP_NORM_TTGIR, FakeOptions())
     parser._parse_function_signature()
     parser._parse_body()
@@ -2811,9 +2827,11 @@ module {
 }
 """
 
+
 def test_ttgir_dropout_detected():
     """TTGIR dropout pattern is detected (2 inputs + cmp + select + mul)."""
     from triton_msl.codegen.ttgir_parser import TTGIRParser
+
     parser = TTGIRParser(DROPOUT_TTGIR, FakeOptions())
     parser._parse_function_signature()
     parser._parse_body()
@@ -2824,6 +2842,7 @@ def test_ttgir_dropout_detected():
 def test_ttgir_dropout_not_confused_with_activation():
     """Dropout (2 input ptrs) is not confused with activation (1 input ptr)."""
     from triton_msl.codegen.ttgir_parser import TTGIRParser
+
     parser = TTGIRParser(DROPOUT_TTGIR, FakeOptions())
     parser._parse_function_signature()
     parser._parse_body()
@@ -2873,9 +2892,11 @@ module {
 }
 """
 
+
 def test_ttgir_gather_detected():
     """TTGIR gather pattern is detected (2 inputs with int index + 1 output)."""
     from triton_msl.codegen.ttgir_parser import TTGIRParser
+
     parser = TTGIRParser(GATHER_TTGIR, FakeOptions())
     parser._parse_function_signature()
     parser._parse_body()
@@ -2886,6 +2907,7 @@ def test_ttgir_gather_detected():
 def test_ttgir_gather_not_confused_with_dropout():
     """Gather (int index input) is not confused with dropout (float random input)."""
     from triton_msl.codegen.ttgir_parser import TTGIRParser
+
     parser = TTGIRParser(GATHER_TTGIR, FakeOptions())
     parser._parse_function_signature()
     parser._parse_body()
@@ -2935,9 +2957,11 @@ module {
 }
 """
 
+
 def test_ttgir_scatter_detected():
     """TTGIR scatter pattern is detected (store ptr uses loaded index)."""
     from triton_msl.codegen.ttgir_parser import TTGIRParser
+
     parser = TTGIRParser(SCATTER_TTGIR, FakeOptions())
     parser._parse_function_signature()
     parser._parse_body()
@@ -2948,6 +2972,7 @@ def test_ttgir_scatter_detected():
 def test_ttgir_scatter_not_confused_with_gather():
     """Scatter (store at loaded index) is not confused with gather (load at loaded index)."""
     from triton_msl.codegen.ttgir_parser import TTGIRParser
+
     # Scatter IR should match scatter, not gather
     parser = TTGIRParser(SCATTER_TTGIR, FakeOptions())
     parser._parse_function_signature()
@@ -3007,9 +3032,11 @@ module {
 }
 """
 
+
 def test_ttgir_transpose_detected():
     """TTGIR transpose pattern is detected (2D grid, 1 input, 1 output)."""
     from triton_msl.codegen.ttgir_parser import TTGIRParser
+
     parser = TTGIRParser(TRANSPOSE_TTGIR, FakeOptions())
     parser._parse_function_signature()
     parser._parse_body()
@@ -3020,6 +3047,7 @@ def test_ttgir_transpose_detected():
 def test_ttgir_transpose_not_confused_with_elementwise():
     """Transpose (2D grid) is not confused with 1D elementwise."""
     from triton_msl.codegen.ttgir_parser import TTGIRParser
+
     # Elementwise (1D, single program_id) should not be transpose
     parser = TTGIRParser(GATHER_TTGIR, FakeOptions())  # gather uses 1D
     parser._parse_function_signature()
@@ -3082,9 +3110,11 @@ module {
 }
 """
 
+
 def test_ttgir_instance_norm_detected():
     """TTGIR instance norm pattern is detected (1 input, reduce + rsqrt)."""
     from triton_msl.codegen.ttgir_parser import TTGIRParser
+
     parser = TTGIRParser(INSTANCE_NORM_TTGIR, FakeOptions())
     parser._parse_function_signature()
     parser._parse_body()
@@ -3095,6 +3125,7 @@ def test_ttgir_instance_norm_detected():
 def test_ttgir_instance_norm_not_confused_with_layer_norm():
     """Instance norm (1 input, no weight/bias) is not confused with layer norm."""
     from triton_msl.codegen.ttgir_parser import TTGIRParser
+
     parser = TTGIRParser(INSTANCE_NORM_TTGIR, FakeOptions())
     parser._parse_function_signature()
     parser._parse_body()
@@ -3149,9 +3180,11 @@ module {
 }
 """
 
+
 def test_ttgir_residual_add_detected():
     """TTGIR residual add pattern is detected (2 inputs, only add)."""
     from triton_msl.codegen.ttgir_parser import TTGIRParser
+
     parser = TTGIRParser(RESIDUAL_ADD_TTGIR, FakeOptions())
     parser._parse_function_signature()
     parser._parse_body()
@@ -3162,6 +3195,7 @@ def test_ttgir_residual_add_detected():
 def test_ttgir_residual_add_not_confused_with_dropout():
     """Residual add (just add) is not confused with dropout (cmp + select + mul)."""
     from triton_msl.codegen.ttgir_parser import TTGIRParser
+
     parser = TTGIRParser(RESIDUAL_ADD_TTGIR, FakeOptions())
     parser._parse_function_signature()
     parser._parse_body()
@@ -3211,9 +3245,11 @@ module {
 }
 """
 
+
 def test_ttgir_embedding_detected():
     """TTGIR embedding pattern is detected (float table + int indices)."""
     from triton_msl.codegen.ttgir_parser import TTGIRParser
+
     parser = TTGIRParser(EMBEDDING_TTGIR, FakeOptions())
     parser._parse_function_signature()
     parser._parse_body()
@@ -3224,6 +3260,7 @@ def test_ttgir_embedding_detected():
 def test_ttgir_embedding_not_confused_with_gather():
     """Embedding (2+ scalar args) routes differently from plain gather."""
     from triton_msl.codegen.ttgir_parser import TTGIRParser
+
     parser = TTGIRParser(EMBEDDING_TTGIR, FakeOptions())
     parser._parse_function_signature()
     parser._parse_body()
@@ -3270,9 +3307,11 @@ module {
 }
 """
 
+
 def test_ttgir_concat_detected():
     """TTGIR concat pattern is detected (2+ inputs, 1 output, no math)."""
     from triton_msl.codegen.ttgir_parser import TTGIRParser
+
     parser = TTGIRParser(CONCAT_TTGIR, FakeOptions())
     parser._parse_function_signature()
     parser._parse_body()
@@ -3321,9 +3360,11 @@ module {
 }
 """
 
+
 def test_ttgir_split_detected():
     """TTGIR split pattern is detected (1 input, 2+ outputs)."""
     from triton_msl.codegen.ttgir_parser import TTGIRParser
+
     parser = TTGIRParser(SPLIT_TTGIR, FakeOptions())
     parser._parse_function_signature()
     parser._parse_body()
@@ -3369,9 +3410,11 @@ module {
 }
 """
 
+
 def test_ttgir_repeat_kv_detected():
     """TTGIR repeat_kv pattern is detected (1 in, 1 out, 4+ scalars)."""
     from triton_msl.codegen.ttgir_parser import TTGIRParser
+
     parser = TTGIRParser(REPEAT_KV_TTGIR, FakeOptions())
     parser._parse_function_signature()
     parser._parse_body()
@@ -3425,6 +3468,7 @@ module {
 def test_ttgir_where_detected():
     """TTGIR where pattern is detected (3 inputs, 1 output, select op)."""
     from triton_msl.codegen.ttgir_parser import TTGIRParser
+
     parser = TTGIRParser(WHERE_TTGIR, FakeOptions())
     parser._parse_function_signature()
     parser._parse_body()
@@ -3475,6 +3519,7 @@ module {
 def test_ttgir_clamp_detected():
     """TTGIR clamp pattern is detected (1 in, 1 out, max+min ops)."""
     from triton_msl.codegen.ttgir_parser import TTGIRParser
+
     parser = TTGIRParser(CLAMP_TTGIR, FakeOptions())
     parser._parse_function_signature()
     parser._parse_body()
@@ -3526,6 +3571,7 @@ module {
 def test_ttgir_cumsum_detected():
     """TTGIR cumsum pattern is detected (scf.for with addf, 1 in, 1 out)."""
     from triton_msl.codegen.ttgir_parser import TTGIRParser
+
     parser = TTGIRParser(CUMSUM_TTGIR, FakeOptions())
     parser._parse_function_signature()
     parser._parse_body()

@@ -23,8 +23,7 @@ from triton_msl.codegen.msl_types import triton_type_to_msl
 from triton_msl.codegen._lowerer_helpers import _mlir_to_triton_dtype
 
 
-def _emit_masked_staged_store(lines, *, acc, scratch, gr, gc, cond, dst, out_type,
-                              store_pfx="", indent="    "):
+def _emit_masked_staged_store(lines, *, acc, scratch, gr, gc, cond, dst, out_type, store_pfx="", indent="    "):
     """Emit the masked, per-simdgroup staged store of ONE float8x8 accumulator.
 
     simdgroup_store can't mask, so each simdgroup stages its 8x8 into its OWN
@@ -69,7 +68,9 @@ class _TemplateMixin:
         the non-K-loop single-tile form; the K-loop form threads strides directly.
         """
         a_row, a_col, b_row, b_col, c_row, c_col = descriptors
-        M = info.get("M"); N = info.get("N"); K = info.get("K")
+        M = info.get("M")
+        N = info.get("N")
+        K = info.get("K")
 
         def _is_lit_eq(stride, dim):
             if dim is None:
@@ -77,10 +78,9 @@ class _TemplateMixin:
             try:
                 return int(str(stride)) == int(dim)
             except (TypeError, ValueError):
-                return False   # a runtime arg NAME (not an int literal) → not dense
+                return False  # a runtime arg NAME (not an int literal) → not dense
 
-        return (_is_lit_eq(a_row, K) and _is_lit_eq(b_row, N)
-                and _is_lit_eq(c_row, N))
+        return _is_lit_eq(a_row, K) and _is_lit_eq(b_row, N) and _is_lit_eq(c_row, N)
 
     def _matmul_stride_decision(self, info):
         """Decide the stride-aware lowering route for a bare-matmul ``info``.
@@ -105,19 +105,21 @@ class _TemplateMixin:
         """
         sd = self.infer_dot_strides()
         if sd is None:
-            return None              # not a traceable single-dot matmul
+            return None  # not a traceable single-dot matmul
         descriptors = self._inferred_stride_descriptors()
         if descriptors is None:
             # Single-dot matmul but a stride could not be inferred. Guessing
             # row-major here is exactly the silent-wrong we are eliminating.
             from triton_msl.errors import MetalNonRecoverableError
+
             raise MetalNonRecoverableError(
                 "matmul operand stride could not be inferred from the address "
                 "arithmetic (traced layout: "
                 f"{sd}); refusing to assume a row-major layout, which would "
                 "silently mis-compute a transposed/strided operand. File an "
                 "issue at https://github.com/bledden/triton-msl/issues",
-                op_name="tt.dot")
+                op_name="tt.dot",
+            )
         a_row, a_col, b_row, b_col, c_row, c_col = descriptors
         # Contiguous inner dim == col stride is literal "1". A runtime-arg or
         # non-unit-constant col stride means the inner dim is strided.
@@ -135,15 +137,17 @@ class _TemplateMixin:
         block size). De-duplicated from three copies after the re-audit
         (2026-06-27) found the fused matmul+softmax twin was the one copy MISSING
         this guard -> multi-block silent-wrong."""
-        pid_axes = {s.attrs.get("axis", 0) for s in self.graph.ops
-                    if s.op == "tt.get_program_id"}
+        pid_axes = {s.attrs.get("axis", 0) for s in self.graph.ops if s.op == "tt.get_program_id"}
         if (1 in pid_axes and not has_N) or (0 in pid_axes and not has_M):
             from triton_msl.errors import MetalNonRecoverableError
+
             raise MetalNonRecoverableError(
                 f"{what} tiles the output across programs (program_id axes "
                 f"{sorted(pid_axes)}) but M/N are baked as constexpr, not runtime "
                 "args — the true output extent/strides can't be derived here. "
-                "Refusing rather than emit silently-wrong output.", op_name="tt.dot")
+                "Refusing rather than emit silently-wrong output.",
+                op_name="tt.dot",
+            )
 
     def _lower_strided_scalar_matmul(self, info, descriptors):
         """Fully stride-aware scalar matmul for a NON-contiguous-inner operand.
@@ -186,10 +190,14 @@ class _TemplateMixin:
 
         has_k_loop = bool(info.get("has_k_loop"))
         if has_k_loop:
-            BLOCK_M = info["BLOCK_M"]; BLOCK_N = info["BLOCK_N"]; BLOCK_K = info["BLOCK_K"]
+            BLOCK_M = info["BLOCK_M"]
+            BLOCK_N = info["BLOCK_N"]
+            BLOCK_K = info["BLOCK_K"]
             scalar_arg_map = info.get("scalar_args", {})
         else:
-            BLOCK_M = info["M"]; BLOCK_N = info["N"]; BLOCK_K = info["K"]
+            BLOCK_M = info["M"]
+            BLOCK_N = info["N"]
+            BLOCK_K = info["K"]
             scalar_arg_map = {a.name: a for a in all_scalar_args}
 
         has_M = "M" in scalar_arg_map
@@ -343,8 +351,7 @@ class _TemplateMixin:
         # all 6 inferred strides). The common DENSE case stays on the fast path. (The
         # K-loop variant DOES declare all args, so it threads the inferred row strides as
         # leading dims directly — see _lower_k_loop_dot_inline.)
-        if (decision is not None and decision[0] == "simdgroup"
-                and not info.get("has_k_loop")):
+        if decision is not None and decision[0] == "simdgroup" and not info.get("has_k_loop"):
             descriptors = decision[1]
             if not self._simdgroup_leading_dims_are_dense(info, descriptors):
                 return self._lower_strided_scalar_matmul(info, descriptors)
@@ -353,8 +360,9 @@ class _TemplateMixin:
         # the generic inline kernel below is still emitted + returned).
         self._fast_matmul = self._maybe_fast_matmul_descriptor()
         if info.get("has_k_loop"):
-            return self._lower_k_loop_dot_inline(info, decision[1] if (
-                decision is not None and decision[0] == "simdgroup") else None)
+            return self._lower_k_loop_dot_inline(
+                info, decision[1] if (decision is not None and decision[0] == "simdgroup") else None
+            )
 
         # The non-K-loop simple-dot fast path emits the whole baked M×N output from a
         # SINGLE threadgroup and never references program_id -- the 4th twin of the
@@ -456,7 +464,9 @@ class _TemplateMixin:
         lines.append(f"            for (uint i = tiitg; i < 256u; i += 128u) {{")
         lines.append(f"                uint r = i / 8u, c = i % 8u;")
         lines.append(f"                uint gr = row_base + r, gc = kk + c;")
-        lines.append(f"                tg_A[i] = (gr < M && gc < K) ? {stage_cast}({a_name}[a_batch_off + {a_index}]) : {pad};")
+        lines.append(
+            f"                tg_A[i] = (gr < M && gc < K) ? {stage_cast}({a_name}[a_batch_off + {a_index}]) : {pad};"
+        )
         lines.append(f"            }}")
 
         # Load B tile (8x32) cooperatively. ``trans_b`` analogue: original
@@ -466,7 +476,9 @@ class _TemplateMixin:
         lines.append(f"            for (uint i = tiitg; i < 256u; i += 128u) {{")
         lines.append(f"                uint r = i / 32u, c = i % 32u;")
         lines.append(f"                uint gr = kk + r, gc = col_base_tg + c;")
-        lines.append(f"                tg_B[i] = (gr < K && gc < N) ? {stage_cast}({b_name}[b_batch_off + {b_index}]) : {pad};")
+        lines.append(
+            f"                tg_B[i] = (gr < K && gc < N) ? {stage_cast}({b_name}[b_batch_off + {b_index}]) : {pad};"
+        )
         lines.append(f"            }}")
         lines.append(f"")
         lines.append(f"            threadgroup_barrier(mem_flags::mem_threadgroup);")
@@ -520,11 +532,16 @@ class _TemplateMixin:
             lines.append(f"        uint laneid = tiitg % 32u;")
             for _n, _acc in enumerate(("acc0", "acc1", "acc2", "acc3")):
                 _emit_masked_staged_store(
-                    lines, acc=_acc, scratch="tg_out",
-                    gr=f"row_base + {_n * 8}u + i / 8u", gc="col_base + i % 8u",
+                    lines,
+                    acc=_acc,
+                    scratch="tg_out",
+                    gr=f"row_base + {_n * 8}u + i / 8u",
+                    gc="col_base + i % 8u",
                     cond="gr < M && gc < N",
                     dst=f"{c_name}[c_batch_off + gr * N + gc]",
-                    out_type=output_msl_type, indent="        ")
+                    out_type=output_msl_type,
+                    indent="        ",
+                )
 
         lines.append(f"    }} // tile_col")
         lines.append(f"    }} // tile_row")
@@ -532,7 +549,6 @@ class _TemplateMixin:
         lines.append(f"}}")
 
         return "\n".join(lines)
-
 
     def _lower_k_loop_dot_inline(self, info, descriptors=None):
         """Generate MSL for a K-loop dot kernel using simdgroup MMA.
@@ -618,11 +634,9 @@ class _TemplateMixin:
         for i, arg in enumerate(self.graph.args):
             if arg.is_ptr:
                 arg_msl_type = triton_type_to_msl(arg.elem_type)
-                arg_decls.append(
-                    f"    device {arg_msl_type}* {arg.name} [[buffer({i})]]")
+                arg_decls.append(f"    device {arg_msl_type}* {arg.name} [[buffer({i})]]")
             else:
-                arg_decls.append(
-                    f"    device int* {arg.name}_buf [[buffer({i})]]")
+                arg_decls.append(f"    device int* {arg.name}_buf [[buffer({i})]]")
         lines.append(",\n".join(arg_decls) + ",")
         lines.append(f"    uint3 pid3 [[threadgroup_position_in_grid]],")
         lines.append(f"    uint sgitg [[simdgroup_index_in_threadgroup]],")
@@ -693,9 +707,9 @@ class _TemplateMixin:
             if row_desc is None:
                 return dim_default
             if row_desc in scalar_names:
-                return f"(uint){row_desc}"   # runtime row stride (sliced/padded rows)
+                return f"(uint){row_desc}"  # runtime row stride (sliced/padded rows)
             try:
-                return f"{int(str(row_desc))}u"   # compile-time literal row stride
+                return f"{int(str(row_desc))}u"  # compile-time literal row stride
             except (TypeError, ValueError):
                 return dim_default
 
@@ -722,6 +736,7 @@ class _TemplateMixin:
         # a reachable silent-wrong. (WS1 integrity fix; also adds a-fragment
         # reuse across col blocks, which helps throughput.)
         from triton_msl.errors import MetalNonRecoverableError
+
         # The simdgroup tiling is 8x8: BLOCK_M must split into 8-row tiles and
         # BLOCK_K into 8-deep MMA steps, else the row loop / inner K loop drop
         # the tail and silently under-compute. (Unreachable via normal kernels —
@@ -730,43 +745,45 @@ class _TemplateMixin:
         if BLOCK_M % 8 != 0:
             raise MetalNonRecoverableError(
                 f"K-loop matmul BLOCK_M={BLOCK_M} is not a multiple of 8; the "
-                "8-row simdgroup tiling would drop the tail rows. Refusing.")
+                "8-row simdgroup tiling would drop the tail rows. Refusing."
+            )
         if BLOCK_K % 8 != 0:
             raise MetalNonRecoverableError(
                 f"K-loop matmul BLOCK_K={BLOCK_K} is not a multiple of 8; the "
-                "8-deep MMA step would drop the tail of K. Refusing.")
+                "8-deep MMA step would drop the tail of K. Refusing."
+            )
         if BLOCK_N % 8 != 0:
             raise MetalNonRecoverableError(
                 f"K-loop matmul BLOCK_N={BLOCK_N} is not a multiple of 8; "
-                "output columns tile in 8-wide simdgroup blocks. Refusing.")
+                "output columns tile in 8-wide simdgroup blocks. Refusing."
+            )
         # Distribute the BLOCK_N/8 8-wide column blocks across the 4 simdgroups
         # (ceil). For BLOCK_N a multiple of 32 all four are fully used; for
         # smaller / non-32-multiple BLOCK_N the extra simdgroups idle (guarded).
         total_col_blocks = BLOCK_N // 8
-        col_tiles = (total_col_blocks + 3) // 4   # 8-wide col blocks per simdgroup
+        col_tiles = (total_col_blocks + 3) // 4  # 8-wide col blocks per simdgroup
         cols_per_sg = col_tiles * 8
-        col_needs_guard = (total_col_blocks % 4 != 0)
+        col_needs_guard = total_col_blocks % 4 != 0
 
         def _col_guard(c):
             # Uniform-per-simdgroup predicate: is local block c a real column?
             # None when every (sgitg, c) is in range (no runtime cost).
-            return (f"(sgitg * {col_tiles}u + {c}u) < {total_col_blocks}u"
-                    if col_needs_guard else None)
+            return f"(sgitg * {col_tiles}u + {c}u) < {total_col_blocks}u" if col_needs_guard else None
+
         # Threadgroup budget: the staged path needs tg_A + tg_B (plus a small
         # 1 KiB store scratch). Refuse if it exceeds Metal's 32 KiB threadgroup
         # limit rather than emit a kernel that silently overflows.
-        tg_elt = 2 if tg_type in ("half", "bfloat") else 4   # bfloat is 2 bytes too
+        tg_elt = 2 if tg_type in ("half", "bfloat") else 4  # bfloat is 2 bytes too
         tg_bytes = (tg_a_size + tg_b_size) * tg_elt + 4 * 64 * 4
         if tg_bytes > 32 * 1024:
             raise MetalNonRecoverableError(
                 f"K-loop matmul needs {tg_bytes} B of threadgroup memory "
-                "(> 32 KiB limit) for the staged path; refusing.")
+                "(> 32 KiB limit) for the staged path; refusing."
+            )
 
         # Accumulators: one simdgroup_float8x8 per (8-row tile, 8-col block).
-        acc_names = [[f"acc_{r}_{c}" for c in range(col_tiles)]
-                     for r in range(n_row_tiles)]
-        all_accs = [acc_names[r][c] for r in range(n_row_tiles)
-                    for c in range(col_tiles)]
+        acc_names = [[f"acc_{r}_{c}" for c in range(col_tiles)] for r in range(n_row_tiles)]
+        all_accs = [acc_names[r][c] for r in range(n_row_tiles) for c in range(col_tiles)]
         lines.append(f"    {acc_frag} {', '.join(n + '(0)' for n in all_accs)};")
         b_names = [f"b_frag{c}" for c in range(col_tiles)]
         lines.append(f"    {in_frag} a_frag, {', '.join(b_names)};")
@@ -785,19 +802,27 @@ class _TemplateMixin:
             for c in range(col_tiles):
                 g = _col_guard(c)
                 pfx = f"if ({g}) " if g else ""
-                lines.append(f"            {pfx}simdgroup_load(b_frag{c}, {b_name} + k * {b_ld} + col_base + sgitg * {cols_per_sg}u + {c * 8}u, {b_ld});")
+                lines.append(
+                    f"            {pfx}simdgroup_load(b_frag{c}, {b_name} + k * {b_ld} + col_base + sgitg * {cols_per_sg}u + {c * 8}u, {b_ld});"
+                )
             for t in range(n_row_tiles):
-                lines.append(f"            simdgroup_load(a_frag, {a_name} + (row_base + {t * 8}u) * {a_ld} + k, {a_ld});")
+                lines.append(
+                    f"            simdgroup_load(a_frag, {a_name} + (row_base + {t * 8}u) * {a_ld} + k, {a_ld});"
+                )
                 for c in range(col_tiles):
                     g = _col_guard(c)
                     pfx = f"if ({g}) " if g else ""
-                    lines.append(f"            {pfx}simdgroup_multiply_accumulate({acc_names[t][c]}, a_frag, b_frag{c}, {acc_names[t][c]});")
+                    lines.append(
+                        f"            {pfx}simdgroup_multiply_accumulate({acc_names[t][c]}, a_frag, b_frag{c}, {acc_names[t][c]});"
+                    )
             lines.append(f"        }}")
             for t in range(n_row_tiles):
                 for c in range(col_tiles):
                     g = _col_guard(c)
                     pfx = f"if ({g}) " if g else ""
-                    lines.append(f"        {pfx}simdgroup_store({acc_names[t][c]}, {c_name} + (row_base + {t * 8}u) * {c_ld} + col_base + sgitg * {cols_per_sg}u + {c * 8}u, {c_ld});")
+                    lines.append(
+                        f"        {pfx}simdgroup_store({acc_names[t][c]}, {c_name} + (row_base + {t * 8}u) * {c_ld} + col_base + sgitg * {cols_per_sg}u + {c * 8}u, {c_ld});"
+                    )
             lines.append(f"        return;")
             lines.append(f"    }}")
             lines.append(f"")
@@ -828,13 +853,17 @@ class _TemplateMixin:
         for c in range(col_tiles):
             g = _col_guard(c)
             pfx = f"if ({g}) " if g else ""
-            lines.append(f"        {pfx}simdgroup_load(b_frag{c}, tg_B + sgitg * {cols_per_sg}u + {c * 8}u, {BLOCK_N});")
+            lines.append(
+                f"        {pfx}simdgroup_load(b_frag{c}, tg_B + sgitg * {cols_per_sg}u + {c * 8}u, {BLOCK_N});"
+            )
         for t in range(n_row_tiles):
             lines.append(f"        simdgroup_load(a_frag, tg_A + {t}u * 8u * {STAGE_DEPTH}u, {STAGE_DEPTH});")
             for c in range(col_tiles):
                 g = _col_guard(c)
                 pfx = f"if ({g}) " if g else ""
-                lines.append(f"        {pfx}simdgroup_multiply_accumulate({acc_names[t][c]}, a_frag, b_frag{c}, {acc_names[t][c]});")
+                lines.append(
+                    f"        {pfx}simdgroup_multiply_accumulate({acc_names[t][c]}, a_frag, b_frag{c}, {acc_names[t][c]});"
+                )
         lines.append(f"        threadgroup_barrier(mem_flags::mem_threadgroup);")
         lines.append(f"    }} // K-loop")
         lines.append(f"")
@@ -860,11 +889,17 @@ class _TemplateMixin:
                 # (every thread must reach them, regardless of which columns its
                 # simdgroup owns).
                 _emit_masked_staged_store(
-                    lines, acc=acc_names[t][c], scratch="tg_st",
+                    lines,
+                    acc=acc_names[t][c],
+                    scratch="tg_st",
                     gr=f"row_base + {t * 8}u + i / 8u",
                     gc=f"col_base + sgitg * {cols_per_sg}u + {c * 8}u + i % 8u",
-                    cond=cond, dst=f"{c_name}[gr * {c_ld} + gc]",
-                    out_type=output_msl_type, store_pfx=spfx, indent="    ")
+                    cond=cond,
+                    dst=f"{c_name}[gr * {c_ld} + gc]",
+                    out_type=output_msl_type,
+                    store_pfx=spfx,
+                    indent="    ",
+                )
 
         lines.append(f"}}")
 
@@ -877,8 +912,15 @@ class _TemplateMixin:
         # kernel's compile-time tg usage, not the per-dispatch host length, so
         # only a SEPARATE no-tg kernel recovers the residual occupancy.)
         _argnames = [a.name for a in self.graph.args]
-        if (output_msl_type == "float" and has_M and has_N and has_K
-                and "M" in _argnames and "N" in _argnames and "K" in _argnames):
+        if (
+            output_msl_type == "float"
+            and has_M
+            and has_N
+            and has_K
+            and "M" in _argnames
+            and "N" in _argnames
+            and "K" in _argnames
+        ):
             dn = f"{safe_name}__mmdirect"
             lines.append("")
             lines.append(f"kernel void {dn}(")
@@ -899,28 +941,36 @@ class _TemplateMixin:
             for c in range(col_tiles):
                 g = _col_guard(c)
                 pfx = f"if ({g}) " if g else ""
-                lines.append(f"        {pfx}simdgroup_load(b_frag{c}, {b_name} + k * {b_ld} + col_base + sgitg * {cols_per_sg}u + {c * 8}u, {b_ld});")
+                lines.append(
+                    f"        {pfx}simdgroup_load(b_frag{c}, {b_name} + k * {b_ld} + col_base + sgitg * {cols_per_sg}u + {c * 8}u, {b_ld});"
+                )
             for t in range(n_row_tiles):
                 lines.append(f"        simdgroup_load(a_frag, {a_name} + (row_base + {t * 8}u) * {a_ld} + k, {a_ld});")
                 for c in range(col_tiles):
                     g = _col_guard(c)
                     pfx = f"if ({g}) " if g else ""
-                    lines.append(f"        {pfx}simdgroup_multiply_accumulate({acc_names[t][c]}, a_frag, b_frag{c}, {acc_names[t][c]});")
+                    lines.append(
+                        f"        {pfx}simdgroup_multiply_accumulate({acc_names[t][c]}, a_frag, b_frag{c}, {acc_names[t][c]});"
+                    )
             lines.append(f"    }}")
             for t in range(n_row_tiles):
                 for c in range(col_tiles):
                     g = _col_guard(c)
                     pfx = f"if ({g}) " if g else ""
-                    lines.append(f"    {pfx}simdgroup_store({acc_names[t][c]}, {c_name} + (row_base + {t * 8}u) * {c_ld} + col_base + sgitg * {cols_per_sg}u + {c * 8}u, {c_ld});")
+                    lines.append(
+                        f"    {pfx}simdgroup_store({acc_names[t][c]}, {c_name} + (row_base + {t * 8}u) * {c_ld} + col_base + sgitg * {cols_per_sg}u + {c * 8}u, {c_ld});"
+                    )
             lines.append(f"}}")
             self._mm_two_kernel = {
-                "direct_name": dn, "block_m": BLOCK_M, "block_n": BLOCK_N,
-                "m_idx": _argnames.index("M"), "n_idx": _argnames.index("N"),
+                "direct_name": dn,
+                "block_m": BLOCK_M,
+                "block_n": BLOCK_N,
+                "m_idx": _argnames.index("M"),
+                "n_idx": _argnames.index("N"),
                 "k_idx": _argnames.index("K"),
             }
 
         return "\n".join(lines)
-
 
     def _lower_flip_template(self, info) -> str:
         """Generate a direct MSL kernel for tl.flip of a 3D tensor.
@@ -953,11 +1003,9 @@ class _TemplateMixin:
         for i, arg in enumerate(self.graph.args):
             if arg.is_ptr:
                 arg_msl_type = triton_type_to_msl(arg.elem_type)
-                arg_decls.append(
-                    f"    device {arg_msl_type}* {arg.name} [[buffer({i})]]")
+                arg_decls.append(f"    device {arg_msl_type}* {arg.name} [[buffer({i})]]")
             else:
-                arg_decls.append(
-                    f"    device int* {arg.name}_buf [[buffer({i})]]")
+                arg_decls.append(f"    device int* {arg.name}_buf [[buffer({i})]]")
 
         lines = []
         lines.append("#include <metal_stdlib>")
@@ -995,7 +1043,6 @@ class _TemplateMixin:
         lines.append("")
 
         return "\n".join(lines)
-
 
     def _lower_softmax_template(self, info) -> str:
         """Emit a TG-cached row-wise softmax kernel.
@@ -1053,13 +1100,11 @@ class _TemplateMixin:
         for i, arg in enumerate(self.graph.args):
             if arg.is_ptr:
                 arg_msl_type = triton_type_to_msl(arg.elem_type)
-                arg_decls.append(
-                    f"    device {arg_msl_type}* {arg.name} [[buffer({i})]]")
+                arg_decls.append(f"    device {arg_msl_type}* {arg.name} [[buffer({i})]]")
             else:
                 # Scalar arg passed as constant&
                 arg_msl_type = triton_type_to_msl(arg.elem_type) if arg.elem_type else "int"
-                arg_decls.append(
-                    f"    constant {arg_msl_type}& {arg.name} [[buffer({i})]]")
+                arg_decls.append(f"    constant {arg_msl_type}& {arg.name} [[buffer({i})]]")
 
         lines = []
         lines.append("#include <metal_stdlib>")
@@ -1110,8 +1155,7 @@ class _TemplateMixin:
         lines.append("    threadgroup_barrier(mem_flags::mem_threadgroup);")
         lines.append("    if (tiisg == 0) reduce_buf[sgitg] = simd_max_v;")
         lines.append("    threadgroup_barrier(mem_flags::mem_threadgroup);")
-        lines.append(f"    float row_max = simd_max((tiisg < {n_simd}u) ? "
-                     f"reduce_buf[tiisg] : -INFINITY);")
+        lines.append(f"    float row_max = simd_max((tiisg < {n_simd}u) ? reduce_buf[tiisg] : -INFINITY);")
         lines.append("    float local_sum = 0.0f;")
         lines.append("")
 
@@ -1147,8 +1191,7 @@ class _TemplateMixin:
         lines.append("    threadgroup_barrier(mem_flags::mem_threadgroup);")
         lines.append("    if (tiisg == 0) reduce_buf[sgitg] = simd_sum_v;")
         lines.append("    threadgroup_barrier(mem_flags::mem_threadgroup);")
-        lines.append(f"    float row_sum = simd_sum((tiisg < {n_simd}u) ? "
-                     f"reduce_buf[tiisg] : 0.0f);")
+        lines.append(f"    float row_sum = simd_sum((tiisg < {n_simd}u) ? reduce_buf[tiisg] : 0.0f);")
         lines.append("    float inv_sum = 1.0f / row_sum;")
         lines.append("")
 
@@ -1224,12 +1267,10 @@ class _TemplateMixin:
         for i, arg in enumerate(self.graph.args):
             if arg.is_ptr:
                 arg_msl_type = triton_type_to_msl(arg.elem_type)
-                arg_decls.append(
-                    f"    device {arg_msl_type}* {arg.name} [[buffer({i})]]")
+                arg_decls.append(f"    device {arg_msl_type}* {arg.name} [[buffer({i})]]")
             else:
                 arg_msl_type = triton_type_to_msl(arg.elem_type) if arg.elem_type else "int"
-                arg_decls.append(
-                    f"    constant {arg_msl_type}& {arg.name} [[buffer({i})]]")
+                arg_decls.append(f"    constant {arg_msl_type}& {arg.name} [[buffer({i})]]")
 
         # eps default — matches torch.nn.LayerNorm. Most layer-norm Triton
         # kernels pass eps as a constexpr, so it doesn\\'t reach codegen as
@@ -1359,13 +1400,10 @@ class _TemplateMixin:
         for i, arg in enumerate(self.graph.args):
             if arg.is_ptr:
                 arg_msl_type = triton_type_to_msl(arg.elem_type)
-                arg_decls.append(
-                    f"    device {arg_msl_type}* {arg.name} [[buffer({i})]]")
+                arg_decls.append(f"    device {arg_msl_type}* {arg.name} [[buffer({i})]]")
             else:
-                arg_msl_type = (triton_type_to_msl(arg.elem_type)
-                                if arg.elem_type else "int")
-                arg_decls.append(
-                    f"    constant {arg_msl_type}& {arg.name} [[buffer({i})]]")
+                arg_msl_type = triton_type_to_msl(arg.elem_type) if arg.elem_type else "int"
+                arg_decls.append(f"    constant {arg_msl_type}& {arg.name} [[buffer({i})]]")
 
         lines = []
         lines.append("#include <metal_stdlib>")
@@ -1407,8 +1445,7 @@ class _TemplateMixin:
         # in_flat = sum_d O[d] * src_stride[order[d]];  O[d]=(k/dst_stride[d])%dst_shape[d]
         terms = []
         for d in range(rank):
-            o_d = (f"(k % {dst_shape[d]}u)" if dst_stride[d] == 1
-                   else f"((k / {dst_stride[d]}u) % {dst_shape[d]}u)")
+            o_d = f"(k % {dst_shape[d]}u)" if dst_stride[d] == 1 else f"((k / {dst_stride[d]}u) % {dst_shape[d]}u)"
             terms.append(f"{o_d} * {src_stride[order[d]]}u")
         in_flat = " + ".join(terms)
 
@@ -1424,13 +1461,10 @@ class _TemplateMixin:
         for i, arg in enumerate(self.graph.args):
             if arg.is_ptr:
                 arg_msl_type = triton_type_to_msl(arg.elem_type)
-                arg_decls.append(
-                    f"    device {arg_msl_type}* {arg.name} [[buffer({i})]]")
+                arg_decls.append(f"    device {arg_msl_type}* {arg.name} [[buffer({i})]]")
             else:
-                arg_msl_type = (triton_type_to_msl(arg.elem_type)
-                                if arg.elem_type else "int")
-                arg_decls.append(
-                    f"    constant {arg_msl_type}& {arg.name} [[buffer({i})]]")
+                arg_msl_type = triton_type_to_msl(arg.elem_type) if arg.elem_type else "int"
+                arg_decls.append(f"    constant {arg_msl_type}& {arg.name} [[buffer({i})]]")
 
         lines = [
             "#include <metal_stdlib>",
@@ -1476,17 +1510,14 @@ class _TemplateMixin:
         for i, arg in enumerate(self.graph.args):
             if arg.is_ptr:
                 arg_msl_type = triton_type_to_msl(arg.elem_type)
-                arg_decls.append(
-                    f"    device {arg_msl_type}* {arg.name} [[buffer({i})]]")
+                arg_decls.append(f"    device {arg_msl_type}* {arg.name} [[buffer({i})]]")
             else:
-                arg_msl_type = (triton_type_to_msl(arg.elem_type)
-                                if arg.elem_type else "int")
-                arg_decls.append(
-                    f"    constant {arg_msl_type}& {arg.name} [[buffer({i})]]")
+                arg_msl_type = triton_type_to_msl(arg.elem_type) if arg.elem_type else "int"
+                arg_decls.append(f"    constant {arg_msl_type}& {arg.name} [[buffer({i})]]")
 
         # out_cell(i) = sum_k ((i / in_stride_k) % size_k) * out_stride_k
         oc_terms = []
-        for (in_s, size, out_s) in surviving:
+        for in_s, size, out_s in surviving:
             coord = f"((i / {in_s}u) % {size}u)"
             oc_terms.append(coord if out_s == 1 else f"{coord} * {out_s}u")
         oc_expr = " + ".join(oc_terms) if oc_terms else "0u"
@@ -1508,13 +1539,11 @@ class _TemplateMixin:
         lines.append("    threadgroup_barrier(mem_flags::mem_threadgroup);")
         lines.append(f"    for (uint i = lid; i < {total}u; i += {threads}u) {{")
         lines.append(f"        uint _oc = {oc_expr};")
-        lines.append(f"        atomic_fetch_add_explicit(&_acc[_oc], "
-                     f"(int){in_arg}[i], memory_order_relaxed);")
+        lines.append(f"        atomic_fetch_add_explicit(&_acc[_oc], (int){in_arg}[i], memory_order_relaxed);")
         lines.append("    }")
         lines.append("    threadgroup_barrier(mem_flags::mem_threadgroup);")
         lines.append(f"    for (uint e = lid; e < {out_total}u; e += {threads}u) {{")
-        lines.append(f"        {out_arg}[e] = ({msl_type})atomic_load_explicit("
-                     "&_acc[e], memory_order_relaxed);")
+        lines.append(f"        {out_arg}[e] = ({msl_type})atomic_load_explicit(&_acc[e], memory_order_relaxed);")
         lines.append("    }")
         lines.append("}")
         lines.append("")
@@ -1598,12 +1627,11 @@ class _TemplateMixin:
         cols_per_sg = N // 4
         if cols_per_sg == 0 or cols_per_sg % 8:
             return None
-        col_tiles_per_sg = cols_per_sg // 8        # 8×8 col tiles per SG
-        row_tiles = m_block // 8                   # 8×8 row tiles per strip
+        col_tiles_per_sg = cols_per_sg // 8  # 8×8 col tiles per SG
+        row_tiles = m_block // 8  # 8×8 row tiles per strip
 
         def _addr(base, row, col, row_stride, col_stride, inner_dim):
-            row_term = f"({row}) * {row_stride}" if row_stride \
-                else f"({row}) * {inner_dim}u"
+            row_term = f"({row}) * {row_stride}" if row_stride else f"({row}) * {inner_dim}u"
             col_term = f"({col}) * {col_stride}" if col_stride else f"({col})"
             return f"{base}[{row_term} + {col_term}]"
 
@@ -1613,13 +1641,10 @@ class _TemplateMixin:
         for i, arg in enumerate(self.graph.args):
             if arg.is_ptr:
                 m = triton_type_to_msl(arg.elem_type)
-                arg_decls.append(
-                    f"    device {m}* {arg.name} [[buffer({i})]]")
+                arg_decls.append(f"    device {m}* {arg.name} [[buffer({i})]]")
             else:
-                m = (triton_type_to_msl(arg.elem_type)
-                     if arg.elem_type else "int")
-                arg_decls.append(
-                    f"    constant {m}& {arg.name} [[buffer({i})]]")
+                m = triton_type_to_msl(arg.elem_type) if arg.elem_type else "int"
+                arg_decls.append(f"    constant {m}& {arg.name} [[buffer({i})]]")
 
         lines = []
         lines.append("#include <metal_stdlib>")
@@ -1645,21 +1670,18 @@ class _TemplateMixin:
         lines.append("        // Per-SG output accumulators for this strip.")
         for rt in range(row_tiles):
             for ct in range(col_tiles_per_sg):
-                lines.append(
-                    f"        simdgroup_float8x8 acc_{rt}_{ct}(0);")
+                lines.append(f"        simdgroup_float8x8 acc_{rt}_{ct}(0);")
         lines.append("")
 
         lines.append(f"        for (uint kk = 0u; kk < {K}u; kk += 8u) {{")
         # Stage strip\'s A[M_BLOCK, 8] cooperatively.
-        lines.append(
-            f"            for (uint i = tiitg; i < {m_block * 8}u; i += 128u) {{")
+        lines.append(f"            for (uint i = tiitg; i < {m_block * 8}u; i += 128u) {{")
         lines.append("                uint r = i / 8u, c = i % 8u;")
         a_load = _addr(a_ptr, "mstrip + r", "kk + c", a_row_s, a_col_s, K)
         lines.append(f"                tg_A[i] = {in_cast}({a_load});")
         lines.append("            }")
         # Stage B[8, N] cooperatively.
-        lines.append(
-            f"            for (uint i = tiitg; i < {8 * N}u; i += 128u) {{")
+        lines.append(f"            for (uint i = tiitg; i < {8 * N}u; i += 128u) {{")
         lines.append(f"                uint r = i / {N}u, c = i % {N}u;")
         b_load = _addr(b_ptr, "kk + r", "c", b_row_s, b_col_s, N)
         lines.append(f"                tg_B[i] = {in_cast}({b_load});")
@@ -1668,18 +1690,15 @@ class _TemplateMixin:
         lines.append("")
         for ct in range(col_tiles_per_sg):
             lines.append(f"            {in_frag} b_{ct};")
-            lines.append(
-                f"            simdgroup_load(b_{ct}, "
-                f"tg_B + sgitg * {cols_per_sg}u + {ct * 8}u, {N});")
+            lines.append(f"            simdgroup_load(b_{ct}, tg_B + sgitg * {cols_per_sg}u + {ct * 8}u, {N});")
         lines.append("")
         lines.append(f"            {in_frag} a_frag;")
         for rt in range(row_tiles):
-            lines.append(
-                f"            simdgroup_load(a_frag, tg_A + {rt * 8 * 8}u, 8);")
+            lines.append(f"            simdgroup_load(a_frag, tg_A + {rt * 8 * 8}u, 8);")
             for ct in range(col_tiles_per_sg):
                 lines.append(
-                    f"            simdgroup_multiply_accumulate(acc_{rt}_{ct}, "
-                    f"a_frag, b_{ct}, acc_{rt}_{ct});")
+                    f"            simdgroup_multiply_accumulate(acc_{rt}_{ct}, a_frag, b_{ct}, acc_{rt}_{ct});"
+                )
         lines.append("            threadgroup_barrier(mem_flags::mem_threadgroup);")
         lines.append("        }")
         lines.append("")
@@ -1690,9 +1709,7 @@ class _TemplateMixin:
             for ct in range(col_tiles_per_sg):
                 row_off = rt * 8 * N
                 col_off = f"sgitg * {cols_per_sg}u + {ct * 8}u"
-                lines.append(
-                    f"        simdgroup_store(acc_{rt}_{ct}, "
-                    f"tg_C + {row_off}u + {col_off}, {N});")
+                lines.append(f"        simdgroup_store(acc_{rt}_{ct}, tg_C + {row_off}u + {col_off}, {N});")
         lines.append("        threadgroup_barrier(mem_flags::mem_threadgroup);")
         lines.append("")
 
@@ -1700,8 +1717,7 @@ class _TemplateMixin:
         # per element on the staged tg_C, then write. Early-return leaves the
         # softmax path below untouched.
         if info.get("epilogue_ops"):
-            lines.extend(self._emit_matmul_epilogue_loop(
-                info, m_block, N, c_ptr, c_row_s, c_col_s, c_msl_type, _addr))
+            lines.extend(self._emit_matmul_epilogue_loop(info, m_block, N, c_ptr, c_row_s, c_col_s, c_msl_type, _addr))
             lines.append("        threadgroup_barrier(mem_flags::mem_threadgroup);")
             lines.append("    }  // end M-strip loop")
             lines.append("}")
@@ -1709,8 +1725,7 @@ class _TemplateMixin:
             return "\n".join(lines)
 
         # Row softmax across the strip\'s M_BLOCK rows.
-        lines.append(
-            f"        for (uint row = tiitg; row < {m_block}u; row += 128u) {{")
+        lines.append(f"        for (uint row = tiitg; row < {m_block}u; row += 128u) {{")
         lines.append(f"            uint row_off = row * {N}u;")
         lines.append("            float row_max = -INFINITY;")
         lines.append(f"            for (uint c = 0u; c < {N}u; c++) {{")
@@ -1731,11 +1746,9 @@ class _TemplateMixin:
         lines.append("")
 
         # Write strip to global.
-        lines.append(
-            f"        for (uint i = tiitg; i < {m_block * N}u; i += 128u) {{")
+        lines.append(f"        for (uint i = tiitg; i < {m_block * N}u; i += 128u) {{")
         lines.append(f"            uint row = i / {N}u, col = i % {N}u;")
-        c_store_addr = _addr(c_ptr, "mstrip + row", "col",
-                             c_row_s, c_col_s, N)
+        c_store_addr = _addr(c_ptr, "mstrip + row", "col", c_row_s, c_col_s, N)
         lines.append(f"            {c_store_addr} = ({c_msl_type})tg_C[i];")
         lines.append("        }")
         lines.append("        threadgroup_barrier(mem_flags::mem_threadgroup);")
@@ -1746,9 +1759,15 @@ class _TemplateMixin:
 
     # MSL for each fused-epilogue op given operand expressions. Reuses the same
     # operators/functions the generic op dispatch maps to (#158).
-    _EPI_BIN = {"arith.addf": "+", "arith.subf": "-", "arith.mulf": "*",
-                "arith.divf": "/", "arith.addi": "+", "arith.subi": "-",
-                "arith.muli": "*"}
+    _EPI_BIN = {
+        "arith.addf": "+",
+        "arith.subf": "-",
+        "arith.mulf": "*",
+        "arith.divf": "/",
+        "arith.addi": "+",
+        "arith.subi": "-",
+        "arith.muli": "*",
+    }
     # NaN-QUIET min/max (IEEE minNum/maxNum): MSL fmax/fmin return the non-NaN
     # operand — correct for maxnumf/minnumf.
     _EPI_FN2 = {"arith.maxnumf": "fmax", "arith.minnumf": "fmin"}
@@ -1756,14 +1775,23 @@ class _TemplateMixin:
     # operand is NaN the result must be NaN. Plain fmax/fmin would silently drop it
     # (re-audit #5 — relu(NaN accumulator) returned 0.0 instead of NaN).
     _EPI_FN2_NANPROP = {"arith.maximumf": "fmax", "arith.minimumf": "fmin"}
-    _EPI_FN1 = {"math.exp": "exp", "math.exp2": "exp2", "math.log": "log",
-                "math.log2": "log2", "math.sqrt": "sqrt", "math.rsqrt": "rsqrt",
-                "math.sin": "precise::sin", "math.cos": "precise::cos",
-                "math.erf": "erf", "math.tanh": "precise::tanh",
-                "math.floor": "floor", "math.ceil": "ceil", "math.absf": "fabs"}
+    _EPI_FN1 = {
+        "math.exp": "exp",
+        "math.exp2": "exp2",
+        "math.log": "log",
+        "math.log2": "log2",
+        "math.sqrt": "sqrt",
+        "math.rsqrt": "rsqrt",
+        "math.sin": "precise::sin",
+        "math.cos": "precise::cos",
+        "math.erf": "erf",
+        "math.tanh": "precise::tanh",
+        "math.floor": "floor",
+        "math.ceil": "ceil",
+        "math.absf": "fabs",
+    }
 
-    def _emit_matmul_epilogue_loop(self, info, m_block, N, c_ptr, c_row_s,
-                                   c_col_s, c_msl_type, _addr):
+    def _emit_matmul_epilogue_loop(self, info, m_block, N, c_ptr, c_row_s, c_col_s, c_msl_type, _addr):
         """Per-element fused-epilogue loop body (#158).
 
         Lowers the topologically-ordered epilogue op chain to scalar MSL on the
@@ -1772,6 +1800,7 @@ class _TemplateMixin:
         ``col``; layout/cast ops pass through.
         """
         from triton_msl.codegen._lowerer_detection import _EPI_PASSTHROUGH
+
         by_id = {ssa.id: ssa for ssa in self.graph.ops}
         bias = info.get("bias_ptr")
         # The matmul result staged in tg_C is a@b (accumulators init to 0). If a
@@ -1782,7 +1811,7 @@ class _TemplateMixin:
         # M > m_block (re-audit #8), so here mstrip is always 0 for a row bias and this
         # is exact; the mstrip term is kept for correctness if that guard ever loosens.
         acc_idx = "(mstrip + row)" if info.get("acc_bias_dim") == "row" else "col"
-        dot_expr = (f"(tg_C[i] + {acc_bias}[{acc_idx}])" if acc_bias else "tg_C[i]")
+        dot_expr = f"(tg_C[i] + {acc_bias}[{acc_idx}])" if acc_bias else "tg_C[i]"
         val = {info["dot_id"]: dot_expr}
 
         def _const_expr(op):
@@ -1827,8 +1856,7 @@ class _TemplateMixin:
                 e = f"{self._EPI_FN2[op.op]}(({es[0]}), ({es[1]}))"
             elif op.op in self._EPI_FN2_NANPROP and len(es) >= 2:
                 _fn = self._EPI_FN2_NANPROP[op.op]
-                e = (f"((isnan({es[0]}) || isnan({es[1]})) ? NAN : "
-                     f"{_fn}(({es[0]}), ({es[1]})))")
+                e = f"((isnan({es[0]}) || isnan({es[1]})) ? NAN : {_fn}(({es[0]}), ({es[1]})))"
             elif op.op in self._EPI_FN1 and es:
                 e = f"{self._EPI_FN1[op.op]}(({es[0]}))"
             elif op.op == "math.fma" and len(es) >= 3:
@@ -1842,8 +1870,7 @@ class _TemplateMixin:
                 if op.attrs.get("propagateNan", "none") == "all":
                     # propagate_nan=ALL: NaN in -> NaN out (plain clamp would drop it,
                     # the same class as the maximumf/minimumf NaN-drop — re-audit #6).
-                    e = (f"(isnan({es[0]}) ? NAN : "
-                         f"clamp(({es[0]}), ({es[1]}), ({es[2]})))")
+                    e = f"(isnan({es[0]}) ? NAN : clamp(({es[0]}), ({es[1]}), ({es[2]})))"
                 else:
                     e = f"clamp(({es[0]}), ({es[1]}), ({es[2]}))"
             else:
@@ -1851,18 +1878,22 @@ class _TemplateMixin:
                 # through to `e = es[0]` (return operand 0) — a SILENT-WRONG trap (that
                 # is how math.fma slipped through). Refuse loudly instead.
                 from triton_msl.errors import MetalNonRecoverableError
+
                 raise MetalNonRecoverableError(
                     f"Fused matmul epilogue has no correct lowering for '{op.op}'. "
                     f"Refusing rather than emit operand-0 (silent-wrong).",
-                    op_name=op.op)
+                    op_name=op.op,
+                )
             var = f"ep{n}"
             n += 1
             body.append(f"            float {var} = {e};")
             val[op.id] = var
 
         out = val.get(info["store_value_id"], "tg_C[i]")
-        lines = [f"        for (uint i = tiitg; i < {m_block * N}u; i += 128u) {{",
-                 f"            uint row = i / {N}u, col = i % {N}u;"]
+        lines = [
+            f"        for (uint i = tiitg; i < {m_block * N}u; i += 128u) {{",
+            f"            uint row = i / {N}u, col = i % {N}u;",
+        ]
         lines.extend(body)
         c_store_addr = _addr(c_ptr, "mstrip + row", "col", c_row_s, c_col_s, N)
         lines.append(f"            {c_store_addr} = ({c_msl_type})({out});")
@@ -1899,10 +1930,13 @@ class _TemplateMixin:
         # topk loudly rather than mis-compute (fixing the K<N trim is a follow-up).
         if K < N:
             from triton_msl.errors import MetalNonRecoverableError
+
             raise MetalNonRecoverableError(
                 f"tl.topk (k={K} < N={N}) is not correctly lowered — the K<N trim "
                 f"mis-computes (duplicated values). Refusing rather than return wrong "
-                f"results. Use a full tl.sort and slice, or k == N.", op_name="tt.reduce")
+                f"results. Use a full tl.sort and slice, or k == N.",
+                op_name="tt.reduce",
+            )
         descending = info["descending"]
         elem_type = info["elem_type"]
         x_ptr = info["x_ptr"]
@@ -1923,15 +1957,12 @@ class _TemplateMixin:
             if arg.is_ptr:
                 arg_msl_type = triton_type_to_msl(arg.elem_type)
                 if arg.name == z_ptr:
-                    arg_decls.append(
-                        f"    volatile device {arg_msl_type}* {arg.name} [[buffer({i})]]")
+                    arg_decls.append(f"    volatile device {arg_msl_type}* {arg.name} [[buffer({i})]]")
                 else:
-                    arg_decls.append(
-                        f"    device const {arg_msl_type}* {arg.name} [[buffer({i})]]")
+                    arg_decls.append(f"    device const {arg_msl_type}* {arg.name} [[buffer({i})]]")
             else:
                 scalar_ty = triton_type_to_msl(arg.elem_type or "i32")
-                arg_decls.append(
-                    f"    constant {scalar_ty}& {arg.name} [[buffer({i})]]")
+                arg_decls.append(f"    constant {scalar_ty}& {arg.name} [[buffer({i})]]")
 
         # Integer sort? If elem type is integer we just use standard
         # `<` / `>` over the integer values. For floats, use `<` / `>`.
@@ -2005,7 +2036,6 @@ class _TemplateMixin:
 
         return "\n".join(lines)
 
-
     def _lower_3d_reduce_template(self, info) -> str:
         """Generate a complete MSL kernel for 3D axis reduction.
 
@@ -2061,11 +2091,9 @@ class _TemplateMixin:
         for i, arg in enumerate(self.graph.args):
             if arg.is_ptr:
                 arg_msl_type = triton_type_to_msl(arg.elem_type)
-                arg_decls.append(
-                    f"    device {arg_msl_type}* {arg.name} [[buffer({i})]]")
+                arg_decls.append(f"    device {arg_msl_type}* {arg.name} [[buffer({i})]]")
             else:
-                arg_decls.append(
-                    f"    device int* {arg.name}_buf [[buffer({i})]]")
+                arg_decls.append(f"    device int* {arg.name}_buf [[buffer({i})]]")
 
         x_name = ptr_args[0].name if ptr_args else "X"
         z_name = ptr_args[1].name if len(ptr_args) > 1 else "Z"
@@ -2125,8 +2153,7 @@ class _TemplateMixin:
         # implicit float->half but NOT float->bfloat, so a bf16 output otherwise fails to
         # compile ("assigning to 'bfloat' from 'float'") — reduce-fuzzer finding. No-op
         # for float/half.
-        _out_msl3d = (triton_type_to_msl(ptr_args[1].elem_type)
-                      if len(ptr_args) > 1 else "float")
+        _out_msl3d = triton_type_to_msl(ptr_args[1].elem_type) if len(ptr_args) > 1 else "float"
         _scast3d = "" if _out_msl3d in ("float", "half") else f"({_out_msl3d})"
         R0, R1 = result_dims
         lines.append(f"    for (uint _r = lid; _r < {result_total}u; _r += {block_size}u)")
@@ -2136,7 +2163,6 @@ class _TemplateMixin:
         lines.append("")
 
         return "\n".join(lines)
-
 
     def _lower_3d_argminmax_template(self, info) -> str:
         """Generate a complete MSL kernel for 3D argmin/argmax.
@@ -2149,7 +2175,7 @@ class _TemplateMixin:
         combine_op = info["combine_op"]
         block_size = info["block_size"]
         total = M * N * K
-        is_max = (combine_op == "argmax")
+        is_max = combine_op == "argmax"
 
         # Determine result dimensions
         if axis == 0:
@@ -2185,11 +2211,9 @@ class _TemplateMixin:
         for i, arg in enumerate(self.graph.args):
             if arg.is_ptr:
                 arg_msl_type = triton_type_to_msl(arg.elem_type)
-                arg_decls.append(
-                    f"    device {arg_msl_type}* {arg.name} [[buffer({i})]]")
+                arg_decls.append(f"    device {arg_msl_type}* {arg.name} [[buffer({i})]]")
             else:
-                arg_decls.append(
-                    f"    device int* {arg.name}_buf [[buffer({i})]]")
+                arg_decls.append(f"    device int* {arg.name}_buf [[buffer({i})]]")
 
         x_name = ptr_args[0].name if ptr_args else "X"
         z_name = ptr_args[1].name if len(ptr_args) > 1 else "Z"
@@ -2256,7 +2280,6 @@ class _TemplateMixin:
 
         return "\n".join(lines)
 
-
     def _lower_dot_via_prebuilt_template(self) -> str:
         """Generate strided matmul MSL for kernels containing tt.dot.
 
@@ -2278,6 +2301,7 @@ class _TemplateMixin:
         # routed BEFORE this method, so a multi-dot / 3-D dot reaching here is genuinely
         # unmodeled: refuse loudly rather than mis-emit. (Split into separate kernels.)
         from triton_msl.errors import MetalNonRecoverableError as _MNR
+
         def _all_dot_ops(ops):
             for s in ops:
                 if s.op == "tt.dot":
@@ -2286,13 +2310,15 @@ class _TemplateMixin:
                     yield from _all_dot_ops(s.region_ops)
                 if s.else_ops:
                     yield from _all_dot_ops(s.else_ops)
+
         _all_dots = list(_all_dot_ops(self.graph.ops))
         if len(_all_dots) > 1:
             raise _MNR(
                 "chain-dot / multiple tt.dot in one kernel (e.g. z = (x@y)@w) is not "
                 "supported: the matmul template models a single 2-D matmul and would "
                 "silently drop the later dot(s). Split into separate matmul kernels.",
-                op_name="tt.dot")
+                op_name="tt.dot",
+            )
         if _all_dots:
             _rshape = _extract_shape(_all_dots[0].type_str or "")
             if _rshape and len(_rshape) >= 3:
@@ -2300,7 +2326,8 @@ class _TemplateMixin:
                     "batched / 3-D tt.dot (rank>=3 result) is not supported: the matmul "
                     "template models a single 2-D matmul and would drop the batch axis. "
                     "Loop the batch on the host or use a per-batch 2-D kernel.",
-                    op_name="tt.dot")
+                    op_name="tt.dot",
+                )
 
         # Extract tile dimensions from tt.make_range ops (for simple template fallback)
         tile_dims = []
@@ -2344,14 +2371,17 @@ class _TemplateMixin:
         if not _init_ids:
             for _s in self.graph.ops:
                 if _s.op == "tt.dot" and len(_s.operand_ids) >= 3:
-                    _init_ids.append(_s.operand_ids[2]); break
-        if _dot_shape and any(
-                self._acc_init_is_bias(_i, _by, dot_shape=_dot_shape) for _i in _init_ids):
+                    _init_ids.append(_s.operand_ids[2])
+                    break
+        if _dot_shape and any(self._acc_init_is_bias(_i, _by, dot_shape=_dot_shape) for _i in _init_ids):
             from triton_msl.errors import MetalNonRecoverableError
+
             raise MetalNonRecoverableError(
                 "strided matmul with a non-zero accumulator init (fused bias / tl.full) "
                 "is silently dropped by the strided template (it seeds acc=0). Refusing. "
-                "Add the bias as a separate kernel after the matmul.", op_name="tt.dot")
+                "Add the bias as a separate kernel after the matmul.",
+                op_name="tt.dot",
+            )
 
         # Determine dtype from pointer args
         dtype = "fp32"
@@ -2378,7 +2408,6 @@ class _TemplateMixin:
             return self._lower_dot_constant_template(const_info, ptr_args)
         return self._lower_dot_simple_template(tile_dims, ptr_args, dtype)
 
-
     def _lower_dot_constant_template(self, const_info, ptr_args):
         """Generate MSL for dot product where both inputs are compile-time constants."""
         const_a, const_b, M, N, K, dot_elem_type = const_info
@@ -2400,8 +2429,7 @@ class _TemplateMixin:
         for i, arg in enumerate(self.graph.args):
             if arg.is_ptr:
                 arg_msl_type = triton_type_to_msl(arg.elem_type)
-                arg_decls.append(
-                    f"    device {arg_msl_type}* {arg.name} [[buffer({i})]]")
+                arg_decls.append(f"    device {arg_msl_type}* {arg.name} [[buffer({i})]]")
         lines.append(",\n".join(arg_decls) + ",")
         lines.append("    uint lid [[thread_position_in_threadgroup]]")
         lines.append(") {")
@@ -2415,7 +2443,6 @@ class _TemplateMixin:
         lines.append("}")
         lines.append("")
         return "\n".join(lines)
-
 
     def _lower_dot_simple_template(self, tile_dims, ptr_args, dtype) -> str:
         """Fall back to optimized simdgroup matmul template for simple kernels."""
@@ -2435,10 +2462,12 @@ class _TemplateMixin:
         has_pid = any(s.op == "tt.get_program_id" for s in self.graph.ops)
         if has_pid and len(scalar_args) < 3:
             from triton_msl.errors import MetalNonRecoverableError
+
             raise MetalNonRecoverableError(
                 "matmul template requires runtime M/N/K scalar args but the "
                 "kernel bakes its dims as constexpr; cannot derive the true "
-                "output strides (e.g. test_dot_mulbroadcasted).")
+                "output strides (e.g. test_dot_mulbroadcasted)."
+            )
 
         block_m = tile_dims[0] if len(tile_dims) > 0 else 32
         block_n = block_m
@@ -2461,8 +2490,11 @@ class _TemplateMixin:
         self._fast_matmul = self._maybe_fast_matmul_descriptor()
 
         msl = make_matmul_kernel(
-            block_m=block_m, block_n=block_n, block_k=block_k,
-            dtype=dtype, out_dtype=out_dtype,
+            block_m=block_m,
+            block_n=block_n,
+            block_k=block_k,
+            dtype=dtype,
+            out_dtype=out_dtype,
         )
 
         safe_name = _sanitize_msl_name(self.graph.func_name)
@@ -2471,13 +2503,13 @@ class _TemplateMixin:
         if len(ptr_args) >= 3:
             a_name, b_name, c_name = ptr_args[0].name, ptr_args[1].name, ptr_args[2].name
             # Replace parameter declarations -- use regex to match any MSL type (float, half, etc.)
-            msl = re.sub(r'(device\s+const\s+\w+\*)\s+A\s', rf'\1 {a_name} ', msl)
-            msl = re.sub(r'(device\s+const\s+\w+\*)\s+B\s', rf'\1 {b_name} ', msl)
-            msl = re.sub(r'(volatile\s+device\s+\w+\*|device\s+\w+\*)\s+C\s', rf'\1 {c_name} ', msl)
+            msl = re.sub(r"(device\s+const\s+\w+\*)\s+A\s", rf"\1 {a_name} ", msl)
+            msl = re.sub(r"(device\s+const\s+\w+\*)\s+B\s", rf"\1 {b_name} ", msl)
+            msl = re.sub(r"(volatile\s+device\s+\w+\*|device\s+\w+\*)\s+C\s", rf"\1 {c_name} ", msl)
             # Replace body references
-            msl = re.sub(r'(?<![a-zA-Z_])A\[', f'{a_name}[', msl)
-            msl = re.sub(r'(?<![a-zA-Z_])B\[', f'{b_name}[', msl)
-            msl = re.sub(r'(?<![a-zA-Z_])C\[', f'{c_name}[', msl)
+            msl = re.sub(r"(?<![a-zA-Z_])A\[", f"{a_name}[", msl)
+            msl = re.sub(r"(?<![a-zA-Z_])B\[", f"{b_name}[", msl)
+            msl = re.sub(r"(?<![a-zA-Z_])C\[", f"{c_name}[", msl)
 
         return msl
 
@@ -2497,8 +2529,10 @@ class _TemplateMixin:
         None -> generic kernel. Never silent-wrong.
         """
         import os
+
         if os.environ.get("TRITON_MSL_FAST_MATMUL", "1") == "0":
             return None
+
         # Exactly one tt.dot (a matmul), scanning nested regions (K-loop body).
         def _all(ops):
             for s in ops:
@@ -2507,6 +2541,7 @@ class _TemplateMixin:
                     yield from _all(s.region_ops)
                 if s.else_ops:
                     yield from _all(s.else_ops)
+
         dots = [s for s in _all(self.graph.ops) if s.op == "tt.dot"]
         if len(dots) != 1:
             return None
@@ -2534,9 +2569,7 @@ class _TemplateMixin:
             # Role resolution succeeded: verify canonical A=arg0, B=arg1, C=arg2.
             if len(roles) < 3:
                 return None
-            if not (roles[0].name == args[0].name
-                    and roles[1].name == args[1].name
-                    and roles[2].name == args[2].name):
+            if not (roles[0].name == args[0].name and roles[1].name == args[1].name and roles[2].name == args[2].name):
                 return None
         else:
             # Role resolution failed (K-loop tracer limitation): fall back to
@@ -2592,9 +2625,10 @@ class _TemplateMixin:
                     _hop = _by_id.get(_hi)
                     if _hop is None or not _hop.operand_ids:
                         break
-                    _hi = _hop.operand_ids[0]; _depth += 1
+                    _hi = _hop.operand_ids[0]
+                    _depth += 1
                 if _arg_index.get(_hi) != 5:
-                    return None   # K-loop bound is not args[5] => non-canonical => refuse
+                    return None  # K-loop bound is not args[5] => non-canonical => refuse
         # STRIDE GATE (brief): the fast compile_shader template hard-codes
         # ROW-MAJOR addressing — leading dims = the M/N/K args, all INNER strides
         # = 1. A non-contiguous inner dim (a transposed B from ``x @ w.t()``)
@@ -2616,7 +2650,7 @@ class _TemplateMixin:
         _name_to_idx = {a.name: i for i, a in enumerate(args)}
         try:
             _sd = self.infer_dot_strides()
-        except Exception:                                      # noqa: BLE001
+        except Exception:  # noqa: BLE001
             _sd = None
         stride_checks = []
         if _sd is not None:
@@ -2637,7 +2671,7 @@ class _TemplateMixin:
             for _rs, _exp_idx in ((_ar, _kidx), (_br, _nidx), (_cr, _nidx)):
                 if _rs in _name_to_idx:
                     _ri = _name_to_idx[_rs]
-                    if _ri != _exp_idx:               # explicit stride arg != dim
+                    if _ri != _exp_idx:  # explicit stride arg != dim
                         stride_checks.append((_ri, _exp_idx))
                 elif _rs == "1":
                     # row stride literally 1 but the dim is a runtime arg: only
@@ -2649,13 +2683,11 @@ class _TemplateMixin:
                     # equals the runtime dim. Decline rather than risk it.
                     return None
         from triton_msl.codegen._msl_templates import make_simdgroup_matmul_kernel_fast
+
         rr = rc = 4
         fast_msl = make_simdgroup_matmul_kernel_fast(dtype=msl_dtype, rr=rr, rc=rc, out_dtype=msl_out)
         # (msl, m_idx, n_idx, k_idx, tile_m, tile_n, msl_dtype, msl_out, stride_checks).
         # The driver builds alternative (rr,rc) variants for per-shape autotuning;
         # stride_checks are verified at dispatch (skip fast path if a runtime
         # stride doesn't match the assumed row-major layout).
-        return (fast_msl, 3, 4, 5, 8 * rr, 32 * rc, msl_dtype, msl_out,
-                tuple(stride_checks))
-
-
+        return (fast_msl, 3, 4, 5, 8 * rr, 32 * rc, msl_dtype, msl_out, tuple(stride_checks))

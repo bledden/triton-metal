@@ -6,6 +6,7 @@ buffers + the MPS stream). This runtime wraps that: compile (cached on the MSL
 string) + dispatch. It has NO triton-msl driver knowledge — the driver
 selects when to use it.
 """
+
 from __future__ import annotations
 
 
@@ -13,15 +14,14 @@ class CompileShaderRuntime:
     """Compile + cache + dispatch MSL via torch.mps.compile_shader."""
 
     def __init__(self):
-        self._lib_cache = {}               # msl_source -> compiled library
+        self._lib_cache = {}  # msl_source -> compiled library
         self._unsupported: set[str] = set()  # msl_source strings that failed; skip fast-path
 
     def available(self) -> bool:
         try:
             import torch
-            return (hasattr(torch, "mps")
-                    and torch.backends.mps.is_available()
-                    and hasattr(torch.mps, "compile_shader"))
+
+            return hasattr(torch, "mps") and torch.backends.mps.is_available() and hasattr(torch.mps, "compile_shader")
         except Exception:
             return False
 
@@ -36,6 +36,7 @@ class CompileShaderRuntime:
         lib = self._lib_cache.get(msl)
         if lib is None:
             import torch
+
             lib = torch.mps.compile_shader(msl)
             self._lib_cache[msl] = lib
         return lib

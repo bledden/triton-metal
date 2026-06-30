@@ -15,6 +15,7 @@ cell; a refusal is always acceptable (a fast-path may decline an edge it can't d
 
 Run deep:  TRITON_MSL_FALLBACK=error python tests/test_fuzz_matmul.py 400
 """
+
 import math
 import os
 import shutil
@@ -42,13 +43,15 @@ def _clear_cache():
 def _tol(dtype):
     if dtype == torch.float32:
         return dict(rtol=2e-3, atol=2e-3)
-    return dict(rtol=4e-2, atol=4e-2)   # fp16/bf16 compute-in-fp32, narrowed output
+    return dict(rtol=4e-2, atol=4e-2)  # fp16/bf16 compute-in-fp32, narrowed output
 
 
 # --------------------------------------------------------------------------- kernels
 @triton.jit
 def _k_simple(a, b, c, M: tl.constexpr, N: tl.constexpr, K: tl.constexpr):
-    om = tl.arange(0, M); on = tl.arange(0, N); ok = tl.arange(0, K)
+    om = tl.arange(0, M)
+    on = tl.arange(0, N)
+    ok = tl.arange(0, K)
     av = tl.load(a + om[:, None] * K + ok[None, :])
     bv = tl.load(b + ok[:, None] * N + on[None, :])
     tl.store(c + om[:, None] * N + on[None, :], tl.dot(av, bv).to(c.dtype.element_ty))
@@ -56,7 +59,9 @@ def _k_simple(a, b, c, M: tl.constexpr, N: tl.constexpr, K: tl.constexpr):
 
 @triton.jit
 def _k_simple_bias(a, b, c, M: tl.constexpr, N: tl.constexpr, K: tl.constexpr):
-    om = tl.arange(0, M); on = tl.arange(0, N); ok = tl.arange(0, K)
+    om = tl.arange(0, M)
+    on = tl.arange(0, N)
+    ok = tl.arange(0, K)
     av = tl.load(a + om[:, None] * K + ok[None, :])
     bv = tl.load(b + ok[:, None] * N + on[None, :])
     acc = tl.dot(av, bv, tl.full((M, N), 3.0, tl.float32))
@@ -64,41 +69,51 @@ def _k_simple_bias(a, b, c, M: tl.constexpr, N: tl.constexpr, K: tl.constexpr):
 
 
 @triton.jit
-def _k_kloop(a, b, c, sam, sak, sbk, sbn, scm, scn, K,
-             BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr):
-    rm = tl.arange(0, BM); rn = tl.arange(0, BN); rk = tl.arange(0, BK)
+def _k_kloop(a, b, c, sam, sak, sbk, sbn, scm, scn, K, BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr):
+    rm = tl.arange(0, BM)
+    rn = tl.arange(0, BN)
+    rk = tl.arange(0, BK)
     acc = tl.zeros((BM, BN), tl.float32)
     for k0 in range(0, K, BK):
         kk = k0 + rk
-        acc += tl.dot(tl.load(a + rm[:, None] * sam + kk[None, :] * sak),
-                      tl.load(b + kk[:, None] * sbk + rn[None, :] * sbn))
+        acc += tl.dot(
+            tl.load(a + rm[:, None] * sam + kk[None, :] * sak), tl.load(b + kk[:, None] * sbk + rn[None, :] * sbn)
+        )
     tl.store(c + rm[:, None] * scm + rn[None, :] * scn, acc.to(c.dtype.element_ty))
 
 
 @triton.jit
-def _k_kloop_bias(a, b, c, sam, sak, sbk, sbn, scm, scn, K,
-                  BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr):
-    rm = tl.arange(0, BM); rn = tl.arange(0, BN); rk = tl.arange(0, BK)
+def _k_kloop_bias(a, b, c, sam, sak, sbk, sbn, scm, scn, K, BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr):
+    rm = tl.arange(0, BM)
+    rn = tl.arange(0, BN)
+    rk = tl.arange(0, BK)
     acc = tl.full((BM, BN), 3.0, tl.float32)
     for k0 in range(0, K, BK):
         kk = k0 + rk
-        acc += tl.dot(tl.load(a + rm[:, None] * sam + kk[None, :] * sak),
-                      tl.load(b + kk[:, None] * sbk + rn[None, :] * sbn))
+        acc += tl.dot(
+            tl.load(a + rm[:, None] * sam + kk[None, :] * sak), tl.load(b + kk[:, None] * sbk + rn[None, :] * sbn)
+        )
     tl.store(c + rm[:, None] * scm + rn[None, :] * scn, acc.to(c.dtype.element_ty))
 
 
 @triton.jit
-def _k_strided_masked(a, b, c, sam, sak, sbk, sbn, scm, scn, M, N, K,
-                      BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr):
-    pm = tl.program_id(0); pn = tl.program_id(1)
-    rm = pm * BM + tl.arange(0, BM); rn = pn * BN + tl.arange(0, BN); rk = tl.arange(0, BK)
+def _k_strided_masked(
+    a, b, c, sam, sak, sbk, sbn, scm, scn, M, N, K, BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr
+):
+    pm = tl.program_id(0)
+    pn = tl.program_id(1)
+    rm = pm * BM + tl.arange(0, BM)
+    rn = pn * BN + tl.arange(0, BN)
+    rk = tl.arange(0, BK)
     acc = tl.zeros((BM, BN), tl.float32)
     for k0 in range(0, K, BK):
         kk = k0 + rk
         am = (rm[:, None] < M) & (kk[None, :] < K)
         bm = (kk[:, None] < K) & (rn[None, :] < N)
-        acc += tl.dot(tl.load(a + rm[:, None] * sam + kk[None, :] * sak, mask=am, other=0.0),
-                      tl.load(b + kk[:, None] * sbk + rn[None, :] * sbn, mask=bm, other=0.0))
+        acc += tl.dot(
+            tl.load(a + rm[:, None] * sam + kk[None, :] * sak, mask=am, other=0.0),
+            tl.load(b + kk[:, None] * sbk + rn[None, :] * sbn, mask=bm, other=0.0),
+        )
     cm = (rm[:, None] < M) & (rn[None, :] < N)
     tl.store(c + rm[:, None] * scm + rn[None, :] * scn, acc.to(c.dtype.element_ty), mask=cm)
 
@@ -109,35 +124,42 @@ def _k_strided_masked(a, b, c, sam, sak, sbk, sbn, scm, scn, M, N, K,
 # column-major, or otherwise strided. Row-major addressing would be silently
 # wrong, so the backend must use the inferred strides (correct) or refuse loudly.
 @triton.jit
-def _k_kloop_strided(a, b, c, sam, sak, sbk, sbn, scm, scn, M, N, K,
-                     BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr):
-    pm = tl.program_id(0); pn = tl.program_id(1)
-    rm = pm * BM + tl.arange(0, BM); rn = pn * BN + tl.arange(0, BN); rk = tl.arange(0, BK)
+def _k_kloop_strided(
+    a, b, c, sam, sak, sbk, sbn, scm, scn, M, N, K, BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr
+):
+    pm = tl.program_id(0)
+    pn = tl.program_id(1)
+    rm = pm * BM + tl.arange(0, BM)
+    rn = pn * BN + tl.arange(0, BN)
+    rk = tl.arange(0, BK)
     acc = tl.zeros((BM, BN), tl.float32)
     for k0 in range(0, K, BK):
         kk = k0 + rk
-        acc += tl.dot(tl.load(a + rm[:, None] * sam + kk[None, :] * sak),
-                      tl.load(b + kk[:, None] * sbk + rn[None, :] * sbn))
+        acc += tl.dot(
+            tl.load(a + rm[:, None] * sam + kk[None, :] * sak), tl.load(b + kk[:, None] * sbk + rn[None, :] * sbn)
+        )
     tl.store(c + rm[:, None] * scm + rn[None, :] * scn, acc.to(c.dtype.element_ty))
 
 
 # Single-tile (no program_id) strided matmul with an optional fused epilogue.
 @triton.jit
-def _k_single_strided(a, b, c, sam, sak, sbk, sbn, scm, scn,
-                      BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr):
-    om = tl.arange(0, BM); on = tl.arange(0, BN); ok = tl.arange(0, BK)
+def _k_single_strided(a, b, c, sam, sak, sbk, sbn, scm, scn, BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr):
+    om = tl.arange(0, BM)
+    on = tl.arange(0, BN)
+    ok = tl.arange(0, BK)
     av = tl.load(a + om[:, None] * sam + ok[None, :] * sak)
     bv = tl.load(b + ok[:, None] * sbk + on[None, :] * sbn)
     tl.store(c + om[:, None] * scm + on[None, :] * scn, tl.dot(av, bv).to(c.dtype.element_ty))
 
 
 @triton.jit
-def _k_single_strided_epi(a, b, c, sam, sak, sbk, sbn, scm, scn,
-                          BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr):
-    om = tl.arange(0, BM); on = tl.arange(0, BN); ok = tl.arange(0, BK)
+def _k_single_strided_epi(a, b, c, sam, sak, sbk, sbn, scm, scn, BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr):
+    om = tl.arange(0, BM)
+    on = tl.arange(0, BN)
+    ok = tl.arange(0, BK)
     av = tl.load(a + om[:, None] * sam + ok[None, :] * sak)
     bv = tl.load(b + ok[:, None] * sbk + on[None, :] * sbn)
-    acc = tl.dot(av, bv) * 2.0 + 1.0       # fused scale+bias epilogue
+    acc = tl.dot(av, bv) * 2.0 + 1.0  # fused scale+bias epilogue
     tl.store(c + om[:, None] * scm + on[None, :] * scn, acc.to(c.dtype.element_ty))
 
 
@@ -148,47 +170,100 @@ def _k_single_strided_epi(a, b, c, sam, sak, sbk, sbn, scm, scn,
 # routing (a transposed/strided operand must still be correct or refuse, NOT the old
 # name-match row-major guess).
 @triton.jit
-def _k_kloop_stdname(a_ptr, b_ptr, c_ptr,
-                     stride_am, stride_ak, stride_bk, stride_bn, stride_cm, stride_cn,
-                     M, N, K, BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr):
-    pm = tl.program_id(0); pn = tl.program_id(1)
-    rm = pm * BM + tl.arange(0, BM); rn = pn * BN + tl.arange(0, BN); rk = tl.arange(0, BK)
+def _k_kloop_stdname(
+    a_ptr,
+    b_ptr,
+    c_ptr,
+    stride_am,
+    stride_ak,
+    stride_bk,
+    stride_bn,
+    stride_cm,
+    stride_cn,
+    M,
+    N,
+    K,
+    BM: tl.constexpr,
+    BN: tl.constexpr,
+    BK: tl.constexpr,
+):
+    pm = tl.program_id(0)
+    pn = tl.program_id(1)
+    rm = pm * BM + tl.arange(0, BM)
+    rn = pn * BN + tl.arange(0, BN)
+    rk = tl.arange(0, BK)
     acc = tl.zeros((BM, BN), tl.float32)
     for k0 in range(0, K, BK):
         kk = k0 + rk
-        acc += tl.dot(tl.load(a_ptr + rm[:, None] * stride_am + kk[None, :] * stride_ak),
-                      tl.load(b_ptr + kk[:, None] * stride_bk + rn[None, :] * stride_bn))
-    tl.store(c_ptr + rm[:, None] * stride_cm + rn[None, :] * stride_cn,
-             acc.to(c_ptr.dtype.element_ty))
+        acc += tl.dot(
+            tl.load(a_ptr + rm[:, None] * stride_am + kk[None, :] * stride_ak),
+            tl.load(b_ptr + kk[:, None] * stride_bk + rn[None, :] * stride_bn),
+        )
+    tl.store(c_ptr + rm[:, None] * stride_cm + rn[None, :] * stride_cn, acc.to(c_ptr.dtype.element_ty))
 
 
 @triton.jit
-def _k_single_stdname(a_ptr, b_ptr, c_ptr,
-                      stride_am, stride_ak, stride_bk, stride_bn, stride_cm, stride_cn,
-                      BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr):
-    om = tl.arange(0, BM); on = tl.arange(0, BN); ok = tl.arange(0, BK)
+def _k_single_stdname(
+    a_ptr,
+    b_ptr,
+    c_ptr,
+    stride_am,
+    stride_ak,
+    stride_bk,
+    stride_bn,
+    stride_cm,
+    stride_cn,
+    BM: tl.constexpr,
+    BN: tl.constexpr,
+    BK: tl.constexpr,
+):
+    om = tl.arange(0, BM)
+    on = tl.arange(0, BN)
+    ok = tl.arange(0, BK)
     av = tl.load(a_ptr + om[:, None] * stride_am + ok[None, :] * stride_ak)
     bv = tl.load(b_ptr + ok[:, None] * stride_bk + on[None, :] * stride_bn)
-    tl.store(c_ptr + om[:, None] * stride_cm + on[None, :] * stride_cn,
-             tl.dot(av, bv).to(c_ptr.dtype.element_ty))
+    tl.store(c_ptr + om[:, None] * stride_cm + on[None, :] * stride_cn, tl.dot(av, bv).to(c_ptr.dtype.element_ty))
 
 
 # --- BATCHED 3-D matmul (the docstring advertised a batch-pid case but defined none) ---
 # Batch on program_id(0); each batch advances A/B/C base pointers. Batched MMA is not
 # implemented -> the backend must REFUSE loudly (never compute batch 0 for every batch).
 @triton.jit
-def _k_batched(a, b, c, Bz, M, N, K, sab, sam, sak, sbb, sbk, sbn, scb, scm, scn,
-               BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr):
-    pb = tl.program_id(0); pm = tl.program_id(1); pn = tl.program_id(2)
-    rm = pm * BM + tl.arange(0, BM); rn = pn * BN + tl.arange(0, BN); rk = tl.arange(0, BK)
+def _k_batched(
+    a,
+    b,
+    c,
+    Bz,
+    M,
+    N,
+    K,
+    sab,
+    sam,
+    sak,
+    sbb,
+    sbk,
+    sbn,
+    scb,
+    scm,
+    scn,
+    BM: tl.constexpr,
+    BN: tl.constexpr,
+    BK: tl.constexpr,
+):
+    pb = tl.program_id(0)
+    pm = tl.program_id(1)
+    pn = tl.program_id(2)
+    rm = pm * BM + tl.arange(0, BM)
+    rn = pn * BN + tl.arange(0, BN)
+    rk = tl.arange(0, BK)
     ap = a + pb * sab + (rm[:, None] * sam + rk[None, :] * sak)
     bp = b + pb * sbb + (rk[:, None] * sbk + rn[None, :] * sbn)
     acc = tl.zeros((BM, BN), tl.float32)
     for k0 in range(0, K, BK):
         acc += tl.dot(tl.load(ap), tl.load(bp))
-        ap += BK * sak; bp += BK * sbk
-    tl.store(c + pb * scb + (rm[:, None] * scm + rn[None, :] * scn),
-             acc.to(c.dtype.element_ty))
+        ap += BK * sak
+        bp += BK * sbk
+    tl.store(c + pb * scb + (rm[:, None] * scm + rn[None, :] * scn), acc.to(c.dtype.element_ty))
 
 
 # --------------------------------------------------------------------------- runner
@@ -203,38 +278,37 @@ def _run_cell(form, M, N, K, dtype, seed):
     A = torch.randn(M, K, device="mps", dtype=dtype)
     B = torch.randn(K, N, device="mps", dtype=dtype)
     C = torch.empty(M, N, device="mps", dtype=dtype)
-    ref = (A.float() @ B.float())
+    ref = A.float() @ B.float()
     bias = 0.0
     try:
         if form == "simple":
             _k_simple[(1,)](A, B, C, M=M, N=N, K=K)
         elif form == "simple_bias":
-            _k_simple_bias[(1,)](A, B, C, M=M, N=N, K=K); bias = 3.0
+            _k_simple_bias[(1,)](A, B, C, M=M, N=N, K=K)
+            bias = 3.0
         elif form == "kloop":
-            _k_kloop[(1, 1)](A, B, C, *A.stride(), *B.stride(), *C.stride(), K,
-                             BM=M, BN=N, BK=min(16, K))
+            _k_kloop[(1, 1)](A, B, C, *A.stride(), *B.stride(), *C.stride(), K, BM=M, BN=N, BK=min(16, K))
         elif form == "kloop_bias":
-            _k_kloop_bias[(1, 1)](A, B, C, *A.stride(), *B.stride(), *C.stride(), K,
-                                  BM=M, BN=N, BK=min(16, K)); bias = 3.0
+            _k_kloop_bias[(1, 1)](A, B, C, *A.stride(), *B.stride(), *C.stride(), K, BM=M, BN=N, BK=min(16, K))
+            bias = 3.0
         elif form == "strided_masked":
             BM, BN, BK = 32, 32, 16
             grid = ((M + BM - 1) // BM, (N + BN - 1) // BN)
-            _k_strided_masked[grid](A, B, C, *A.stride(), *B.stride(), *C.stride(),
-                                    M, N, K, BM=BM, BN=BN, BK=BK)
+            _k_strided_masked[grid](A, B, C, *A.stride(), *B.stride(), *C.stride(), M, N, K, BM=BM, BN=BN, BK=BK)
         else:
             return ("crash:badform", form)
         torch.mps.synchronize()
     except MetalNonRecoverableError:
         return ("refused", None)
     except FileNotFoundError:
-        _clear_cache()                                     # transient cache race; retry
+        _clear_cache()  # transient cache race; retry
         try:
             return _run_cell(form, M, N, K, dtype, seed + 100000)
         except MetalNonRecoverableError:
             return ("refused", None)
-        except Exception as e:                             # noqa: BLE001
+        except Exception as e:  # noqa: BLE001
             return (f"crash:{type(e).__name__}", str(e)[:80])
-    except Exception as e:                                 # noqa: BLE001
+    except Exception as e:  # noqa: BLE001
         return (f"crash:{type(e).__name__}", str(e)[:80])
     got = C.float()
     exp = ref + bias
@@ -259,7 +333,7 @@ def _make_operand(shape, layout, dtype):
     """
     r, c = shape
     if layout == "trans":
-        return torch.randn(c, r, device="mps", dtype=dtype).t()   # logical (r,c), stride (1,c)
+        return torch.randn(c, r, device="mps", dtype=dtype).t()  # logical (r,c), stride (1,c)
     if layout == "sliced":
         pad = 8
         return torch.randn(r, c + pad, device="mps", dtype=dtype)[:, :c]  # stride (c+pad, 1)
@@ -277,34 +351,29 @@ def _run_strided_cell(form, M, N, K, dtype, a_lay, b_lay, c_lay, seed):
     torch.manual_seed(seed)
     A = _make_operand((M, K), a_lay, dtype)
     B = _make_operand((K, N), b_lay, dtype)
-    if c_lay == "trans":            # column-major output: logical (M,N), stride (1,M)
+    if c_lay == "trans":  # column-major output: logical (M,N), stride (1,M)
         C = torch.empty(N, M, device="mps", dtype=dtype).t()
-    elif c_lay == "sliced":         # row-sliced output: logical (M,N), stride (N+pad,1)
+    elif c_lay == "sliced":  # row-sliced output: logical (M,N), stride (N+pad,1)
         C = torch.empty(M, N + 8, device="mps", dtype=dtype)[:, :N]
     else:
         C = torch.empty(M, N, device="mps", dtype=dtype)
-    ref = (A.float() @ B.float())
+    ref = A.float() @ B.float()
     epi = form.endswith("_epi")
     if epi:
         ref = ref * 2.0 + 1.0
     try:
         if form.startswith("kloop") and "stdname" not in form:
             BM, BN, BK = M, N, min(16, K)
-            _k_kloop_strided[(1, 1)](A, B, C, *A.stride(), *B.stride(), *C.stride(),
-                                     M, N, K, BM=BM, BN=BN, BK=BK)
+            _k_kloop_strided[(1, 1)](A, B, C, *A.stride(), *B.stride(), *C.stride(), M, N, K, BM=BM, BN=BN, BK=BK)
         elif form == "kloop_stdname":
             BM, BN, BK = M, N, min(16, K)
-            _k_kloop_stdname[(1, 1)](A, B, C, *A.stride(), *B.stride(), *C.stride(),
-                                     M, N, K, BM=BM, BN=BN, BK=BK)
+            _k_kloop_stdname[(1, 1)](A, B, C, *A.stride(), *B.stride(), *C.stride(), M, N, K, BM=BM, BN=BN, BK=BK)
         elif form == "single_stdname":
-            _k_single_stdname[(1,)](A, B, C, *A.stride(), *B.stride(), *C.stride(),
-                                    BM=M, BN=N, BK=K)
+            _k_single_stdname[(1,)](A, B, C, *A.stride(), *B.stride(), *C.stride(), BM=M, BN=N, BK=K)
         elif form == "single":
-            _k_single_strided[(1,)](A, B, C, *A.stride(), *B.stride(), *C.stride(),
-                                    BM=M, BN=N, BK=K)
+            _k_single_strided[(1,)](A, B, C, *A.stride(), *B.stride(), *C.stride(), BM=M, BN=N, BK=K)
         elif form == "single_epi":
-            _k_single_strided_epi[(1,)](A, B, C, *A.stride(), *B.stride(), *C.stride(),
-                                        BM=M, BN=N, BK=K)
+            _k_single_strided_epi[(1,)](A, B, C, *A.stride(), *B.stride(), *C.stride(), BM=M, BN=N, BK=K)
         else:
             return ("crash:badform", form)
         torch.mps.synchronize()
@@ -316,9 +385,9 @@ def _run_strided_cell(form, M, N, K, dtype, a_lay, b_lay, c_lay, seed):
             return _run_strided_cell(form, M, N, K, dtype, a_lay, b_lay, c_lay, seed + 100000)
         except MetalNonRecoverableError:
             return ("refused", None)
-        except Exception as e:                             # noqa: BLE001
+        except Exception as e:  # noqa: BLE001
             return (f"crash:{type(e).__name__}", str(e)[:80])
-    except Exception as e:                                 # noqa: BLE001
+    except Exception as e:  # noqa: BLE001
         return (f"crash:{type(e).__name__}", str(e)[:80])
     got = C.float()
     err = (got - ref).abs().max().item()
@@ -342,7 +411,7 @@ def _po2_cells():
         for dt in _DTYPES:
             for M in _PO2:
                 for K in _PO2:
-                    cells.append((form, M, M, K, dt))   # N=M to bound the matrix
+                    cells.append((form, M, M, K, dt))  # N=M to bound the matrix
     return cells
 
 
@@ -350,7 +419,7 @@ def _strided_cells():
     # unaligned M/N/K through the strided+masked form
     cells = []
     for dt in _DTYPES:
-        for (M, N, K) in [(48, 48, 48), (40, 24, 40), (33, 65, 17), (96, 32, 80), (17, 17, 33)]:
+        for M, N, K in [(48, 48, 48), (40, 24, 40), (33, 65, 17), (96, 32, 80), (17, 17, 33)]:
             cells.append(("strided_masked", M, N, K, dt))
     return cells
 
@@ -361,7 +430,7 @@ def _transposed_cells():
     cells = []
     shapes = [(32, 32, 32), (64, 32, 64), (32, 64, 32)]
     for dt in _DTYPES:
-        for (M, N, K) in shapes:
+        for M, N, K in shapes:
             # transposed B (x @ w.t()) — the canonical case, pid-tiled + single-tile.
             cells.append(("kloop", M, N, K, dt, "rowmaj", "trans", "rowmaj"))
             cells.append(("single", M, N, K, dt, "rowmaj", "trans", "rowmaj"))
@@ -381,8 +450,8 @@ def _stdname_cells():
     cells = []
     shapes = [(32, 32, 32), (64, 32, 64), (32, 64, 32)]
     for dt in _DTYPES:
-        for (M, N, K) in shapes:
-            for bl in ("rowmaj", "trans"):     # contiguous + transposed (x @ w.t())
+        for M, N, K in shapes:
+            for bl in ("rowmaj", "trans"):  # contiguous + transposed (x @ w.t())
                 cells.append(("kloop_stdname", M, N, K, dt, "rowmaj", bl, "rowmaj"))
             cells.append(("single_stdname", M, N, K, dt, "rowmaj", "trans", "rowmaj"))
             cells.append(("kloop_stdname", M, N, K, dt, "trans", "rowmaj", "rowmaj"))  # trans-A
@@ -398,7 +467,7 @@ def _sliced_cells():
     cells = []
     shapes = [(32, 32, 32), (64, 32, 64), (32, 64, 32)]
     for dt in _DTYPES:
-        for (M, N, K) in shapes:
+        for M, N, K in shapes:
             cells.append(("single", M, N, K, dt, "sliced", "rowmaj", "rowmaj"))  # sliced A
             cells.append(("single", M, N, K, dt, "rowmaj", "sliced", "rowmaj"))  # sliced B
             cells.append(("single", M, N, K, dt, "rowmaj", "rowmaj", "sliced"))  # sliced C
@@ -411,7 +480,7 @@ def _sliced_cells():
 def _batched_cells():
     cells = []
     for dt in _DTYPES:
-        for (Bz, M, N, K) in [(4, 32, 32, 32), (3, 64, 32, 64), (2, 32, 64, 48)]:
+        for Bz, M, N, K in [(4, 32, 32, 32), (3, 64, 32, 64), (2, 32, 64, 48)]:
             cells.append((Bz, M, N, K, dt))
     return cells
 
@@ -427,9 +496,7 @@ def _run_batched_cell(Bz, M, N, K, dtype, seed):
     ref = torch.bmm(A.float(), B.float())
     BM, BN, BK = M, N, min(16, K)
     try:
-        _k_batched[(Bz, 1, 1)](A, B, C, Bz, M, N, K,
-                               *A.stride(), *B.stride(), *C.stride(),
-                               BM=BM, BN=BN, BK=BK)
+        _k_batched[(Bz, 1, 1)](A, B, C, Bz, M, N, K, *A.stride(), *B.stride(), *C.stride(), BM=BM, BN=BN, BK=BK)
         torch.mps.synchronize()
     except MetalNonRecoverableError:
         return ("refused", None)
@@ -439,9 +506,9 @@ def _run_batched_cell(Bz, M, N, K, dtype, seed):
             return _run_batched_cell(Bz, M, N, K, dtype, seed + 100000)
         except MetalNonRecoverableError:
             return ("refused", None)
-        except Exception as e:                             # noqa: BLE001
+        except Exception as e:  # noqa: BLE001
             return (f"crash:{type(e).__name__}", str(e)[:80])
-    except Exception as e:                                 # noqa: BLE001
+    except Exception as e:  # noqa: BLE001
         return (f"crash:{type(e).__name__}", str(e)[:80])
     err = (C.float() - ref).abs().max().item()
     scale = max(ref.abs().max().item(), 1e-6)
@@ -457,20 +524,16 @@ def _run_batched_cell(Bz, M, N, K, dtype, seed):
 @pytest.mark.parametrize("form,M,N,K,dtype", _po2_cells())
 def test_matmul_po2_correct_or_refuse(form, M, N, K, dtype):
     status, detail = _run_cell(form, M, N, K, dtype, seed=0)
-    assert not status.startswith("wrong"), \
-        f"SILENT-WRONG {form} {M}x{N}x{K} {dtype}: rel_err {detail}"
-    assert not status.startswith("crash"), \
-        f"CRYPTIC-CRASH {form} {M}x{N}x{K} {dtype}: {status} {detail}"
+    assert not status.startswith("wrong"), f"SILENT-WRONG {form} {M}x{N}x{K} {dtype}: rel_err {detail}"
+    assert not status.startswith("crash"), f"CRYPTIC-CRASH {form} {M}x{N}x{K} {dtype}: {status} {detail}"
 
 
 @requires
 @pytest.mark.parametrize("form,M,N,K,dtype", _strided_cells())
 def test_matmul_strided_unaligned_correct_or_refuse(form, M, N, K, dtype):
     status, detail = _run_cell(form, M, N, K, dtype, seed=0)
-    assert not status.startswith("wrong"), \
-        f"SILENT-WRONG {form} {M}x{N}x{K} {dtype}: rel_err {detail}"
-    assert not status.startswith("crash"), \
-        f"CRYPTIC-CRASH {form} {M}x{N}x{K} {dtype}: {status} {detail}"
+    assert not status.startswith("wrong"), f"SILENT-WRONG {form} {M}x{N}x{K} {dtype}: rel_err {detail}"
+    assert not status.startswith("crash"), f"CRYPTIC-CRASH {form} {M}x{N}x{K} {dtype}: {status} {detail}"
 
 
 @requires
@@ -523,19 +586,19 @@ def _deep(n_seeds):
     tally = {"correct": 0, "refused": 0, "wrong": 0, "crash": 0}
     bad = []
     for seed in range(n_seeds):
-        for (form, M, N, K, dt) in cells:
+        for form, M, N, K, dt in cells:
             status, detail = _run_cell(form, M, N, K, dt, seed=seed)
             kind = status.split(":")[0]
             tally[kind] = tally.get(kind, 0) + 1
             if kind in ("wrong", "crash"):
                 bad.append((seed, form, M, N, K, str(dt), status, detail))
-        for (form, M, N, K, dt, al, bl, cl) in tcells:
+        for form, M, N, K, dt, al, bl, cl in tcells:
             status, detail = _run_strided_cell(form, M, N, K, dt, al, bl, cl, seed=seed)
             kind = status.split(":")[0]
             tally[kind] = tally.get(kind, 0) + 1
             if kind in ("wrong", "crash"):
                 bad.append((seed, form, M, N, K, str(dt), f"{al}/{bl}/{cl}", status, detail))
-        for (Bz, M, N, K, dt) in bcells:
+        for Bz, M, N, K, dt in bcells:
             status, detail = _run_batched_cell(Bz, M, N, K, dt, seed=seed)
             kind = status.split(":")[0]
             tally[kind] = tally.get(kind, 0) + 1

@@ -37,6 +37,7 @@ def mlx_available():
     """Check if MLX is available for metal_kernel dispatch."""
     try:
         import mlx.core as mx
+
         mx.fast.metal_kernel  # verify API exists
         return True
     except (ImportError, AttributeError):
@@ -46,6 +47,7 @@ def mlx_available():
 def _mlx_dtype_to_triton_sig(dtype):
     """Map MLX dtype to Triton signature string."""
     import mlx.core as mx
+
     mapping = {
         mx.float32: "*fp32",
         mx.float16: "*fp16",
@@ -87,9 +89,7 @@ def _build_signature(jit_fn, args, constexpr_kwargs):
             constexprs[name] = constexpr_kwargs[name]
         else:
             if runtime_idx >= len(args):
-                raise ValueError(
-                    f"Not enough args: expected arg for '{name}' at position {runtime_idx}"
-                )
+                raise ValueError(f"Not enough args: expected arg for '{name}' at position {runtime_idx}")
             arg = args[runtime_idx]
             if isinstance(arg, mx.array):
                 signature[name] = _mlx_dtype_to_triton_sig(arg.dtype)
@@ -173,6 +173,5 @@ def triton_call(kernel_fn, *args, grid, num_warps=4, **constexpr_kwargs):
         extraction = extract_msl_for_mlx(msl_source, output_arg_indices)
         _compile_cache[key] = (extraction, block_size, needs_2d_grid)
 
-    launcher = MLXLauncher(extraction, block_size=block_size,
-                           needs_2d_grid=needs_2d_grid)
+    launcher = MLXLauncher(extraction, block_size=block_size, needs_2d_grid=needs_2d_grid)
     return launcher(grid, *args)

@@ -17,6 +17,7 @@ import triton_msl.mlx as tmlx
 
 # ─── MSL Extractor Unit Tests ─────────────────────────────────────────────────
 
+
 class TestMSLExtractor:
     """Unit tests for MSL body extraction."""
 
@@ -155,6 +156,7 @@ kernel void k(
 
 # ─── MLX Launcher Tests ───────────────────────────────────────────────────────
 
+
 class TestMLXLauncher:
     """Tests for MLXLauncher dispatch with pre-extracted MSL."""
 
@@ -217,6 +219,7 @@ kernel void add_kernel(
 
 
 # ─── End-to-End triton_call() Tests ───────────────────────────────────────────
+
 
 class TestTritonCallElementwise:
     """End-to-end tests: @triton.jit → triton_call() → MLX output."""
@@ -303,7 +306,7 @@ class TestTritonCallReductions:
             row = tl.program_id(0)
             offsets = tl.arange(0, BLOCK)
             mask = offsets < n_cols
-            x = tl.load(x_ptr + row * n_cols + offsets, mask=mask, other=-float('inf'))
+            x = tl.load(x_ptr + row * n_cols + offsets, mask=mask, other=-float("inf"))
             x_max = tl.max(x, axis=0)
             x = x - x_max
             exp_x = tl.exp(x)
@@ -320,6 +323,7 @@ class TestTritonCallReductions:
         (result,) = tmlx.triton_call(softmax_kernel, x, out, cols, grid=(rows,), BLOCK=128)
 
         from scipy.special import softmax as scipy_softmax
+
         ref = scipy_softmax(x_np, axis=1).flatten()
         np.testing.assert_allclose(np.array(result), ref, atol=1e-5)
 

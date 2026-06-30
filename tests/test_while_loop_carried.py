@@ -7,6 +7,7 @@ predicates by SSA name, and scf.while's before/after regions reuse names
 `a<n` term emitted as `a>=n` -> the loop broke immediately and the carried
 var read its initial value (downstream tridec bug 3, 2026-06-10).
 """
+
 import pytest
 
 try:
@@ -14,6 +15,7 @@ try:
     import triton
     import triton.language as tl
     import Metal
+
     HAS = Metal.MTLCreateSystemDefaultDevice() is not None
 except Exception:
     HAS = False
@@ -21,9 +23,11 @@ except Exception:
 requires_metal = pytest.mark.skipif(not HAS, reason="Metal/torch/triton needed")
 
 if HAS:
+
     @triton.jit
     def _while_early_exit(O, n_legs):
-        leg = 0; done = 0
+        leg = 0
+        done = 0
         while (leg < n_legs) and (done == 0):
             leg += 1
             if leg >= 3:

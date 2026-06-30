@@ -28,10 +28,10 @@ from triton_msl.codegen.msl_types import triton_type_to_msl
 # defs, none of which run at import time) lets both orders resolve. See #152.
 
 
-
 # ---------------------------------------------------------------------------
 # High-level kernel generators
 # ---------------------------------------------------------------------------
+
 
 def make_elementwise_kernel(name, n_inputs, op, block_size=256, dtype="fp32"):
     """Generate an elementwise kernel: output[i] = op(input_0[i], ..., input_n[i]).
@@ -199,6 +199,7 @@ def make_scalar_mul_kernel(block_size=256, dtype="fp32"):
 # ---------------------------------------------------------------------------
 # Reduction kernel generators
 # ---------------------------------------------------------------------------
+
 
 def make_reduce_kernel(name, op, block_size=256, dtype="fp32"):
     """Generate a 1D reduction kernel: output[group] = reduce(input[group*N:...]).
@@ -509,10 +510,12 @@ def make_matmul_kernel(block_m=32, block_n=32, block_k=32, dtype="fp32", out_dty
     _tg_bytes = (block_m * block_k + block_k * block_n) * 4
     if _tg_bytes > 32 * 1024:
         from triton_msl.errors import MetalNonRecoverableError
+
         raise MetalNonRecoverableError(
             f"matmul tile {block_m}x{block_n}x{block_k} needs {_tg_bytes // 1024} KiB "
             f"of threadgroup memory (tileA + tileB, fp32), over Metal's 32 KiB limit. "
-            f"Use smaller BLOCK_M/BLOCK_N/BLOCK_K.")
+            f"Use smaller BLOCK_M/BLOCK_N/BLOCK_K."
+        )
 
     # Shared memory tiles (always float for computation)
     kb.declare_threadgroup_array("tileA", dtype="fp32", size=block_m * block_k)
@@ -864,8 +867,7 @@ def make_activation_kernel(activation="tanh", block_size=256, dtype="fp32"):
         "hardswish": "x * clamp(x / 6.0f + 0.5f, 0.0f, 1.0f)",
     }
     if activation not in act_map:
-        raise ValueError(f"Unknown activation: {activation}. "
-                         f"Supported: {list(act_map.keys())}")
+        raise ValueError(f"Unknown activation: {activation}. Supported: {list(act_map.keys())}")
 
     msl_ty = triton_type_to_msl(dtype)
     compute_ty = _msl_compute_type(dtype)
@@ -1077,7 +1079,11 @@ def make_layer_norm_kernel(block_size=256, dtype="fp32", eps=1e-6):
     # Pass 3: Normalize
     needs_cast = dtype in ("fp16", "bf16")
     store_ty = triton_type_to_msl(dtype) if needs_cast else None
-    compute_expr = "(float(input[row_start + i]) - mean_val) * inv_std * float(gamma[i]) + float(beta[i])" if needs_cast else "(input[row_start + i] - mean_val) * inv_std * gamma[i] + beta[i]"
+    compute_expr = (
+        "(float(input[row_start + i]) - mean_val) * inv_std * float(gamma[i]) + float(beta[i])"
+        if needs_cast
+        else "(input[row_start + i] - mean_val) * inv_std * gamma[i] + beta[i]"
+    )
     store_expr = f"{store_ty}({compute_expr})" if needs_cast else compute_expr
     kb.raw_line(f"for (uint i = lid; i < n_cols; i += {block_size}u) {{")
     kb.indent()
@@ -1830,9 +1836,17 @@ kernel void flash_attention(
 """
 
 
-def make_flash_attention_kernel_simdgroup(head_dim=128, BLOCK_M=32, BLOCK_N=64, causal=False,
-                       out_dtype="fp32", arg_decls=None, bindings=None,
-                       kernel_name="flash_attention", scale=None):
+def make_flash_attention_kernel_simdgroup(
+    head_dim=128,
+    BLOCK_M=32,
+    BLOCK_N=64,
+    causal=False,
+    out_dtype="fp32",
+    arg_decls=None,
+    bindings=None,
+    kernel_name="flash_attention",
+    scale=None,
+):
     """simdgroup_matrix FlashAttention-2 (fp32/fp16, causal/non-causal, head_dim=128).
 
     Device-direct simdgroup MMA: QK^T via transpose-load, register-resident O
@@ -1848,6 +1862,7 @@ def make_flash_attention_kernel_simdgroup(head_dim=128, BLOCK_M=32, BLOCK_N=64, 
     Same buffer ABI as make_flash_attention_kernel_tiled.
     """
     import math as _math
+
     D, BM, BN, NT = head_dim, BLOCK_M, BLOCK_N, 256
     if not (BM == 32 and BN == 64 and D % 8 == 0):
         raise ValueError("simd FA requires BLOCK_M=32, BLOCK_N=64, head_dim%8==0")
@@ -1863,24 +1878,43 @@ def make_flash_attention_kernel_simdgroup(head_dim=128, BLOCK_M=32, BLOCK_N=64, 
     else:
         raise ValueError(f"out_dtype must be fp32/f32/fp16/f16 (got {out_dtype!r})")
     Dc_tail = 8
-    _LOGICAL = ["q_sz", "q_sh", "q_sm", "q_sk", "k_sz", "k_sh", "k_sn", "k_sk",
-                "v_sz", "v_sh", "v_sn", "v_sk", "o_sz", "o_sh", "o_sm", "o_sk",
-                "Z", "H", "N_CTX"]
+    _LOGICAL = [
+        "q_sz",
+        "q_sh",
+        "q_sm",
+        "q_sk",
+        "k_sz",
+        "k_sh",
+        "k_sn",
+        "k_sk",
+        "v_sz",
+        "v_sh",
+        "v_sn",
+        "v_sk",
+        "o_sz",
+        "o_sh",
+        "o_sm",
+        "o_sk",
+        "Z",
+        "H",
+        "N_CTX",
+    ]
     if (arg_decls is None) != (bindings is None):
         raise ValueError("arg_decls and bindings must be provided together")
     if arg_decls is None:
-        arg_decls = [f"    device const {elem}* Q [[buffer(0)]]",
-                     f"    device const {elem}* K [[buffer(1)]]",
-                     f"    device const {elem}* V [[buffer(2)]]",
-                     f"    device {elem}* Out [[buffer(3)]]"]
+        arg_decls = [
+            f"    device const {elem}* Q [[buffer(0)]]",
+            f"    device const {elem}* K [[buffer(1)]]",
+            f"    device const {elem}* V [[buffer(2)]]",
+            f"    device {elem}* Out [[buffer(3)]]",
+        ]
         for i, nm in enumerate(_LOGICAL):
             arg_decls.append(f"    constant uint& arg_{nm} [[buffer({4 + i})]]")
         bindings = {nm: f"arg_{nm}" for nm in _LOGICAL}
     sig = ",\n".join(arg_decls)
     bind_lines = "\n".join(f"    const uint {nm} = {bindings[nm]};" for nm in _LOGICAL)
     if elem == "half":
-        p_buffers = (f"    threadgroup half tgP[{BM} * {BN}];\n"
-                     f"    threadgroup float on_scratch[{n_groups} * 64];")
+        p_buffers = f"    threadgroup half tgP[{BM} * {BN}];\n    threadgroup float on_scratch[{n_groups} * 64];"
         p_write, p_src = "tgP[r*BN+cj] = half(p);", "tgP"
     else:
         p_buffers = f"    threadgroup float on_scratch[{n_groups} * 64];"
@@ -1899,8 +1933,7 @@ def make_flash_attention_kernel_simdgroup(head_dim=128, BLOCK_M=32, BLOCK_N=64, 
     def block(mode):
         g, qd, kd = guard_decls(mode)
         if mode == "full":
-            kload = ("            simdgroup_load(kf, K + k_base + (kv_start + sgitg*8u)*k_sn "
-                     "+ kc*k_sk, k_sn, 0, true);")
+            kload = "            simdgroup_load(kf, K + k_base + (kv_start + sgitg*8u)*k_sn + kc*k_sk, k_sn, 0, true);"
         else:
             kload = (
                 "            threadgroup_barrier(mem_flags::mem_threadgroup);\n"
@@ -1987,9 +2020,20 @@ def make_flash_attention_kernel_simdgroup(head_dim=128, BLOCK_M=32, BLOCK_N=64, 
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }"""
-        return tmpl % {"KVFRAG": kv_frag, "DCT": Dc_tail, "KLOAD": kload, "QD": qd,
-                       "KD": kd, "GUARD": g, "PWRITE": p_write, "PLOADT": p_load_t,
-                       "BN": BN, "NG": n_groups, "VLOAD": vload, "PSRC": p_src}
+        return tmpl % {
+            "KVFRAG": kv_frag,
+            "DCT": Dc_tail,
+            "KLOAD": kload,
+            "QD": qd,
+            "KD": kd,
+            "GUARD": g,
+            "PWRITE": p_write,
+            "PLOADT": p_load_t,
+            "BN": BN,
+            "NG": n_groups,
+            "VLOAD": vload,
+            "PSRC": p_src,
+        }
 
     block_full, block_tail = block("full"), block("tail")
     final_store = (
@@ -2068,11 +2112,20 @@ kernel void {kernel_name}(
 }}
 """
     return head
-def make_flash_attention_kernel_tiled(head_dim=128, BLOCK_M=32, BLOCK_N=32,
-                                      Dc=64, causal=False, out_dtype="fp32",
-                                      arg_decls=None, bindings=None,
-                                      kernel_name="flash_attention",
-                                      scale=None):
+
+
+def make_flash_attention_kernel_tiled(
+    head_dim=128,
+    BLOCK_M=32,
+    BLOCK_N=32,
+    Dc=64,
+    causal=False,
+    out_dtype="fp32",
+    arg_decls=None,
+    bindings=None,
+    kernel_name="flash_attention",
+    scale=None,
+):
     """Generate a HEAD-DIM-TILED FlashAttention-2 kernel for Metal (fp32/fp16).
 
     Same online-softmax FA2 algorithm as ``make_flash_attention_kernel`` but with
@@ -2162,41 +2215,61 @@ def make_flash_attention_kernel_tiled(head_dim=128, BLOCK_M=32, BLOCK_N=32,
     # ("fp16") agree.
     if out_dtype in ("fp32", "f32"):
         elem_t = "float"
-        store_cast = lambda expr: expr          # noqa: E731  (float -> float, no-op)
+        store_cast = lambda expr: expr  # noqa: E731  (float -> float, no-op)
     elif out_dtype in ("fp16", "f16"):
         elem_t = "half"
         store_cast = lambda expr: f"half({expr})"  # noqa: E731  (float -> half)
     else:
-        raise ValueError(f"make_flash_attention_kernel_tiled: out_dtype must be "
-                         f"one of fp32/f32/fp16/f16 (got {out_dtype!r})")
+        raise ValueError(
+            f"make_flash_attention_kernel_tiled: out_dtype must be one of fp32/f32/fp16/f16 (got {out_dtype!r})"
+        )
     # Causal mask expression: emitted into the online-softmax row loop.
     # When causal=True the mask excludes kv positions *after* the query position
     # (kv_row > q_row), mapping those scores to -INFINITY before exp/sum.
     # q_row and kv_row are already in scope at the insertion point.
     if causal:
         score_guard = "(kv_row < N_CTX && kv_row <= q_row)"
-        prob_guard  = "(kv_row < N_CTX && kv_row <= q_row)"
+        prob_guard = "(kv_row < N_CTX && kv_row <= q_row)"
     else:
         score_guard = "(kv_row < N_CTX)"
-        prob_guard  = "(kv_row < N_CTX)"
+        prob_guard = "(kv_row < N_CTX)"
     if head_dim % Dc != 0:
-        raise ValueError(f"make_flash_attention_kernel_tiled: head_dim ({head_dim}) "
-                         f"must be a multiple of Dc ({Dc})")
+        raise ValueError(f"make_flash_attention_kernel_tiled: head_dim ({head_dim}) must be a multiple of Dc ({Dc})")
     if (arg_decls is None) != (bindings is None):
-        raise ValueError("make_flash_attention_kernel_tiled: arg_decls and "
-                         "bindings must be provided together (or both omitted)")
+        raise ValueError(
+            "make_flash_attention_kernel_tiled: arg_decls and bindings must be provided together (or both omitted)"
+        )
 
-    TPG = BLOCK_M * BLOCK_N          # threads per threadgroup
+    TPG = BLOCK_M * BLOCK_N  # threads per threadgroup
     KV_STAGE = max(BLOCK_M, BLOCK_N) * Dc  # shared K/V staging buffer size
     import math as _math
+
     # When ``scale`` is provided (e.g. from the detector's info["scale"]), bake
     # THAT exact value so a kernel with a non-standard temperature computes
     # correctly.  When None, fall back to the canonical 1/sqrt(head_dim).
     SCALE = float(scale) if scale is not None else 1.0 / _math.sqrt(float(head_dim))
 
-    _LOGICAL = ["q_sz", "q_sh", "q_sm", "q_sk", "k_sz", "k_sh", "k_sn", "k_sk",
-                "v_sz", "v_sh", "v_sn", "v_sk", "o_sz", "o_sh", "o_sm", "o_sk",
-                "Z", "H", "N_CTX"]
+    _LOGICAL = [
+        "q_sz",
+        "q_sh",
+        "q_sm",
+        "q_sk",
+        "k_sz",
+        "k_sh",
+        "k_sn",
+        "k_sk",
+        "v_sz",
+        "v_sh",
+        "v_sn",
+        "v_sk",
+        "o_sz",
+        "o_sh",
+        "o_sm",
+        "o_sk",
+        "Z",
+        "H",
+        "N_CTX",
+    ]
     if arg_decls is None:
         # Canonical full ABI: Q,K,V,Out (0..3), 16 strides (4..19), Z,H,N_CTX
         # (20..22). Each logical name is its own buffer arg of the same name.
@@ -2213,13 +2286,11 @@ def make_flash_attention_kernel_tiled(head_dim=128, BLOCK_M=32, BLOCK_N=32,
 
     missing = [n for n in _LOGICAL if n not in bindings]
     if missing:
-        raise ValueError(f"make_flash_attention_kernel_tiled: bindings missing "
-                         f"{missing}")
+        raise ValueError(f"make_flash_attention_kernel_tiled: bindings missing {missing}")
     sig = ",\n".join(arg_decls)
     # Local aliases so the body references uniform names regardless of which
     # strides/dims are real buffer args vs baked constants.
-    bind_lines = "\n".join(
-        f"    const uint {name} = {bindings[name]};" for name in _LOGICAL)
+    bind_lines = "\n".join(f"    const uint {name} = {bindings[name]};" for name in _LOGICAL)
 
     return f"""#include <metal_stdlib>
 using namespace metal;
@@ -3402,9 +3473,7 @@ def make_concat_kernel(n_inputs=2, block_size=256):
     for i in range(n_inputs):
         size_params.append(f"    constant uint& n_{i} [[buffer({out_idx + 1 + i})]]")
 
-    all_params = ",\n".join(input_params + size_params + [
-        "    uint gid [[thread_position_in_grid]]"
-    ])
+    all_params = ",\n".join(input_params + size_params + ["    uint gid [[thread_position_in_grid]]"])
 
     # Build the copy logic
     copy_logic = ""
@@ -3451,10 +3520,9 @@ def make_split_kernel(n_outputs=2, block_size=256):
         out_params.append(f"    device float* output_{i} [[buffer({i + 1})]]")
 
     all_params = ",\n".join(
-        ["    device const float* input [[buffer(0)]]"] +
-        out_params +
-        [f"    constant uint& chunk_size [[buffer({n_outputs + 1})]]",
-         "    uint gid [[thread_position_in_grid]]"]
+        ["    device const float* input [[buffer(0)]]"]
+        + out_params
+        + [f"    constant uint& chunk_size [[buffer({n_outputs + 1})]]", "    uint gid [[thread_position_in_grid]]"]
     )
 
     # Build dispatch logic
@@ -4188,19 +4256,14 @@ def make_simdgroup_matmul_kernel_fast(dtype="fp16", rr=4, rc=4, out_dtype="fp32"
     else:
         raise ValueError(f"fast matmul out_dtype supports fp16/bf16/fp32, got {out_dtype}")
 
-    accs = "\n    ".join(
-        "simdgroup_float8x8 " + ", ".join(f"c{r}_{c}(0)" for c in range(rc))
-        + ";" for r in range(rr))
+    accs = "\n    ".join("simdgroup_float8x8 " + ", ".join(f"c{r}_{c}(0)" for c in range(rc)) + ";" for r in range(rr))
     bdecl = ", ".join(f"b{c}" for c in range(rc))
-    loads_b = "\n        ".join(
-        f"simdgroup_load(b{c}, B + k * N + col0 + {c * 8}u, N);"
-        for c in range(rc))
+    loads_b = "\n        ".join(f"simdgroup_load(b{c}, B + k * N + col0 + {c * 8}u, N);" for c in range(rc))
     inner = []
     for r in range(rr):
         inner.append(f"simdgroup_load(a_frag, A + (row_base + {r * 8}u) * K + k, K);")
         for c in range(rc):
-            inner.append(
-                f"simdgroup_multiply_accumulate(c{r}_{c}, a_frag, b{c}, c{r}_{c});")
+            inner.append(f"simdgroup_multiply_accumulate(c{r}_{c}, a_frag, b{c}, c{r}_{c});")
     inner = "\n        ".join(inner)
     if out_dtype in ("fp16", "f16", "bf16"):
         # float8x8 accumulator can't simdgroup_store directly to a half/bfloat
@@ -4215,7 +4278,8 @@ def make_simdgroup_matmul_kernel_fast(dtype="fp16", rr=4, rc=4, out_dtype="fp32"
                 _epi.append(
                     f"for (uint i = tiisg; i < 64u; i += 32u) {{ "
                     f"C[(row_base + {r * 8}u + i / 8u) * N + col0 + {c * 8}u + i % 8u] "
-                    f"= {out_t}(scratch[sgitg*64u + i]); }}")
+                    f"= {out_t}(scratch[sgitg*64u + i]); }}"
+                )
                 _epi.append("simdgroup_barrier(mem_flags::mem_threadgroup);")
         stores = "\n    ".join(_epi)
     else:
@@ -4223,7 +4287,9 @@ def make_simdgroup_matmul_kernel_fast(dtype="fp16", rr=4, rc=4, out_dtype="fp32"
         _scratch_line = ""
         stores = "\n    ".join(
             f"simdgroup_store(c{r}_{c}, C + (row_base + {r * 8}u) * N + col0 + {c * 8}u, N);"
-            for r in range(rr) for c in range(rc))
+            for r in range(rr)
+            for c in range(rc)
+        )
 
     return f"""#include <metal_stdlib>
 #include <metal_simdgroup_matrix>
@@ -4917,9 +4983,7 @@ def make_reduce_scatter_kernel(n_buffers=2, block_size=256, dtype="fp32"):
     # Build buffer parameters
     buffer_params = []
     for i in range(n_buffers):
-        buffer_params.append(
-            f"    device const {msl_ty}* input{i} [[buffer({i})]]"
-        )
+        buffer_params.append(f"    device const {msl_ty}* input{i} [[buffer({i})]]")
     out_idx = n_buffers
     n_idx = n_buffers + 1
     buffer_params.append(f"    device {msl_ty}* output [[buffer({out_idx})]]")
@@ -4969,9 +5033,7 @@ def make_all_reduce_kernel(n_buffers=2, block_size=256, dtype="fp32", op="sum"):
 
     buffer_params = []
     for i in range(n_buffers):
-        buffer_params.append(
-            f"    device const {msl_ty}* input{i} [[buffer({i})]]"
-        )
+        buffer_params.append(f"    device const {msl_ty}* input{i} [[buffer({i})]]")
     out_idx = n_buffers
     n_idx = n_buffers + 1
     buffer_params.append(f"    device {msl_ty}* output [[buffer({out_idx})]]")
@@ -5217,8 +5279,9 @@ kernel void atomic_max_kernel(
     return kb.build()
 
 
-def make_conv2d_kernel(in_channels=3, out_channels=64, kernel_h=3, kernel_w=3,
-                       stride_h=1, stride_w=1, pad_h=1, pad_w=1, block_size=256):
+def make_conv2d_kernel(
+    in_channels=3, out_channels=64, kernel_h=3, kernel_w=3, stride_h=1, stride_w=1, pad_h=1, pad_w=1, block_size=256
+):
     """Generate a 2D convolution kernel using direct computation.
 
     Each thread computes one output element by iterating over the filter
@@ -5289,8 +5352,7 @@ kernel void conv2d_kernel(
     return kb.build()
 
 
-def make_max_pool2d_kernel(kernel_h=2, kernel_w=2, stride_h=2, stride_w=2,
-                           pad_h=0, pad_w=0, block_size=256):
+def make_max_pool2d_kernel(kernel_h=2, kernel_w=2, stride_h=2, stride_w=2, pad_h=0, pad_w=0, block_size=256):
     """Generate a 2D max pooling kernel.
 
     Each thread computes one output element by scanning the pooling window.
@@ -5348,8 +5410,7 @@ kernel void max_pool2d_kernel(
     return kb.build()
 
 
-def make_avg_pool2d_kernel(kernel_h=2, kernel_w=2, stride_h=2, stride_w=2,
-                           pad_h=0, pad_w=0, block_size=256):
+def make_avg_pool2d_kernel(kernel_h=2, kernel_w=2, stride_h=2, stride_w=2, pad_h=0, pad_w=0, block_size=256):
     """Generate a 2D average pooling kernel.
 
     Each thread computes one output element by averaging the pooling window.

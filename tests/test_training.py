@@ -20,8 +20,7 @@ import torch.nn as nn
 
 pytestmark = pytest.mark.skipif(
     not torch._dynamo.is_dynamo_supported(),
-    reason="torch.compile/TorchDynamo unsupported in this interpreter "
-    "(torch._dynamo.is_dynamo_supported() is False).",
+    reason="torch.compile/TorchDynamo unsupported in this interpreter (torch._dynamo.is_dynamo_supported() is False).",
 )
 
 
@@ -29,6 +28,7 @@ pytestmark = pytest.mark.skipif(
 def setup_backend():
     """Register the metal triton backend and reset dynamo around each test."""
     import triton_msl.inductor
+
     triton_msl.inductor.register_metal_triton_backend()
     torch._dynamo.reset()
     yield
@@ -44,8 +44,12 @@ def _mlp():
 
 def _cnn():
     return nn.Sequential(
-        nn.Conv2d(3, 16, 3, padding=1), nn.BatchNorm2d(16), nn.ReLU(),
-        nn.AdaptiveAvgPool2d(1), nn.Flatten(), nn.Linear(16, 10),
+        nn.Conv2d(3, 16, 3, padding=1),
+        nn.BatchNorm2d(16),
+        nn.ReLU(),
+        nn.AdaptiveAvgPool2d(1),
+        nn.Flatten(),
+        nn.Linear(16, 10),
     )
 
 
@@ -54,25 +58,22 @@ def _transformer():
         def __init__(self):
             super().__init__()
             self.emb = nn.Embedding(100, 64)
-            self.enc = nn.TransformerEncoder(
-                nn.TransformerEncoderLayer(64, 4, 128, batch_first=True, dropout=0.0), 2)
+            self.enc = nn.TransformerEncoder(nn.TransformerEncoderLayer(64, 4, 128, batch_first=True, dropout=0.0), 2)
             self.head = nn.Linear(64, 100)
 
         def forward(self, x):
             return self.head(self.enc(self.emb(x))).mean(1)
+
     return T()
 
 
 def _data(kind):
     torch.manual_seed(7)
     if kind == "mlp":
-        return (torch.randn(16, 64, device=DEVICE),
-                torch.randint(0, 32, (16,), device=DEVICE))
+        return (torch.randn(16, 64, device=DEVICE), torch.randint(0, 32, (16,), device=DEVICE))
     if kind == "cnn":
-        return (torch.randn(8, 3, 16, 16, device=DEVICE),
-                torch.randint(0, 10, (8,), device=DEVICE))
-    return (torch.randint(0, 100, (8, 16), device=DEVICE),
-            torch.randint(0, 100, (8,), device=DEVICE))
+        return (torch.randn(8, 3, 16, 16, device=DEVICE), torch.randint(0, 10, (8,), device=DEVICE))
+    return (torch.randint(0, 100, (8, 16), device=DEVICE), torch.randint(0, 100, (8,), device=DEVICE))
 
 
 _BUILD = {"mlp": _mlp, "cnn": _cnn, "transformer": _transformer}
@@ -98,6 +99,7 @@ def _train(kind, compiled, steps=8):
 @pytest.mark.parametrize("kind", ["mlp", "cnn", "transformer"])
 def test_backward_grads_match_eager(kind):
     """One forward+backward: compiled gradients == eager gradients."""
+
     def grads(compiled):
         torch.manual_seed(0)
         model = _BUILD[kind]().to(DEVICE)
@@ -106,11 +108,12 @@ def test_backward_grads_match_eager(kind):
         fn = torch.compile(model, backend="inductor") if compiled else model
         loss = nn.functional.cross_entropy(fn(x), y)
         loss.backward()
-        return loss.detach().cpu().item(), \
-            [p.grad.detach().cpu().clone() for p in model.parameters()]
+        return loss.detach().cpu().item(), [p.grad.detach().cpu().clone() for p in model.parameters()]
 
-    torch._dynamo.reset(); le, ge = grads(False)
-    torch._dynamo.reset(); lc, gc = grads(True)
+    torch._dynamo.reset()
+    le, ge = grads(False)
+    torch._dynamo.reset()
+    lc, gc = grads(True)
     assert abs(le - lc) < 1e-3, f"{kind}: loss eager={le} vs compiled={lc}"
     max_gd = max((a - b).abs().max().item() for a, b in zip(ge, gc))
     assert max_gd < 2e-3, f"{kind}: max grad diff {max_gd:.3e} (eager vs compiled)"
@@ -119,11 +122,12 @@ def test_backward_grads_match_eager(kind):
 @pytest.mark.parametrize("kind", ["mlp", "cnn", "transformer"])
 def test_training_loop_converges_and_matches_eager(kind):
     """A multi-step Adam loop converges (loss drops) and tracks eager."""
-    torch._dynamo.reset(); eager = _train(kind, compiled=False)
-    torch._dynamo.reset(); compiled = _train(kind, compiled=True)
+    torch._dynamo.reset()
+    eager = _train(kind, compiled=False)
+    torch._dynamo.reset()
+    compiled = _train(kind, compiled=True)
     # Learns: final loss meaningfully below the first step.
-    assert compiled[-1] < compiled[0] - 0.05, \
-        f"{kind}: did not converge ({compiled[0]:.3f} -> {compiled[-1]:.3f})"
+    assert compiled[-1] < compiled[0] - 0.05, f"{kind}: did not converge ({compiled[0]:.3f} -> {compiled[-1]:.3f})"
     # Tracks eager step-by-step. The compiled (triton-msl MSL) and eager (MPS)
     # paths are two independent fp backends; their loss trajectories drift by only
     # ~1e-6 here when idle, but the DEEP transformer amplifies a RARE transient
@@ -135,8 +139,9 @@ def test_training_loop_converges_and_matches_eager(kind):
     # >>0.05, per the convergence check above). mlp/cnn are shallow and stay tight.
     step_tol = 1e-2 if kind == "transformer" else 2e-3
     max_step = max(abs(a - b) for a, b in zip(eager, compiled))
-    assert max_step < step_tol, \
+    assert max_step < step_tol, (
         f"{kind}: compiled loss trajectory diverges from eager (max {max_step:.3e} >= {step_tol})"
+    )
 
 
 def test_embedding_backward_compiles():

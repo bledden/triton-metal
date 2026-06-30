@@ -60,6 +60,7 @@ def _fresh_inductor_cache():
     try:
         import shutil
         import torch._inductor.runtime.cache_dir_utils as _cdu
+
         shutil.rmtree(_cdu.cache_dir(), ignore_errors=True)
     except Exception:
         pass
@@ -74,9 +75,7 @@ class MetalKernelRunner:
 
         self.device = Metal.MTLCreateSystemDefaultDevice()
         self.queue = self.device.newCommandQueue()
-        self._cache_dir = os.path.join(
-            tempfile.gettempdir(), "triton_msl_test_cache"
-        )
+        self._cache_dir = os.path.join(tempfile.gettempdir(), "triton_msl_test_cache")
         os.makedirs(self._cache_dir, exist_ok=True)
 
     def compile(self, msl_src, kernel_name):
@@ -91,13 +90,11 @@ class MetalKernelRunner:
             with open(metal_path, "w") as f:
                 f.write(msl_src)
             subprocess.check_call(
-                ["xcrun", "-sdk", "macosx", "metal", "-c", metal_path,
-                 "-o", air_path, "-std=metal3.2", "-O2"],
+                ["xcrun", "-sdk", "macosx", "metal", "-c", metal_path, "-o", air_path, "-std=metal3.2", "-O2"],
                 stderr=subprocess.PIPE,
             )
             subprocess.check_call(
-                ["xcrun", "-sdk", "macosx", "metallib", air_path,
-                 "-o", metallib_path],
+                ["xcrun", "-sdk", "macosx", "metallib", air_path, "-o", metallib_path],
                 stderr=subprocess.PIPE,
             )
         return metallib_path
@@ -113,11 +110,7 @@ class MetalKernelRunner:
         function = library.newFunctionWithName_(kernel_name)
         assert function is not None, f"Kernel '{kernel_name}' not found"
 
-        pipeline, error = (
-            self.device.newComputePipelineStateWithFunction_error_(
-                function, None
-            )
-        )
+        pipeline, error = self.device.newComputePipelineStateWithFunction_error_(function, None)
         assert error is None, f"Pipeline failed: {error}"
         return pipeline
 
@@ -126,9 +119,7 @@ class MetalKernelRunner:
         import Metal
 
         n = len(data)
-        buf = self.device.newBufferWithLength_options_(
-            n * 4, Metal.MTLResourceStorageModeShared
-        )
+        buf = self.device.newBufferWithLength_options_(n * 4, Metal.MTLResourceStorageModeShared)
         view = buf.contents().as_buffer(n * 4)
         for i, val in enumerate(data):
             struct.pack_into("f", view, i * 4, float(val))
@@ -138,17 +129,13 @@ class MetalKernelRunner:
         """Create an empty float buffer of n elements."""
         import Metal
 
-        return self.device.newBufferWithLength_options_(
-            n * 4, Metal.MTLResourceStorageModeShared
-        )
+        return self.device.newBufferWithLength_options_(n * 4, Metal.MTLResourceStorageModeShared)
 
     def make_uint_buffer(self, value):
         """Create a buffer with a single uint32."""
         import Metal
 
-        buf = self.device.newBufferWithLength_options_(
-            4, Metal.MTLResourceStorageModeShared
-        )
+        buf = self.device.newBufferWithLength_options_(4, Metal.MTLResourceStorageModeShared)
         view = buf.contents().as_buffer(4)
         struct.pack_into("I", view, 0, value)
         return buf
@@ -157,9 +144,7 @@ class MetalKernelRunner:
         """Create a buffer with a single int32."""
         import Metal
 
-        buf = self.device.newBufferWithLength_options_(
-            4, Metal.MTLResourceStorageModeShared
-        )
+        buf = self.device.newBufferWithLength_options_(4, Metal.MTLResourceStorageModeShared)
         view = buf.contents().as_buffer(4)
         struct.pack_into("i", view, 0, value)
         return buf
@@ -168,9 +153,7 @@ class MetalKernelRunner:
         """Create a buffer with a single float."""
         import Metal
 
-        buf = self.device.newBufferWithLength_options_(
-            4, Metal.MTLResourceStorageModeShared
-        )
+        buf = self.device.newBufferWithLength_options_(4, Metal.MTLResourceStorageModeShared)
         view = buf.contents().as_buffer(4)
         struct.pack_into("f", view, 0, value)
         return buf
@@ -207,9 +190,7 @@ class MetalKernelRunner:
         import Metal
 
         n = len(data)
-        buf = self.device.newBufferWithLength_options_(
-            n * 2, Metal.MTLResourceStorageModeShared
-        )
+        buf = self.device.newBufferWithLength_options_(n * 2, Metal.MTLResourceStorageModeShared)
         view = buf.contents().as_buffer(n * 2)
         for i, val in enumerate(data):
             struct.pack_into("e", view, i * 2, float(val))
@@ -219,9 +200,7 @@ class MetalKernelRunner:
         """Create an empty half-precision buffer of n elements."""
         import Metal
 
-        return self.device.newBufferWithLength_options_(
-            n * 2, Metal.MTLResourceStorageModeShared
-        )
+        return self.device.newBufferWithLength_options_(n * 2, Metal.MTLResourceStorageModeShared)
 
     def read_half_buffer(self, buf, n):
         """Read n half-precision values from a Metal buffer."""
@@ -246,9 +225,7 @@ class MetalKernelRunner:
         import Metal
 
         n = len(data)
-        buf = self.device.newBufferWithLength_options_(
-            n * 2, Metal.MTLResourceStorageModeShared
-        )
+        buf = self.device.newBufferWithLength_options_(n * 2, Metal.MTLResourceStorageModeShared)
         view = buf.contents().as_buffer(n * 2)
         for i, val in enumerate(data):
             bf16 = self._float_to_bf16_bytes(float(val))
@@ -260,9 +237,7 @@ class MetalKernelRunner:
         """Create an empty bfloat16 buffer of n elements."""
         import Metal
 
-        return self.device.newBufferWithLength_options_(
-            n * 2, Metal.MTLResourceStorageModeShared
-        )
+        return self.device.newBufferWithLength_options_(n * 2, Metal.MTLResourceStorageModeShared)
 
     def read_bf16_buffer(self, buf, n):
         """Read n bfloat16 values from a Metal buffer."""
@@ -280,6 +255,7 @@ def metal_device():
     if not _has_metal():
         pytest.skip("No Metal GPU available")
     import Metal
+
     return Metal.MTLCreateSystemDefaultDevice()
 
 

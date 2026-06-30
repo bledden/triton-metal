@@ -3,6 +3,7 @@ model is ON, so the tridec Bug-2 reduction-in-loop kernel computes at BLOCK>=256
 instead of refusing. The inverse of test_unknown_value_backstop's escape-hatch
 (MEPT=0) refusal. Serial GPU.
 """
+
 import pytest
 
 try:
@@ -10,6 +11,7 @@ try:
     import triton
     import triton.language as tl
     import Metal
+
     HAS = Metal.MTLCreateSystemDefaultDevice() is not None
 except Exception:
     HAS = False
@@ -25,6 +27,7 @@ def _default_env(monkeypatch):
 
 
 if HAS:
+
     @triton.jit
     def _sum_in_loop(X, OUT, N, n_tiles, BLOCK: tl.constexpr):
         offs = tl.arange(0, BLOCK)
@@ -43,5 +46,4 @@ def test_bug2_computes_by_default(BLOCK):
     X = torch.randn(N)
     OUT = torch.zeros(1)
     _sum_in_loop[(1,)](X, OUT, N, (N + BLOCK - 1) // BLOCK, BLOCK=BLOCK)
-    assert abs(float(OUT[0]) - X.sum().item()) < 1e-1, (
-        f"BLOCK={BLOCK}: got {float(OUT[0])}, want {X.sum().item()}")
+    assert abs(float(OUT[0]) - X.sum().item()) < 1e-1, f"BLOCK={BLOCK}: got {float(OUT[0])}, want {X.sum().item()}"

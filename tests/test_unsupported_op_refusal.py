@@ -6,6 +6,7 @@ variant the lowerer doesn't model) must REFUSE loudly, not be dropped silently
 (its UNKNOWN_<id> result fails loud at MSL compile if consumed, or is harmless
 if dead), so it stays a comment.
 """
+
 import pytest
 
 from triton_msl.codegen.generic_lowerer import GenericLowerer
@@ -14,8 +15,7 @@ from triton_msl.errors import MetalNonRecoverableError
 
 
 def _mk(op, ssa_id):
-    return SSAValue(id=ssa_id, name="v", op=op, operand_ids=[], attrs={},
-                    type_str="", elem_type="f32", is_tensor=False)
+    return SSAValue(id=ssa_id, name="v", op=op, operand_ids=[], attrs={}, type_str="", elem_type="f32", is_tensor=False)
 
 
 def _bare_lowerer():
@@ -38,6 +38,7 @@ def test_result_producing_unknown_op_does_not_refuse():
     # consumed). Must NOT raise MetalNonRecoverableError.
     lo = _bare_lowerer()
     import triton_msl.codegen.msl_emitter as _m
+
     lo.kb = _m.KernelBuilder("k")
     try:
         lo._lower_op_dispatch(_mk("tt.some_unknown_valued", 123))
@@ -86,18 +87,32 @@ def test_generic_dot_refuses_large_tile():
     lo = _bare_lowerer()
     lo._find_op_type_str = lambda oid: "tensor<128x128xf32>"
     lo._lookup = lambda oid: "acc"
-    big = SSAValue(id=1, name="d", op="tt.dot", operand_ids=[10, 11, 12],
-                   attrs={}, type_str="tensor<128x128xf32>", elem_type="f32",
-                   is_tensor=True)
+    big = SSAValue(
+        id=1,
+        name="d",
+        op="tt.dot",
+        operand_ids=[10, 11, 12],
+        attrs={},
+        type_str="tensor<128x128xf32>",
+        elem_type="f32",
+        is_tensor=True,
+    )
     with pytest.raises(MetalNonRecoverableError):
         lo._lower_dot(big)
 
     # A <=64 tile must NOT trip the large-tile guard (it may fail later for an
     # unrelated reason in this bare setup, but never via the ">64" refusal).
     lo._find_op_type_str = lambda oid: "tensor<32x32xf32>"
-    small = SSAValue(id=2, name="d", op="tt.dot", operand_ids=[10, 11, 12],
-                     attrs={}, type_str="tensor<32x32xf32>", elem_type="f32",
-                     is_tensor=True)
+    small = SSAValue(
+        id=2,
+        name="d",
+        op="tt.dot",
+        operand_ids=[10, 11, 12],
+        attrs={},
+        type_str="tensor<32x32xf32>",
+        elem_type="f32",
+        is_tensor=True,
+    )
     try:
         lo._lower_dot(small)
     except MetalNonRecoverableError as e:

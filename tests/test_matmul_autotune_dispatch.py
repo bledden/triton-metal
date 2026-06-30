@@ -6,6 +6,7 @@ Also contains driver-level unit tests for the three review findings on Task 2:
   - Finding 2 (test gap): non-(4,4) config must actually reach dispatch
   - Finding 3 (blocking): mark_unsupported must target sel_msl, not fast_msl
 """
+
 import os
 import math
 import platform
@@ -13,9 +14,9 @@ import pytest
 import torch
 
 requires_mps = pytest.mark.skipif(
-    not (platform.system() == "Darwin" and torch.backends.mps.is_available()
-         and hasattr(torch.mps, "compile_shader")),
-    reason="needs MPS + compile_shader")
+    not (platform.system() == "Darwin" and torch.backends.mps.is_available() and hasattr(torch.mps, "compile_shader")),
+    reason="needs MPS + compile_shader",
+)
 
 
 def _mm(M, K, N):
@@ -23,9 +24,9 @@ def _mm(M, K, N):
     import triton.language as tl
 
     @triton.jit
-    def mm(a_ptr, b_ptr, c_ptr, M, N, K,
-           BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr):
-        pid_m = tl.program_id(0); pid_n = tl.program_id(1)
+    def mm(a_ptr, b_ptr, c_ptr, M, N, K, BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr):
+        pid_m = tl.program_id(0)
+        pid_n = tl.program_id(1)
         offs_m = pid_m * BM + tl.arange(0, BM)
         offs_n = pid_n * BN + tl.arange(0, BN)
         offs_k = tl.arange(0, BK)
@@ -36,7 +37,8 @@ def _mm(M, K, N):
             acc += tl.dot(a, b)
         tl.store(c_ptr + offs_m[:, None] * N + offs_n[None, :], acc)
 
-    a = torch.randn(M, K, device="mps"); b = torch.randn(K, N, device="mps")
+    a = torch.randn(M, K, device="mps")
+    b = torch.randn(K, N, device="mps")
     c = torch.empty(M, N, device="mps")
     grid = (M // 32, N // 32)
     mm[grid](a, b, c, M, N, K, BM=32, BN=32, BK=32)
@@ -47,9 +49,9 @@ def _mm(M, K, N):
 @requires_mps
 @pytest.mark.parametrize("M,K,N", [(512, 512, 512), (1024, 1024, 1024), (2048, 512, 2048)])
 def test_autotuned_matmul_matches_torch(M, K, N):
-    os.environ.pop("TRITON_MSL_MATMUL_AUTOTUNE", None)   # default ON
+    os.environ.pop("TRITON_MSL_MATMUL_AUTOTUNE", None)  # default ON
     c, ref = _mm(M, K, N)
-    assert (c - ref).abs().max().item() < 1e-1   # fp32 matmul over K, generous abs tol
+    assert (c - ref).abs().max().item() < 1e-1  # fp32 matmul over K, generous abs tol
 
 
 @requires_mps
@@ -66,12 +68,13 @@ def test_optout_matches_torch():
 # Shared: fake CompileShaderRuntime for driver-block unit tests
 # ---------------------------------------------------------------------------
 
+
 class _RecordingRuntime:
     """Fake CompileShaderRuntime. Intercepts dispatch and records which MSL was used."""
 
     def __init__(self, *, fail_dispatch=False):
         self._unsupported = set()
-        self.dispatched_msls = []   # ordered list of MSL strings passed to dispatch
+        self.dispatched_msls = []  # ordered list of MSL strings passed to dispatch
         self._fail_dispatch = fail_dispatch
 
     def available(self):
@@ -92,8 +95,7 @@ class _RecordingRuntime:
             raise RuntimeError("injected dispatch failure")
 
 
-def _run_fast_matmul_block(rt, descriptor, M, N, K, best_rrrc_override=None,
-                            monkeypatch=None):
+def _run_fast_matmul_block(rt, descriptor, M, N, K, best_rrrc_override=None, monkeypatch=None):
     """Thin wrapper around the real dispatch_fast_matmul from
     triton_msl.autotuning._fast_matmul_dispatch.  Exists so tests that predated
     the extraction keep a stable call-site.
@@ -107,9 +109,9 @@ def _run_fast_matmul_block(rt, descriptor, M, N, K, best_rrrc_override=None,
     """
     from triton_msl.autotuning._fast_matmul_dispatch import dispatch_fast_matmul
     import triton_msl.autotuning.matmul_tuner as _tuner_mod
+
     if best_rrrc_override is not None and monkeypatch is not None:
-        monkeypatch.setattr(_tuner_mod, "best_rrrc",
-                            lambda *a, **kw: best_rrrc_override)
+        monkeypatch.setattr(_tuner_mod, "best_rrrc", lambda *a, **kw: best_rrrc_override)
 
     kargs = [None, None, None, M, N, K]
     dispatch_fast_matmul(rt, descriptor, kargs)
@@ -120,6 +122,7 @@ def _run_fast_matmul_block(rt, descriptor, M, N, K, best_rrrc_override=None,
 # Finding 1 (test gap): descriptor must have exactly 8 elements and carry
 # msl_dtype / msl_out in fields 6 and 7.
 # ---------------------------------------------------------------------------
+
 
 def test_descriptor_has_8_elements_and_carries_dtype_fields():
     """The fast_matmul descriptor built by the lowerer must be exactly 8 elements:
@@ -133,20 +136,13 @@ def test_descriptor_has_8_elements_and_carries_dtype_fields():
 
     for msl_dtype, msl_out in [("fp32", "fp32"), ("fp16", "fp16"), ("fp32", "fp16")]:
         rr = rc = 4
-        fast_msl = make_simdgroup_matmul_kernel_fast(
-            dtype=msl_dtype, rr=rr, rc=rc, out_dtype=msl_out)
+        fast_msl = make_simdgroup_matmul_kernel_fast(dtype=msl_dtype, rr=rr, rc=rc, out_dtype=msl_out)
         # This mirrors the lowerer's return statement exactly:
         descriptor = (fast_msl, 3, 4, 5, 8 * rr, 32 * rc, msl_dtype, msl_out)
 
-        assert len(descriptor) == 8, (
-            f"descriptor for ({msl_dtype},{msl_out}) must be 8 elements, got {len(descriptor)}"
-        )
-        assert descriptor[6] == msl_dtype, (
-            f"descriptor[6] must be msl_dtype={msl_dtype!r}, got {descriptor[6]!r}"
-        )
-        assert descriptor[7] == msl_out, (
-            f"descriptor[7] must be msl_out={msl_out!r}, got {descriptor[7]!r}"
-        )
+        assert len(descriptor) == 8, f"descriptor for ({msl_dtype},{msl_out}) must be 8 elements, got {len(descriptor)}"
+        assert descriptor[6] == msl_dtype, f"descriptor[6] must be msl_dtype={msl_dtype!r}, got {descriptor[6]!r}"
+        assert descriptor[7] == msl_out, f"descriptor[7] must be msl_out={msl_out!r}, got {descriptor[7]!r}"
         assert isinstance(descriptor[6], str) and isinstance(descriptor[7], str), (
             "descriptor[6] and [7] must be plain strings for driver unpacking"
         )
@@ -171,6 +167,7 @@ def test_descriptor_has_8_elements_and_carries_dtype_fields():
 # driver block must dispatch that config's MSL — not the (4,4) default.
 # ---------------------------------------------------------------------------
 
+
 def test_non_default_config_reaches_dispatch_when_tuner_selects_it(monkeypatch):
     """When best_rrrc returns a non-(4,4) config, the fast-matmul dispatch block
     must call rt.dispatch with the MSL for THAT config, not fast_msl (the (4,4)
@@ -186,8 +183,12 @@ def test_non_default_config_reaches_dispatch_when_tuner_selects_it(monkeypatch):
     rt = _RecordingRuntime(fail_dispatch=False)
 
     _run_fast_matmul_block(
-        rt, descriptor, M=512, N=512, K=512,
-        best_rrrc_override=(2, 4),   # tuner returns (2,4)
+        rt,
+        descriptor,
+        M=512,
+        N=512,
+        K=512,
+        best_rrrc_override=(2, 4),  # tuner returns (2,4)
         monkeypatch=monkeypatch,
     )
 
@@ -197,9 +198,7 @@ def test_non_default_config_reaches_dispatch_when_tuner_selects_it(monkeypatch):
         "fast-matmul block must dispatch the (2,4)-selected MSL, not the (4,4) default.\n"
         f"Expected sel_msl (rr=2,rc=4); got the (4,4) default or something else."
     )
-    assert dispatched != fast_msl, (
-        "dispatched the fixed (4,4) MSL — the autotuner selection is not being used"
-    )
+    assert dispatched != fast_msl, "dispatched the fixed (4,4) MSL — the autotuner selection is not being used"
 
 
 # ---------------------------------------------------------------------------
@@ -213,6 +212,7 @@ def test_non_default_config_reaches_dispatch_when_tuner_selects_it(monkeypatch):
 # ---------------------------------------------------------------------------
 
 # --- Medium: wasted-work loop test (RED until is_unsupported(sel_msl) gate added) ---
+
 
 def test_failed_non_default_sel_msl_not_retried_on_second_call(monkeypatch):
     """After a non-(4,4) sel_msl dispatch fails and is marked unsupported, a
@@ -234,7 +234,11 @@ def test_failed_non_default_sel_msl_not_retried_on_second_call(monkeypatch):
 
     # First call: dispatch is attempted, fails, sel_msl marked unsupported
     _run_fast_matmul_block(
-        rt, descriptor, M=512, N=512, K=512,
+        rt,
+        descriptor,
+        M=512,
+        N=512,
+        K=512,
         best_rrrc_override=(2, 4),
         monkeypatch=monkeypatch,
     )
@@ -244,7 +248,11 @@ def test_failed_non_default_sel_msl_not_retried_on_second_call(monkeypatch):
 
     # Second call: sel_msl is already unsupported — dispatch must NOT be attempted again
     _run_fast_matmul_block(
-        rt, descriptor, M=512, N=512, K=512,
+        rt,
+        descriptor,
+        M=512,
+        N=512,
+        K=512,
         best_rrrc_override=(2, 4),
         monkeypatch=monkeypatch,
     )
@@ -257,6 +265,7 @@ def test_failed_non_default_sel_msl_not_retried_on_second_call(monkeypatch):
 
 # --- Low-3: _dispatch_fast_matmul extracted to autotuning module (RED until extracted) ---
 
+
 def test_dispatch_fast_matmul_importable_from_autotuning(monkeypatch):
     """_dispatch_fast_matmul must be a callable in triton_msl.autotuning._fast_matmul_dispatch.
     This test RED-s until the function is extracted from the inline block in driver.py.
@@ -264,14 +273,13 @@ def test_dispatch_fast_matmul_importable_from_autotuning(monkeypatch):
     function, eliminating the silent divergence risk for future refactors.
     """
     from triton_msl.autotuning import _fast_matmul_dispatch as _mod
+
     assert hasattr(_mod, "dispatch_fast_matmul"), (
         "dispatch_fast_matmul is not yet exported from "
         "triton_msl.autotuning._fast_matmul_dispatch. "
         "Extract the fast-matmul dispatch block to that module."
     )
-    assert callable(_mod.dispatch_fast_matmul), (
-        "dispatch_fast_matmul must be callable"
-    )
+    assert callable(_mod.dispatch_fast_matmul), "dispatch_fast_matmul must be callable"
 
 
 def test_mark_unsupported_targets_sel_msl_not_fast_msl(monkeypatch):
@@ -294,8 +302,12 @@ def test_mark_unsupported_targets_sel_msl_not_fast_msl(monkeypatch):
     rt = _RecordingRuntime(fail_dispatch=True)  # dispatch raises -> except block fires
 
     _run_fast_matmul_block(
-        rt, descriptor, M=512, N=512, K=512,
-        best_rrrc_override=(2, 4),   # tuner returns (2,4) -> sel_msl != fast_msl
+        rt,
+        descriptor,
+        M=512,
+        N=512,
+        K=512,
+        best_rrrc_override=(2, 4),  # tuner returns (2,4) -> sel_msl != fast_msl
         monkeypatch=monkeypatch,
     )
 

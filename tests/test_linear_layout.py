@@ -94,18 +94,15 @@ def test_blocked_to_linear_simple_1d():
 
 def test_msl_position_expr_matches_python():
     """The MSL-emitted expression must compute the same positions as the Python helper."""
-    ll = LinearLayout(register_basis=[32, 64, 16],
-                      lane_basis=[128, 256, 512, 1, 2],
-                      warp_basis=[4, 8])
+    ll = LinearLayout(register_basis=[32, 64, 16], lane_basis=[128, 256, 512, 1, 2], warp_basis=[4, 8])
     expr = ll.msl_position_expr("r", "l", "w")
+
     # Spot-check by mock-evaluating in Python (replace ``& {b}`` with int math).
     # The expression form is: "((-(int)((r >> i) & 1u)) & B) ^ ..."
     # Simulate the int-bool-and-int-mask trick.
     def eval_expr(r, l, w):
         result = 0
-        for var, bases in (
-            (r, ll.register_basis), (l, ll.lane_basis), (w, ll.warp_basis)
-        ):
+        for var, bases in ((r, ll.register_basis), (l, ll.lane_basis), (w, ll.warp_basis)):
             for i, b in enumerate(bases):
                 result ^= (-((var >> i) & 1)) & b
         return result

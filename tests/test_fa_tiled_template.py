@@ -19,6 +19,7 @@ triton_msl/backend/compile_shader_runtime.py):
 where `threads` is the TOTAL number of threads (n_groups * group_size), NOT the
 number of threadgroups.
 """
+
 import math
 import pytest
 import torch
@@ -51,9 +52,7 @@ def test_tiled_fa_fp32_noncausal(Z, H, N_CTX, HEAD_DIM):
     v = torch.randn(Z, H, N_CTX, HEAD_DIM, device="mps", dtype=torch.float32)
     out = torch.empty_like(q)
 
-    src = make_flash_attention_kernel_tiled(
-        HEAD_DIM, BLOCK_M, BLOCK_N, Dc=64, causal=False, out_dtype="fp32"
-    )
+    src = make_flash_attention_kernel_tiled(HEAD_DIM, BLOCK_M, BLOCK_N, Dc=64, causal=False, out_dtype="fp32")
     lib = torch.mps.compile_shader(src)
 
     # 2-D threadgroup grid (matches the real routed dispatch): grid.x = q-blocks
@@ -68,10 +67,16 @@ def test_tiled_fa_fp32_noncausal(Z, H, N_CTX, HEAD_DIM):
     # ABI order (real _flash_attn_fwd): Q, K, V, Out, <16 strides>, Z, H, N_CTX.
     # scale (1/sqrt(HEAD_DIM)) is baked into the template — not passed here.
     lib.flash_attention(
-        q, k, v, out,
+        q,
+        k,
+        v,
+        out,
         *s,
-        Z, H, N_CTX,
-        threads=threads, group_size=group_size,
+        Z,
+        H,
+        N_CTX,
+        threads=threads,
+        group_size=group_size,
     )
     torch.mps.synchronize()
 
@@ -95,11 +100,10 @@ def test_standalone_fp16_decl():
     branch of the canonical ABI emission so a future change to elem_t won't
     silently regress the pointer type.
     """
-    src = make_flash_attention_kernel_tiled(head_dim=128, BLOCK_M=32, BLOCK_N=32,
-                                            out_dtype="fp16")
+    src = make_flash_attention_kernel_tiled(head_dim=128, BLOCK_M=32, BLOCK_N=32, out_dtype="fp16")
     assert "device const half* Q" in src, (
         "expected 'device const half* Q' in standalone fp16 MSL; "
-        f"got pointer decl: {src[src.find('device const'):src.find('device const')+40]!r}"
+        f"got pointer decl: {src[src.find('device const') : src.find('device const') + 40]!r}"
     )
 
 
@@ -107,28 +111,28 @@ def test_standalone_fp16_decl():
 # Finding 1: scale parameter — golden/structure assertions
 # ---------------------------------------------------------------------------
 
+
 def test_explicit_scale_baked_verbatim():
     """When scale=0.5 is passed, the template bakes 0.5 exactly (not 1/sqrt(D))."""
     import math
-    src = make_flash_attention_kernel_tiled(128, 32, 32, Dc=64, causal=False,
-                                            out_dtype="fp32", scale=0.5)
+
+    src = make_flash_attention_kernel_tiled(128, 32, 32, Dc=64, causal=False, out_dtype="fp32", scale=0.5)
     # The baked constant must be 0.5, not the canonical 1/sqrt(128).
     canonical = 1.0 / math.sqrt(128.0)
-    assert repr(0.5) + "f" in src, \
-        f"expected '0.5f' in MSL but not found; snippet: {src[src.find('scale'):][:80]}"
+    assert repr(0.5) + "f" in src, f"expected '0.5f' in MSL but not found; snippet: {src[src.find('scale') :][:80]}"
     # Ensure the canonical value is NOT baked when scale=0.5 is provided.
-    assert repr(canonical) + "f" not in src, \
+    assert repr(canonical) + "f" not in src, (
         f"canonical scale {canonical!r} must not appear when scale=0.5 is explicitly given"
+    )
 
 
 def test_scale_none_uses_canonical():
     """scale=None (default) falls back to 1/sqrt(head_dim) as before."""
     import math
-    src = make_flash_attention_kernel_tiled(128, 32, 32, Dc=64, causal=False,
-                                            out_dtype="fp32", scale=None)
+
+    src = make_flash_attention_kernel_tiled(128, 32, 32, Dc=64, causal=False, out_dtype="fp32", scale=None)
     canonical = 1.0 / math.sqrt(128.0)
-    assert repr(canonical) + "f" in src, \
-        f"expected canonical scale {canonical!r}f in MSL; not found"
+    assert repr(canonical) + "f" in src, f"expected canonical scale {canonical!r}f in MSL; not found"
 
 
 def test_lower_passes_detected_scale():
@@ -146,20 +150,18 @@ def test_lower_passes_detected_scale():
     import inspect
 
     # Part 1: template bakes the provided scale, not the canonical one.
-    src_05 = make_flash_attention_kernel_tiled(128, 32, 32, Dc=64, causal=False,
-                                               out_dtype="fp32", scale=0.5)
+    src_05 = make_flash_attention_kernel_tiled(128, 32, 32, Dc=64, causal=False, out_dtype="fp32", scale=0.5)
     canonical = 1.0 / math.sqrt(128.0)
-    assert repr(0.5) + "f" in src_05, \
-        f"scale=0.5 not baked into MSL; snippet: {src_05[src_05.find('scale'):][:80]}"
-    assert repr(canonical) + "f" not in src_05, \
-        f"canonical scale {canonical!r} must NOT appear when scale=0.5 is given"
+    assert repr(0.5) + "f" in src_05, f"scale=0.5 not baked into MSL; snippet: {src_05[src_05.find('scale') :][:80]}"
+    assert repr(canonical) + "f" not in src_05, f"canonical scale {canonical!r} must NOT appear when scale=0.5 is given"
 
     # Part 2: the lowerer call site passes info["scale"].
     from triton_msl.codegen.generic_lowerer import GenericLowerer
+
     src_lower = inspect.getsource(
         GenericLowerer._lower_flash_attention_template  # type: ignore[attr-defined]
     )
     assert 'scale=info["scale"]' in src_lower, (
         '_lower_flash_attention_template must pass scale=info["scale"] to '
-        'make_flash_attention_kernel_tiled — detected scale is not being forwarded'
+        "make_flash_attention_kernel_tiled — detected scale is not being forwarded"
     )

@@ -12,6 +12,7 @@ pin that fp16/bf16 atomic_add produces the CORRECT result (no corruption), and
 that the supported fp32 atomic still works. Detailed correctness coverage
 (accumulation, neighbor preservation, bf16) lives in tests/test_fp16_atomics.py.
 """
+
 import os
 import subprocess
 import sys
@@ -26,6 +27,7 @@ try:
     import triton.language as tl
     import Metal
     from triton_msl.backend.compiler import MetalBackend
+
     HAS = Metal.MTLCreateSystemDefaultDevice() is not None
     HAS_CPP = MetalBackend._has_cpp_passes()
 except Exception:
@@ -36,6 +38,7 @@ requires_metal = pytest.mark.skipif(not HAS, reason="Metal/torch/triton needed")
 
 
 if HAS:
+
     @triton.jit
     def _scatter_add(Idx, Val, Out, N: tl.constexpr):
         i = tl.arange(0, N)
@@ -54,7 +57,7 @@ def test_fp16_atomic_add_correct_not_silentwrong():
     np.testing.assert_allclose(out.float().numpy(), [4.0, 4.0], atol=1e-3)
 
 
-_FP16_ATOMIC_SCRIPT = '''import os
+_FP16_ATOMIC_SCRIPT = """import os
 os.environ.setdefault("TRITON_DEFAULT_BACKEND", "metal")
 import torch, triton, triton.language as tl
 @triton.jit
@@ -68,7 +71,7 @@ k[(1,)](idx, val, out, N=8)
 got = out.float().tolist()
 assert abs(got[0] - 4.0) < 1e-3 and abs(got[1] - 4.0) < 1e-3, got
 print("OK", got)
-'''
+"""
 
 
 @requires_metal
@@ -82,19 +85,20 @@ def test_fp16_atomic_correct_under_default_route():
     must produce the right result ([4, 4]), never silently-corrupt output.
     """
     root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    env = dict(os.environ,
-               PYTHONPATH=root,
-               TRITON_MSL_CACHE_DIR=tempfile.mkdtemp(),
-               TRITON_CACHE_DIR=tempfile.mkdtemp())
+    env = dict(
+        os.environ, PYTHONPATH=root, TRITON_MSL_CACHE_DIR=tempfile.mkdtemp(), TRITON_CACHE_DIR=tempfile.mkdtemp()
+    )
     env.pop("TRITON_MSL_FORCE_PYTHON", None)
-    r = subprocess.run([sys.executable, "-c", _FP16_ATOMIC_SCRIPT],
-                       env=env, capture_output=True, text=True, timeout=180)
+    r = subprocess.run(
+        [sys.executable, "-c", _FP16_ATOMIC_SCRIPT], env=env, capture_output=True, text=True, timeout=180
+    )
     assert r.returncode == 0, (
         f"fp16 atomic_add must succeed on the default route; "
-        f"exited {r.returncode}\nstdout: {r.stdout}\nstderr: {r.stderr}")
+        f"exited {r.returncode}\nstdout: {r.stdout}\nstderr: {r.stderr}"
+    )
     assert "OK" in r.stdout, (
-        f"expected correct [4, 4] result on default route, got:\n"
-        f"stdout: {r.stdout}\nstderr: {r.stderr}")
+        f"expected correct [4, 4] result on default route, got:\nstdout: {r.stdout}\nstderr: {r.stderr}"
+    )
 
 
 @requires_metal

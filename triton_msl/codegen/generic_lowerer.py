@@ -20,7 +20,9 @@ from triton_msl.codegen.mlir_walker import IRGraph, SSAValue, FuncArg, CalledFun
 from triton_msl.codegen.msl_emitter import KernelBuilder, _msl_compute_type, _sanitize_msl_name
 from triton_msl.codegen.msl_types import triton_type_to_msl
 from triton_msl.errors import (
-    MetalCodegenError, MetalNotImplementedError, MetalNonRecoverableError,
+    MetalCodegenError,
+    MetalNotImplementedError,
+    MetalNonRecoverableError,
 )
 
 
@@ -61,8 +63,12 @@ def _simd_fa_eligible(info):
     Q/K/V/Out. info["strides"][role] is [z,h,m,k]; index 3 (k) == "c1" means the
     innermost stride folded to 1 (contiguous). Non-contiguous -> scalar template
     (handles general strides) -> never silent-wrong."""
-    if not (info.get("head_dim") == 128 and info.get("block_m") == 32
-            and info.get("block_n") == 32 and info.get("out_dtype") in ("f32", "f16")):
+    if not (
+        info.get("head_dim") == 128
+        and info.get("block_m") == 32
+        and info.get("block_n") == 32
+        and info.get("out_dtype") in ("f32", "f16")
+    ):
         return False
     st = info.get("strides", {})
     return all(st.get(r, [None] * 4)[3] == "c1" for r in ("q", "k", "v", "o"))
@@ -90,40 +96,92 @@ from triton_msl.codegen._lowerer_control import _ControlFlowMixin
 # split/gather/broadcast/expand_dims/reshape), atomics, reduce/scan/
 # histogram, tt.dot, control flow (scf.*), ttg.*. FP8 kernels are excluded
 # separately (fp8 truncf emits a scalar conversion chain).
-_MEPT_SAFE_OPS = frozenset({
-    # producers / memory (wired array path)
-    "tt.make_range", "tt.addptr", "tt.load", "tt.store",
-    # scalar / broadcast operands (never produce a register array)
-    "tt.get_program_id", "tt.get_num_programs", "arith.constant",
-    "tt.splat", "tt.return",
-    # elementwise binary -> _emit_binary / _emit_builtin_binary /
-    # _emit_nan_propagating_minmax (all route through _mept_binary_dispatch)
-    "arith.addf", "arith.addi", "arith.subf", "arith.subi",
-    "arith.mulf", "arith.muli", "arith.divf", "arith.divsi", "arith.divui",
-    "arith.remsi", "arith.remui", "arith.remf",
-    "arith.maxf", "arith.maxsi", "arith.maxui",
-    "arith.minf", "arith.minsi", "arith.minui",
-    "arith.maxnumf", "arith.minnumf", "arith.maximumf", "arith.minimumf",
-    "arith.andi", "arith.ori", "arith.xori",
-    "arith.shli", "arith.shrsi", "arith.shrui",
-    # comparison (cmpi and cmpf are array-wired)
-    "arith.cmpi",
-    "arith.cmpf",
-    # ternary select (tl.where) -> _lower_select / _mept_select_dispatch
-    "arith.select",
-    # unary
-    "arith.negf",
-    # casts (passthrough or _emit_cast / _emit_int_cast / _emit_uitofp)
-    "arith.extf", "arith.truncf", "arith.sitofp", "arith.uitofp",
-    "arith.fptosi", "arith.fptoui", "arith.extsi", "arith.extui",
-    "arith.trunci", "arith.index_cast", "arith.index_castui",
-    # math (array-wired in _lower_math)
-    "math.exp", "math.exp2", "math.log", "math.log2", "math.sqrt",
-    "math.rsqrt", "math.abs", "math.absf", "math.absi", "math.sin",
-    "math.cos", "math.tanh", "math.floor", "math.ceil", "math.round",
-    "math.fma", "math.powf", "math.copysign", "math.atan2",
-    "math.roundeven", "math.trunc",
-})
+_MEPT_SAFE_OPS = frozenset(
+    {
+        # producers / memory (wired array path)
+        "tt.make_range",
+        "tt.addptr",
+        "tt.load",
+        "tt.store",
+        # scalar / broadcast operands (never produce a register array)
+        "tt.get_program_id",
+        "tt.get_num_programs",
+        "arith.constant",
+        "tt.splat",
+        "tt.return",
+        # elementwise binary -> _emit_binary / _emit_builtin_binary /
+        # _emit_nan_propagating_minmax (all route through _mept_binary_dispatch)
+        "arith.addf",
+        "arith.addi",
+        "arith.subf",
+        "arith.subi",
+        "arith.mulf",
+        "arith.muli",
+        "arith.divf",
+        "arith.divsi",
+        "arith.divui",
+        "arith.remsi",
+        "arith.remui",
+        "arith.remf",
+        "arith.maxf",
+        "arith.maxsi",
+        "arith.maxui",
+        "arith.minf",
+        "arith.minsi",
+        "arith.minui",
+        "arith.maxnumf",
+        "arith.minnumf",
+        "arith.maximumf",
+        "arith.minimumf",
+        "arith.andi",
+        "arith.ori",
+        "arith.xori",
+        "arith.shli",
+        "arith.shrsi",
+        "arith.shrui",
+        # comparison (cmpi and cmpf are array-wired)
+        "arith.cmpi",
+        "arith.cmpf",
+        # ternary select (tl.where) -> _lower_select / _mept_select_dispatch
+        "arith.select",
+        # unary
+        "arith.negf",
+        # casts (passthrough or _emit_cast / _emit_int_cast / _emit_uitofp)
+        "arith.extf",
+        "arith.truncf",
+        "arith.sitofp",
+        "arith.uitofp",
+        "arith.fptosi",
+        "arith.fptoui",
+        "arith.extsi",
+        "arith.extui",
+        "arith.trunci",
+        "arith.index_cast",
+        "arith.index_castui",
+        # math (array-wired in _lower_math)
+        "math.exp",
+        "math.exp2",
+        "math.log",
+        "math.log2",
+        "math.sqrt",
+        "math.rsqrt",
+        "math.abs",
+        "math.absf",
+        "math.absi",
+        "math.sin",
+        "math.cos",
+        "math.tanh",
+        "math.floor",
+        "math.ceil",
+        "math.round",
+        "math.fma",
+        "math.powf",
+        "math.copysign",
+        "math.atan2",
+        "math.roundeven",
+        "math.trunc",
+    }
+)
 
 
 # Compute ops that, when present at TOP LEVEL (not inside the K-loop scf.for
@@ -133,19 +191,40 @@ _MEPT_SAFE_OPS = frozenset({
 # matmul kernel containing one is routed to the generic op-by-op lowerer instead
 # (re-audit #6). Pure casts/broadcasts are intentionally EXCLUDED (the templates
 # cast on store), as are comparisons/selects (matmuls don't carry those).
-_MATMUL_EPILOGUE_COMPUTE_OPS = frozenset({
-    "arith.addf", "arith.subf", "arith.mulf", "arith.divf", "arith.negf",
-    "math.fma", "math.exp", "math.exp2", "math.log", "math.log2",
-    "math.sqrt", "math.rsqrt", "math.sin", "math.cos", "math.erf",
-    "math.tanh", "math.floor", "math.ceil", "math.absf", "math.powf",
-    "arith.maximumf", "arith.minimumf", "arith.maxnumf", "arith.minnumf",
-    "tt.clampf",
-    # tl.where(cond, acc, x) — e.g. relu-via-where — is a TOP-LEVEL arith.select on
-    # the matmul result. (A masked LOAD's select lives inside the scf.for region, not
-    # at top level, so this does NOT over-refuse bounds-masked matmuls.) re-audit #8:
-    # a K-loop matmul + relu-via-where silently dropped the mask, storing the raw dot.
-    "arith.select",
-})
+_MATMUL_EPILOGUE_COMPUTE_OPS = frozenset(
+    {
+        "arith.addf",
+        "arith.subf",
+        "arith.mulf",
+        "arith.divf",
+        "arith.negf",
+        "math.fma",
+        "math.exp",
+        "math.exp2",
+        "math.log",
+        "math.log2",
+        "math.sqrt",
+        "math.rsqrt",
+        "math.sin",
+        "math.cos",
+        "math.erf",
+        "math.tanh",
+        "math.floor",
+        "math.ceil",
+        "math.absf",
+        "math.powf",
+        "arith.maximumf",
+        "arith.minimumf",
+        "arith.maxnumf",
+        "arith.minnumf",
+        "tt.clampf",
+        # tl.where(cond, acc, x) — e.g. relu-via-where — is a TOP-LEVEL arith.select on
+        # the matmul result. (A masked LOAD's select lives inside the scf.for region, not
+        # at top level, so this does NOT over-refuse bounds-masked matmuls.) re-audit #8:
+        # a K-loop matmul + relu-via-where silently dropped the mask, storing the raw dot.
+        "arith.select",
+    }
+)
 
 _MATMUL_EPILOGUE_REFUSE_MSG = (
     "matmul with a trailing compute epilogue (bias/activation/fma/clamp) that the "
@@ -160,6 +239,7 @@ _MATMUL_EPILOGUE_REFUSE_MSG = (
 # Generic Lowerer
 # ---------------------------------------------------------------------------
 
+
 class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _DetectionMixin, _TemplateMixin):
     """Lower an IRGraph to MSL source code via KernelBuilder."""
 
@@ -170,11 +250,11 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
         # read by emit_msl into metadata. None for every other kernel.
         self._fast_matmul = None
         self.options = options
-        self.env = {}           # ssa_id -> MSL variable name
-        self.env_types = {}     # ssa_id -> triton dtype string
-        self.env_is_mask = {}   # ssa_id -> True if this is a bool mask
-        self.env_is_ptr = {}    # ssa_id -> (base_ptr_name, offsets_var)
-        self.env_shapes = {}    # ssa_id -> shape tuple, e.g., (32, 64)
+        self.env = {}  # ssa_id -> MSL variable name
+        self.env_types = {}  # ssa_id -> triton dtype string
+        self.env_is_mask = {}  # ssa_id -> True if this is a bool mask
+        self.env_is_ptr = {}  # ssa_id -> (base_ptr_name, offsets_var)
+        self.env_shapes = {}  # ssa_id -> shape tuple, e.g., (32, 64)
         # Phase 4 foundation: track how many tensor elements per thread each
         # SSA value carries. The current lowerer emits 1 scalar per thread for
         # every tensor, so the default is 1; ``_track_n_elems`` reads the
@@ -184,14 +264,14 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
         # ``_lower_convert_layout`` guard about when a real shuffle is
         # required. See ``docs/superpowers/plans/2026-05-21-multi-element-
         # per-thread.md`` for the staged refactor plan.
-        self.env_n_elems = {}   # ssa_id -> int (elements per thread, ≥ 1)
+        self.env_n_elems = {}  # ssa_id -> int (elements per thread, ≥ 1)
         # Phase 4c: alongside env_n_elems, store the resolved
         # ``LinearLayout`` when one is available. Consulted by MEPT
         # producers (e.g. ``_lower_make_range``) to emit the correct
         # per-register position math via ``msl_position_expr``. When
         # absent (the synthetic / contiguous case), producers fall back
         # to the simple ``lid*N + i`` formula.
-        self.env_layout = {}    # ssa_id -> LinearLayout
+        self.env_layout = {}  # ssa_id -> LinearLayout
         # Some per-thread scalar values come from a broadcast-redundant layout:
         # thread `lid` does not hold the element at flat index `lid`, but at a
         # different index (e.g., after a 3D reduce that broadcasts the reduced
@@ -306,11 +386,10 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
         _var_array. wraploop: a single expression emitted inside the caller's
         _loop_e loop (scalar-shaped, indexed by _loop_e in body(0))."""
         from triton_msl.codegen.regval import RegVal
+
         if regval.form == "array" and regval.n_elems > 1:
-            arr = self._var_array(
-                base, [body(e) for e in range(regval.n_elems)], regval.ty)
-            return RegVal(name=arr, n_elems=regval.n_elems, ty=regval.ty,
-                          form="array")
+            arr = self._var_array(base, [body(e) for e in range(regval.n_elems)], regval.ty)
+            return RegVal(name=arr, n_elems=regval.n_elems, ty=regval.ty, form="array")
         name = self._next_var(base)
         self.kb.raw_line(f"    {regval.ty} {name} = {body(0)};")
         return RegVal(name=name, n_elems=1, ty=regval.ty, form=regval.form)
@@ -402,6 +481,7 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
         if re.search(rf"#{re.escape(alias)}\s*=\s*#ttg\.linear<", mod_text):
             try:
                 from triton_msl.codegen._linear_layout import parse_linear_layout
+
                 ll = parse_linear_layout(mod_text, alias)
                 if ll:
                     self.env_n_elems[ssa_id] = ll.num_registers_per_thread
@@ -414,6 +494,7 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
         if re.search(rf"#{re.escape(alias)}\s*=\s*#ttg\.blocked<", mod_text):
             try:
                 from triton_msl.codegen._linear_layout import blocked_to_linear
+
                 spt = self._parse_blocked_field(mod_text, alias, "sizePerThread")
                 tpw = self._parse_blocked_field(mod_text, alias, "threadsPerWarp")
                 wpc = self._parse_blocked_field(mod_text, alias, "warpsPerCTA")
@@ -459,12 +540,13 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
                 from triton_msl.codegen._linear_layout import (
                     parse_linear_layout,
                 )
+
                 return parse_linear_layout(mod_text, alias)
-            if re.search(rf"#{re.escape(alias)}\s*=\s*#ttg\.blocked<",
-                         mod_text):
+            if re.search(rf"#{re.escape(alias)}\s*=\s*#ttg\.blocked<", mod_text):
                 from triton_msl.codegen._linear_layout import (
                     blocked_to_linear,
                 )
+
                 spt = self._parse_blocked_field(mod_text, alias, "sizePerThread")
                 tpw = self._parse_blocked_field(mod_text, alias, "threadsPerWarp")
                 wpc = self._parse_blocked_field(mod_text, alias, "warpsPerCTA")
@@ -485,7 +567,8 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
         """
         m = re.search(
             rf"#{re.escape(alias)}\s*=\s*#ttg\.blocked<\{{(.+?)\}}>",
-            mod_text, re.DOTALL,
+            mod_text,
+            re.DOTALL,
         )
         if not m:
             return None
@@ -662,8 +745,7 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
         )
         violation = _rc.check_all(ctx)
         if violation is not None:
-            raise MetalNonRecoverableError(
-                violation.message, op_name=violation.op_name)
+            raise MetalNonRecoverableError(violation.message, op_name=violation.op_name)
 
     def lower(self) -> str:
         """Lower the IRGraph to MSL source code."""
@@ -701,6 +783,7 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
                     yield from _fa_walk(_s.region_ops)
                 if getattr(_s, "else_ops", None):
                     yield from _fa_walk(_s.else_ops)
+
         _fa_ops = list(_fa_walk(self.graph.ops))
         _fa_dots = [s for s in _fa_ops if s.op == "tt.dot"]
         # FA-specific gate: >=2 dots with BOTH exp and a max (softmax with the
@@ -716,7 +799,7 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
             _fa_maxdim = 0
             _fa_mindim = 1 << 30
             for _d in _fa_dots:
-                for _oid in (_d.operand_ids or []):
+                for _oid in _d.operand_ids or []:
                     _t = self._find_op_type_str(_oid)
                     _sh = _extract_shape(_t) if _t else None
                     if _sh:
@@ -733,16 +816,18 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
             # Covers bf16 introduced via explicit .to(tl.bfloat16) on Q/K/V or the
             # scores (any dot operand). FA stays fp16/fp32 only.
             _fa_has_bf16 = any(
-                (self._find_op_type_str(_oid) or "") and
-                ("bf16" in (self._find_op_type_str(_oid) or "")
-                 or "bfloat" in (self._find_op_type_str(_oid) or ""))
-                for _d in _fa_dots for _oid in (_d.operand_ids or []))
+                (self._find_op_type_str(_oid) or "")
+                and ("bf16" in (self._find_op_type_str(_oid) or "") or "bfloat" in (self._find_op_type_str(_oid) or ""))
+                for _d in _fa_dots
+                for _oid in (_d.operand_ids or [])
+            )
             if _fa_has_bf16:
                 raise MetalNonRecoverableError(
                     "FlashAttention with bf16 dot operands is not supported: the "
                     "attention lowering (fp32/fp16 only) silently mis-computes for "
                     "bf16 at any head_dim. Refusing to emit silently-wrong output. "
-                    "Use fp16 or fp32 for Q/K/V in attention.")
+                    "Use fp16 or fp32 for Q/K/V in attention."
+                )
             # FUSED-SCALE-ON-DOT-RESULT GATE (naming-independence follow-up): the generic
             # attention lowering silently mis-computes when a tt.dot RESULT feeds an
             # elementwise scale/bias before the softmax — e.g. the scores scaled INSIDE
@@ -759,13 +844,19 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
                 # True if SSA _id is a scalar broadcast into the tile — a splat of a
                 # constant/scalar (the scale/bias factor), NOT a per-element tensor
                 # (like the loop-carried accumulator). Walks layout-only wrappers.
-                _o = _fa_by_id.get(_id); _seen = set()
+                _o = _fa_by_id.get(_id)
+                _seen = set()
                 while _o is not None and _o.id not in _seen:
                     _seen.add(_o.id)
                     if _o.op in ("tt.splat",):
                         return True
-                    if _o.op in ("tt.broadcast", "ttg.convert_layout", "tt.reshape",
-                                 "tt.expand_dims", "arith.constant"):
+                    if _o.op in (
+                        "tt.broadcast",
+                        "ttg.convert_layout",
+                        "tt.reshape",
+                        "tt.expand_dims",
+                        "arith.constant",
+                    ):
                         if _o.op == "arith.constant":
                             return True
                         _o = _fa_by_id.get(_o.operand_ids[0]) if _o.operand_ids else None
@@ -791,6 +882,7 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
                         if any(_is_scalar_splat(o) for o in _others):
                             return True
                 return False
+
             if any(_dot_result_scaled(_d) for _d in _fa_dots):
                 raise MetalNonRecoverableError(
                     "FlashAttention that applies an elementwise scale/bias to a tt.dot "
@@ -799,7 +891,8 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
                     "lowering — the fused op on the dot result is silently dropped / "
                     "mis-applied. Refusing to emit silently-wrong output. Scale Q "
                     "BEFORE the dot instead (q = q * (1/√d); qk = tl.dot(q, kᵀ)).",
-                    op_name="tt.dot")
+                    op_name="tt.dot",
+                )
             # Empirically mapped failure boundary (2026-06-17): the attention
             # lowering is validated only at BLOCK_M = BLOCK_N = 32, head_dim in
             # {32, 64}. Two distinct out-of-range failure modes — only ONE was
@@ -831,10 +924,13 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
             # addressing the FA stride-walker doesn't model.
             if _fa_maxdim == 128:
                 info = self._detect_flash_attention()
-                if (info is not None
-                        and info["block_m"] == 32 and info["block_n"] == 32
-                        and info["head_dim"] == 128
-                        and info["out_dtype"] in ("f32", "f16")):
+                if (
+                    info is not None
+                    and info["block_m"] == 32
+                    and info["block_n"] == 32
+                    and info["head_dim"] == 128
+                    and info["out_dtype"] in ("f32", "f16")
+                ):
                     return self._lower_flash_attention_template(info)
 
             if _fa_maxdim > 64:
@@ -842,7 +938,8 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
                     f"FlashAttention head_dim > 64 (a dot tile dimension is "
                     f"{_fa_maxdim}) is not supported: the attention lowering is "
                     f"validated only for head_dim <= 64. Refusing to emit "
-                    f"silently-wrong output. Use head_dim <= 64.")
+                    f"silently-wrong output. Use head_dim <= 64."
+                )
             if _fa_mindim < 32:
                 raise MetalNonRecoverableError(
                     f"FlashAttention with a block tile dimension < 32 (smallest "
@@ -850,7 +947,8 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
                     f"attention lowering silently mis-computes for BLOCK_M/BLOCK_N "
                     f"below 32 (rows past the first become garbage), for any "
                     f"head_dim. Refusing to emit silently-wrong output. Use "
-                    f"BLOCK_M = BLOCK_N = 32.")
+                    f"BLOCK_M = BLOCK_N = 32."
+                )
 
         # Check for the fused matmul + row-softmax pattern FIRST — before the
         # simple/K-loop dot detectors. _detect_simple_dot matches any
@@ -911,8 +1009,7 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
         softmax_info = self._detect_softmax()
         if softmax_info:
             msl = self._lower_softmax_template(softmax_info)
-            self.effective_block_size = (
-                (self.options.num_warps if self.options else 4) * 32)
+            self.effective_block_size = (self.options.num_warps if self.options else 4) * 32
             self._prescan_stores()
             return msl
 
@@ -923,8 +1020,7 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
         layer_norm_info = self._detect_layer_norm()
         if layer_norm_info:
             msl = self._lower_layer_norm_template(layer_norm_info)
-            self.effective_block_size = (
-                (self.options.num_warps if self.options else 4) * 32)
+            self.effective_block_size = (self.options.num_warps if self.options else 4) * 32
             self._prescan_stores()
             return msl
 
@@ -936,8 +1032,7 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
         trans_reshape_info = self._detect_transpose_via_reshape()
         if trans_reshape_info:
             msl = self._lower_transpose_via_reshape_template(trans_reshape_info)
-            self.effective_block_size = (
-                (self.options.num_warps if self.options else 4) * 32)
+            self.effective_block_size = (self.options.num_warps if self.options else 4) * 32
             self._prescan_stores()
             return msl
 
@@ -951,8 +1046,7 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
         nd_trans_info = self._detect_nd_trans()
         if nd_trans_info:
             msl = self._lower_nd_trans_template(nd_trans_info)
-            self.effective_block_size = (
-                (self.options.num_warps if self.options else 4) * 32)
+            self.effective_block_size = (self.options.num_warps if self.options else 4) * 32
             self._prescan_stores()
             return msl
 
@@ -975,8 +1069,7 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
         pcr_info = self._detect_permute_chained_reduce()
         if pcr_info:
             msl = self._lower_permute_chained_reduce_template(pcr_info)
-            self.effective_block_size = (
-                (self.options.num_warps if self.options else 4) * 32)
+            self.effective_block_size = (self.options.num_warps if self.options else 4) * 32
             self._prescan_stores()
             return msl
 
@@ -1049,13 +1142,22 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
                     yield from _scan_all_ops(s.else_ops)
 
         all_ops_iter = list(_scan_all_ops(self.graph.ops))
-        has_reduce_ops = any(
-            ssa.op == "tt.reduce" for ssa in all_ops_iter
-        )
+        has_reduce_ops = any(ssa.op == "tt.reduce" for ssa in all_ops_iter)
         has_barrier_ops = any(
-            ssa.op in ("tt.reduce", "tt.scan", "tt.debug_barrier", "ttg.barrier",
-                       "tt.trans", "tt.dot", "ttg.local_alloc", "tt.gather",
-                       "tt.cat", "tt.join", "tt.split")
+            ssa.op
+            in (
+                "tt.reduce",
+                "tt.scan",
+                "tt.debug_barrier",
+                "ttg.barrier",
+                "tt.trans",
+                "tt.dot",
+                "ttg.local_alloc",
+                "tt.gather",
+                "tt.cat",
+                "tt.join",
+                "tt.split",
+            )
             for ssa in all_ops_iter
         )
         # Cooperative shared-memory-staging ops (one element per thread). When a
@@ -1065,16 +1167,14 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
         # re-counted each bin num_warps times (re-audit #5 silent-wrong). These two
         # dispatch strategies are mutually exclusive, so the combination refuses.
         _coop_staging_ops = any(
-            ssa.op in ("tt.scan", "tt.trans", "tt.gather", "tt.cat",
-                       "tt.join", "tt.split", "tt.histogram")
+            ssa.op in ("tt.scan", "tt.trans", "tt.gather", "tt.cat", "tt.join", "tt.split", "tt.histogram")
             for ssa in all_ops_iter
         )
         # Multi-value reduces (argmin/argmax) need per-element indices which
         # are incompatible with the multi-pass accumulation loop (the loop
         # variable goes out of scope before the reduce handler runs).
         has_multivalue_reduce = any(
-            ssa.op == "tt.reduce" and ssa.result_ids and len(ssa.result_ids) >= 2
-            for ssa in all_ops_iter
+            ssa.op == "tt.reduce" and ssa.result_ids and len(ssa.result_ids) >= 2 for ssa in all_ops_iter
         )
         num_threads = self.graph.num_warps * 32
 
@@ -1106,8 +1206,7 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
                 return False
             sll = self._resolve_linear_layout(src_t, src_sh)
             dll = self._resolve_linear_layout(s.type_str or "", dst_sh)
-            return (sll is not None and dll is not None
-                    and sll.total_elements == dll.total_elements)
+            return sll is not None and dll is not None and sll.total_elements == dll.total_elements
 
         def _op_mept_ok(s):
             if s.op in _MEPT_SAFE_OPS:
@@ -1116,9 +1215,11 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
                 return _convert_resolves(s)
             return False
 
-        mept_kernel_safe = self.mept_enabled and all(
-            _op_mept_ok(s) for s in all_ops_iter
-        ) and not any(_op_is_fp8(s) for s in all_ops_iter)
+        mept_kernel_safe = (
+            self.mept_enabled
+            and all(_op_mept_ok(s) for s in all_ops_iter)
+            and not any(_op_is_fp8(s) for s in all_ops_iter)
+        )
 
         # Phase 4e: is this kernel eligible for single-pass MEPT *with* a
         # 1-D full reduce? The reduce operand (a per-thread register array)
@@ -1145,10 +1246,8 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
         mept_reduce_eligible = (
             self.mept_enabled
             and any(s.op == "tt.reduce" for s in _top_ops)
-            and all(_op_mept_ok(s) or s.op == "tt.reduce"
-                    for s in _top_ops)
-            and all(_reduce_is_1d_full(s) for s in _top_ops
-                    if s.op == "tt.reduce")
+            and all(_op_mept_ok(s) or s.op == "tt.reduce" for s in _top_ops)
+            and all(_reduce_is_1d_full(s) for s in _top_ops if s.op == "tt.reduce")
             and not any(_op_is_fp8(s) for s in all_ops_iter)
         )
 
@@ -1230,8 +1329,7 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
         mept_arrayform_eligible = (
             self.mept_enabled
             and any(s.op in _CF_OPS for s in _top_ops)
-            and _region_needs_arrays(
-                _top_ops, _tensor_value_ids(_top_ops, _value_is_multi))
+            and _region_needs_arrays(_top_ops, _tensor_value_ids(_top_ops, _value_is_multi))
             and all(_arrayform_op_ok(s) for s in _top_ops)
             and all(_reduce_is_1d_full(r) for r in _all_reduces(_top_ops))
             and not any(_op_is_fp8(s) for s in all_ops_iter)
@@ -1285,10 +1383,7 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
         # ``block_size // num_threads``. The arrayform exact-cover gate must use
         # the SAME count or it disagrees with the codegen (BLOCK=1024 was
         # rejected with size_per_thread=4 even though the array path emits 8).
-        mept_elems_per_thread = (
-            block_size // num_threads
-            if num_threads and block_size % num_threads == 0 else 0
-        )
+        mept_elems_per_thread = block_size // num_threads if num_threads and block_size % num_threads == 0 else 0
         if has_2d_axis_reduce and block_size <= 1024:
             # Skip multipass; use full block_size with one element per thread.
             # _lower_reduce_2d handles the sequential reduction internally.
@@ -1299,6 +1394,7 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
             # The reduce path stores to shared[lid] which needs lid < total,
             # so check that reduce inputs fit within 1024.
             max_reduce_size = 0
+
             def _scan_reduce_sizes(ops):
                 nonlocal max_reduce_size
                 for op in ops:
@@ -1312,6 +1408,7 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
                             max_reduce_size = max(max_reduce_size, rs)
                     if op.region_ops:
                         _scan_reduce_sizes(op.region_ops)
+
             _scan_reduce_sizes(self.graph.ops)
             if max_reduce_size <= 1024:
                 block_size = max(max_reduce_size, 1024)
@@ -1324,9 +1421,11 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
             # block_size with one element per thread.
             pass
         elif size_per_thread > 1 and block_size > num_threads:
-            if (mept_arrayform_eligible
-                    and mept_elems_per_thread > 1
-                    and num_threads * mept_elems_per_thread == block_size):
+            if (
+                mept_arrayform_eligible
+                and mept_elems_per_thread > 1
+                and num_threads * mept_elems_per_thread == block_size
+            ):
                 # MEPT M2 single-pass register-array form for control-flow
                 # kernels. Each thread owns mept_elems_per_thread contiguous
                 # elements as a register array (idx[i] = lid*N + i). The array
@@ -1340,8 +1439,7 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
                 self._total_elements = block_size
                 block_size = num_threads
                 self._mept_single_pass = True
-            elif (mept_reduce_eligible
-                    and num_threads * size_per_thread == block_size):
+            elif mept_reduce_eligible and num_threads * size_per_thread == block_size:
                 # Phase 4e MEPT-reduce single-pass: each thread loads its
                 # ``size_per_thread`` elements as a register array, folds
                 # them to a scalar partial (_mept_reduce_fold), then the
@@ -1360,12 +1458,13 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
                         "dispatches only num_threads threads while the cooperative op "
                         "stages one element per thread, so the staging tail is "
                         "under-computed (silent-wrong). Split into separate kernels "
-                        "or use BLOCK <= num_threads.", op_name="tt.reduce")
+                        "or use BLOCK <= num_threads.",
+                        op_name="tt.reduce",
+                    )
                 use_multipass = True
                 self._total_elements = block_size
                 block_size = num_threads
-            elif (mept_kernel_safe and not has_barrier_ops
-                  and num_threads * size_per_thread == block_size):
+            elif mept_kernel_safe and not has_barrier_ops and num_threads * size_per_thread == block_size:
                 # Phase 4c MEPT single-pass: each of ``num_threads`` threads
                 # owns ``size_per_thread`` contiguous elements via a register
                 # array (idx[i] = lid*N + i). One pass covers the whole tile,
@@ -1393,7 +1492,8 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
                         ">1024 tile: the multipass reduce and one-element-per-thread "
                         "staging are mutually exclusive, so the staging tail is "
                         "under-computed (silent-wrong). Split into separate kernels.",
-                        op_name="tt.reduce")
+                        op_name="tt.reduce",
+                    )
                 use_multipass = True
                 self._total_elements = block_size
                 block_size = 1024
@@ -1407,7 +1507,7 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
         # If the kernel is too large for the generic lowerer (cooperative ops
         # with > 1024 total elements), emit a minimal kernel with UNSUPPORTED
         # so the legacy parser can handle it via prebuilt templates.
-        if getattr(self, '_flash_too_large', False):
+        if getattr(self, "_flash_too_large", False):
             self.kb = KernelBuilder(self.graph.func_name, block_size=block_size)
             self._register_args()
             self.kb.comment("UNSUPPORTED: 2D kernel with cooperative ops exceeds 1024 elements")
@@ -1433,7 +1533,9 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
         else:
             # Standard path: single wrapping loop or no loop
             if self._needs_wrapping:
-                self.kb.raw_line(f"    for (uint _loop_e = lid; _loop_e < {self._total_elements}u; _loop_e += {block_size}u) {{")
+                self.kb.raw_line(
+                    f"    for (uint _loop_e = lid; _loop_e < {self._total_elements}u; _loop_e += {block_size}u) {{"
+                )
 
             # Lower each op
             for ssa in self.graph.ops:
@@ -1468,17 +1570,15 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
         # an over-broad heuristic wrongly forced them to the legacy parser
         # (regressed 106 atomic tests). A truly empty body has zero
         # statement lines; any real kernel has many.
-        graph_has_store = any(
-            op.op in ("tt.store", "tt.atomic_rmw", "tt.atomic_cas")
-            for op in self.graph.ops
-        )
+        graph_has_store = any(op.op in ("tt.store", "tt.atomic_rmw", "tt.atomic_cas") for op in self.graph.ops)
         body_lines = getattr(self.kb, "_body_lines", [])
         body_has_stmt = any(";" in ln for ln in body_lines)
         if graph_has_store and not body_has_stmt:
             self.kb.comment(
                 "UNSUPPORTED: generic lowering produced an empty body for a "
                 "kernel that stores (e.g. an unhandled N-D permute/reduce) — "
-                "falling back to the legacy parser.")
+                "falling back to the legacy parser."
+            )
             msl = self.kb.build()
             msl = _alias_shared_memory(msl)
         return msl
@@ -1567,6 +1667,7 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
                     dots.append(o)
                 if o.region_ops:
                     _find(o.region_ops)
+
         _find(self.graph.ops)
         if len(dots) != 1:
             return False
@@ -1587,9 +1688,16 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
         # is NOT over-refused.
         dot = dots[0]
         _passthrough = {
-            "ttg.convert_layout", "tt.reshape", "tt.trans",
-            "arith.truncf", "arith.extf", "arith.bitcast",
-            "arith.sitofp", "arith.uitofp", "arith.fptosi", "arith.fptoui",
+            "ttg.convert_layout",
+            "tt.reshape",
+            "tt.trans",
+            "arith.truncf",
+            "arith.extf",
+            "arith.bitcast",
+            "arith.sitofp",
+            "arith.uitofp",
+            "arith.fptosi",
+            "arith.fptoui",
             "tt.fp_to_fp",
         }
 
@@ -1606,7 +1714,7 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
         output_id = dot.id
         for top in self.graph.ops:
             if top.region_ops and _region_has(top.region_ops, dot.id):
-                output_id = top.id    # the scf.for loop result carries the accumulator
+                output_id = top.id  # the scf.for loop result carries the accumulator
                 break
 
         _seen = set()
@@ -1620,11 +1728,11 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
                 if _vid not in (_op.operand_ids or []):
                     continue
                 if _op.op == "tt.store":
-                    continue                  # terminal — fine
+                    continue  # terminal — fine
                 if _op.op in _passthrough:
                     _frontier.append(_op.id)  # follow a representation change
                 else:
-                    return True               # integer (or any) output epilogue
+                    return True  # integer (or any) output epilogue
         return False
 
     def _resolve_constant_int(self, ssa_id):
@@ -1666,10 +1774,11 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
                             return "add-rows"
                     # Fallback: use load shape vs dot shape
                     load_shape = _extract_shape(op.type_str)
-                    dot_shape = _extract_shape(
-                        op_map[next(i for i in op_map
-                                    if op_map[i].op == "tt.dot")].type_str
-                    ) if any(op_map[i].op == "tt.dot" for i in op_map) else []
+                    dot_shape = (
+                        _extract_shape(op_map[next(i for i in op_map if op_map[i].op == "tt.dot")].type_str)
+                        if any(op_map[i].op == "tt.dot" for i in op_map)
+                        else []
+                    )
                     if load_shape and dot_shape and len(dot_shape) >= 2:
                         M_dim, N_dim = dot_shape[0], dot_shape[1]
                         load_size = load_shape[0] if len(load_shape) == 1 else max(load_shape)
@@ -1685,10 +1794,16 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
                 return "zero"
 
             # Follow through passthrough ops
-            if op.op in ("ttg.convert_layout", "tt.broadcast",
-                         "tt.expand_dims", "tt.splat",
-                         "arith.extf", "arith.truncf",
-                         "arith.sitofp", "arith.uitofp"):
+            if op.op in (
+                "ttg.convert_layout",
+                "tt.broadcast",
+                "tt.expand_dims",
+                "tt.splat",
+                "arith.extf",
+                "arith.truncf",
+                "arith.sitofp",
+                "arith.uitofp",
+            ):
                 if op.op == "tt.broadcast":
                     has_broadcast = True
                 if op.op == "tt.expand_dims":
@@ -1709,6 +1824,7 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
         Scalar-only kernels (no tensor operations) should use block_size=1
         to avoid multiple threads racing on the same scalar memory locations.
         """
+
         def _check_ops(ops):
             for ssa in ops:
                 if ssa.op in ("tt.make_range", "tt.splat", "tt.broadcast"):
@@ -1720,6 +1836,7 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
                 if ssa.else_ops and _check_ops(ssa.else_ops):
                     return True
             return False
+
         return _check_ops(self.graph.ops)
 
     def _prescan_stores(self):
@@ -1863,11 +1980,11 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
         # Also record expand_dims by parent layout to pair dim=0/dim=1 siblings
         # so each make_range can know its tile's inner dimension.
         # Use an instance-level dict to accumulate across recursive prescan calls.
-        if not hasattr(self, '_expand_by_parent'):
+        if not hasattr(self, "_expand_by_parent"):
             self._expand_by_parent = {}
-        if not hasattr(self, '_make_range_stride_below'):
+        if not hasattr(self, "_make_range_stride_below"):
             self._make_range_stride_below = {}
-        if not hasattr(self, '_make_range_full_shape'):
+        if not hasattr(self, "_make_range_full_shape"):
             self._make_range_full_shape = {}
         expand_by_parent = self._expand_by_parent
 
@@ -1919,7 +2036,7 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
             broadcast_shape = tuple(same_rank) if same_rank else tuple(out_shape)
             self._make_range_full_shape[mr_id] = broadcast_shape
             stride_below = 1
-            for s in broadcast_shape[dim + 1:]:
+            for s in broadcast_shape[dim + 1 :]:
                 stride_below *= s
             self._make_range_stride_below[mr_id] = stride_below
 
@@ -1959,11 +2076,12 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
                     # sizes. The position `dim` is the make_range's axis in
                     # that shape; stride_below = product of broadcast dims
                     # after `dim`.
-                    broadcast_shape = max_2d_shape if (max_2d_shape and
-                        len(max_2d_shape) == len(final_shape)) else final_shape
+                    broadcast_shape = (
+                        max_2d_shape if (max_2d_shape and len(max_2d_shape) == len(final_shape)) else final_shape
+                    )
                     self._make_range_full_shape[mr_id] = broadcast_shape
                     stride_below = 1
-                    for s in broadcast_shape[dim + 1:]:
+                    for s in broadcast_shape[dim + 1 :]:
                         stride_below *= s
                     self._make_range_stride_below[mr_id] = stride_below
 
@@ -1976,6 +2094,7 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
                     elif mr_id in op_by_id and op_by_id[mr_id].type_str:
                         src_type = op_by_id[mr_id].type_str
                     import re as _re
+
                     # Extract the parent layout identifier. The type string
                     # may use aliases (#blocked, #blocked1) or inline defs
                     # (#ttg.blocked<{...}>).  Use a nested-brace-aware match.
@@ -1985,14 +2104,14 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
                         # Find the `=` and the start of the layout spec
                         eq_idx = src_type.find("=", pidx)
                         if eq_idx >= 0:
-                            rest = src_type[eq_idx + 1:].strip()
+                            rest = src_type[eq_idx + 1 :].strip()
                             # Capture everything up to matching `>` or `}`
                             depth = 0
                             end_idx = 0
                             for ci, ch in enumerate(rest):
-                                if ch in ('<', '{', '['):
+                                if ch in ("<", "{", "["):
                                     depth += 1
-                                elif ch in ('>', '}', ']'):
+                                elif ch in (">", "}", "]"):
                                     if depth == 0:
                                         end_idx = ci
                                         break
@@ -2005,12 +2124,11 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
                     range_size = 0
                     if mr_op:
                         range_size = mr_op.attrs.get("end", 0) - mr_op.attrs.get("start", 0)
-                    expand_by_parent.setdefault(parent_key, []).append(
-                        (dim, mr_id, range_size))
+                    expand_by_parent.setdefault(parent_key, []).append((dim, mr_id, range_size))
 
         # For each parent layout, pair dim=0 and dim=1 make_ranges to
         # determine the tile inner dim for dim=0 (row) make_ranges.
-        if not hasattr(self, '_make_range_inner_N'):
+        if not hasattr(self, "_make_range_inner_N"):
             self._make_range_inner_N = {}
         for parent_key, entries in expand_by_parent.items():
             dim0_entries = [(mr_id, rs) for d, mr_id, rs in entries if d == 0]
@@ -2030,12 +2148,13 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
         # This happens in tl.topk M>1: the Z-offset make_range has parent
         # layout for the (M, k) output tile, which is smaller than the block
         # that processes the (M, N) input.
-        if not hasattr(self, '_make_range_store_only'):
+        if not hasattr(self, "_make_range_store_only"):
             self._make_range_store_only = set()
 
         # Build a use map: SSA id -> set of op IDs that use it
         use_of = {}
         all_oplist = []
+
         def _coll(ops):
             for o in ops:
                 all_oplist.append(o)
@@ -2043,6 +2162,7 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
                     _coll(o.region_ops)
                 if o.else_ops:
                     _coll(o.else_ops)
+
         _coll(ops)
         for o in all_oplist:
             if o.operand_ids:
@@ -2052,6 +2172,7 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
         # For each make_range, do a transitive use walk; check if it reaches
         # any tt.load (or tt.gather etc.) as well as any tt.store.
         op_by_id2 = {o.id: o for o in all_oplist}
+
         def _transitive_uses(start_id):
             seen = {start_id}
             stack = [start_id]
@@ -2101,11 +2222,21 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
                 if op.op == "tt.make_range":
                     return current
                 # Follow through passthroughs (first operand)
-                if op.op in ("arith.extsi", "arith.extui", "arith.trunci",
-                              "arith.index_cast", "arith.index_castui",
-                              "arith.sitofp", "arith.uitofp",
-                              "ttg.convert_layout",
-                              "tt.load") and op.operand_ids:
+                if (
+                    op.op
+                    in (
+                        "arith.extsi",
+                        "arith.extui",
+                        "arith.trunci",
+                        "arith.index_cast",
+                        "arith.index_castui",
+                        "arith.sitofp",
+                        "arith.uitofp",
+                        "ttg.convert_layout",
+                        "tt.load",
+                    )
+                    and op.operand_ids
+                ):
                     current = op.operand_ids[0]
                     continue
                 # tt.addptr: follow the offset (second operand) to reach make_range
@@ -2167,6 +2298,7 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
         """Unified RegVal view over env / env_array. Does not change emission;
         callers migrate to this incrementally (MEPT spine, milestone 1)."""
         from triton_msl.codegen.regval import RegVal
+
         if ssa_id in getattr(self, "env_array", {}):
             name, n, ty = self.env_array[ssa_id]
             return RegVal(name=name, n_elems=n, ty=ty, form="array")
@@ -2326,11 +2458,13 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
             # dead -> harmless), so a comment is safe and tolerates dead-code ops.
             if ssa.id is not None and ssa.id < 0:
                 from triton_msl.errors import MetalNonRecoverableError
+
                 raise MetalNonRecoverableError(
                     f"Refusing to emit silently-wrong output: unsupported "
                     f"side-effecting op '{op}' (no result) has no Metal lowering "
                     f"and would be silently dropped, losing its effect. Add a "
-                    f"handler or an explicit refusal for it.")
+                    f"handler or an explicit refusal for it."
+                )
             self.kb.comment(f"UNSUPPORTED: {op}")
 
     # -- Program ID and indexing --
@@ -2410,8 +2544,8 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
             #   3D (M, N, K), dim 0:      stride_below = N*K
             #   3D (M, N, K), dim 1:      stride_below = K
             #   3D (M, N, K), dim 2:      stride_below = 1
-            stride_below_map = getattr(self, '_make_range_stride_below', {})
-            full_shape = getattr(self, '_make_range_full_shape', {}).get(ssa.id)
+            stride_below_map = getattr(self, "_make_range_stride_below", {})
+            full_shape = getattr(self, "_make_range_full_shape", {}).get(ssa.id)
             if ssa.id in stride_below_map and full_shape and len(full_shape) >= 3:
                 stride_below = stride_below_map[ssa.id]
                 if stride_below == 1:
@@ -2425,7 +2559,7 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
                 # For row (dim 0): range covers rows, N = total / range = inner dim
                 # For col (dim 1): range IS the inner dim, N = range_size
                 if dim == 0:
-                    inner_N_map = getattr(self, '_make_range_inner_N', {})
+                    inner_N_map = getattr(self, "_make_range_inner_N", {})
                     if ssa.id in inner_N_map:
                         N = inner_N_map[ssa.id]
                     else:
@@ -2433,9 +2567,8 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
                     # Store-only make_ranges whose tile is smaller than the
                     # kernel's element count: scale inner_N so lid/N still
                     # yields the correct M-index (see tl.topk M>1 case).
-                    store_only = getattr(self, '_make_range_store_only', set())
-                    if (ssa.id in store_only and range_size > 0
-                            and total > range_size * N):
+                    store_only = getattr(self, "_make_range_store_only", set())
+                    if ssa.id in store_only and range_size > 0 and total > range_size * N:
                         N = total // range_size
                     expr = f"{lid} / {N}u"
                 else:
@@ -2494,8 +2627,7 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
         # kernels (where _needs_wrapping is False but the array form is
         # unsupported) or kernels containing unwired ops (select, atomics,
         # shape ops, ...).
-        if (n_per_thread > 1
-                and getattr(self, "_mept_single_pass", False)):
+        if n_per_thread > 1 and getattr(self, "_mept_single_pass", False):
             ll = self.env_layout.get(ssa.id)
             if ll is not None and ll.num_registers_per_thread == n_per_thread:
                 # Compute lane / warp from lid:
@@ -2516,8 +2648,7 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
                         exprs.append(f"(uint)({pos_expr})")
             else:
                 exprs = [
-                    f"{start}u + {lid} * {n_per_thread}u + {i}u" if start != 0
-                    else f"{lid} * {n_per_thread}u + {i}u"
+                    f"{start}u + {lid} * {n_per_thread}u + {i}u" if start != 0 else f"{lid} * {n_per_thread}u + {i}u"
                     for i in range(n_per_thread)
                 ]
             var_name = self._var_array("idx", exprs, "uint")
@@ -2709,8 +2840,7 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
         # Trace the source through passthroughs to find the make_range.
         ops_list = list(self.graph.ops)
         op_by_id = {o.id: o for o in ops_list}
-        mr_id = self._trace_to_make_range(ssa.operand_ids[0], ops_list,
-                                          op_by_id)
+        mr_id = self._trace_to_make_range(ssa.operand_ids[0], ops_list, op_by_id)
         if mr_id is None:
             return False
 
@@ -2743,7 +2873,7 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
             return False
 
         stride_below = 1
-        for s in bcast_shape[dim + 1:]:
+        for s in bcast_shape[dim + 1 :]:
             stride_below *= s
 
         var_name = self._next_var("idx")
@@ -2774,8 +2904,7 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
             # an env_array, record env_ptr_array so tt.load / tt.store
             # can emit per-position accesses. The base pointer is always
             # scalar (one buffer); only the offset varies per array slot.
-            if (self.mept_enabled
-                    and offset_id in self.env_array):
+            if self.mept_enabled and offset_id in self.env_array:
                 offset_arr, n, _ = self.env_array[offset_id]
                 # Chained addptr with array offset: combine with any
                 # existing scalar parent offset.
@@ -2785,31 +2914,20 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
                     base_ptr, parent_arr, parent_n = parent_ptr_array
                     if parent_n == n:
                         # Both array: produce a combined-offset array.
-                        combined_exprs = [
-                            f"{parent_arr}[{i}] + {offset_arr}[{i}]"
-                            for i in range(n)
-                        ]
-                        combined_name = self._var_array(
-                            "off", combined_exprs, "uint")
-                        self.env_ptr_array[ssa.id] = (
-                            base_ptr, combined_name, n)
+                        combined_exprs = [f"{parent_arr}[{i}] + {offset_arr}[{i}]" for i in range(n)]
+                        combined_name = self._var_array("off", combined_exprs, "uint")
+                        self.env_ptr_array[ssa.id] = (base_ptr, combined_name, n)
                         # env[ssa.id] is mostly informational here;
                         # tt.load reads env_ptr_array directly.
-                        self.env[ssa.id] = (
-                            f"{base_ptr}[{combined_name}[0]]")
+                        self.env[ssa.id] = f"{base_ptr}[{combined_name}[0]]"
                         self._propagate_shape_elementwise(ssa)
                         return
                 if parent_ptr_info:
                     base_ptr, existing_offset = parent_ptr_info
-                    combined_exprs = [
-                        f"{existing_offset} + {offset_arr}[{i}]"
-                        for i in range(n)
-                    ]
-                    combined_name = self._var_array(
-                        "off", combined_exprs, "uint")
+                    combined_exprs = [f"{existing_offset} + {offset_arr}[{i}]" for i in range(n)]
+                    combined_name = self._var_array("off", combined_exprs, "uint")
                     self.env_ptr_array[ssa.id] = (base_ptr, combined_name, n)
-                    self.env[ssa.id] = (
-                        f"{base_ptr}[{combined_name}[0]]")
+                    self.env[ssa.id] = f"{base_ptr}[{combined_name}[0]]"
                     self._propagate_shape_elementwise(ssa)
                     return
                 # No parent — base pointer is the operand directly.
@@ -2857,8 +2975,10 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
         if self.mept_enabled and ptr_arr_info is not None:
             dtype = _mlir_to_triton_dtype(ssa.elem_type)
             from triton_msl.codegen.msl_builtins import (
-                is_fp8_type, fp8_to_float_func,
+                is_fp8_type,
+                fp8_to_float_func,
             )
+
             base_ptr, off_arr, n = ptr_arr_info
             is_fp8 = is_fp8_type(dtype)
             if is_fp8:
@@ -2895,8 +3015,7 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
                     if mask_var is None:
                         raw_exprs.append(pos)
                     else:
-                        mask_expr = (f"{mask_var}[{i}]" if mask_is_array
-                                     else mask_var)
+                        mask_expr = f"{mask_var}[{i}]" if mask_is_array else mask_var
                         raw_exprs.append(f"{mask_expr} ? {pos} : uchar(0)")
                 raw_name = self._var_array("raw", raw_exprs, "uchar")
                 # Step 2: convert uchar → float per position. When
@@ -2909,15 +3028,13 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
                     if mask_var is None:
                         val_exprs.append(convert)
                     else:
-                        mask_expr = (f"{mask_var}[{i}]" if mask_is_array
-                                     else mask_var)
+                        mask_expr = f"{mask_var}[{i}]" if mask_is_array else mask_var
                         other_expr = (
                             f"static_cast<float>({other_val}[{i}])"
                             if other_val_is_array
                             else f"static_cast<float>({other_val})"
                         )
-                        val_exprs.append(
-                            f"{mask_expr} ? {convert} : {other_expr}")
+                        val_exprs.append(f"{mask_expr} ? {convert} : {other_expr}")
                 var_name = self._var_array("val", val_exprs, "float")
                 self.env[ssa.id] = var_name
                 self.env_array[ssa.id] = (var_name, n, "float")
@@ -2931,15 +3048,13 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
                 if mask_var is None:
                     exprs.append(loaded)
                     continue
-                mask_expr = (f"{mask_var}[{i}]" if mask_is_array
-                             else mask_var)
+                mask_expr = f"{mask_var}[{i}]" if mask_is_array else mask_var
                 other_expr = (
                     f"static_cast<{compute_type}>({other_val}[{i}])"
                     if other_val_is_array
                     else f"static_cast<{compute_type}>({other_val})"
                 )
-                exprs.append(
-                    f"{mask_expr} ? {loaded} : {other_expr}")
+                exprs.append(f"{mask_expr} ? {loaded} : {other_expr}")
             var_name = self._var_array("val", exprs, compute_type)
             self.env[ssa.id] = var_name
             self.env_array[ssa.id] = (var_name, n, compute_type)
@@ -2965,6 +3080,7 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
 
         # Check if this is an FP8 load — needs software conversion from uchar
         from triton_msl.codegen.msl_builtins import is_fp8_type, fp8_to_float_func
+
         fp8_load = is_fp8_type(dtype)
         if fp8_load:
             zero = "0.0f"  # FP8 computes in float
@@ -2990,22 +3106,13 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
             to_float = fp8_to_float_func(dtype)
             raw_var = self._next_var("raw")
             if mask_var:
+                self.kb.raw_line(f"    uchar {raw_var} = {mask_var} ? {base_ptr}[{offsets}] : uchar(0);")
                 self.kb.raw_line(
-                    f"    uchar {raw_var} = {mask_var} ? "
-                    f"{base_ptr}[{offsets}] : uchar(0);"
-                )
-                self.kb.raw_line(
-                    f"    float {var_name} = {mask_var} ? "
-                    f"{to_float}({raw_var}) : "
-                    f"static_cast<float>({other_val});"
+                    f"    float {var_name} = {mask_var} ? {to_float}({raw_var}) : static_cast<float>({other_val});"
                 )
             else:
-                self.kb.raw_line(
-                    f"    uchar {raw_var} = {base_ptr}[{offsets}];"
-                )
-                self.kb.raw_line(
-                    f"    float {var_name} = {to_float}({raw_var});"
-                )
+                self.kb.raw_line(f"    uchar {raw_var} = {base_ptr}[{offsets}];")
+                self.kb.raw_line(f"    float {var_name} = {to_float}({raw_var});")
         elif mask_var:
             self.kb.raw_line(
                 f"    {compute_type} {var_name} = {mask_var} ? "
@@ -3013,10 +3120,7 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
                 f"static_cast<{compute_type}>({other_val});"
             )
         else:
-            self.kb.raw_line(
-                f"    {compute_type} {var_name} = "
-                f"static_cast<{compute_type}>({base_ptr}[{offsets}]);"
-            )
+            self.kb.raw_line(f"    {compute_type} {var_name} = static_cast<{compute_type}>({base_ptr}[{offsets}]);")
 
         self.env[ssa.id] = var_name
         self.env_types[ssa.id] = dtype
@@ -3061,20 +3165,27 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
         ptr_arr_info = self.env_ptr_array.get(ptr_id)
         val_arr_info = self.env_array.get(val_id)
         val_is_splat = val_id in self._is_splat
-        if (self.mept_enabled and ptr_arr_info is not None
-                and ((val_arr_info is not None
-                      and ptr_arr_info[2] == val_arr_info[1])
-                     or (val_arr_info is None and val_is_splat))):
+        if (
+            self.mept_enabled
+            and ptr_arr_info is not None
+            and (
+                (val_arr_info is not None and ptr_arr_info[2] == val_arr_info[1])
+                or (val_arr_info is None and val_is_splat)
+            )
+        ):
             base_ptr, off_arr, n = ptr_arr_info
             if val_arr_info is not None:
                 _val_arr = val_arr_info[0]
+
                 def _mept_val_at(i, _a=_val_arr):
                     return f"{_a}[{i}]"
             else:
                 # Splat/constant: same scalar written to every MEPT position.
                 _splat_val = self._lookup(val_id)
+
                 def _mept_val_at(i, _v=_splat_val):
                     return _v
+
             # Optional mask is the third operand if present.
             mask_var = None
             mask_is_array = False
@@ -3104,13 +3215,12 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
                 if mask_var is None:
                     self.kb.raw_line(f"    {write}")
                 else:
-                    cond = (f"{mask_var}[{i}]" if mask_is_array
-                            else mask_var)
+                    cond = f"{mask_var}[{i}]" if mask_is_array else mask_var
                     self.kb.raw_line(f"    if ({cond}) {{ {write} }}")
             return
 
         # Check if the value to store is smem-backed with total > block_size
-        smem_descs = getattr(self, '_shared_mem_descs', {})
+        smem_descs = getattr(self, "_shared_mem_descs", {})
         val_smem = smem_descs.get(val_id)
         if val_smem is None:
             # The store value may be a dtype CAST / layout convert of a smem-backed
@@ -3125,10 +3235,19 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
             # to the output pointer dtype, so the narrowing is preserved. Do NOT
             # rebind val_id (the total<=block_size flat path needs the cast value).
             # Re-audit 2026-06-27.
-            _FOLLOW = {"ttg.convert_layout", "arith.truncf", "arith.extf",
-                       "tt.fp_to_fp", "arith.sitofp", "arith.uitofp",
-                       "arith.fptosi", "arith.fptoui", "arith.trunci",
-                       "arith.extsi", "arith.extui"}
+            _FOLLOW = {
+                "ttg.convert_layout",
+                "arith.truncf",
+                "arith.extf",
+                "tt.fp_to_fp",
+                "arith.sitofp",
+                "arith.uitofp",
+                "arith.fptosi",
+                "arith.fptoui",
+                "arith.trunci",
+                "arith.extsi",
+                "arith.extui",
+            }
 
             def _flat_ops(ops):
                 for o in ops:
@@ -3137,6 +3256,7 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
                         yield from _flat_ops(o.region_ops)
                     if o.else_ops:
                         yield from _flat_ops(o.else_ops)
+
             _by_id = {o.id: o for o in _flat_ops(self.graph.ops)}
             _cur = val_id
             for _ in range(8):
@@ -3184,11 +3304,11 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
                                 yield from _all_ops(o.region_ops)
                             if o.else_ops:
                                 yield from _all_ops(o.else_ops)
+
                     all_ops = list(_all_ops(self.graph.ops))
                     op_by_id = {o.id: o for o in all_ops}
 
-                    new_offset = self._rebuild_staged_fill_offset(
-                        ptr_id, op_by_id, base_ptr, M, N)
+                    new_offset = self._rebuild_staged_fill_offset(ptr_id, op_by_id, base_ptr, M, N)
 
                     # Masked over-threadgroup store: reconstruct the per-element
                     # mask STRUCTURALLY via the same term-walk (row/col bounds
@@ -3198,16 +3318,11 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
                     # `(_fill_row + r_8) < N_CTX`. Unresolvable masks refuse.
                     mask_expr = None
                     if mask_id is not None:
-                        mask_expr = self._rebuild_staged_fill_mask(
-                            mask_id, op_by_id, M, N)
+                        mask_expr = self._rebuild_staged_fill_mask(mask_id, op_by_id, M, N)
 
-                    self.kb.raw_line(
-                        f"    for (uint _st = lid; _st < {val_total}u; "
-                        f"_st += {bs}u) {{")
-                    self.kb.raw_line(
-                        f"        uint _fill_row = _st / {N}u;")
-                    self.kb.raw_line(
-                        f"        uint _fill_col = _st % {N}u;")
+                    self.kb.raw_line(f"    for (uint _st = lid; _st < {val_total}u; _st += {bs}u) {{")
+                    self.kb.raw_line(f"        uint _fill_row = _st / {N}u;")
+                    self.kb.raw_line(f"        uint _fill_col = _st % {N}u;")
 
                     store_val = f"{smem_name}[_st]"
                     store_dtype = self._trace_ptr_dtype(ptr_id)
@@ -3217,12 +3332,9 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
                         store_val = f"static_cast<{store_type}>({store_val})"
 
                     if mask_expr is not None:
-                        self.kb.raw_line(
-                            f"        if ({mask_expr}) "
-                            f"{base_ptr}[{new_offset}] = {store_val};")
+                        self.kb.raw_line(f"        if ({mask_expr}) {base_ptr}[{new_offset}] = {store_val};")
                     else:
-                        self.kb.raw_line(
-                            f"        {base_ptr}[{new_offset}] = {store_val};")
+                        self.kb.raw_line(f"        {base_ptr}[{new_offset}] = {store_val};")
                     self.kb.raw_line(f"    }}")
                     return
 
@@ -3233,10 +3345,14 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
         # the row offset from addptr, and using base_ptr[idx] would lose it.
         ptr_shape = self.env_shapes.get(ptr_id)
         val_shape = self.env_shapes.get(val_id)
-        if (self._is_2d and ptr_shape and len(ptr_shape) == 2
-                and (ptr_shape[0] == 1 or ptr_shape[1] == 1)
-                and ptr_shape[0] != ptr_shape[1]
-                and ptr_shape[0] != 1):
+        if (
+            self._is_2d
+            and ptr_shape
+            and len(ptr_shape) == 2
+            and (ptr_shape[0] == 1 or ptr_shape[1] == 1)
+            and ptr_shape[0] != ptr_shape[1]
+            and ptr_shape[0] != 1
+        ):
             result_size = max(ptr_shape)
             ptr_info = self.env_is_ptr.get(ptr_id)
             if ptr_info:
@@ -3257,8 +3373,7 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
             if self._effective_2d_shape and len(self._effective_2d_shape) == 2:
                 inner_N = self._effective_2d_shape[1]
                 guard_size = result_size * inner_N
-            self.kb.raw_line(
-                f"    if ({idx} < {guard_size}u) {base_ptr}[{offsets}] = {cast_val};")
+            self.kb.raw_line(f"    if ({idx} < {guard_size}u) {base_ptr}[{offsets}] = {cast_val};")
             return
 
         # Refuse a BLOCK-wide tensor store the base path can only emit as one
@@ -3272,18 +3387,22 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
         # num_threads == BLOCK (n=1), or reduce BLOCK.
         _val_shape = self.env_shapes.get(val_id)
         _num_threads = self.kb.block_size
-        if (not self._mept_single_pass
-                and not self._needs_wrapping
-                and _val_shape is not None
-                and len(_val_shape) >= 1
-                and _val_shape[0] > _num_threads):
+        if (
+            not self._mept_single_pass
+            and not self._needs_wrapping
+            and _val_shape is not None
+            and len(_val_shape) >= 1
+            and _val_shape[0] > _num_threads
+        ):
             from triton_msl.errors import MetalNonRecoverableError
+
             raise MetalNonRecoverableError(
                 f"Refusing a {_val_shape[0]}-element tensor store with only "
                 f"{_num_threads} threads: the base path stores one element per "
                 f"thread, so a tile wider than the threadgroup would silently "
                 f"drop the rest. Launch with num_warps = BLOCK/32 (so "
-                f"num_threads == BLOCK), or reduce BLOCK.")
+                f"num_threads == BLOCK), or reduce BLOCK."
+            )
 
         ptr_info = self.env_is_ptr.get(ptr_id)
         if ptr_info:
@@ -3315,7 +3434,7 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
         # shared memory redistribution. If so, all 1D stores in this kernel
         # should use simple lid < N guards because the convert_layout
         # changed the thread-to-element mapping to simple (thread i = element i).
-        val_converted = hasattr(self, '_converted_layout_ids') and bool(getattr(self, '_converted_layout_ids', set()))
+        val_converted = hasattr(self, "_converted_layout_ids") and bool(getattr(self, "_converted_layout_ids", set()))
         if self._is_2d and not self._is_scalar_ptr(ptr_id):
             store_shape = self.env_shapes.get(ptr_id)
             if not store_shape:
@@ -3336,8 +3455,7 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
                 # broadcast uses lid / N (blocked). Fix: use lid / N as the
                 # store index and select one thread per row block.
                 shape = self._effective_2d_shape
-                if (shape and len(shape) >= 2 and store_1d_guard == shape[0]
-                        and shape[1] > 0):
+                if shape and len(shape) >= 2 and store_1d_guard == shape[0] and shape[1] > 0:
                     N = shape[1]
                     offsets = f"({lid} / {N}u)"
                     guard = f"{lid} % {N}u == 0u && {lid} / {N}u < {store_1d_guard}u"
@@ -3358,6 +3476,7 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
         If store_dtype is not FP8, returns a regular static_cast or passthrough.
         """
         from triton_msl.codegen.msl_builtins import is_fp8_type, fp8_from_float_func
+
         if is_fp8_type(store_dtype):
             self._inject_fp8_device_functions(store_dtype)
             return f"{fp8_from_float_func(store_dtype)}({val_var})"
@@ -3370,7 +3489,8 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
     def _inject_fp8_device_functions(self, dtype: str):
         """Inject FP8 conversion device functions into the kernel builder."""
         from triton_msl.codegen.msl_builtins import fp8_device_functions
-        if not hasattr(self, '_fp8_injected'):
+
+        if not hasattr(self, "_fp8_injected"):
             self._fp8_injected = set()
         if dtype not in self._fp8_injected:
             self._fp8_injected.add(dtype)
@@ -3471,22 +3591,14 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
             # matching width (not always f32) to correctly recover NaN/Inf.
             try:
                 if ssa.elem_type == "f64":
-                    float_val = _struct.unpack(
-                        '<d', _struct.pack('<Q', value & 0xFFFFFFFFFFFFFFFF)
-                    )[0]
+                    float_val = _struct.unpack("<d", _struct.pack("<Q", value & 0xFFFFFFFFFFFFFFFF))[0]
                 elif ssa.elem_type == "f16":
-                    float_val = _struct.unpack(
-                        '<e', _struct.pack('<H', value & 0xFFFF)
-                    )[0]
+                    float_val = _struct.unpack("<e", _struct.pack("<H", value & 0xFFFF))[0]
                 elif ssa.elem_type == "bf16":
                     # bfloat16: upper 16 bits of an f32 bit pattern
-                    float_val = _struct.unpack(
-                        '<f', _struct.pack('<I', (value & 0xFFFF) << 16)
-                    )[0]
+                    float_val = _struct.unpack("<f", _struct.pack("<I", (value & 0xFFFF) << 16))[0]
                 else:  # f32
-                    float_val = _struct.unpack(
-                        '<f', _struct.pack('<I', value & 0xFFFFFFFF)
-                    )[0]
+                    float_val = _struct.unpack("<f", _struct.pack("<I", value & 0xFFFFFFFF))[0]
             except _struct.error:
                 float_val = 0.0
 
@@ -3509,9 +3621,7 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
             return
 
         # Determine type and format
-        if (isinstance(value, bool)
-                or (isinstance(value, str) and value in ("true", "false"))
-                or ssa.elem_type == "i1"):
+        if isinstance(value, bool) or (isinstance(value, str) and value in ("true", "false")) or ssa.elem_type == "i1":
             # i1 must render as 0/1 (or true/false). An i1 all-ones constant arrives as
             # the integer -1 (or "-1"); the int path below would emit it verbatim, and
             # `mask ^ -1` (bool NOT via arith.xori) is then ALWAYS truthy — re-audit #10:
@@ -3704,9 +3814,7 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
                 if lay == b_lay and (b_shape is None or _shape_numel(shape) > _shape_numel(b_shape)):
                     b_shape = shape
             if a_shape is not None and b_shape is not None:
-                self._bcast_layout[ssa.id] = (
-                    a_lay if _shape_numel(a_shape) >= _shape_numel(b_shape) else b_lay
-                )
+                self._bcast_layout[ssa.id] = a_lay if _shape_numel(a_shape) >= _shape_numel(b_shape) else b_lay
             else:
                 self._bcast_layout[ssa.id] = a_lay
             return
@@ -3742,6 +3850,7 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
             return True
         # Check operand types
         from triton_msl.codegen.msl_builtins import is_fp8_type
+
         for op_id in ssa.operand_ids[:2]:
             dtype = self.env_types.get(op_id)
             if dtype and (dtype.startswith("fp") or dtype in ("bf16",) or is_fp8_type(dtype)):
@@ -3763,15 +3872,10 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
         propagate = ssa.attrs.get("propagateNan", "none")
         if propagate == "all":
             # NaN-propagating: if x is NaN, result is NaN
-            self.kb.raw_line(
-                f"    float {var_name} = isnan({x}) "
-                f"? NAN : fmin(fmax({x}, {lo}), {hi});"
-            )
+            self.kb.raw_line(f"    float {var_name} = isnan({x}) ? NAN : fmin(fmax({x}, {lo}), {hi});")
         else:
             # NaN-quiet: standard clamp
-            self.kb.raw_line(
-                f"    float {var_name} = fmin(fmax({x}, {lo}), {hi});"
-            )
+            self.kb.raw_line(f"    float {var_name} = fmin(fmax({x}, {lo}), {hi});")
         self.env[ssa.id] = var_name
         self.env_types[ssa.id] = "fp32"
         # Shape: clamp is element-wise
@@ -3825,18 +3929,21 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
 
         # Mapping from Triton float dtype -> MSL type name
         _FP_DTYPE_TO_MSL = {
-            "fp16": "half", "fp32": "float", "bf16": "bfloat", "fp64": "double",
-            "f16": "half", "f32": "float", "f64": "double",
+            "fp16": "half",
+            "fp32": "float",
+            "bf16": "bfloat",
+            "fp64": "double",
+            "f16": "half",
+            "f32": "float",
+            "f64": "double",
         }
         _FP_ELEM_TO_MSL = {"f16": "half", "bf16": "bfloat", "f32": "float", "f64": "double"}
         _FP_ELEM_TO_DTYPE = {"f16": "fp16", "bf16": "bf16", "f32": "fp32", "f64": "fp64"}
 
         # Width mapping for MSL types
         _FP_WIDTH = {"half": 16, "bfloat": 16, "float": 32, "double": 64}
-        _INT_WIDTH_FROM_DTYPE = {"i8": 8, "i16": 16, "i32": 32, "i64": 64,
-                                 "u8": 8, "u16": 16, "u32": 32, "u64": 64}
-        _INT_MSL_FROM_WIDTH = {8: ("char", "i8"), 16: ("short", "i16"),
-                               32: ("int", "i32"), 64: ("long", "i64")}
+        _INT_WIDTH_FROM_DTYPE = {"i8": 8, "i16": 16, "i32": 32, "i64": 64, "u8": 8, "u16": 16, "u32": 32, "u64": 64}
+        _INT_MSL_FROM_WIDTH = {8: ("char", "i8"), 16: ("short", "i16"), 32: ("int", "i32"), 64: ("long", "i64")}
 
         if src_is_float and dst_is_int:
             # float -> int bitcast. MSL as_type requires matching widths, so
@@ -3880,8 +3987,7 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
             # the width-matching float type and cast if widths differ.
             src_int_width = _INT_WIDTH_FROM_DTYPE.get(src_dtype, 32)
             # Find matching float type by width
-            _WIDTH_TO_FP = {16: ("half", "fp16"), 32: ("float", "fp32"),
-                            64: ("double", "fp64")}
+            _WIDTH_TO_FP = {16: ("half", "fp16"), 32: ("float", "fp32"), 64: ("double", "fp64")}
             dst_msl_fp = _FP_ELEM_TO_MSL.get(dst_elem, "float")
             dst_width = _FP_WIDTH.get(dst_msl_fp, 32)
             dst_dtype_name = _FP_ELEM_TO_DTYPE.get(dst_elem, "fp32")
@@ -3957,9 +4063,7 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
             to_func = fp8_to_float_func(dst_dtype)
             # Convert to fp8 encoding and back to float (the actual fp8 byte
             # is materialized at the store boundary when writing to uchar buffer)
-            self.kb.raw_line(
-                f"    float {var_name} = {to_func}({from_func}(static_cast<float>({src_var})));"
-            )
+            self.kb.raw_line(f"    float {var_name} = {to_func}({from_func}(static_cast<float>({src_var})));")
             self.env[ssa.id] = var_name
             self.env_types[ssa.id] = dst_dtype
         elif is_fp8_type(src_dtype) and is_fp8_type(dst_dtype):
@@ -3969,9 +4073,7 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
             var_name = self._next_var("fp8")
             from_func = fp8_from_float_func(dst_dtype)
             to_func = fp8_to_float_func(dst_dtype)
-            self.kb.raw_line(
-                f"    float {var_name} = {to_func}({from_func}(static_cast<float>({src_var})));"
-            )
+            self.kb.raw_line(f"    float {var_name} = {to_func}({from_func}(static_cast<float>({src_var})));")
             self.env[ssa.id] = var_name
             self.env_types[ssa.id] = dst_dtype
         elif rounding == "rtz" and src_dtype == "fp32" and dst_dtype in ("fp16", "bf16"):
@@ -4001,20 +4103,14 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
             # where the mask trick is insufficient).
             self.kb.raw_line(f"    float {back_var} = static_cast<float>({cand_var});")
             # If |back| > |orig| and orig is finite, nudge toward zero by 1 ULP.
-            self.kb.raw_line(
-                f"    bool {adj_var} = isfinite({f32_var}) && (fabs({back_var}) > fabs({f32_var}));"
-            )
+            self.kb.raw_line(f"    bool {adj_var} = isfinite({f32_var}) && (fabs({back_var}) > fabs({f32_var}));")
             # Compute one-ULP-nudge toward zero. IEEE 754 bit patterns grow
             # in magnitude with the float's magnitude on each side of zero;
             # in two's-complement representation of the underlying short,
             # decrementing reduces magnitude regardless of sign (e.g. f16
             # 0xC000 = -2.0 → 0xBFFF = -1.999, magnitude shrinks toward 0).
-            self.kb.raw_line(
-                f"    short {adj_bits} = as_type<short>({cand_var});"
-            )
-            self.kb.raw_line(
-                f"    {adj_bits} = {adj_var} ? (short)({adj_bits} - 1) : {adj_bits};"
-            )
+            self.kb.raw_line(f"    short {adj_bits} = as_type<short>({cand_var});")
+            self.kb.raw_line(f"    {adj_bits} = {adj_var} ? (short)({adj_bits} - 1) : {adj_bits};")
             self.kb.raw_line(f"    {dst_msl} {out_var} = as_type<{dst_msl}>({adj_bits});")
             self.env[ssa.id] = out_var
             self.env_types[ssa.id] = dst_dtype
@@ -4035,6 +4131,7 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
         src_id = ssa.operand_ids[0]
         src_dtype = self.env_types.get(src_id, "fp32")
         from triton_msl.codegen.msl_builtins import is_fp8_type, fp8_to_float_func
+
         if is_fp8_type(src_dtype):
             # FP8 → float: the load already converted to float, so this is a passthrough.
             # However, if the source is a raw uchar (from bitcast or constant), convert.
@@ -4060,6 +4157,7 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
         dst_elem = ssa.elem_type or "f16"
         dst_dtype = _mlir_to_triton_dtype(dst_elem)
         from triton_msl.codegen.msl_builtins import is_fp8_type, fp8_from_float_func, fp8_to_float_func
+
         if is_fp8_type(dst_dtype):
             # FP32 → FP8: emit conversion call
             src_var = self._lookup(ssa.operand_ids[0])
@@ -4069,14 +4167,11 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
             to_func = fp8_to_float_func(dst_dtype)
             # Convert to fp8 and immediately back to float for further computation
             # The actual fp8 encoding is stored at the store boundary
-            self.kb.raw_line(
-                f"    float {var_name} = {to_func}({from_func}(static_cast<float>({src_var})));"
-            )
+            self.kb.raw_line(f"    float {var_name} = {to_func}({from_func}(static_cast<float>({src_var})));")
             self.env[ssa.id] = var_name
             self.env_types[ssa.id] = dst_dtype
         else:
-            narrow = ("half" if dst_dtype in ("fp16", "f16")
-                      else "bfloat" if dst_dtype in ("bf16",) else None)
+            narrow = "half" if dst_dtype in ("fp16", "f16") else "bfloat" if dst_dtype in ("bf16",) else None
             # Quantize when the source is a SCALAR float (the static_cast round-trip
             # is valid MSL). That covers BOTH the pure one-element-per-thread kernel
             # AND the wrap-loop body (where the value is scalar-shaped per iteration,
@@ -4085,8 +4180,9 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
             # _mept_single_pass / env_n_elems>1 (that array case is a documented
             # per-element follow-up). The earlier `not _needs_wrapping` over-excluded
             # the wrap-loop and left `.to(fp16)` un-quantized for large N (re-audit #2).
-            _scalar_mode = (not getattr(self, "_mept_single_pass", False)
-                            and self.env_n_elems.get(ssa.operand_ids[0], 1) == 1)
+            _scalar_mode = (
+                not getattr(self, "_mept_single_pass", False) and self.env_n_elems.get(ssa.operand_ids[0], 1) == 1
+            )
             if narrow is not None and _scalar_mode:
                 # SCALAR fp32->fp16/bf16: round-trip narrow->wide so the VALUE
                 # actually quantizes (e.g. 2049.0 -> 2048.0) while the register
@@ -4096,9 +4192,7 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
                 # precision — 2026-06-22 re-audit silent-wrong.)
                 src_var = self._lookup(ssa.operand_ids[0])
                 var_name = self._next_var("truncf")
-                self.kb.raw_line(
-                    f"    float {var_name} = "
-                    f"static_cast<float>(static_cast<{narrow}>({src_var}));")
+                self.kb.raw_line(f"    float {var_name} = static_cast<float>(static_cast<{narrow}>({src_var}));")
                 self.env[ssa.id] = var_name
             elif narrow is not None and ssa.operand_ids[0] in self.env_array:
                 # MEPT single-pass ARRAY form: the source is a per-thread register
@@ -4107,8 +4201,7 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
                 # precision, exactly as in the scalar path. (Was a passthrough that
                 # dropped quantization for large array kernels — re-audit #3 silent-wrong.)
                 _src_name, _n, _ = self.env_array[ssa.operand_ids[0]]
-                _exprs = [f"static_cast<float>(static_cast<{narrow}>({_src_name}[{_i}]))"
-                          for _i in range(_n)]
+                _exprs = [f"static_cast<float>(static_cast<{narrow}>({_src_name}[{_i}]))" for _i in range(_n)]
                 _arr = self._var_array("truncf", _exprs, "float")
                 self.env[ssa.id] = _arr
                 self.env_array[ssa.id] = (_arr, _n, "float")
@@ -4156,6 +4249,7 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
         # operand is 64-bit; ``eq``/``ne`` (no cast) were already width-safe.
         def _is64(oid):
             return self.env_types.get(oid) in ("i64", "u64", "ui64")
+
         wide64 = _is64(ssa.operand_ids[0]) or _is64(ssa.operand_ids[1])
         s_cast = "(long)" if wide64 else "(int)"
         u_cast = "(ulong)" if wide64 else "(uint)"
@@ -4165,17 +4259,19 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
         # downstream consumers (tt.load mask, tt.store mask, arith.andi
         # on i1) read it as an env_array.
         if is_unsigned:
+
             def _make_expr(av, bv, _op=op_str):
                 return f"{u_cast}{av} {_op} {u_cast}{bv}"
         elif is_signed:
+
             def _make_expr(av, bv, _op=op_str):
                 return f"{s_cast}{av} {_op} {s_cast}{bv}"
         else:
+
             def _make_expr(av, bv, _op=op_str):
                 return f"{av} {_op} {bv}"
-        if self._mept_binary_dispatch(
-                ssa, ssa.operand_ids[0], ssa.operand_ids[1], a, b,
-                _make_expr, "bool", "i1"):
+
+        if self._mept_binary_dispatch(ssa, ssa.operand_ids[0], ssa.operand_ids[1], a, b, _make_expr, "bool", "i1"):
             # _mept_binary_dispatch set env / env_array; mark as mask.
             self.env_is_mask[ssa.id] = True
             return
@@ -4237,9 +4333,7 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
             return f"{av} < {bv}"
 
         # MEPT array path: if either operand is a register array, emit bool[N].
-        if self._mept_binary_dispatch(
-                ssa, ssa.operand_ids[0], ssa.operand_ids[1], a, b,
-                _expr, "bool", "i1"):
+        if self._mept_binary_dispatch(ssa, ssa.operand_ids[0], ssa.operand_ids[1], a, b, _expr, "bool", "i1"):
             self.env_is_mask[ssa.id] = True
             return
 
@@ -4306,8 +4400,8 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
         # per-element select and return. Scalar/flag-off select falls through
         # to the byte-identical scalar emission below.
         if self._mept_select_dispatch(
-                ssa, ssa.operand_ids[0], ssa.operand_ids[1],
-                ssa.operand_ids[2], cond, true_val, false_val, ty, dtype):
+            ssa, ssa.operand_ids[0], ssa.operand_ids[1], ssa.operand_ids[2], cond, true_val, false_val, ty, dtype
+        ):
             return
 
         self.kb.raw_line(f"    {ty} {var_name} = {cond} ? {true_val} : {false_val};")
@@ -4390,11 +4484,7 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
                 # Phase 4b: ternary MEPT — require all-or-nothing array
                 # form. If any operand is an array, all three must be
                 # arrays of the same length (or scalar to broadcast).
-                if self.mept_enabled and (
-                    a_id in self.env_array
-                    or b_id in self.env_array
-                    or c_id in self.env_array
-                ):
+                if self.mept_enabled and (a_id in self.env_array or b_id in self.env_array or c_id in self.env_array):
                     a = self._lookup(a_id)
                     b = self._lookup(b_id)
                     c = self._lookup(c_id)
@@ -4402,14 +4492,13 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
                     ns = [arr[1] for arr in arrs if arr is not None]
                     n = ns[0] if ns else 1
                     if all((arr is None or arr[1] == n) for arr in arrs):
+
                         def _read(i, sid, scalar):
                             arr = self.env_array.get(sid)
                             return f"{arr[0]}[{i}]" if arr else scalar
+
                         exprs = [
-                            f"fma({_read(i, a_id, a)}, "
-                            f"{_read(i, b_id, b)}, "
-                            f"{_read(i, c_id, c)})"
-                            for i in range(n)
+                            f"fma({_read(i, a_id, a)}, {_read(i, b_id, b)}, {_read(i, c_id, c)})" for i in range(n)
                         ]
                         var_name = self._var_array("r", exprs, "float")
                         self.env[ssa.id] = var_name
@@ -4444,29 +4533,25 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
 
         elif op in ("math.powf", "math.copysign", "math.atan2"):
             if len(ssa.operand_ids) >= 2:
-                bin_fn = {"math.powf": "pow",
-                          "math.copysign": "copysign",
-                          "math.atan2": "atan2"}[op]
+                bin_fn = {"math.powf": "pow", "math.copysign": "copysign", "math.atan2": "atan2"}[op]
                 a_id, b_id = ssa.operand_ids[0], ssa.operand_ids[1]
                 a = self._lookup(a_id)
                 b = self._lookup(b_id)
+
                 # Phase 4b: MEPT array path via shared dispatcher.
                 def _make_expr(av, bv, _fn=bin_fn):
                     return f"{_fn}({av}, {bv})"
-                if self._mept_binary_dispatch(
-                        ssa, a_id, b_id, a, b, _make_expr,
-                        "float", "fp32"):
+
+                if self._mept_binary_dispatch(ssa, a_id, b_id, a, b, _make_expr, "float", "fp32"):
                     return
                 var_name = self._next_var("r")
-                self.kb.raw_line(
-                    f"    float {var_name} = {bin_fn}({a}, {b});")
+                self.kb.raw_line(f"    float {var_name} = {bin_fn}({a}, {b});")
                 self.env[ssa.id] = var_name
                 self.env_types[ssa.id] = "fp32"
 
         elif op in ("math.roundeven", "math.trunc"):
             # Both are simple unary float ops with a different MSL name.
-            un_fn = {"math.roundeven": "rint",
-                     "math.trunc": "trunc"}[op]
+            un_fn = {"math.roundeven": "rint", "math.trunc": "trunc"}[op]
             src_id = ssa.operand_ids[0]
             if self.mept_enabled and src_id in self.env_array:
                 src_name, n, _ = self.env_array[src_id]
@@ -4637,7 +4722,9 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
                     f"permutation {order} is not supported by the generic "
                     "lowerer (only 2-D transpose is). Refusing rather than "
                     "dropping the permutation and returning wrong output "
-                    "(e.g. test_trans_4d).", op_name="tt.trans")
+                    "(e.g. test_trans_4d).",
+                    op_name="tt.trans",
+                )
 
         if len(src_shape) < 2 or not self._is_2d:
             # 1D or unknown — passthrough
@@ -4663,7 +4750,8 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
                 f"{_TG_MAX}-thread threadgroup: the shared-memory transpose maps one "
                 f"element per thread, so elements past {_TG_MAX} would be left "
                 f"untransposed (silent-wrong). Use a tile with M*N <= {_TG_MAX}.",
-                op_name="tt.trans")
+                op_name="tt.trans",
+            )
 
         # Determine types
         input_dtype = self.env_types.get(src_id, "fp32")
@@ -4698,10 +4786,7 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
         # After transpose, output position (i, j) = source (j, i).
         # Output is N×M. Thread lid in output maps to (lid/M, lid%M).
         # We want source value at (lid%M, lid/M) = source[(lid%M)*N + (lid/M)].
-        self.kb.raw_line(
-            f"    {msl_type} {result_var} = {shared_name}["
-            f"(lid % {M}u) * {N}u + (lid / {M}u)];"
-        )
+        self.kb.raw_line(f"    {msl_type} {result_var} = {shared_name}[(lid % {M}u) * {N}u + (lid / {M}u)];")
 
         self.env[ssa.id] = result_var
         self.env_types[ssa.id] = input_dtype
@@ -4766,8 +4851,8 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
         # a hard refusal, never a guess.
         def _refuse(field):
             raise MetalNonRecoverableError(
-                f"FlashAttention recognized but {field} could not be resolved; "
-                f"refusing rather than guess")
+                f"FlashAttention recognized but {field} could not be resolved; refusing rather than guess"
+            )
 
         op_by_id = {}
 
@@ -4778,6 +4863,7 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
                     _collect(s.region_ops)
                 if s.else_ops:
                     _collect(s.else_ops)
+
         _collect(self.graph.ops)
 
         arg_by_id = {a.id: a for a in self.graph.args}
@@ -4883,8 +4969,7 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
                 return None
             row_stride = _stride_from_index_term(rop.operand_ids[1])
             splat_base = op_by_id.get(rop.operand_ids[0])
-            if splat_base is None or splat_base.op != "tt.splat" \
-                    or not splat_base.operand_ids:
+            if splat_base is None or splat_base.op != "tt.splat" or not splat_base.operand_ids:
                 return None
             # scalar chain: addptr([addptr(PTR, muli(off_z, SZ))], muli(off_h, SH))
             # (2-level), or addptr(PTR, muli(off_hz, SZ)) (1-level, when off_h*SH
@@ -4902,8 +4987,7 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
                 z_stride = outer_stride
                 h_stride = C1
                 base = inner_arg
-            elif inner is not None and inner.op == "tt.addptr" \
-                    and len(inner.operand_ids) >= 2:
+            elif inner is not None and inner.op == "tt.addptr" and len(inner.operand_ids) >= 2:
                 # 2-level: addptr(addptr(PTR, muli(off_z,SZ)), muli(off_h,SH)).
                 z_stride = _scalar_stride_from_muli(inner.operand_ids[1])
                 h_stride = outer_stride
@@ -4925,9 +5009,11 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
             # stride (strides[3]) IS legitimately C1 (contiguous innermost stride).
             if strides[2] == C1:
                 from triton_msl.errors import MetalNonRecoverableError
+
                 raise MetalNonRecoverableError(
                     "FlashAttention row stride resolved to 1; expected head_dim "
-                    "— refusing rather than risk wrong addressing")
+                    "— refusing rather than risk wrong addressing"
+                )
             return base.index, strides
 
         def _load_addr_for_dot_operand(operand_id, _depth=0):
@@ -4952,10 +5038,20 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
             while sid in op_by_id and sid not in seen:
                 seen.add(sid)
                 op = op_by_id[sid]
-                if op.op in ("ttg.local_load", "ttg.local_alloc",
-                             "ttg.memdesc_trans", "tt.trans", "tt.reshape",
-                             "ttg.convert_layout",
-                             "arith.extf", "arith.truncf") and op.operand_ids:
+                if (
+                    op.op
+                    in (
+                        "ttg.local_load",
+                        "ttg.local_alloc",
+                        "ttg.memdesc_trans",
+                        "tt.trans",
+                        "tt.reshape",
+                        "ttg.convert_layout",
+                        "arith.extf",
+                        "arith.truncf",
+                    )
+                    and op.operand_ids
+                ):
                     sid = op.operand_ids[0]
                     continue
                 if op.op == "tt.load" and op.operand_ids:
@@ -5008,9 +5104,14 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
         qk_out_shape = _extract_shape(dot_qk.type_str or "")
         # dot 1 (P@V): result = [block_m, head_dim].
         pv_out_shape = _extract_shape(dot_pv.type_str or "")
-        if (not a_shape or len(a_shape) != 2
-                or not qk_out_shape or len(qk_out_shape) != 2
-                or not pv_out_shape or len(pv_out_shape) != 2):
+        if (
+            not a_shape
+            or len(a_shape) != 2
+            or not qk_out_shape
+            or len(qk_out_shape) != 2
+            or not pv_out_shape
+            or len(pv_out_shape) != 2
+        ):
             _refuse("the dot tile shapes")
         block_m, head_dim = a_shape
         if qk_out_shape[0] != block_m:
@@ -5039,8 +5140,7 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
         for s in all_ops:
             if s.op == "arith.select":
                 sel_shape = _extract_shape(s.type_str or "")
-                if (tuple(sel_shape) == (block_m, block_n)
-                        and dot_qk.id in (s.operand_ids or [])):
+                if tuple(sel_shape) == (block_m, block_n) and dot_qk.id in (s.operand_ids or []):
                     causal = True
                     break
 
@@ -5062,8 +5162,13 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
                             scale = float(v)
                 break
             if op.operand_ids and op.op in (
-                    "ttg.local_load", "ttg.local_alloc", "ttg.memdesc_trans",
-                    "tt.trans", "tt.reshape", "ttg.convert_layout"):
+                "ttg.local_load",
+                "ttg.local_alloc",
+                "ttg.memdesc_trans",
+                "tt.trans",
+                "tt.reshape",
+                "ttg.convert_layout",
+            ):
                 scale_id = op.operand_ids[0]
                 continue
             break
@@ -5077,14 +5182,25 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
             _refuse("the output dtype")
 
         return {
-            "q": q_idx, "k": k_idx, "v": v_idx, "out": o_idx,
+            "q": q_idx,
+            "k": k_idx,
+            "v": v_idx,
+            "out": o_idx,
             "strides": {
-                "q": q_strides, "k": k_strides,
-                "v": v_strides, "o": o_strides,
+                "q": q_strides,
+                "k": k_strides,
+                "v": v_strides,
+                "o": o_strides,
             },
-            "Z": z_val, "H": h_val, "N_CTX": n_ctx_arg.index,
-            "block_m": block_m, "block_n": block_n, "head_dim": head_dim,
-            "causal": causal, "scale": scale, "out_dtype": out_dtype,
+            "Z": z_val,
+            "H": h_val,
+            "N_CTX": n_ctx_arg.index,
+            "block_m": block_m,
+            "block_n": block_n,
+            "head_dim": head_dim,
+            "causal": causal,
+            "scale": scale,
+            "out_dtype": out_dtype,
         }
 
     def _lower_flash_attention_template(self, info: dict) -> str:
@@ -5141,19 +5257,20 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
                 "output. Use a full-tile store (the tile-boundary mask om < N_CTX is "
                 "honored automatically by the template boundary), or apply the partial-"
                 "output mask in a separate elementwise kernel.",
-                op_name="tt.dot")
+                op_name="tt.dot",
+            )
 
         # The four pointer roles must be the first four args in canonical order
         # (Q,K,V,Out = 0,1,2,3) — the template hard-codes Q/K/V/Out at buffers
         # 0..3. The detector already required four DISTINCT roles; enforce the
         # ORDER the template assumes (a permuted order would bind wrongly).
-        if not (info["q"] == 0 and info["k"] == 1
-                and info["v"] == 2 and info["out"] == 3):
+        if not (info["q"] == 0 and info["k"] == 1 and info["v"] == 2 and info["out"] == 3):
             raise MetalNonRecoverableError(
                 "FlashAttention recognized but Q/K/V/Out are not the first four "
                 f"kernel args in order (got q={info['q']},k={info['k']},"
                 f"v={info['v']},out={info['out']}). Refusing to bind buffers in "
-                "the wrong order rather than risk silently-wrong output.")
+                "the wrong order rather than risk silently-wrong output."
+            )
 
         # Defense-in-depth (carry item 2): cross-check Q/K/Out roles against the
         # generic dot-pointer resolver. dot 0 is QK^T (operands Q, K) and the
@@ -5168,6 +5285,7 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
                     yield from _fa_walk(s.region_ops)
                 if getattr(s, "else_ops", None):
                     yield from _fa_walk(s.else_ops)
+
         _all = list(_fa_walk(self.graph.ops))
         _dots = [s for s in _all if s.op == "tt.dot"]
         _order = {s.id: i for i, s in enumerate(_all)}
@@ -5182,7 +5300,8 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
                     "detector and the generic dot-pointer resolver "
                     f"(detector q={info['q']},k={info['k']},out={info['out']}; "
                     f"resolver q={r_idx['q']},k={r_idx['k']},out={r_idx['out']}). "
-                    "Refusing rather than risk a mis-bound buffer.")
+                    "Refusing rather than risk a mis-bound buffer."
+                )
 
         # Build the [[buffer(N)]] declarations from the ACTUAL arg list so the
         # binding order matches the launcher exactly: pointers as device buffers,
@@ -5192,8 +5311,7 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
         # NOT the triton names — those (``N_CTX``, ``Z``, ``H`` ...) would collide
         # with the template's logical-alias locals. Binding is by buffer INDEX,
         # so the scalar name is free. A index->msl-name map resolves logical dims.
-        ptr_names = {info["q"]: "Q", info["k"]: "K",
-                     info["v"]: "V", info["out"]: "Out"}
+        ptr_names = {info["q"]: "Q", info["k"]: "K", info["v"]: "V", info["out"]: "Out"}
         args = self.graph.args
         arg_decls = []
         name_by_index = {}
@@ -5202,13 +5320,12 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
                 # Arg list must be densely 0-indexed by position for the
                 # positional buffer binding to be valid.
                 raise MetalNonRecoverableError(
-                    "FlashAttention arg list is not densely indexed; refusing "
-                    "rather than risk a mis-bound buffer.")
+                    "FlashAttention arg list is not densely indexed; refusing rather than risk a mis-bound buffer."
+                )
             if a.is_ptr:
                 m = triton_type_to_msl(a.elem_type)
                 qual = "device const" if i != info["out"] else "device"
-                arg_decls.append(
-                    f"    {qual} {m}* {ptr_names[i]} [[buffer({i})]]")
+                arg_decls.append(f"    {qual} {m}* {ptr_names[i]} [[buffer({i})]]")
                 name_by_index[i] = ptr_names[i]
             else:
                 buf_name = f"fa_arg{i}"
@@ -5225,20 +5342,29 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
             # Unresolvable — must not silently bake a wrong value.
             raise MetalNonRecoverableError(
                 "FlashAttention stride/dim could not be mapped to a kernel arg; "
-                "refusing rather than risk silently-wrong output.")
+                "refusing rather than risk silently-wrong output."
+            )
 
-        qs, ks, vs, os_ = (info["strides"]["q"], info["strides"]["k"],
-                           info["strides"]["v"], info["strides"]["o"])
+        qs, ks, vs, os_ = (info["strides"]["q"], info["strides"]["k"], info["strides"]["v"], info["strides"]["o"])
         bindings = {
-            "q_sz": _expr(qs[0]), "q_sh": _expr(qs[1]),
-            "q_sm": _expr(qs[2]), "q_sk": _expr(qs[3]),
-            "k_sz": _expr(ks[0]), "k_sh": _expr(ks[1]),
-            "k_sn": _expr(ks[2]), "k_sk": _expr(ks[3]),
-            "v_sz": _expr(vs[0]), "v_sh": _expr(vs[1]),
-            "v_sn": _expr(vs[2]), "v_sk": _expr(vs[3]),
-            "o_sz": _expr(os_[0]), "o_sh": _expr(os_[1]),
-            "o_sm": _expr(os_[2]), "o_sk": _expr(os_[3]),
-            "Z": _expr(info["Z"]), "H": _expr(info["H"]),
+            "q_sz": _expr(qs[0]),
+            "q_sh": _expr(qs[1]),
+            "q_sm": _expr(qs[2]),
+            "q_sk": _expr(qs[3]),
+            "k_sz": _expr(ks[0]),
+            "k_sh": _expr(ks[1]),
+            "k_sn": _expr(ks[2]),
+            "k_sk": _expr(ks[3]),
+            "v_sz": _expr(vs[0]),
+            "v_sh": _expr(vs[1]),
+            "v_sn": _expr(vs[2]),
+            "v_sk": _expr(vs[3]),
+            "o_sz": _expr(os_[0]),
+            "o_sh": _expr(os_[1]),
+            "o_sm": _expr(os_[2]),
+            "o_sk": _expr(os_[3]),
+            "Z": _expr(info["Z"]),
+            "H": _expr(info["H"]),
             "N_CTX": _expr(info["N_CTX"]),
         }
 
@@ -5251,9 +5377,13 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
         # types match) and applies the promote-on-load / cast-on-store epilogue.
         if _simd_fa_eligible(info):
             msl = make_flash_attention_kernel_simdgroup(
-                head_dim, 32, 64, causal=info["causal"],
+                head_dim,
+                32,
+                64,
+                causal=info["causal"],
                 out_dtype=info["out_dtype"],
-                arg_decls=arg_decls, bindings=bindings,
+                arg_decls=arg_decls,
+                bindings=bindings,
                 kernel_name=_sanitize_msl_name(self.graph.func_name),
                 scale=info["scale"],
             )
@@ -5261,9 +5391,14 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
             self.effective_block_size = 256
         else:
             msl = make_flash_attention_kernel_tiled(
-                head_dim, block_m, block_n, Dc=64, causal=info["causal"],
+                head_dim,
+                block_m,
+                block_n,
+                Dc=64,
+                causal=info["causal"],
                 out_dtype=info["out_dtype"],
-                arg_decls=arg_decls, bindings=bindings,
+                arg_decls=arg_decls,
+                bindings=bindings,
                 kernel_name=_sanitize_msl_name(self.graph.func_name),
                 scale=info["scale"],
             )
@@ -5281,6 +5416,7 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
         """Find the type_str for an SSA value by searching ops, recursing
         into nested scf regions (region_ops = body/then, else_ops = while
         body/else) at any depth. Returns "" if not found."""
+
         def _search(ops):
             for ssa in ops:
                 if ssa.id == ssa_id:
@@ -5291,6 +5427,7 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
                     if r is not None:
                         return r
             return None
+
         r = _search(self.graph.ops)
         if r is not None:
             return r
@@ -5337,7 +5474,9 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
             raise MetalNonRecoverableError(
                 f"tt.join / tl.cat producing {2 * N} elements exceeds the 1024-thread "
                 f"threadgroup: only 1024 threads dispatch, so the upper half is never "
-                f"written. Refusing rather than mis-compute.", op_name="tt.join")
+                f"written. Refusing rather than mis-compute.",
+                op_name="tt.join",
+            )
 
         # Detect the join → trans → reshape pattern
         trans_ssa = None
@@ -5370,9 +5509,7 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
         if trans_ssa and reshape_ssa:
             # Fused cat: one element per thread (tt.join in has_barrier_ops), 2*N<=1024
             # guaranteed by the guard above. Use _lid_expr (== lid here) for the select.
-            self.kb.raw_line(
-                f"    {msl_type} {result_var} = ({self._lid_expr} < {N}u) ? {a_var} : {b_var};"
-            )
+            self.kb.raw_line(f"    {msl_type} {result_var} = ({self._lid_expr} < {N}u) ? {a_var} : {b_var};")
             # Register result for all intermediate SSA ids
             self.env[ssa.id] = result_var
             self.env_types[ssa.id] = input_dtype
@@ -5388,9 +5525,15 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
             shared_a = f"join_shared_a_{self._shared_counter}"
             shared_b = f"join_shared_b_{self._shared_counter}"
             self._shared_counter += 1
-            shared_dtype = ("i64" if input_dtype == "i64"
-                            else "u64" if input_dtype in ("u64", "ui64")
-                            else "fp32" if is_float else "i32")
+            shared_dtype = (
+                "i64"
+                if input_dtype == "i64"
+                else "u64"
+                if input_dtype in ("u64", "ui64")
+                else "fp32"
+                if is_float
+                else "i32"
+            )
             self.kb.declare_threadgroup_array(shared_a, dtype=shared_dtype, size=N)
             self.kb.declare_threadgroup_array(shared_b, dtype=shared_dtype, size=N)
 
@@ -5447,7 +5590,8 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
                 f"tt.cat producing {2 * N} elements exceeds the 1024-thread "
                 f"threadgroup: the one-element-per-thread shared-memory concat can't "
                 f"cover it (high half unwritten). Refusing rather than mis-compute.",
-                op_name="tt.cat")
+                op_name="tt.cat",
+            )
 
         # Determine type
         input_dtype = self.env_types.get(a_id, "fp32")
@@ -5483,10 +5627,7 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
         self.kb.raw_line(f"    threadgroup_barrier(mem_flags::mem_threadgroup);")
 
         # Read: cat[lid] = a[lid] for lid < N, b[lid-N] for lid >= N
-        self.kb.raw_line(
-            f"    {msl_type} {result_var} = (lid < {N}u) ? "
-            f"{shared_a}[lid] : {shared_b}[lid - {N}u];"
-        )
+        self.kb.raw_line(f"    {msl_type} {result_var} = (lid < {N}u) ? {shared_a}[lid] : {shared_b}[lid - {N}u];")
 
         self.env[ssa.id] = result_var
         self.env_types[ssa.id] = input_dtype
@@ -5533,7 +5674,8 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
             f"tt.split (de-interleave of a {total}-element input) is not correctly "
             f"lowered: the de-interleave layout does not match the store index, so it "
             f"mis-computes at every size. Refusing rather than silently mis-compute.",
-            op_name="tt.split")
+            op_name="tt.split",
+        )
 
         # Determine types
         input_dtype = self.env_types.get(src_id, "i32")
@@ -5570,9 +5712,7 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
             self.kb.raw_line(f"    }}")  # close wrapping loop
             self.kb.raw_line(f"    threadgroup_barrier(mem_flags::mem_threadgroup);")
             # Reopen for reads
-            self.kb.raw_line(
-                f"    for (uint _loop_e = lid; _loop_e < {total}u; _loop_e += {bs}u) {{"
-            )
+            self.kb.raw_line(f"    for (uint _loop_e = lid; _loop_e < {total}u; _loop_e += {bs}u) {{")
         else:
             self.kb.raw_line(f"    {shared_name}[{elem}] = {src_var};")
             self.kb.raw_line(f"    threadgroup_barrier(mem_flags::mem_threadgroup);")
@@ -5580,12 +5720,8 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
         # Read de-interleaved: z1 = even elements, z2 = odd elements
         z1_var = self._next_var("split")
         z2_var = self._next_var("split")
-        self.kb.raw_line(
-            f"    {msl_type} {z1_var} = {shared_name}[({elem} % {N}u) * 2u];"
-        )
-        self.kb.raw_line(
-            f"    {msl_type} {z2_var} = {shared_name}[({elem} % {N}u) * 2u + 1u];"
-        )
+        self.kb.raw_line(f"    {msl_type} {z1_var} = {shared_name}[({elem} % {N}u) * 2u];")
+        self.kb.raw_line(f"    {msl_type} {z2_var} = {shared_name}[({elem} % {N}u) * 2u + 1u];")
 
         # Register both results
         rid1, rid2 = ssa.result_ids[0], ssa.result_ids[1]
@@ -5674,11 +5810,15 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
         if src_ptr_name:
             self.kb.raw_line(f"    for (uint _h = lid; _h < {M}u; _h += {bs}u) {{")
             self.kb.raw_line(f"        int _hval = static_cast<int>({src_ptr_name}[_h]);")
-            self.kb.raw_line(f"        if (_h < {M}u{mask_extra}) atomic_fetch_add_explicit(&{hist_name}[(uint)_hval], 1, memory_order_relaxed);")
+            self.kb.raw_line(
+                f"        if (_h < {M}u{mask_extra}) atomic_fetch_add_explicit(&{hist_name}[(uint)_hval], 1, memory_order_relaxed);"
+            )
             self.kb.raw_line(f"    }}")
         else:
             # Fallback: use the loaded input_var (only works when not wrapping)
-            self.kb.raw_line(f"    if (lid < {M}u{mask_extra}) atomic_fetch_add_explicit(&{hist_name}[(uint){input_var}], 1, memory_order_relaxed);")
+            self.kb.raw_line(
+                f"    if (lid < {M}u{mask_extra}) atomic_fetch_add_explicit(&{hist_name}[(uint){input_var}], 1, memory_order_relaxed);"
+            )
         self.kb.raw_line(f"    threadgroup_barrier(mem_flags::mem_threadgroup);")
 
         # Read result. When N <= block_size each thread holds a unique bin
@@ -5691,9 +5831,13 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
             # Reopen wrapping loop and load hist_0[_loop_e] per iteration.
             total = getattr(self, "_total_elements", self.effective_block_size)
             self.kb.raw_line(f"    for (uint _loop_e = lid; _loop_e < {total}u; _loop_e += {bs}u) {{")
-            self.kb.raw_line(f"    int {result_var} = (_loop_e < {N}u) ? atomic_load_explicit(&{hist_name}[_loop_e], memory_order_relaxed) : 0;")
+            self.kb.raw_line(
+                f"    int {result_var} = (_loop_e < {N}u) ? atomic_load_explicit(&{hist_name}[_loop_e], memory_order_relaxed) : 0;"
+            )
         else:
-            self.kb.raw_line(f"    int {result_var} = (lid < {N}u) ? atomic_load_explicit(&{hist_name}[lid], memory_order_relaxed) : 0;")
+            self.kb.raw_line(
+                f"    int {result_var} = (lid < {N}u) ? atomic_load_explicit(&{hist_name}[lid], memory_order_relaxed) : 0;"
+            )
             if in_loop:
                 # Reopen wrapping loop for remaining ops (stores)
                 total = getattr(self, "_total_elements", self.effective_block_size)
@@ -5734,8 +5878,7 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
             return f"(int){index_var}"
 
         # splat/broadcast/convert_layout — pass through
-        if name in ("tt.splat", "tt.broadcast", "ttg.convert_layout",
-                    "tt.expand_dims", "tt.unsplat"):
+        if name in ("tt.splat", "tt.broadcast", "ttg.convert_layout", "tt.expand_dims", "tt.unsplat"):
             if not op.operand_ids:
                 return None
             return self._synthesize_mask_for_index(op.operand_ids[0], index_var, _depth + 1)
@@ -5770,12 +5913,14 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
             else:
                 return None
             is_unsigned = pred_name in ("ult", "ule", "ugt", "uge") if pred_name else False
+
             # Width-correct cast (see _lower_cmpi, audit C1): a 64-bit bound
             # (e.g. a large tensor dim compared against an index) must not be
             # truncated to 32 bits. Falls back to 32-bit when the operand type
             # is unknown (index-derived operands, always small).
             def _is64m(oid):
                 return self.env_types.get(oid) in ("i64", "u64", "ui64")
+
             wide64 = _is64m(op.operand_ids[0]) or _is64m(op.operand_ids[1])
             if is_unsigned:
                 cast = "(ulong)" if wide64 else "(uint)"
@@ -5847,6 +5992,7 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
         # silently wrong). See docs/superpowers/plans/2026-06-18-2d-gather-coverage.md.
         def _effective_rank(shape):
             return sum(1 for d in (shape or []) if d != 1)
+
         if _effective_rank(src_shape) > 1 or _effective_rank(idx_shape) > 1:
             self._lower_tt_gather_2d(ssa, src_var, idx_var, src_shape, idx_shape)
             return
@@ -5862,7 +6008,7 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
         # larger than 1024 likewise under-computes the output. The 2-D sibling already
         # refuses this; the 1-D path was missing the guard. Refuse rather than mis-gather.
         _idx_total = 1
-        for _d in (idx_shape or [1]):
+        for _d in idx_shape or [1]:
             _idx_total *= _d
         if S > 1024 or _idx_total > 1024:
             raise MetalNonRecoverableError(
@@ -5870,7 +6016,8 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
                 f"the 1024-thread threadgroup: the source is staged one element per "
                 f"thread, so slots/indices past 1024 read uninitialized memory "
                 f"(silent-wrong). Refusing; strided multi-pass staging is future work.",
-                op_name="tt.gather")
+                op_name="tt.gather",
+            )
 
         # Determine types
         src_dtype = self.env_types.get(ssa.operand_ids[0], "fp32")
@@ -5895,8 +6042,7 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
         if out_shape:
             self.env_shapes[ssa.id] = tuple(out_shape)
 
-    def _lower_tt_gather_2d(self, ssa: SSAValue, src_var, idx_var,
-                            src_shape, idx_shape):
+    def _lower_tt_gather_2d(self, ssa: SSAValue, src_var, idx_var, src_shape, idx_shape):
         """2D tt.gather via full-tile shared-memory staging.
 
             axis=0:  out[i, j] = src[index[i, j], j]   ->  shared[idx*N + col]
@@ -5916,24 +6062,24 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
           - scalar (non-register-array) operands.
         """
         from triton_msl.errors import MetalNonRecoverableError
+
         axis = ssa.attrs.get("axis", 0)
 
-        if (not src_shape or not idx_shape
-                or len(src_shape) != 2 or len(idx_shape) != 2):
+        if not src_shape or not idx_shape or len(src_shape) != 2 or len(idx_shape) != 2:
             raise MetalNonRecoverableError(
                 f"2D tt.gather: expected 2D src and index (got src "
-                f"{tuple(src_shape or ())}, index {tuple(idx_shape or ())}).")
+                f"{tuple(src_shape or ())}, index {tuple(idx_shape or ())})."
+            )
         if axis not in (0, 1):
-            raise MetalNonRecoverableError(
-                f"2D tt.gather: unsupported axis {axis} (only 0 and 1).")
+            raise MetalNonRecoverableError(f"2D tt.gather: unsupported axis {axis} (only 0 and 1).")
         # Register-array (multi-element-per-thread) operands aren't a single
         # per-thread scalar, so the flat ``shared[lid] = src`` staging would
         # mis-map. Refuse rather than guess.
-        if (ssa.operand_ids[0] in self.env_array
-                or ssa.operand_ids[1] in self.env_array):
+        if ssa.operand_ids[0] in self.env_array or ssa.operand_ids[1] in self.env_array:
             raise MetalNonRecoverableError(
                 "2D tt.gather: register-array (multi-element-per-thread) operands "
-                "are not yet supported; refusing rather than mis-staging.")
+                "are not yet supported; refusing rather than mis-staging."
+            )
 
         # Shape compatibility per axis. The output/index drives the thread grid
         # (block_size == idx rows*cols); the SOURCE tile is staged into shared.
@@ -5948,12 +6094,14 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
             if src_shape[1] != idx_shape[1]:
                 raise MetalNonRecoverableError(
                     f"2D tt.gather axis=0 requires matching column counts "
-                    f"(src {tuple(src_shape)} vs index {tuple(idx_shape)}); refusing.")
+                    f"(src {tuple(src_shape)} vs index {tuple(idx_shape)}); refusing."
+                )
         else:  # axis == 1
             if tuple(src_shape) != tuple(idx_shape):
                 raise MetalNonRecoverableError(
                     f"2D tt.gather axis=1 (ragged) is not yet lowered "
-                    f"(src {tuple(src_shape)} vs index {tuple(idx_shape)}); refusing.")
+                    f"(src {tuple(src_shape)} vs index {tuple(idx_shape)}); refusing."
+                )
 
         src_total = src_shape[0] * src_shape[1]
         idx_total = idx_shape[0] * idx_shape[1]
@@ -5966,11 +6114,13 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
             raise MetalNonRecoverableError(
                 f"2D tt.gather: tile too large (src {src_total}, index {idx_total} "
                 "elems) for one-element-per-thread staging in a 1024-thread "
-                "threadgroup. Refusing; strided multi-pass staging is future work.")
+                "threadgroup. Refusing; strided multi-pass staging is future work."
+            )
         if src_total > idx_total:
             raise MetalNonRecoverableError(
                 f"2D tt.gather: source ({src_total} elems) larger than the index/"
-                f"thread grid ({idx_total}); cannot stage every source element. Refusing.")
+                f"thread grid ({idx_total}); cannot stage every source element. Refusing."
+            )
 
         src_dtype = self.env_types.get(ssa.operand_ids[0], "fp32")
         is_float = src_dtype.startswith("fp") or src_dtype.startswith("bf")
@@ -5999,9 +6149,7 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
         # out-of-bounds shared read here. For in-range threads the computed index
         # is in [0, src_total) by construction (idx in [0, src_rows), col in [0,N)).
         result_var = self._next_var("gathered2d")
-        self.kb.raw_line(
-            f"    {msl_type} {result_var} = ({lid} < {idx_total}u) ? "
-            f"{shared_name}[{gathered}] : {zero};")
+        self.kb.raw_line(f"    {msl_type} {result_var} = ({lid} < {idx_total}u) ? {shared_name}[{gathered}] : {zero};")
 
         self.env[ssa.id] = result_var
         self.env_types[ssa.id] = src_dtype
@@ -6129,8 +6277,7 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
         self.env[ssa.id] = var_name
         self.env_types[ssa.id] = ssa.elem_type or "i32"
 
-    def _register_bcast_layout_by_type(self, type_str: str, shape: tuple,
-                                       layout_expr: str) -> None:
+    def _register_bcast_layout_by_type(self, type_str: str, shape: tuple, layout_expr: str) -> None:
         """Register a reduce output's bcast_layout, keyed both by shape and
         by the layout signature extracted from its type_str.
 
@@ -6170,8 +6317,11 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
         copy that a fix could land in only one of.
         """
         _PASS = (
-            "arith.index_cast", "arith.index_castui",
-            "arith.extsi", "arith.extui", "arith.trunci",
+            "arith.index_cast",
+            "arith.index_castui",
+            "arith.extsi",
+            "arith.extui",
+            "arith.trunci",
         )
 
         def _const_str(tid):
@@ -6182,9 +6332,7 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
             op = op_by_id.get(tid)
             ev = self.env.get(tid)
             if op is None:
-                if (isinstance(ev, str) and ev
-                        and not ev.startswith("idx_")
-                        and not ev.startswith("r_")):
+                if isinstance(ev, str) and ev and not ev.startswith("idx_") and not ev.startswith("r_"):
                     return ev
                 return None
             if op.op in ("arith.constant", "tt.splat"):
@@ -6227,13 +6375,11 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
                 return None
             if not op.operand_ids:
                 return None
-            return self._staged_fill_terms(
-                op.operand_ids[0], coeff, d, op_by_id, depth + 1)
+            return self._staged_fill_terms(op.operand_ids[0], coeff, d, op_by_id, depth + 1)
         if name == "tt.broadcast" or name in _PASS:
             if not op.operand_ids:
                 return None
-            return self._staged_fill_terms(
-                op.operand_ids[0], coeff, axis_dim, op_by_id, depth + 1)
+            return self._staged_fill_terms(op.operand_ids[0], coeff, axis_dim, op_by_id, depth + 1)
         if name in ("tt.splat", "arith.constant"):
             ev = self.env.get(nid)
             if isinstance(ev, str) and ev:
@@ -6242,13 +6388,11 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
         if name in ("arith.addi", "arith.subi"):
             if len(op.operand_ids) < 2:
                 return None
-            left = self._staged_fill_terms(
-                op.operand_ids[0], coeff, axis_dim, op_by_id, depth + 1)
+            left = self._staged_fill_terms(op.operand_ids[0], coeff, axis_dim, op_by_id, depth + 1)
             if left is None:
                 return None
             rc = coeff if name == "arith.addi" else _neg_coeff(coeff)
-            right = self._staged_fill_terms(
-                op.operand_ids[1], rc, axis_dim, op_by_id, depth + 1)
+            right = self._staged_fill_terms(op.operand_ids[1], rc, axis_dim, op_by_id, depth + 1)
             if right is None:
                 return None
             return left + right
@@ -6258,11 +6402,9 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
             a, b = op.operand_ids[0], op.operand_ids[1]
             ca, cb = _const_str(a), _const_str(b)
             if cb is not None and ca is None:
-                return self._staged_fill_terms(
-                    a, _mul_coeff(coeff, cb), axis_dim, op_by_id, depth + 1)
+                return self._staged_fill_terms(a, _mul_coeff(coeff, cb), axis_dim, op_by_id, depth + 1)
             if ca is not None and cb is None:
-                return self._staged_fill_terms(
-                    b, _mul_coeff(coeff, ca), axis_dim, op_by_id, depth + 1)
+                return self._staged_fill_terms(b, _mul_coeff(coeff, ca), axis_dim, op_by_id, depth + 1)
             return None
         # Any other op breaks structural resolution.
         return None
@@ -6291,7 +6433,8 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
                 "threadgroup: the per-element mask is not a single "
                 "structurally-resolvable row/col bounds comparison and cannot "
                 "be safely reconstructed. Refusing (correct-or-refuse).",
-                op_name="tt.store")
+                op_name="tt.store",
+            )
 
         def _render(terms, cast):
             """Render a _staged_fill_terms list to a scalar MSL expr (each
@@ -6336,22 +6479,15 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
                     _refuse()
                 # Sign-cast each operand consistently with _lower_cmpi so the
                 # comparison can't be flipped by C++ unsigned promotion.
-                is_unsigned = (pred_name in ("ult", "ule", "ugt", "uge")
-                               if pred_name
-                               else pred_int in (6, 7, 8, 9))
-                is_signed = (pred_name in ("slt", "sle", "sgt", "sge")
-                             if pred_name
-                             else pred_int in (2, 3, 4, 5))
+                is_unsigned = pred_name in ("ult", "ule", "ugt", "uge") if pred_name else pred_int in (6, 7, 8, 9)
+                is_signed = pred_name in ("slt", "sle", "sgt", "sge") if pred_name else pred_int in (2, 3, 4, 5)
                 cast = "(uint)" if is_unsigned else "(int)" if is_signed else ""
-                lhs = _render(self._staged_fill_terms(
-                    op.operand_ids[0], None, None, op_by_id), cast)
-                rhs = _render(self._staged_fill_terms(
-                    op.operand_ids[1], None, None, op_by_id), cast)
+                lhs = _render(self._staged_fill_terms(op.operand_ids[0], None, None, op_by_id), cast)
+                rhs = _render(self._staged_fill_terms(op.operand_ids[1], None, None, op_by_id), cast)
                 if lhs is None or rhs is None:
                     _refuse()
                 return f"({lhs} {sym} {rhs})"
-            if op.op in ("tt.broadcast", "tt.splat", "arith.extsi",
-                         "arith.extui", "arith.trunci") and op.operand_ids:
+            if op.op in ("tt.broadcast", "tt.splat", "arith.extsi", "arith.extui", "arith.trunci") and op.operand_ids:
                 cur = op.operand_ids[0]
                 continue
             _refuse()
@@ -6391,7 +6527,7 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
         # Walk the addptr chain, collecting every additive offset term plus any
         # block-constant offset folded onto the base pointer (a scalar
         # program-id / batch-stride addptr applied before the splat).
-        parts = []        # row/col index contributions
+        parts = []  # row/col index contributions
         const_terms = []  # block-constant contributions (same for all _sa)
 
         def _refuse():
@@ -6400,7 +6536,8 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
                 "shared-memory-staged tt.dot operand to a (row/col, stride) "
                 "index or a block-constant. Refusing to emit a "
                 "possibly-transposed staging rather than risk a silent "
-                "miscompute (correct-or-refuse).")
+                "miscompute (correct-or-refuse)."
+            )
 
         def _add(sub):
             if sub is None:
@@ -6415,7 +6552,8 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
                             f"has a make_range extent ({extent}) that does not "
                             f"match the staged tile dimension ({want}); the "
                             "(_sa/N, _sa%N) fill decomposition would mis-stage "
-                            "it. Refusing (correct-or-refuse).")
+                            "it. Refusing (correct-or-refuse)."
+                        )
                     idx = "(int)_fill_row" if dim == 0 else "(int)_fill_col"
                     if start != 0:
                         idx = f"({start} + {idx})"
@@ -6431,8 +6569,7 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
             if op.op == "tt.addptr":
                 if len(op.operand_ids) < 2:
                     break
-                _add(self._staged_fill_terms(
-                    op.operand_ids[1], None, None, op_by_id))
+                _add(self._staged_fill_terms(op.operand_ids[1], None, None, op_by_id))
                 cur = op.operand_ids[0]
                 continue
             if op.op == "tt.broadcast" and op.operand_ids:
@@ -6470,6 +6607,7 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
         if not shape or len(shape) < 2:
             # Try parsing memdesc directly: !ttg.memdesc<32x32xf32, ...>
             import re
+
             m = re.search(r"memdesc<((?:\d+x)+)", ssa.type_str or "")
             if m:
                 dims_str = m.group(1).rstrip("x")
@@ -6539,6 +6677,7 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
                     yield from _all_ops(o.region_ops)
                 if o.else_ops:
                     yield from _all_ops(o.else_ops)
+
         all_ops = list(_all_ops(self.graph.ops))
         op_by_id = {o.id: o for o in all_ops}
 
@@ -6559,8 +6698,7 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
                 break
             if op.operand_ids:
                 if len(op.operand_ids) >= 2:
-                    post_load_ops.insert(
-                        0, (op.op, self._lookup(op.operand_ids[1])))
+                    post_load_ops.insert(0, (op.op, self._lookup(op.operand_ids[1])))
                 cur_id = op.operand_ids[0]
             else:
                 break
@@ -6580,8 +6718,7 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
                 base_ptr = load_ptr_info[0]
                 # Per-load structural rebuild of each staged element's global
                 # address (correct-or-refuse for transposed/strided operands).
-                new_offset = self._rebuild_staged_fill_offset(
-                    load_addptr_id, op_by_id, base_ptr, M, N)
+                new_offset = self._rebuild_staged_fill_offset(load_addptr_id, op_by_id, base_ptr, M, N)
                 self.kb.raw_line(f"    for (uint _sa = lid; _sa < {total}u; _sa += {bs}u) {{")
                 self.kb.raw_line(f"        uint _fill_row = _sa / {N}u;")
                 self.kb.raw_line(f"        uint _fill_col = _sa % {N}u;")
@@ -6600,8 +6737,7 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
                 # contiguous row-major source; rebuild structurally so a
                 # transposed/strided source stages correctly (or refuses).
                 base_ptr = load_ptr_info[0]
-                new_offset = self._rebuild_staged_fill_offset(
-                    load_addptr_id, op_by_id, base_ptr, M, N)
+                new_offset = self._rebuild_staged_fill_offset(load_addptr_id, op_by_id, base_ptr, M, N)
                 self.kb.raw_line(f"    for (uint _sa = lid; _sa < {total}u; _sa += {bs}u) {{")
                 self.kb.raw_line(f"        uint _fill_row = _sa / {N}u;")
                 self.kb.raw_line(f"        uint _fill_col = _sa % {N}u;")
@@ -6631,7 +6767,7 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
         self.env_types[ssa.id] = src_dtype
         self.env_shapes[ssa.id] = shape
         # Mark as shared memory descriptor
-        if not hasattr(self, '_shared_mem_descs'):
+        if not hasattr(self, "_shared_mem_descs"):
             self._shared_mem_descs = {}
         self._shared_mem_descs[ssa.id] = (shared_name, shape, shared_dtype)
         # Also mark the source operand as having its data in shared memory.
@@ -6651,7 +6787,7 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
             return
 
         src_id = ssa.operand_ids[0]
-        shared_info = getattr(self, '_shared_mem_descs', {}).get(src_id)
+        shared_info = getattr(self, "_shared_mem_descs", {}).get(src_id)
         if not shared_info:
             # No shared memory descriptor — passthrough
             self._emit_passthrough(ssa)
@@ -6663,7 +6799,7 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
         self.env[ssa.id] = shared_name
         self.env_types[ssa.id] = shared_dtype
         self.env_shapes[ssa.id] = shape
-        if not hasattr(self, '_shared_mem_descs'):
+        if not hasattr(self, "_shared_mem_descs"):
             self._shared_mem_descs = {}
         self._shared_mem_descs[ssa.id] = shared_info
 
@@ -6685,7 +6821,7 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
         self._emit_passthrough(ssa)
 
         # Propagate shared memory descriptor with transposed flag
-        if not hasattr(self, '_shared_mem_descs'):
+        if not hasattr(self, "_shared_mem_descs"):
             self._shared_mem_descs = {}
         shared_info = self._shared_mem_descs.get(src_id)
         if shared_info:
@@ -6698,7 +6834,7 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
             self._shared_mem_descs[ssa.id] = (shared_name, trans_shape, shared_dtype)
             self.env_shapes[ssa.id] = trans_shape
             # Mark this shared array as transposed for dot indexing
-            if not hasattr(self, '_shared_mem_transposed'):
+            if not hasattr(self, "_shared_mem_transposed"):
                 self._shared_mem_transposed = set()
             self._shared_mem_transposed.add(shared_name)
 
@@ -6737,11 +6873,13 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
             # Returning the accumulator here drops A@B silently (audit #165 —
             # same class as the #157 matmul-epilogue refusals). Refuse loudly.
             from triton_msl.errors import MetalNonRecoverableError
+
             raise MetalNonRecoverableError(
                 f"Refusing to emit silently-wrong output: tt.dot operand shapes "
                 f"({a_shape} x {b_shape}) are not both 2-D; the generic dot path "
                 f"cannot lower this and would silently return the accumulator, "
-                f"dropping the matmul. File an issue or restructure the dot.")
+                f"dropping the matmul. File an issue or restructure the dot."
+            )
 
         M, K = a_shape[0], a_shape[1]
         K2, N = b_shape[0], b_shape[1]
@@ -6759,6 +6897,7 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
         _dot_max = max(M, K, N)
         if _dot_max > 64:
             from triton_msl.errors import MetalNonRecoverableError
+
             raise MetalNonRecoverableError(
                 f"Refusing a tt.dot with tile dim {_dot_max} (> 64) on the generic "
                 f"per-thread path: this fallback is validated only for tile dims <= 64 "
@@ -6766,22 +6905,23 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
                 f"the validated simdgroup templates and FlashAttention (head_dim <= "
                 f"128) through the FA2 template; a dot reaching here escaped them "
                 f"(e.g. a max-less head_dim-128 attention). Refusing rather than emit "
-                f"silently-wrong output.")
+                f"silently-wrong output."
+            )
 
         # Get shared memory names for A and B
         # Trace through local_load to find the shared memory arrays
-        a_shared = getattr(self, '_shared_mem_descs', {}).get(a_id)
-        b_shared = getattr(self, '_shared_mem_descs', {}).get(b_id)
+        a_shared = getattr(self, "_shared_mem_descs", {}).get(a_id)
+        b_shared = getattr(self, "_shared_mem_descs", {}).get(b_id)
 
         if not a_shared:
             for op in self.graph.ops:
                 if op.id == a_id and op.op == "ttg.local_load" and op.operand_ids:
-                    a_shared = getattr(self, '_shared_mem_descs', {}).get(op.operand_ids[0])
+                    a_shared = getattr(self, "_shared_mem_descs", {}).get(op.operand_ids[0])
                     break
         if not b_shared:
             for op in self.graph.ops:
                 if op.id == b_id and op.op == "ttg.local_load" and op.operand_ids:
-                    b_shared = getattr(self, '_shared_mem_descs', {}).get(op.operand_ids[0])
+                    b_shared = getattr(self, "_shared_mem_descs", {}).get(op.operand_ids[0])
                     break
 
         if not a_shared or not b_shared:
@@ -6789,11 +6929,13 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
             # lower this. Returning the accumulator drops A@B silently; refuse
             # loudly instead (audit #165).
             from triton_msl.errors import MetalNonRecoverableError
+
             raise MetalNonRecoverableError(
                 "Refusing to emit silently-wrong output: tt.dot operands are not "
                 "in threadgroup (shared) memory (no ttg.local_load source); the "
                 "generic dot path would silently return the accumulator, dropping "
-                "the matmul. File an issue.")
+                "the matmul. File an issue."
+            )
 
         a_smem, _, _ = a_shared
         b_smem, _, _ = b_shared
@@ -6801,7 +6943,7 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
         # Check if operands were transposed via memdesc_trans.
         # Transposed arrays need swapped indexing: B_trans[k, col] reads
         # physical B_orig[col, k] = smem[col * K_orig + k].
-        transposed = getattr(self, '_shared_mem_transposed', set())
+        transposed = getattr(self, "_shared_mem_transposed", set())
         a_trans = a_smem in transposed
         b_trans = b_smem in transposed
 
@@ -6830,7 +6972,7 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
         # (e.g. the 32x64 accumulator in flash attention with HEAD_DIM=64).
         # If so, read the init from shared memory per-element and write the
         # result back to the SAME shared array (no new allocation needed).
-        acc_smem = getattr(self, '_shared_mem_descs', {}).get(ssa.operand_ids[2])
+        acc_smem = getattr(self, "_shared_mem_descs", {}).get(ssa.operand_ids[2])
         acc_is_smem = False
         if acc_smem:
             acc_shape = acc_smem[1]
@@ -6880,18 +7022,13 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
         self.env_shapes[ssa.id] = (M, N)
         # Track that this variable's data is already in shared memory at lid.
         # Downstream reduce can skip the copy and read from result_smem directly.
-        if not hasattr(self, '_shared_mem_descs'):
+        if not hasattr(self, "_shared_mem_descs"):
             self._shared_mem_descs = {}
         self._shared_mem_descs[ssa.id] = (result_smem, (M, N), "fp32")
 
     # -- SCF (structured control flow) --
 
-
-
-
     # -- Atomic ops --
-
-
 
     def _lower_called_funcs(self):
         """Lower all callee (noinline) functions to MSL device functions.
@@ -6920,9 +7057,7 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
         if len(cfunc.return_types) == 0:
             ret_type = "void"
         elif len(cfunc.return_types) == 1:
-            ret_type = triton_type_to_msl(
-                _mlir_to_triton_dtype(cfunc.return_types[0])
-            )
+            ret_type = triton_type_to_msl(_mlir_to_triton_dtype(cfunc.return_types[0]))
         else:
             # Multi-value return: use a struct
             ret_type = f"_ret_{safe_name}"
@@ -7046,17 +7181,18 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
             # (async copy, barrier variant) the passthrough would lose silently.
             # Refuse loudly, consistent with the #165 generic default-deny.
             from triton_msl.errors import MetalNonRecoverableError
+
             raise MetalNonRecoverableError(
                 f"Refusing to emit silently-wrong output: unsupported "
                 f"side-effecting op '{op}' (no result) would be dropped, losing "
-                f"its effect. Add a handler or explicit refusal.")
+                f"its effect. Add a handler or explicit refusal."
+            )
         else:
             # Other (value-producing) ttg ops: passthrough. An undefined result
             # surfaces as UNKNOWN_<id> -> loud MSL compile error if consumed.
             self._emit_passthrough(ssa)
 
-    def _lower_convert_layout_mept_shuffle(self, ssa, src_type, dest_type,
-                                           src_shape, N) -> bool:
+    def _lower_convert_layout_mept_shuffle(self, ssa, src_type, dest_type, src_shape, N) -> bool:
         """Phase 4d: redistribute a per-thread register array via threadgroup
         memory according to source/destination LinearLayouts.
 
@@ -7078,8 +7214,7 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
             return False
         # Sanity: the source array length must match the source layout's
         # register count, and the layouts must describe the same tensor.
-        if (src_ll.num_registers_per_thread != n_src
-                or src_ll.total_elements != dst_ll.total_elements):
+        if src_ll.num_registers_per_thread != n_src or src_ll.total_elements != dst_ll.total_elements:
             return False
         n_dst = dst_ll.num_registers_per_thread
 
@@ -7097,23 +7232,17 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
             shared_dtype = "i32"
         shared_name = f"shuf_{self._shared_counter}"
         self._shared_counter += 1
-        self.kb.declare_threadgroup_array(shared_name, dtype=shared_dtype,
-                                          size=N)
+        self.kb.declare_threadgroup_array(shared_name, dtype=shared_dtype, size=N)
 
         lane = "(lid & 31u)"
         warp = "(lid >> 5u)"
         # Barrier before writing in case the buffer aliases an earlier shuffle.
-        self.kb.raw_line(
-            "    threadgroup_barrier(mem_flags::mem_threadgroup);")
+        self.kb.raw_line("    threadgroup_barrier(mem_flags::mem_threadgroup);")
         for i in range(n_src):
             pos = src_ll.msl_position_expr(f"{i}u", lane, warp)
             self.kb.raw_line(f"    {shared_name}[{pos}] = {src_arr}[{i}];")
-        self.kb.raw_line(
-            "    threadgroup_barrier(mem_flags::mem_threadgroup);")
-        read_exprs = [
-            f"{shared_name}[{dst_ll.msl_position_expr(f'{j}u', lane, warp)}]"
-            for j in range(n_dst)
-        ]
+        self.kb.raw_line("    threadgroup_barrier(mem_flags::mem_threadgroup);")
+        read_exprs = [f"{shared_name}[{dst_ll.msl_position_expr(f'{j}u', lane, warp)}]" for j in range(n_dst)]
         out_var = self._var_array("shuf", read_exprs, arr_ty)
         self.env[ssa.id] = out_var
         self.env_array[ssa.id] = (out_var, n_dst, arr_ty)
@@ -7171,8 +7300,7 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
         # When both source and dest are slice layouts, it's a layout
         # variant change that doesn't affect thread mapping in our model.
         dest_type = ssa.type_str or ""
-        needs_redistribute = ("ttg.slice" in src_type
-                              and "ttg.slice" not in dest_type)
+        needs_redistribute = "ttg.slice" in src_type and "ttg.slice" not in dest_type
 
         # Phase 4d: MEPT array shuffle. When the source value is a per-thread
         # register array and both layouts resolve to LinearLayouts, redistribute
@@ -7182,10 +7310,8 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
         # from their dst-layout positions. This is the general layout-change
         # primitive for MEPT (and the eventual replacement for the targeted
         # transpose/interleave pattern detectors — Phase 4g).
-        if (getattr(self, "mept_enabled", False)
-                and ssa.operand_ids[0] in self.env_array):
-            shuffled = self._lower_convert_layout_mept_shuffle(
-                ssa, src_type, dest_type, src_shape, N)
+        if getattr(self, "mept_enabled", False) and ssa.operand_ids[0] in self.env_array:
+            shuffled = self._lower_convert_layout_mept_shuffle(ssa, src_type, dest_type, src_shape, N)
             if shuffled:
                 return
             # If the shuffle couldn't resolve a layout, fall through. The
@@ -7208,9 +7334,9 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
         alias_match = re.search(r",\s*#(\w+)\s*>\s*$", src_type)
         if alias_match and mod_text:
             from triton_msl.codegen._linear_layout import parse_linear_layout
+
             alias = alias_match.group(1)
-            if re.search(rf"#{re.escape(alias)}\s*=\s*#ttg\.linear<",
-                         mod_text):
+            if re.search(rf"#{re.escape(alias)}\s*=\s*#ttg\.linear<", mod_text):
                 ll = parse_linear_layout(mod_text, alias)
                 if ll and ll.num_registers_per_thread > 1:
                     # Corroborate against env_n_elems tracking (Phase 4a
@@ -7223,7 +7349,8 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
                         f"{ll.num_registers_per_thread} elements per thread; "
                         "add a pattern detector (see "
                         "_detect_transpose_via_reshape) or implement the "
-                        "general per-register shuffle (Phase 4).")
+                        "general per-register shuffle (Phase 4)."
+                    )
 
         if not needs_redistribute or not self._is_2d or N <= 1:
             self._emit_passthrough(ssa)
@@ -7310,7 +7437,7 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
         # Mark this value as having been through convert_layout — the
         # thread-to-element mapping is now simple (thread i = element i).
         # This prevents the store from using 2D-aware guards.
-        if not hasattr(self, '_converted_layout_ids'):
+        if not hasattr(self, "_converted_layout_ids"):
             self._converted_layout_ids = set()
         self._converted_layout_ids.add(ssa.id)
 
@@ -7318,6 +7445,7 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
+
 
 def lower_ir_graph(graph: IRGraph, options=None) -> str:
     """Lower an IRGraph to MSL source code.

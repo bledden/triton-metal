@@ -2,17 +2,84 @@
 
 ## Unreleased (post-0.1.0a1)
 
+The project suite grew **877 → 1,968 passed / 0 failed** over this cycle.
+
+### Portability — verified on NVIDIA silicon
+
+- **The central claim is now measured, not argued**: the same unmodified `@triton.jit`
+  kernels were run on an Apple M4 Max (Metal, Triton 3.7.0) and a rented NVIDIA A40
+  (CUDA, Triton 3.0.0), each checked against the same NumPy reference. vector-add and
+  the fp32/`ieee` matmul produced **bit-identical** outputs across vendors (Δ = 0);
+  softmax matched to fp rounding (~1e-9). The one divergence is NVIDIA's **tf32**
+  default for fp32 `tl.dot` (6.1e-2 vs an fp64 reference; `input_precision="ieee"` →
+  bit-identical). Metal has no tf32, and triton-msl refuses it rather than silently
+  approximating. See the new [`PORTABILITY.md`](PORTABILITY.md) and the reproduce
+  harness `benchmarks/cross_backend_verify.py`.
+- **Runnable local-dev example** — `examples/local_triton_dev.py`: the three canonical
+  Triton tutorial kernels (vector-add, fused softmax, tiled matmul) on deliberately
+  non-multiple shapes, each verified against NumPy on the Metal GPU, with a regression
+  test pinning them.
+
+### Correctness — the anti-silent-wrong campaign
+
+Systematic adversarial audits (multiple independent rounds, plus three new fuzzers)
+closed **~75 silent-wrong bugs** across the dot/reduce/store surfaces; the dot and
+reduce surfaces are now correct-or-refuse by construction:
+
+- **General address-traced matmul stride inference** — transposed / sliced /
+  column-major / pre-transposed-staged operands now compute correctly or refuse
+  loudly, independent of variable naming. The three legacy stride mechanisms were
+  deleted in favor of the one address-traced inference; twin dot-lowering paths
+  (simple-dot vs K-loop epilogue, fragment selection, bias-init detection) were
+  de-duplicated so a fix can no longer land in one copy and miss the other.
+  Chain-dot / 3-D / batched matmuls and ambiguous tile-vs-batch shapes refuse.
+- **Reduce-combine classifier rewritten structurally** — reduce lowering now
+  exact-matches the combine region (sum/max/min/and/or/xor, argmax/argmin, Welford)
+  instead of substring-sniffing, and refuses anything it cannot prove. Closed the
+  unsigned (u8/16/32/64) max/min/argminmax-computed-signed class, i64 coverage
+  holes, NaN-propagation handling, and shared-memory races (missing barriers) on
+  broadcast reads in 2-D/3-D/N-D reduce and fused argminmax.
+- **Masked-store correctness** — matmul/FA templates compute the full tile and clip
+  only at the tile boundary, which silently dropped tighter user store-masks. Now:
+  FlashAttention head_dim ≤ 64 non-tile-boundary output masks **compute + clip**
+  (the honoring generic path); head_dim=128 FA and matmul templates **refuse**; a
+  constant mask bound on a multi-block (`pid*BLOCK + arange`) index is correctly
+  treated as non-trivial (it clips later blocks) instead of being dropped.
+- **fp8 round-to-nearest-even** — the fp32→fp8 downcast rounded half-away-from-zero;
+  now RTNE, matching hardware casts.
+- **Three systemic gates added** — a 97-cell differential routing-boundary sweep
+  (invariant: correct OR loud-refuse, never silent/cryptic, with an OOB canary) and
+  matmul/reduce/combination fuzzers run in the suite.
+
+### torch.compile
+
+- **Persistent MSL stash** — the zero-copy dispatch path now survives Inductor
+  cache restores: warm GPT-2 small went 50.7 ms → **2.1 ms (~24×)**, faster than
+  PyTorch's own native MPS Inductor backend (4.6 ms) and eager (7.3 ms) on M4 Max.
+- **NaN-propagating max/min** lower correctly (was refused → broke compiled softmax
+  and training). CNN/BatchNorm compile via under-filling persistent-reduction
+  configs; product reductions and a 2-D reduce fused with a 2-D scan in one kernel
+  are supported; genuinely-impossible tiles (>1024 threads) refuse loudly.
+
+### Performance
+
 - **bf16 fast matmul** — bf16 is now a fast-matmul input via the M-series
   `simdgroup_bfloat8x8` matrix unit (bf16 in + float32 accumulate, fp32/bf16 out),
   ~12 TFLOP/s vs the ~2.4 TFLOP/s generic float-compute fallback (~4.9×). bf16 is
   the dominant training dtype. FlashAttention bf16 stays refused (FA kernel is
-  fp16/fp32 only).
+  fp16/fp32 only); the fused matmul+softmax bf16 path now uses the bfloat MMA unit.
 - **Deterministic occupancy-gated matmul tile selection** — extends the fast path
   to unaligned M (`M%32≠0`): ~3.7–4.8× for large unaligned-M matmuls vs the generic
   path, no-op aligned, never-regress small (`TRITON_MSL_MATMUL_AUTOTUNE=0` opts out).
+- **N%32 / N%16 / N%8 fast path** — the tuner's strip-width gate was relaxed so
+  unaligned-N shapes keep simdgroup speed (N%16 ~11 TF, N%8 ~5.7 TF, byte-exact),
+  closing the N-alignment perf cliff symmetrically with the M-side rescue.
 - **simdgroup-MMA FlashAttention** at head_dim=128 (fp32 + fp16, causal + non-causal).
 - **`num_stages`** is a documented, honest no-op (pipelining measured not to help on
   Apple — no `cp.async`; the fast paths already overlap load/compute).
+
+### Reporting honesty
+
 - **3 silent-wrongs fixed** (2026-06-21 dual-lens audit): the fp16/bf16 simple-dot
   epilogue raced on a shared threadgroup slot; bf16 FlashAttention at head_dim 32/64
   dispatched wrong (now refused via a dtype gate); a 3D reduce with a pre-reduce op
@@ -21,6 +88,15 @@
 - **Reporting-honesty pass** — fixed a skip-count parser undercount (3,634 → true
   3,782), refreshed the stale conformance ratchet baseline (4,280 → 5,560), corrected
   the fp16 matmul headline label (fp16-in/fp32-out), and stale doc counts.
+
+### Tooling / CI
+
+- Hosted CI gates on **lint + format** (`ruff check` + `ruff format --check`; a
+  repo-wide `ruff format` pass landed, verified behavior-preserving by the full
+  suite). GPU/Metal correctness is validated locally (hosted macOS runners cannot
+  build Triton within their time limit) — documented in CONTRIBUTING.
+- sdist no longer ships a broken half-copy of the test suite (tests and repo-only
+  dirs are pruned; the wheel was always clean).
 
 ## 0.1.0a1 — first PyPI release as `triton-msl` (2026-06-19)
 

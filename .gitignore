@@ -43,3 +43,4 @@ triton_msl/csrc/.cache/
 
 # SDD process scratch (subagent-driven-development ledger/reports)
 .superpowers/
+docs/CHECKPOINT.md

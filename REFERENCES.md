@@ -39,8 +39,8 @@ backend's attention path implements.
 
 [5] Tri Dao. **"FlashAttention-2: Faster Attention with Better Parallelism
 and Work Partitioning."** 2023. arXiv: `2307.08691`. Improvements over [4]
-in work partitioning; informs the K-loop staging in this backend's FA
-HEAD_DIM=32 path.
+in work partitioning; informs the K-loop staging in this backend's
+FlashAttention path (head_dim 32/64/128).
 
 ## Online softmax
 

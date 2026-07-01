@@ -8,9 +8,11 @@ Metal (Apple Silicon) backend for [OpenAI Triton](https://github.com/triton-lang
 
 **The same `@triton.jit` source runs on NVIDIA.** triton-msl is a Triton *backend*, not a
 dialect — only the final stage (→ MSL) is Apple-specific, so the kernel you develop and
-correctness-debug on your Mac is the identical code that runs on a CUDA GPU. The fp32 paths
-are **verified bit-identical on a real NVIDIA A40** ([`PORTABILITY.md`](PORTABILITY.md)):
-develop kernel *logic* on the laptop you own, rent a GPU only for the performance pass.
+correctness-debug on your Mac is the identical code that runs on a CUDA GPU. Verified on a
+real NVIDIA A40: two of the three example fp32 kernels (vector-add, `ieee` matmul) produced
+**bit-identical** outputs across vendors; softmax matched to fp rounding (~1e-9)
+([`PORTABILITY.md`](PORTABILITY.md)). Develop kernel *logic* on the laptop you own, rent a
+GPU only for the performance pass.
 
 ## Status
 

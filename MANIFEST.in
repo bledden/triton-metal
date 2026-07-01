@@ -1,0 +1,12 @@
+# sdist manifest. Without this, setuptools' legacy default pulled tests/test_*.py into
+# the sdist while omitting tests/__init__.py, conftest.py, and tests/golden/ — a broken
+# half-copy of the suite. Tests need a Mac + a source-built Triton anyway, so exclude
+# them (and other repo-only dirs) from the sdist entirely; the wheel was always clean.
+prune tests
+prune docs
+prune benchmarks
+prune reports
+prune examples
+prune third_party
+prune scripts
+prune .github

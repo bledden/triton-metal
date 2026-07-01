@@ -11,7 +11,7 @@ project alongside the underlying Triton compiler ([REFERENCES.md][1]).
   author  = {Ledden, Blake},
   year    = {2026},
   url     = {https://github.com/bledden/triton-msl},
-  version = {0.1.0a1},
+  version = {0.1.0a2},
   note    = {Apple Silicon Metal backend for the OpenAI Triton compiler;
              alpha release. See CHANGELOG.md for current status.}
 }

@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased (post-0.1.0a1)
+## 0.1.0a2 (2026-07-01)
 
 The project suite grew **877 → 1,968 passed / 0 failed** over this cycle.
 

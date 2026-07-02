@@ -60,6 +60,10 @@ jobs:
     needs: test-install
     runs-on: ubuntu-latest
     environment: testpypi
+    # Best-effort dry run only. TestPyPI lags real PyPI on Metadata-Version 2.4 (PEP 639
+    # `License-Expression`) and 400s on artifacts PyPI accepts (verified: a1 is live on PyPI
+    # with license_expression). Its own lag must not block the real release below.
+    continue-on-error: true
     permissions:
       id-token: write
     steps:
@@ -74,7 +78,10 @@ jobs:
           repository-url: https://test.pypi.org/legacy/
 
   publish-pypi:
-    needs: publish-testpypi
+    needs: [test-install, publish-testpypi]
+    # Runs after the TestPyPI dry run but is NOT gated by it (test-install is the real gate);
+    # PyPI validates independently and fails safe if anything is actually wrong.
+    if: ${{ always() && needs.test-install.result == 'success' }}
     runs-on: ubuntu-latest
     environment: pypi
     permissions:

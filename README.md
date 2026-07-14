@@ -87,11 +87,15 @@ receipt + a reproduce harness: [`PORTABILITY.md`](PORTABILITY.md).
 ```bash
 pip install triton-msl
 
-# Triton is required but installed separately (macOS wheels may not be available)
-pip install triton>=3.6.0
+# Triton is required but installed separately. There is no official macOS wheel,
+# so build it from source (the primary, supported path — a one-time ~12 min build):
+pip install git+https://github.com/triton-lang/triton.git
+```
 
-# If no Triton wheel exists for your platform, build from source:
-# pip install git+https://github.com/triton-lang/triton.git
+If you're on the exact platform tuple **Python 3.14 / macOS 15+ / Apple Silicon (M1–M5)**, an unofficial prebuilt Triton wheel is attached to the [GitHub releases](https://github.com/bledden/triton-msl/releases/tag/triton-wheel-3.7.0-cp314-macos-arm64) so you can skip the build:
+
+```bash
+pip install https://github.com/bledden/triton-msl/releases/download/triton-wheel-3.7.0-cp314-macos-arm64/triton-3.7.0+git4da2e268-cp314-cp314-macosx_15_0_arm64.whl
 ```
 
 ## Quick Start

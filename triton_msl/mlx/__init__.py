@@ -1,5 +1,12 @@
 """Triton → MLX backend: zero-copy Metal dispatch via mx.fast.metal_kernel().
 
+This dispatches triton-msl's OWN generated MSL through MLX's runtime — an
+alternative launcher to torch.mps.compile_shader for code that lives on MLX
+arrays. It does NOT call MLX's native ops (mx.matmul, MLX attention, ...), so it
+borrows MLX's dispatch, not its speed; kernels run at the same throughput as the
+compile_shader path. ("Not competitive with MLX in absolute terms" refers to
+MLX's hand-tuned library kernels, which are a different thing from this launcher.)
+
 Usage:
     import triton
     import triton.language as tl

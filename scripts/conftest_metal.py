@@ -211,7 +211,11 @@ UNIMPLEMENTED_FEATURES = {
     # "test_tensor_atomic_add_non_exclusive_offset[64-1-float32]",  # Enabled: now passes
     # "test_tensor_atomic_add_non_exclusive_offset[128-1-float32]",  # Enabled: now passes
     # "test_tensor_atomic_add_access_patterns",  # Enabled: 80 configs pass
-    # scaled_dot — requires microscaling format support
+    # scaled_dot (block-scaled mxfp/fp8 microscaling matmul) — HARDWARE-IMPOSSIBLE,
+    # not an unwritten lowering: Apple's simdgroup matrix units are fp16/bf16/fp32 only
+    # (no fp8/fp4/mxfp unit), and the format can't be safely approximated. This is the
+    # single largest block of skips (~1,759) and it is a hardware limit, not a TODO.
+    # (Kept in this dict for the skip mechanism; classified hardware. See refusal_catalog.)
     "test_scaled_dot",
     # cat_nd — tuple arg handling not implemented
     "test_cat_nd",
@@ -251,7 +255,15 @@ UNIMPLEMENTED_FEATURES = {
     # "test_broadcast",  # Enabled: 2D broadcast via wrapping loop (>1024 threads)
     # "test_abs",  # Enabled: math.absi → MSL abs() for integer types
     # "test_cat",  # Enabled: tt.join→tt.trans→tt.reshape fused cat + tt.cat shared memory
-    "test_libdevice_rint",  # Needs Metal libdevice override (tt.extern_elementwise)
+    # rint IS implemented now (triton_msl._libdevice binds real CUDA libdevice onto
+    # tl.extra.libdevice, installed from MetalBackend.__init__ to dodge the import-time
+    # circular import; __nv_rint → Metal rint(), validated bit-exact on representable
+    # inputs). But the upstream test stays skipped for a *test-precision* reason, NOT an
+    # unimplemented lowering: it feeds int64-range values (~1e18), casts to float32, then
+    # asserts against a float64 np.rint at atol=0/rtol=0. The float32 kernel result differs
+    # from the float64 reference by exactly float32 epsilon (max rel diff 1.2e-7) on those
+    # inputs — a float32 artifact that fails on any float32 backend, not a Metal defect.
+    "test_libdevice_rint",
     # MLIR crash reproducer test — checks CUDA-specific pipeline stage names
     # (make_ttir, make_ttgir, make_llir). Metal pipeline is ttir/ttgir/msl/metallib.
     "test_triton_reproducer_path",

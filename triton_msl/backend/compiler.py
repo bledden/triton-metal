@@ -255,6 +255,19 @@ class MetalBackend(BaseBackend):
     def __init__(self, target: GPUTarget) -> None:
         super().__init__(target)
         self.binary_ext = "metallib"
+        # Fill Triton's stub tl.extra.libdevice with the real CUDA implementations
+        # (their __nv_* symbols are lowered by generic_lowerer). Done here, not at
+        # package import: import happens during Triton's own init via the backend
+        # entry-point, when triton.runtime.jit is only partially loaded and the
+        # libdevice import would hit a circular ImportError. By the time a backend
+        # is instantiated to compile a kernel, Triton is fully initialized, and
+        # this runs before the kernel is traced (where libdevice symbols resolve).
+        try:  # pragma: no cover - best-effort; idempotent
+            from triton_msl._libdevice import install as _install_libdevice
+
+            _install_libdevice()
+        except Exception:
+            pass
 
     def parse_options(self, opts: dict) -> MetalOptions:
         result = {}

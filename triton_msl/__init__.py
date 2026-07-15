@@ -18,3 +18,9 @@ try:  # pragma: no cover - trivial metadata lookup
         __version__ = "0.0.0+unknown"
 except Exception:  # pragma: no cover
     __version__ = "0.0.0+unknown"
+
+# NOTE: tl.extra.libdevice is filled in from the Metal backend compiler
+# (MetalBackend.__init__), NOT here — at package-import time Triton is only
+# partially initialized (this module is imported via the backend entry-point
+# during `import triton`), so the libdevice import hits a circular ImportError.
+# See triton_msl/_libdevice.py and backend/compiler.py.

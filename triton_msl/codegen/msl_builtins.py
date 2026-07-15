@@ -313,20 +313,3 @@ def fp8_device_functions(dtype: str) -> list:
     if not info:
         return []
     return [info[2], info[3]]
-
-
-def all_fp8_device_functions() -> list:
-    """Return all FP8 device function sources (deduplicated).
-
-    Used when multiple FP8 types are present in the same kernel.
-    """
-    seen = set()
-    funcs = []
-    for dtype, (to_name, from_name, to_src, from_src) in FP8_CONVERSION_MAP.items():
-        if to_name not in seen:
-            seen.add(to_name)
-            funcs.append(to_src)
-        if from_name not in seen:
-            seen.add(from_name)
-            funcs.append(from_src)
-    return funcs

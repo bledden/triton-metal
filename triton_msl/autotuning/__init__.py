@@ -1,1 +1,4 @@
-from triton_msl.autotuning.autotuner import MetalAutotuner, AutotuneConfig
+"""Matmul autotuning: deterministic occupancy-gated tile selection.
+
+See ``matmul_tuner`` and ``_fast_matmul_dispatch`` for the production path.
+"""

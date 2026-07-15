@@ -5246,39 +5246,6 @@ kernel void atomic_add_kernel(
     return kb.build()
 
 
-def make_atomic_max_kernel(block_size=256):
-    """Generate a kernel that performs atomic max to a global accumulator.
-
-    Each thread atomically computes max of its input with the output location.
-    Uses atomic_fetch_max on int representation (reinterpret cast).
-
-    Args:
-        block_size: Threads per threadgroup.
-    """
-    # Metal doesn't have atomic_fetch_max for float, so use int reinterpret trick
-    msl = f"""#include <metal_stdlib>
-using namespace metal;
-
-kernel void atomic_max_kernel(
-    device const float* input [[buffer(0)]],
-    device atomic_int* output [[buffer(1)]],
-    constant uint& n_elements [[buffer(2)]],
-    uint gid [[thread_position_in_grid]]
-) {{
-    if (gid >= n_elements) return;
-    float val = input[gid];
-    int int_val = as_type<int>(val);
-    // For positive floats, int comparison preserves order.
-    // Handle negative: flip all bits if negative, else flip sign bit only.
-    int_val = (int_val >= 0) ? int_val : (int_val ^ 0x7FFFFFFF);
-    atomic_fetch_max_explicit(&output[0], int_val, memory_order_relaxed);
-}}
-"""
-    kb = KernelBuilder("atomic_max_kernel", block_size=block_size)
-    kb.set_prebuilt_msl(msl)
-    return kb.build()
-
-
 def make_conv2d_kernel(
     in_channels=3, out_channels=64, kernel_h=3, kernel_w=3, stride_h=1, stride_w=1, pad_h=1, pad_w=1, block_size=256
 ):

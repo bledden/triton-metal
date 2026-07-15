@@ -475,22 +475,6 @@ def _try_parse_number(s: str) -> Any:
 
 
 # ---------------------------------------------------------------------------
-# SSA name extraction from module text
-# ---------------------------------------------------------------------------
-
-
-def _build_result_id_to_ssa_name(module_text: str) -> Dict[str, str]:
-    """Map result SSA names to their position for cross-referencing.
-
-    We can't directly map value.id() to SSA name from bindings alone,
-    but we can match by operation order since walk() and text are both
-    in forward order within the entry block.
-    """
-    # This is used for constant lookups — we match by walk order position
-    return {}
-
-
-# ---------------------------------------------------------------------------
 # MLIR Walker
 # ---------------------------------------------------------------------------
 

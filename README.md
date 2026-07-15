@@ -7,7 +7,7 @@ Metal (Apple Silicon) backend for [OpenAI Triton](https://github.com/triton-lang
 ```
 
 **The same `@triton.jit` source runs on NVIDIA.** triton-msl is a Triton *backend*, not a
-dialect — only the final stage (→ MSL) is Apple-specific, so the kernel you develop and
+dialect: only the final stage (→ MSL) is Apple-specific, so the kernel you develop and
 correctness-debug on your Mac is the identical code that runs on a CUDA GPU. Verified on a
 real NVIDIA A40: two of the three example fp32 kernels (vector-add, `ieee` matmul) produced
 **bit-identical** outputs across vendors; softmax matched to fp rounding (~1e-9)
@@ -16,34 +16,36 @@ GPU only for the performance pass.
 
 ## Status
 
-**Alpha** — actively developed, not yet production-ready.
+**Alpha**: actively developed, not yet production-ready.
 
-- **0 failures** across the upstream Triton `test_core.py` suite — 5,560 kernels
-  attempted and correct, 3,782 documented feature-gap skips (each is either a
-  *refused* kernel — fails loudly, never silent-wrong — or a hardware-impossible
-  case like FP64). Aligned with Triton [\[2\]](REFERENCES.md) release `3.7.0`.
-  Measured by `scripts/run_upstream_tests.py` — the single source of truth for this
-  count — which runs `--device cpu` (torch references compute on CPU while the Metal
+- **0 failures** across the upstream Triton `test_core.py` suite: 5,560 kernels
+  attempted and correct, 3,782 documented skips. Reconciled test by test, almost all
+  are hardware-bounded (no fp8/mxfp matrix unit, no fp64, no 64-bit atomics, no tf32, or
+  over Metal's 1024-thread / 32&nbsp;KB threadgroup ceilings); each is a loud refusal or a
+  hardware-impossible case, never silent-wrong, and effectively none are unwritten
+  lowerings. Aligned with Triton [\[2\]](REFERENCES.md) release `3.7.0`.
+  Measured by `scripts/run_upstream_tests.py` (the single source of truth for this
+  count), which runs `--device cpu` (torch references compute on CPU while the Metal
   backend compiles and runs the kernels on the GPU, since upstream `test_core`
   otherwise assumes CUDA). Re-run it to reproduce; counts in this file and
   `CHANGELOG.md` are regenerated from it, not hand-maintained.
-- **1,968 passed / 0 failed** in the project suite (codegen, GPU correctness,
+- **1,971 passed / 0 failed** in the project suite (codegen, GPU correctness,
   integration, FlashAttention, MLX backend, fast-matmul / compile_shader
   zero-copy, `torch.compile`, and training). FlashAttention: causal + non-causal
   at **HEAD_DIM 32 / 64 / 128** (head_dim 128 fp32 + fp16 via the simdgroup-MMA
   template; see [\[4\]](REFERENCES.md) for the algorithm); **15 / 15** MLX backend
-  tests; the project suite grew from 434 → 603 → 716 → 877 → 1,968 since `0.1.0-alpha`.
+  tests; the project suite grew from 434 → 603 → 716 → 877 → 1,971 since `0.1.0-alpha`.
   (A further ~20 C++-MLIR-backend tests skip unless that optional extension is
   built.)
 - **`torch.compile` routes through triton-msl** on Python 3.10–3.14 (PyTorch
-  Inductor [\[12\]](REFERENCES.md)) — inference and training (AOTAutograd
+  Inductor [\[12\]](REFERENCES.md)), inference and training (AOTAutograd
   backward), static and `dynamic=True`; **32 / 32** `torch.compile` model tests
   (plus 1 inductor-config regression test = 33 total) and the training suite pass.
 - Triton tutorials 01–03, 05 passing.
 - Built against Triton's `TRITON_EXT_ENABLED=1` plugin architecture
   (upstream PR [#9783](https://github.com/triton-lang/triton/pull/9783)).
 - **Integrity contract**: kernels we can lower run correctly; kernels we
-  cannot are *refused* (`MetalNonRecoverableError`) — never silent-wrong.
+  cannot are *refused* (`MetalNonRecoverableError`), never silent-wrong.
   See [`docs/SUPPORTED_OPS.md`](docs/SUPPORTED_OPS.md) for the supported
   ops/dtypes matrix + the loud-refusal catalog, and
   [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) "Lowering paths and the
@@ -53,21 +55,20 @@ See [`REFERENCES.md`](REFERENCES.md) for citations and
 [`docs/superpowers/specs/2026-05-30-triton-msl-roadmap.md`](docs/superpowers/specs/2026-05-30-triton-msl-roadmap.md)
 for the active pre-1.0 roadmap.
 
-## Portability — develop on Apple Silicon, run on NVIDIA
+## Portability: develop on Apple Silicon, run on NVIDIA
 
-triton-msl is a **backend** for Triton, so your `@triton.jit` source is standard Triton —
-the same code runs on NVIDIA (only the final codegen stage differs). The three example
+triton-msl is a **backend** for Triton, so your `@triton.jit` source is standard Triton and the same code runs on NVIDIA (only the final codegen stage differs). The three example
 kernels, unmodified, were run on an Apple M4 Max **and** a rented NVIDIA A40, each checked
 against the same NumPy reference:
 
 | kernel | Mac vs NumPy | NVIDIA vs NumPy | **Mac ↔ NVIDIA Δ** |
 |---|---|---|---|
-| `vector_add` | 0 | 0 | **0 — bit-identical** |
+| `vector_add` | 0 | 0 | **0, bit-identical** |
 | `fused_softmax` | 7.45e-9 | 5.59e-9 | 7.45e-9 |
-| `matmul` (fp32 / `ieee`) | 4.58e-5 | 4.58e-5 | **0 — bit-identical** |
-| `matmul` (`tf32`) | refused (no tf32 on Metal) | 6.07e-2 | — |
+| `matmul` (fp32 / `ieee`) | 4.58e-5 | 4.58e-5 | **0, bit-identical** |
+| `matmul` (`tf32`) | refused (no tf32 on Metal) | 6.07e-2 | n/a |
 
-**Correctness/logic is portable** — two of three kernels were bit-identical across vendors,
+**Correctness/logic is portable**: two of three kernels were bit-identical across vendors,
 and it crossed Triton 3.0.0 ↔ 3.7.0. **Performance is not** (block sizes and fast-path
 routing are hardware-specific). So the workflow is: develop and debug kernel *logic* on the
 Mac you own, then rent a GPU for minutes for the performance pass. The one numerical caveat
@@ -88,7 +89,7 @@ receipt + a reproduce harness: [`PORTABILITY.md`](PORTABILITY.md).
 pip install triton-msl
 
 # Triton is required but installed separately. There is no official macOS wheel,
-# so build it from source (the primary, supported path — a one-time ~12 min build):
+# so build it from source (the primary, supported path, a one-time ~12 min build):
 pip install git+https://github.com/triton-lang/triton.git
 ```
 
@@ -124,15 +125,15 @@ add_kernel[(n + 255) // 256,](x, y, out, n, BLOCK=256)
 print(f"Max error: {(out - (x + y)).abs().max():.2e}")
 ```
 
-Run a fuller, runnable version — vector-add, fused-softmax, and a tiled matmul, each
+Run a fuller, runnable version, vector-add, fused-softmax, and a tiled matmul, each
 on a non-multiple shape (so every load/store boundary mask is exercised) and verified
-against a NumPy reference — with [`examples/local_triton_dev.py`](examples/local_triton_dev.py):
+against a NumPy reference, with [`examples/local_triton_dev.py`](examples/local_triton_dev.py):
 
 ```bash
 python examples/local_triton_dev.py
 ```
 
-It's the same `@triton.jit` source you'd run on a CUDA GPU — develop and verify locally
+It's the same `@triton.jit` source you'd run on a CUDA GPU: develop and verify locally
 on your Mac, then ship the identical kernels to NVIDIA.
 
 ### torch.compile
@@ -154,16 +155,16 @@ out = compiled(x)
 ```
 
 **Performance.** The compiled kernels dispatch zero-copy through the same `compile_shader`
-fast path as the hand-written kernels. On an M4 Max, GPT-2 small (6 layers, 384-dim, 64
-tokens) runs in **~2.1 ms compiled vs ~7.3 ms eager — and ~4.6 ms through PyTorch's *own*
-native MPS Inductor backend**, i.e. triton-msl's path is faster than what PyTorch ships
-natively. Other architectures over eager (M4 Max, measured): BERT encoder ~1.4×, LSTM ~2.3×,
-LayerNorm/GroupNorm/RMSNorm ~2.2×, reduction-heavy modules ~1.6×.
+fast path as the hand-written kernels. At small model sizes the compiled latency is roughly
+on par with eager MPS, so the value here is coverage, not speed: `torch.compile` graphs
+(inference and training) route through triton-msl and stay correct to eager within
+floating-point tolerance, validated across 32 models spanning transformer blocks, a small
+GPT, a ViT, ResNets, and LSTMs, forward and training backward.
 
 **Coverage.** Transformer/attention, RNN, **CNN (incl. BatchNorm)**, normalization, and the
 reductions (sum, product, mean, max/min incl. NaN-propagating, var/std, argmax/argmin, softmax,
-logsumexp, cumsum/cumprod) — including small under-filling reductions **and a 2-D reduction
-fused with a 2-D scan in one kernel** (e.g. `x.sum(1) + x.cumprod(1)[:,-1]`) — compile and match
+logsumexp, cumsum/cumprod), including small under-filling reductions **and a 2-D reduction
+fused with a 2-D scan in one kernel** (e.g. `x.sum(1) + x.cumprod(1)[:,-1]`), compile and match
 eager. Anything genuinely beyond the hardware (a reduction/scan tile exceeding Metal's 1024
 threads/threadgroup) is **refused loudly rather than mis-computed** (`MetalNonRecoverableError`,
 never silent-wrong); the rest of the graph is unaffected.
@@ -192,7 +193,7 @@ out = mx.zeros((n,))
 results = triton_call(add_kernel, x, y, out, n, grid=(4,), BLOCK=256)
 ```
 
-### MPS tensors — zero-copy
+### MPS tensors: zero-copy
 
 The same `@triton.jit` kernel runs **zero-copy** on `torch` MPS tensors: the driver
 dispatches the emitted Metal through `torch.mps.compile_shader`, skipping the host
@@ -209,10 +210,10 @@ add_kernel[(n + 255) // 256,](x, y, out, n, BLOCK=256)  # runs on the GPU, no co
 
 fp16/fp32 matmuls (K%8) on MPS tensors take a direct simdgroup-matrix path, dispatched
 zero-copy. A deterministic, occupancy-gated tile selector picks the coarsest blocking the
-shape's M and N alignment allow — **M%32 + N%32** runs the `(4,4)` tile at ~11–12 TFLOP/s on
+shape's M and N alignment allow: **M%32 + N%32** runs the `(4,4)` tile at ~11–12 TFLOP/s on
 M4 Max; **M%8 or N%8** (not %32) runs a finer rescue tile (lower, but still far above the
 generic path). **M%8 ≠ 0 or N%8 ≠ 0** (e.g. an odd vocab/hidden dim) falls to the ~2.4 TFLOP/s
-generic path — a partial simdgroup strip can't be masked without writing past the matrix.
+generic path: a partial simdgroup strip can't be masked without writing past the matrix.
 
 ```python
 @triton.jit
@@ -241,9 +242,9 @@ matmul_kernel[(M // 64, N // 64)](
     BM=64, BN=64, BK=32)
 ```
 
-### Integrity contract — refused, never silently wrong
+### Integrity contract: refused, never silently wrong
 
-A kernel triton-msl **cannot lower correctly raises `MetalNonRecoverableError`**
+A kernel that triton-msl cannot lower correctly **raises `MetalNonRecoverableError`**
 rather than returning garbage. For example, a pid-tiled matmul that bakes its M/N
 dims as `constexpr` (so the true output strides can't be recovered) is refused:
 
@@ -277,13 +278,11 @@ matrix and the loud-refusal catalog.
 ### FlashAttention
 
 A full FlashAttention v2 forward (causal + non-causal) runs through the standard
-`@triton.jit` path at **`BLOCK_M = BLOCK_N = 32`** for **head_dim 32, 64, and 128** —
-see [`tests/test_flash_attention.py`](tests/test_flash_attention.py) for the kernel and
+`@triton.jit` path at **`BLOCK_M = BLOCK_N = 32`** for **head_dim 32, 64, and 128**, see [`tests/test_flash_attention.py`](tests/test_flash_attention.py) for the kernel and
 launch. head_dim 32/64 use the generic lowering; **head_dim 128** is routed to an
 Apple `simdgroup_matrix` MMA kernel (fp32 + fp16, causal + non-causal, any N_CTX) that
 measures **~5.2× (fp32) / ~6.4× (fp16) faster than the prior scalar path** at N=1024
-(**5.1 / 6.3 TFLOP/s**), rising to **~6.1× / ~7.9× at N=2048** (**6.8 / 8.8 TFLOP/s**) —
-**~45–55% of the in-repo matmul-template peak**. This is NOT
+(**5.1 / 6.3 TFLOP/s**), rising to **~6.1× / ~7.9× at N=2048** (**6.8 / 8.8 TFLOP/s**), **~45–55% of the in-repo matmul-template peak**. This is NOT
 competitive with Apple metal-flash-attention or MLX in absolute terms; it is the
 practical ceiling for a triton-jit-routed MSL kernel at these tile sizes. Out-of-range
 configs are **refused loudly** (`MetalNonRecoverableError`, never silent-wrong): head_dim
@@ -301,7 +300,7 @@ All default-on; set to `0` to disable (an escape hatch for bisecting a regressio
 | `TRITON_MSL_FAST_MATMUL=0` | Use the generic matmul instead of the fast simdgroup-matrix path |
 | `TRITON_MSL_MATMUL_AUTOTUNE=0` | Pin matmul tile selection to the fixed `(4,4)` blocking (M%32≠0 / N%32≠0 shapes drop to the generic path instead of the finer M%8/N%8 rescue tiles) |
 | `TRITON_MSL_MEPT=0` | Disable the multi-element-per-thread register-array model |
-| `TRITON_MSL_LEGACY=1` | Opt **in** to the heuristic legacy text parser (off by default — it can be silent-wrong) |
+| `TRITON_MSL_LEGACY=1` | Opt **in** to the heuristic legacy text parser (off by default, it can be silent-wrong) |
 
 ## What Works
 
@@ -310,7 +309,7 @@ All default-on; set to `0` to disable (an escape hatch for bisecting a regressio
 | **Elementwise** | add, sub, mul, div, exp, log, sqrt, abs, neg, SiLU, GELU, sigmoid, tanh, ReLU, leaky ReLU, clamp, FMA |
 | **Reductions** | sum, max, min, argmax, argmin, xor_sum |
 | **Dot product** | `tl.dot` with strided matmul template, all epilogues (add, softmax, chain-dot, transpose) |
-| **Attention** | FlashAttention [\[4\]](REFERENCES.md) (causal + non-causal) at **`BLOCK_M=BLOCK_N=32`, HEAD_DIM 32 / 64 / 128** via the Python MSL path (head_dim 128 routed to a simdgroup-MMA template — contiguous-stride fast path, scalar fallback otherwise — fp32 + fp16). Out-of-range configs (head_dim > 128; block tiles ≠ 32; bf16) are refused (`MetalNonRecoverableError`, never silent-wrong); larger blocks/head_dim are on the roadmap. |
+| **Attention** | FlashAttention [\[4\]](REFERENCES.md) (causal + non-causal) at **`BLOCK_M=BLOCK_N=32`, HEAD_DIM 32 / 64 / 128** via the Python MSL path (head_dim 128 routed to a simdgroup-MMA template, contiguous-stride fast path, scalar fallback otherwise, fp32 + fp16). Out-of-range configs (head_dim > 128; block tiles ≠ 32; bf16) are refused (`MetalNonRecoverableError`, never silent-wrong); larger blocks/head_dim are on the roadmap. |
 | **Normalization** | Layer norm, RMS norm, batch norm |
 | **Type casts** | FP32, FP16, BF16, INT8, INT16, INT32, bool |
 | **Control flow** | `scf.for`, `scf.if`, while loops |
@@ -326,7 +325,7 @@ All default-on; set to `0` to disable (an escape hatch for bisecting a regressio
 | FP64 | Metal has no FP64 support |
 | FP8, TF32 | Not available on Apple GPUs |
 | Multi-GPU | Apple Silicon is single-GPU |
-| `tl.dot` with sizePerThread > 1 | Requires 2D cooperative execution model (addressed by the register-array spine — WS1) |
+| `tl.dot` with sizePerThread > 1 | Requires 2D cooperative execution model (addressed by the register-array spine, WS1) |
 | Unstructured control flow (`cf.cond_br`) | Refused with `MetalNonRecoverableError` (never silent-wrong); a `cf`-dialect lowerer is WS2 |
 | `tt.dot_scaled` (microscaling matmul) | No Apple microscaling hardware; refused |
 
@@ -352,28 +351,28 @@ fp32 / fp16.
 
 \* fp16 matmul uses fp16 inputs with a **float32 accumulator** (for precision). The
 12.3 figure is the default **fp32-output** path; the true **fp16→fp16** path
-(`out_dtype=fp16`) measures **12.2 TFLOP/s** — essentially identical, since both do
+(`out_dtype=fp16`) measures **12.2 TFLOP/s**, essentially identical, since both do
 the same MACs and the output-cast cost is negligible. Either way it runs at roughly
 the fp32 matrix-unit rate: Apple's simdgroup-matrix unit isn't faster for half
 accumulation, so the 36.9 TFLOP/s fp16 figure is an unreachable vector-ALU peak. The ~58–64% memory-bound
 and ~60% fp32-matmul numbers are **near the practical ceilings** for these kernel
 classes on this hardware (the raw 546 / 18.4 / 36.9 spec peaks are not reachable by
-compute) — see the Phase-5 readiness audit (`docs/audits/`).
+compute), see the Phase-5 readiness audit (`docs/audits/`).
 
 † FA fp16 accumulates in fp32 (correct); % of the 36.9 fp16 vector-ALU peak is not a
-useful comparison — the practical reference is the in-repo matmul peak, of which fp32
+useful comparison; the practical reference is the in-repo matmul peak, of which fp32
 FA reaches ~46% (5.1 / 11.2) and fp16 ~51% (6.3 / 12.3). The FA numbers are **not
 competitive with Apple metal-flash-attention or MLX in absolute terms**.
 
 § The fp32 matmul figure is the cold-machine peak (~11 TFLOP/s, verified 2026-06-24).
 It is **thermally sensitive**: under sustained GPU load an M4 Max throttles the fp32
-path to ~9 TFLOP/s, so `reports/perf_baseline.json` — re-measured after a long
-benchmark session — currently records ~9.2; re-run `test_fast_matmul_perf` on an idle
+path to ~9 TFLOP/s, so `reports/perf_baseline.json`, re-measured after a long
+benchmark session, currently records ~9.2; re-run `test_fast_matmul_perf` on an idle
 machine to see the cold peak. fp16/fp16out throttle less (measured ~12.3/12.2 cold).
 The 11.2 figure is the **dense row-major (contiguous-innermost) case only**.
 **Non-contiguous / transposed / sliced operands** (e.g. `x @ w.t()`, a column-major
 output, or a column slice `t[:, :K]` whose inner stride ≠ 1 or whose row stride ≠ the
-matrix dim) fall **off** the simdgroup fast path — they are computed **correctly** by a
+matrix dim) fall **off** the simdgroup fast path; they are computed **correctly** by a
 fully stride-aware scalar matmul (or refused when un-inferable; **never silently
 wrong**), but that scalar path is **~15–23× slower** (below the generic floor).
 `contiguous()` the operand before the kernel to stay on the fast path. (Batched 3-D
@@ -381,17 +380,17 @@ matmuls are not yet implemented and **refuse loudly**.)
 
 ◊ bf16 matmul uses Apple's `simdgroup_bfloat8x8` matrix unit (float32 accumulate),
 **verified on M4**; on a part without a bfloat matrix unit it falls back to the
-(correct) generic float-compute path — never silently wrong.
+(correct) generic float-compute path, never silently wrong.
 
 ‡ FA rows are **measured** on M4 Max (integration microbenchmark of the shipped
 `make_flash_attention_kernel_simdgroup`: warmup + median over 50 iters), not yet a
-committed regression-benchmark harness. Throughput scales with sequence length —
+committed regression-benchmark harness. Throughput scales with sequence length:
 ~6.8 TFLOP/s (fp32, ~6.1×) / ~8.8 TFLOP/s (fp16, ~7.9×) at N=2048. Correctness
 is verified by the 16-case differential gate (`tests/test_fa_simdgroup_diff.py`: simd
 == scalar oracle == torch, all pass). A dedicated FA throughput benchmark is on the
 roadmap.
 
-**MPS tensors run zero-copy** via `torch.mps.compile_shader` (default-on) — the prior
+**MPS tensors run zero-copy** via `torch.mps.compile_shader` (default-on); the prior
 host-round-trip copy bottleneck is gone. CPU tensors and the MLX backend
 [\[7\]](REFERENCES.md) (`mx.fast.metal_kernel`) also dispatch zero-copy.
 

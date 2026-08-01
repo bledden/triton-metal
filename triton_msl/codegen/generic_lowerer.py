@@ -2937,6 +2937,24 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
                 self._propagate_shape_elementwise(ssa)
                 return
 
+            # Chained addptr: array-offset parent advanced by a SCALAR. Folding a
+            # scalar into an array-of-offsets base (e.g. `x_ptr + offs*K + k`
+            # inside a loop) must add the scalar into each array slot. Without
+            # this, the scalar-offset fall-through below emits
+            # `base[arr[0]][scalar]` — a double subscript that fails to compile.
+            # MEPT-only: the non-MEPT path chains through env_is_ptr (below) and
+            # flattens to a single offset correctly.
+            if self.mept_enabled:
+                parent_ptr_array = self.env_ptr_array.get(ptr_id)
+                if parent_ptr_array:
+                    base_ptr, parent_arr, parent_n = parent_ptr_array
+                    combined_exprs = [f"{parent_arr}[{i}] + {offset_var}" for i in range(parent_n)]
+                    combined_name = self._var_array("off", combined_exprs, "uint")
+                    self.env_ptr_array[ssa.id] = (base_ptr, combined_name, parent_n)
+                    self.env[ssa.id] = f"{base_ptr}[{combined_name}[0]]"
+                    self._propagate_shape_elementwise(ssa)
+                    return
+
             # Check if this is a chained addptr (ptr_id is itself an addptr result)
             parent_ptr_info = self.env_is_ptr.get(ptr_id)
             if parent_ptr_info:

@@ -1,5 +1,25 @@
 # Changelog
 
+## Unreleased
+
+### Platform
+
+- **Validated on macOS 26.6 (Tahoe), build 25G72** — full project suite 1971
+  passed / 0 failed on real hardware. The Metal-version probe already runtime-checks
+  each `-std=metalX.Y` for actual loadability rather than guessing from SDK version
+  numbers, so it was immune to the 15.x→26.x SDK-version jump that broke PyTorch MPS
+  version parsing. No code change was needed — the design anticipated it.
+
+### Correctness
+
+- **MEPT chained-addptr fix** — an array-of-offsets base pointer (`x_ptr + offs*K`)
+  advanced by a *scalar* loop variable (`+ k`, inside a runtime loop) fell through to
+  the scalar-offset lowering and emitted an invalid double subscript
+  (`base[arr[0]][k]`) that failed to compile. This was always a **loud** failure
+  (`MetalCompilationError`), never a silent-wrong. The scalar is now folded into every
+  register-array slot. Surfaced by the macOS-26 C++-backend suite; guarded by a new
+  default-path regression test with a full red-green cycle.
+
 ## 0.1.0a2 (2026-07-01)
 
 The project suite grew **877 → 1,968 passed / 0 failed** over this cycle.

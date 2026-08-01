@@ -48,11 +48,29 @@ if HAS:
             acc = acc + tl.sum(v)
         tl.store(OUT + tl.arange(0, 1), acc)
 
+    @triton.jit
+    def _scalar_advance_array_base(X, OUT, K: tl.constexpr, BLOCK: tl.constexpr):
+        # Chained addptr: an array-of-offsets base (X + offs*K) advanced by a
+        # SCALAR loop induction variable (+ k).  Regression for the MEPT double-
+        # subscript codegen bug (base[arr[0]][k]) surfaced by the macOS-26 suite.
+        # The `pid*BLOCK` term is load-bearing: without it `offs` is a pure
+        # compile-time make_range and `offs*K` folds into a strided range that
+        # never creates the chained array-base this bug lived in.
+        pid = tl.program_id(0)
+        offs = pid * BLOCK + tl.arange(0, BLOCK)
+        acc = tl.zeros((BLOCK,), dtype=tl.float32)
+        for k in range(0, K):
+            v = tl.load(X + offs * K + k)
+            acc = acc + v
+        tl.store(OUT + offs, acc)
+
 
 # All @triton.jit kernels defined in this file.  The autouse fixture below
 # clears their in-process JIT caches before each test.  Add any new kernel
 # defined in this file to this tuple so the cache flush covers it.
-_MODULE_KERNELS = (_sum_carry_in_loop, _min_blocksum_in_loop, _hoisted_reduce_in_loop) if HAS else ()
+_MODULE_KERNELS = (
+    (_sum_carry_in_loop, _min_blocksum_in_loop, _hoisted_reduce_in_loop, _scalar_advance_array_base) if HAS else ()
+)
 
 
 @pytest.fixture(autouse=True)
@@ -131,3 +149,24 @@ def test_inloop_reduce_uncoverable_refuses(monkeypatch):
     OUT = torch.zeros(1, device="mps", dtype=torch.float32)
     with pytest.raises(MetalNonRecoverableError):
         _hoisted_reduce_in_loop[(1,)](X, OUT, C=C, BLOCK=BLOCK)
+
+
+@requires_metal
+@pytest.mark.parametrize("BLOCK", [256, 512, 1024])
+def test_inloop_scalar_advance_of_array_base_correct(BLOCK, monkeypatch):
+    """Regression (found by the macOS-26 C++-backend suite): a chained addptr
+    whose base is an array of offsets (X + offs*K) advanced by a SCALAR loop
+    variable (+ k) must fold the scalar into every register-array slot.  The
+    pre-fix codegen fell through to the scalar-offset path and emitted
+    base[arr[0]][k] — a double subscript that failed to compile (loud
+    MetalCompilationError, never silent-wrong).  MEPT only (BLOCK>128); the
+    non-MEPT path chains through env_is_ptr and was already correct.
+    """
+    monkeypatch.setenv("TRITON_MSL_MEPT", "1")
+    K = 4
+    torch.manual_seed(0)
+    X = torch.randn(BLOCK * K, device="mps", dtype=torch.float32)
+    OUT = torch.zeros(BLOCK, device="mps", dtype=torch.float32)
+    _scalar_advance_array_base[(1,)](X, OUT, K=K, BLOCK=BLOCK)
+    ref = X.view(BLOCK, K).sum(dim=1)
+    torch.testing.assert_close(OUT, ref, rtol=1e-4, atol=1e-4)

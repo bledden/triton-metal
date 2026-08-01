@@ -78,7 +78,7 @@ receipt + a reproduce harness: [`PORTABILITY.md`](PORTABILITY.md).
 ## Requirements
 
 - Apple Silicon Mac (M1 or later)
-- macOS 14 (Sonoma) or later
+- macOS 14 (Sonoma) or later — validated through macOS 26.6 (Tahoe)
 - Xcode Command Line Tools: `xcode-select --install`
 - Python 3.10+
 - PyTorch 2.12+ (2.5+ for the zero-copy MPS fast path; `torch.compile` is developed + tested against 2.12) and Triton 3.7.0

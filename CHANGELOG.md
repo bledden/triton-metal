@@ -16,6 +16,13 @@
   (`sudo xcodebuild -downloadComponent MetalToolchain`) instead of retrying it as a
   transient flake and reporting a misleading "transient, all 3 attempts failed". The
   Requirements doc calls out the component too.
+- **C++ path AIR version now dynamic (macOS 26)** — the opt-in C++/LLVM-IR lowering
+  path hardcoded `air.version = {2,7,0}` / `Metal 3.2`, which macOS 26's toolchain
+  rejects (it wants AIR 2.8 / Metal 4.0), silently degrading the C++ path to CPU
+  execution. device_detect now runtime-probes the toolchain's actual AIR /
+  Metal-language version and threads it through `run_to_llvm` into the emitted
+  metadata, so the C++ path runs on GPU on macOS 26 without breaking older macOS
+  (the probe falls back to 2.7 / 3.2). Requires rebuilding `_triton_msl_cpp`.
 
 ### Correctness
 

@@ -1431,8 +1431,14 @@ class MetalBackend(BaseBackend):
                 block_size = product
             else:
                 block_size = max(end for end, _ in mr_entries)
-        # Run C++ pass pipeline: TTGIR → LLVM IR with AIR metadata
-        air_llvm_ir_opaque = cpp.run_to_llvm(stripped)
+        # Run C++ pass pipeline: TTGIR → LLVM IR with AIR metadata. The AIR /
+        # Metal-language version stamped into the IR must match the installed
+        # toolchain (macOS 26 wants AIR 2.8 / Metal 4.0; older wanted 2.7 / 3.2),
+        # else `xcrun metal -c -x ir` rejects the module and falls back to CPU.
+        from triton_msl.backend.device_detect import air_version_components
+
+        _air = air_version_components()
+        air_llvm_ir_opaque = cpp.run_to_llvm(stripped, _air[0], _air[1], _air[2], _air[3])
 
         if level >= 2:
             debug_dir = _dump_dir()

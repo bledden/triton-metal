@@ -69,7 +69,9 @@ struct AIRImplicitArg {
 // implicitArgs: ordered list of implicit arg descriptors (pid, lid, etc.)
 static void addAIRMetadata(llvm::Module &mod, llvm::Function &kernelFn,
                            unsigned numExplicitArgs,
-                           const llvm::SmallVectorImpl<AIRImplicitArg> &implicitArgs) {
+                           const llvm::SmallVectorImpl<AIRImplicitArg> &implicitArgs,
+                           unsigned airVersionMajor, unsigned airVersionMinor,
+                           unsigned langVersionMajor, unsigned langVersionMinor) {
     auto &ctx = mod.getContext();
     auto *i32Ty = llvm::Type::getInt32Ty(ctx);
 
@@ -342,20 +344,22 @@ static void addAIRMetadata(llvm::Module &mod, llvm::Function &kernelFn,
         llvm::MDString::get(ctx, "triton-msl")
     }));
 
-    // air.version
+    // air.version — must match the installed toolchain (macOS 26 wants 2.8,
+    // older wanted 2.7). Probed at runtime and passed down, never hardcoded:
+    // a stale version here makes `xcrun metal -c -x ir` reject the module.
     auto *verMD = mod.getOrInsertNamedMetadata("air.version");
     verMD->addOperand(llvm::MDNode::get(ctx, {
-        llvm::ConstantAsMetadata::get(llvm::ConstantInt::get(i32Ty, 2)),
-        llvm::ConstantAsMetadata::get(llvm::ConstantInt::get(i32Ty, 7)),
+        llvm::ConstantAsMetadata::get(llvm::ConstantInt::get(i32Ty, airVersionMajor)),
+        llvm::ConstantAsMetadata::get(llvm::ConstantInt::get(i32Ty, airVersionMinor)),
         llvm::ConstantAsMetadata::get(llvm::ConstantInt::get(i32Ty, 0))
     }));
 
-    // air.language_version
+    // air.language_version — likewise (macOS 26: Metal 4.0; older: Metal 3.2).
     auto *langMD = mod.getOrInsertNamedMetadata("air.language_version");
     langMD->addOperand(llvm::MDNode::get(ctx, {
         llvm::MDString::get(ctx, "Metal"),
-        llvm::ConstantAsMetadata::get(llvm::ConstantInt::get(i32Ty, 3)),
-        llvm::ConstantAsMetadata::get(llvm::ConstantInt::get(i32Ty, 2)),
+        llvm::ConstantAsMetadata::get(llvm::ConstantInt::get(i32Ty, langVersionMajor)),
+        llvm::ConstantAsMetadata::get(llvm::ConstantInt::get(i32Ty, langVersionMinor)),
         llvm::ConstantAsMetadata::get(llvm::ConstantInt::get(i32Ty, 0))
     }));
 
@@ -379,6 +383,8 @@ static void addAIRMetadata(llvm::Module &mod, llvm::Function &kernelFn,
 // ---------------------------------------------------------------------------
 
 extern "C" const char* triton_msl_run_to_llvm(const char* mlir_text,
+                                                 int air_major, int air_minor,
+                                                 int lang_major, int lang_minor,
                                                  int* out_success) {
     *out_success = 0;
 
@@ -766,7 +772,9 @@ extern "C" const char* triton_msl_run_to_llvm(const char* mlir_text,
     unsigned numExplicit = kernelFn->arg_size() >= numImplicit
                            ? kernelFn->arg_size() - numImplicit
                            : kernelFn->arg_size();
-    addAIRMetadata(*llvmMod, *kernelFn, numExplicit, airImplicitArgs);
+    addAIRMetadata(*llvmMod, *kernelFn, numExplicit, airImplicitArgs,
+                   static_cast<unsigned>(air_major), static_cast<unsigned>(air_minor),
+                   static_cast<unsigned>(lang_major), static_cast<unsigned>(lang_minor));
 
     // Serialize to text
     static std::string result;

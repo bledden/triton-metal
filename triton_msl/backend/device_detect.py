@@ -178,6 +178,81 @@ def _probe_metal_compiler() -> Optional[str]:
     return None
 
 
+def _extract_air_metadata_ints(ir_text: str, named: str):
+    """Resolve `!<named> = !{!N}` then `!N = !{...}` in LLVM IR text and return
+    the trailing i32 components as a list (ignoring any leading string operand,
+    e.g. the "Metal" tag on air.language_version). None if not found."""
+    import re
+
+    ref = re.search(r"!" + re.escape(named) + r" = !\{!(\d+)\}", ir_text)
+    if not ref:
+        return None
+    node = ref.group(1)
+    val = re.search(r"^!" + node + r" = !\{(.+)\}", ir_text, re.MULTILINE)
+    if not val:
+        return None
+    ints = [int(x) for x in re.findall(r"i32 (\d+)", val.group(1))]
+    return ints or None
+
+
+# Long-standing default (pre-macOS-26 toolchains) used if probing fails.
+_AIR_VERSION_FALLBACK = (2, 7, 3, 2)
+_AIR_VERSION_CACHE = None
+
+
+def _probe_air_version():
+    """Probe the air.version / air.language_version the installed toolchain
+    stamps, by compiling a trivial kernel to LLVM IR and reading the metadata.
+
+    The opt-in C++ lowering path emits LLVM IR that `xcrun metal -c -x ir`
+    compiles directly; that IR must carry the air.version the current toolchain
+    expects, or the module is rejected (macOS 26 wants 2.8; older wanted 2.7).
+    Runtime-probed, never guessed from SDK numbers — same philosophy as
+    _probe_metal_compiler. Returns (air_major, air_minor, lang_major, lang_minor).
+    """
+    import tempfile
+    import os
+
+    metal_path = ll_path = None
+    try:
+        with tempfile.NamedTemporaryFile(suffix=".metal", mode="w", delete=False) as f:
+            f.write("kernel void _probe() {}\n")
+            metal_path = f.name
+        ll_path = metal_path.replace(".metal", ".ll")
+        subprocess.run(
+            ["xcrun", "-sdk", "macosx", "metal", "-S", "-emit-llvm", metal_path, "-o", ll_path],
+            capture_output=True,
+            timeout=10,
+            check=True,
+        )
+        with open(ll_path) as fh:
+            ir = fh.read()
+        air = _extract_air_metadata_ints(ir, "air.version")
+        lang = _extract_air_metadata_ints(ir, "air.language_version")
+        if not air or not lang or len(air) < 2 or len(lang) < 2:
+            return _AIR_VERSION_FALLBACK
+        return (air[0], air[1], lang[0], lang[1])
+    except (subprocess.CalledProcessError, FileNotFoundError, subprocess.TimeoutExpired, OSError, ValueError):
+        return _AIR_VERSION_FALLBACK
+    finally:
+        for p in (metal_path, ll_path):
+            if p:
+                try:
+                    os.unlink(p)
+                except OSError:
+                    pass
+
+
+def air_version_components():
+    """Cached (air_major, air_minor, lang_major, lang_minor) for the installed
+    toolchain, passed to the C++ path's run_to_llvm so its AIR metadata matches
+    the compiler that consumes it. Probed once per process."""
+    global _AIR_VERSION_CACHE
+    if _AIR_VERSION_CACHE is None:
+        _AIR_VERSION_CACHE = _probe_air_version()
+    return _AIR_VERSION_CACHE
+
+
 def _infer_metal_version(sdk_version: Optional[str], chip_family: str) -> str:
     """Infer the highest supported Metal Shading Language version.
 

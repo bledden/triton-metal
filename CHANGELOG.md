@@ -24,6 +24,18 @@
   metadata, so the C++ path runs on GPU on macOS 26 without breaking older macOS
   (the probe falls back to 2.7 / 3.2). Requires rebuilding `_triton_msl_cpp`.
 
+### Gluon
+
+- **Basic Gluon kernels now run on Metal.** Implemented `MetalBackend.get_target_name`
+  (a hole in Triton's out-of-tree `BaseBackend` contract — the Gluon runtime calls it
+  generically, so any backend without it raised `AttributeError`) and populated
+  `metadata["shared"]` in the Gluon lowering path (`gluon_to_ttgir`, which the Gluon
+  path runs instead of `make_ttgir`). Gluon copy / elementwise kernels with an explicit
+  `BlockedLayout` (size_per_thread 1–8 × 4–8 warps) compile and run correctly.
+  NVIDIA-specific Gluon (mma, warp specialization, mbarrier, TMA) remains out of scope.
+  A companion upstream change — a default `get_target_name` on `BaseBackend` — would
+  let any out-of-tree backend get Gluon for free (it is a hole in the base contract).
+
 ### Correctness
 
 - **MEPT chained-addptr fix** — an array-of-offsets base pointer (`x_ptr + offs*K`)

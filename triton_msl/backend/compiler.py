@@ -274,6 +274,15 @@ class MetalBackend(BaseBackend):
     def supports_target(target: GPUTarget):
         return target.backend in ("metal", "mps")
 
+    def get_target_name(self, options) -> str:
+        # Gluon's runtime (triton/experimental/gluon/_runtime.py) reads this to
+        # set the `ttg.target` module attribute for layout verification; the
+        # classic compile path never calls it. Mirrors the in-tree backends'
+        # cuda:<capability> / hip:<arch>. BaseBackend does NOT define this, so an
+        # out-of-tree backend must provide it or any Gluon kernel raises
+        # AttributeError (upstream: it belongs on BaseBackend).
+        return f"metal:{options.arch}"
+
     def __init__(self, target: GPUTarget) -> None:
         super().__init__(target)
         self.binary_ext = "metallib"
@@ -1939,6 +1948,14 @@ class MetalBackend(BaseBackend):
         passes.ttgpuir.add_combine_tensor_select_and_if(pm)
         pm.run(mod, "gluon_to_ttgir")
         metadata["tensordesc_meta"] = mod.get_tensordesc_metadata()
+        # The Gluon path skips make_ttgir, but Triton's launcher reads
+        # metadata.shared directly, so populate it here too (bytes of threadgroup
+        # memory; >=1 avoids a divide-by-zero in occupancy math when unused).
+        try:
+            shared = mod.get_int_attr("ttg.shared")
+        except Exception:
+            shared = None
+        metadata["shared"] = max(1, shared if shared is not None else 0)
         return mod
 
     @staticmethod

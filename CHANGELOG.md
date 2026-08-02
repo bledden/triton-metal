@@ -9,6 +9,13 @@
   each `-std=metalX.Y` for actual loadability rather than guessing from SDK version
   numbers, so it was immune to the 15.x→26.x SDK-version jump that broke PyTorch MPS
   version parsing. No code change was needed — the design anticipated it.
+- **Metal Toolchain detection (macOS 26 / Xcode 26)** — on Tahoe the Metal shader
+  compiler is a separate on-demand component; when absent (fresh setup or an Xcode
+  update), `xcrun metal` fails permanently. triton-msl now detects this specific
+  failure and raises an actionable error naming the fix
+  (`sudo xcodebuild -downloadComponent MetalToolchain`) instead of retrying it as a
+  transient flake and reporting a misleading "transient, all 3 attempts failed". The
+  Requirements doc calls out the component too.
 
 ### Correctness
 

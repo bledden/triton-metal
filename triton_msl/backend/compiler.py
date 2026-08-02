@@ -146,6 +146,28 @@ def _msl_cache_key(mod_text, options_hash):
 # immediately on the first attempt without retrying.
 _METALLIB_COMPILE_ATTEMPTS = 3
 
+# macOS 26 / Xcode 26 ship the Metal shader compiler as a separate on-demand
+# component ("Metal Toolchain"); a fresh setup or an Xcode update can leave it
+# absent, so `xcrun metal` fails with "cannot execute tool 'metal' due to missing
+# Metal Toolchain". This is PERMANENT, not a transient flake — detect it and raise
+# an actionable error instead of retrying (and mislabelling it "transient").
+_METAL_TOOLCHAIN_MISSING_HINT = (
+    "The Metal Toolchain is not installed. macOS 26 / Xcode 26 ship the Metal "
+    "compiler as a separate on-demand component, so a fresh setup or a recent "
+    "Xcode update can leave it absent. Install it with:\n"
+    "    sudo xcodebuild -downloadComponent MetalToolchain\n"
+    "(or Xcode > Settings > Components > Metal Toolchain), then verify with "
+    "`xcrun metal --version`."
+)
+
+
+def _is_metal_toolchain_missing(stderr: str) -> bool:
+    """True when a metal/metallib invocation failed because the Metal Toolchain
+    component is absent (see _METAL_TOOLCHAIN_MISSING_HINT). Such failures are
+    permanent — the caller must raise immediately, never retry as transient."""
+    return "missing Metal Toolchain" in stderr or "cannot execute tool 'metal'" in stderr
+
+
 _NUM_STAGES_WARNED = False
 
 
@@ -1766,6 +1788,12 @@ class MetalBackend(BaseBackend):
                         from triton_msl.errors import MetalCompilationError
 
                         stderr = e.stderr.decode("utf-8", errors="replace") if e.stderr else ""
+                        if _is_metal_toolchain_missing(stderr):
+                            raise MetalCompilationError(
+                                _METAL_TOOLCHAIN_MISSING_HINT,
+                                msl_source=ll_path,
+                                stderr=stderr,
+                            ) from None
                         raise MetalCompilationError(
                             f"Metal IR compilation failed (exit {e.returncode})",
                             msl_source=ll_path,
@@ -2210,6 +2238,15 @@ class MetalBackend(BaseBackend):
                         from triton_msl.errors import MetalCompilationError
 
                         stderr = e.stderr.decode("utf-8", errors="replace") if e.stderr else ""
+                        # A missing Metal Toolchain component is PERMANENT (not a
+                        # transient flake) — raise immediately with install guidance
+                        # rather than retrying and reporting "transient".
+                        if _is_metal_toolchain_missing(stderr):
+                            raise MetalCompilationError(
+                                _METAL_TOOLCHAIN_MISSING_HINT,
+                                msl_source=metal_path,
+                                stderr=stderr,
+                            ) from None
                         # Distinguish a REAL deterministic MSL error from a
                         # TRANSIENT toolchain flake. A genuine compile error
                         # carries a source-location diagnostic

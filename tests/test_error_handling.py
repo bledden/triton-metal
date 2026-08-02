@@ -268,3 +268,39 @@ class TestCodegenErrorWrapping:
             lowerer._lower_op(ssa)
 
         assert "tt.load" in str(exc_info.value)
+
+
+class TestMetalToolchainMissing:
+    """macOS 26 / Xcode 26 ship the Metal compiler as a separate on-demand
+    component; when absent, `xcrun metal` fails permanently. triton-msl must
+    detect this and raise an actionable error, never retry it as a transient
+    flake (which previously mislabelled it "transient, all 3 attempts failed").
+    """
+
+    def test_real_toolchain_missing_stderr_is_detected(self):
+        from triton_msl.backend.compiler import _is_metal_toolchain_missing
+
+        # The exact diagnostic macOS 26 / Xcode 26 emit when the component is gone.
+        real = (
+            "error: error: cannot execute tool 'metal' due to missing Metal "
+            "Toolchain; use: xcodebuild -downloadComponent MetalToolchain"
+        )
+        assert _is_metal_toolchain_missing(real) is True
+
+    def test_syntax_error_is_not_misclassified(self):
+        from triton_msl.backend.compiler import _is_metal_toolchain_missing
+
+        # A genuine compile error must NOT be treated as toolchain-missing.
+        syntax = "/tmp/k.metal:12:5: error: use of undeclared identifier 'foo'"
+        assert _is_metal_toolchain_missing(syntax) is False
+
+    def test_empty_stderr_is_not_toolchain_missing(self):
+        from triton_msl.backend.compiler import _is_metal_toolchain_missing
+
+        # Empty stderr (a spawn/signal transient) is a retry candidate, not this.
+        assert _is_metal_toolchain_missing("") is False
+
+    def test_hint_names_the_fix_command(self):
+        from triton_msl.backend.compiler import _METAL_TOOLCHAIN_MISSING_HINT
+
+        assert "xcodebuild -downloadComponent MetalToolchain" in _METAL_TOOLCHAIN_MISSING_HINT

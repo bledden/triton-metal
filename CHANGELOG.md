@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+### Portability
+
+- **Verified byte-identical on AMD, not just NVIDIA.** The example `@triton.jit` kernels,
+  unmodified, ran on a rented AMD Instinct MI300X (ROCm 7.2.4, gfx942, Triton 3.6.0)
+  alongside the earlier NVIDIA A40 and the Apple M4 Max. `vector_add` and the `ieee` matmul
+  produced the **same SHA-256** across all three vendors (Metal == CUDA == ROCm); softmax
+  matched to fp rounding (~7.5e-9); tf32 is refused on Metal and absent on AMD. The central
+  claim — develop on the Mac you own, run unchanged on datacenter silicon — now holds across
+  three ISAs (Metal / PTX / CDNA3) and three Triton versions (3.0.0 / 3.6.0 / 3.7.0).
+  PORTABILITY.md + README updated.
+
 ### Platform
 
 - **Validated on macOS 26.6 (Tahoe), build 25G72** — full project suite 1971

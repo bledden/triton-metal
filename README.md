@@ -6,11 +6,12 @@ Metal (Apple Silicon) backend for [OpenAI Triton](https://github.com/triton-lang
 @triton.jit → Triton TTIR → TTGIR → MSL → metallib → Apple GPU
 ```
 
-**The same `@triton.jit` source runs on NVIDIA.** triton-msl is a Triton *backend*, not a
-dialect: only the final stage (→ MSL) is Apple-specific, so the kernel you develop and
-correctness-debug on your Mac is the identical code that runs on a CUDA GPU. Verified on a
-real NVIDIA A40: two of the three example fp32 kernels (vector-add, `ieee` matmul) produced
-**bit-identical** outputs across vendors; softmax matched to fp rounding (~1e-9)
+**The same `@triton.jit` source runs on NVIDIA and AMD.** triton-msl is a Triton *backend*,
+not a dialect: only the final stage (→ MSL) is Apple-specific, so the kernel you develop and
+correctness-debug on your Mac is the identical code that runs on a CUDA or ROCm GPU. Verified
+on a real NVIDIA A40 **and** an AMD Instinct MI300X: the two fp32 example kernels (vector-add,
+`ieee` matmul) produced **byte-identical** output — the same SHA-256 across Apple Metal,
+NVIDIA CUDA, and AMD ROCm — and softmax matched to fp rounding (~1e-9)
 ([`PORTABILITY.md`](PORTABILITY.md)). Develop kernel *logic* on the laptop you own, rent a
 GPU only for the performance pass.
 
@@ -55,25 +56,26 @@ See [`REFERENCES.md`](REFERENCES.md) for citations and
 [`docs/superpowers/specs/2026-05-30-triton-msl-roadmap.md`](docs/superpowers/specs/2026-05-30-triton-msl-roadmap.md)
 for the active pre-1.0 roadmap.
 
-## Portability: develop on Apple Silicon, run on NVIDIA
+## Portability: develop on Apple Silicon, run on NVIDIA or AMD
 
-triton-msl is a **backend** for Triton, so your `@triton.jit` source is standard Triton and the same code runs on NVIDIA (only the final codegen stage differs). The three example
-kernels, unmodified, were run on an Apple M4 Max **and** a rented NVIDIA A40, each checked
-against the same NumPy reference:
+triton-msl is a **backend** for Triton, so your `@triton.jit` source is standard Triton and the same code runs on NVIDIA or AMD (only the final codegen stage differs). The three example
+kernels, unmodified, were run on an Apple M4 Max, a rented NVIDIA A40, **and** an AMD Instinct
+MI300X (ROCm), each checked against the same NumPy reference:
 
-| kernel | Mac vs NumPy | NVIDIA vs NumPy | **Mac ↔ NVIDIA Δ** |
+| kernel | Mac vs NumPy | NVIDIA vs NumPy | AMD vs NumPy |
 |---|---|---|---|
-| `vector_add` | 0 | 0 | **0, bit-identical** |
+| `vector_add` | 0 | 0 | 0 |
 | `fused_softmax` | 7.45e-9 | 5.59e-9 | 7.45e-9 |
-| `matmul` (fp32 / `ieee`) | 4.58e-5 | 4.58e-5 | **0, bit-identical** |
-| `matmul` (`tf32`) | refused (no tf32 on Metal) | 6.07e-2 | n/a |
+| `matmul` (fp32 / `ieee`) | 4.58e-5 | 4.58e-5 | 4.58e-5 |
+| `matmul` (`tf32`) | refused (no tf32 on Metal) | 6.07e-2 | n/a (no tf32 on AMD) |
 
-**Correctness/logic is portable**: two of three kernels were bit-identical across vendors,
-and it crossed Triton 3.0.0 ↔ 3.7.0. **Performance is not** (block sizes and fast-path
-routing are hardware-specific). So the workflow is: develop and debug kernel *logic* on the
-Mac you own, then rent a GPU for minutes for the performance pass. The one numerical caveat
-is NVIDIA's **tf32** default for `tl.dot` (pass `input_precision="ieee"` to match). Full
-receipt + a reproduce harness: [`PORTABILITY.md`](PORTABILITY.md).
+**Correctness/logic is portable**: `vector_add` and the `ieee` matmul were **byte-identical**
+across all three vendors — the same SHA-256 on Metal, CUDA, and ROCm — crossing Triton 3.0.0 /
+3.6.0 / 3.7.0. **Performance is not** (block sizes and fast-path routing are hardware-specific).
+So the workflow is: develop and debug kernel *logic* on the Mac you own, then rent a GPU for
+minutes for the performance pass. The one numerical caveat is NVIDIA's **tf32** default for
+`tl.dot` (pass `input_precision="ieee"` to match; AMD and Metal have no tf32). Full receipt +
+a reproduce harness: [`PORTABILITY.md`](PORTABILITY.md).
 
 ## Requirements
 

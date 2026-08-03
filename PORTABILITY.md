@@ -1,12 +1,12 @@
-# Portability — develop on Apple Silicon, run on NVIDIA
+# Portability — develop on Apple Silicon, run on NVIDIA or AMD
 
 triton-msl is a **backend** for [OpenAI Triton](https://github.com/triton-lang/triton),
 not a separate language. Your `@triton.jit` source is standard Triton: the frontend
-(Python → Triton IR) is shared with the NVIDIA backend, and triton-msl only swaps the
-final stage (Triton IR → Metal instead of → PTX). So the kernel you write and debug on a
-Mac is the *same* kernel that runs on an NVIDIA GPU — copy it onto a CUDA box, put your
-tensors on `cuda` instead of `mps`, and it compiles through Triton's NVIDIA backend
-unchanged.
+(Python → Triton IR) is shared with the CUDA and ROCm backends, and triton-msl only swaps
+the final stage (Triton IR → Metal instead of → PTX / GCN). So the kernel you write and
+debug on a Mac is the *same* kernel that runs on an NVIDIA or AMD GPU — copy it onto a
+CUDA or ROCm box, put your tensors on `cuda` instead of `mps` (ROCm's torch also uses the
+`cuda` device), and it compiles through Triton's NVIDIA/AMD backend unchanged.
 
 ## What's portable, and what isn't
 
@@ -20,29 +20,39 @@ The practical consequence: you can develop and correctness-debug a kernel's *log
 Mac you already own — the expensive, iterative part — and trust it transfers. Performance
 tuning still needs the target GPU (rent one for minutes; see *Reproduce* below).
 
-## Verified — bit-identical on real NVIDIA silicon
+## Verified — bit-identical on real NVIDIA *and* AMD silicon
 
-The three example kernels (`examples/local_triton_dev.py`), unmodified, run on both
+The three example kernels (`examples/local_triton_dev.py`), unmodified, run on all three
 backends and checked against the **same** NumPy reference:
 
 - **Mac:** Apple M4 Max (Metal) · triton-msl · Triton 3.7.0 · torch 2.12.1
-- **NVIDIA:** A40 · Triton 3.0.0 · torch 2.4.1+cu124  *(rented for ~8 min, then terminated)*
+- **NVIDIA:** A40 (CUDA) · Triton 3.0.0 · torch 2.4.1  *(rented, then terminated)*
+- **AMD:** Instinct MI300X (ROCm 7.2.4 · gfx942) · Triton 3.6.0 · torch 2.10.0  *(rented, then terminated)*
 
-| kernel | Mac vs NumPy | NVIDIA vs NumPy | **Mac ↔ NVIDIA Δ** |
+| kernel | Mac vs NumPy | NVIDIA vs NumPy | AMD vs NumPy |
 |---|---|---|---|
-| `vector_add` (n = 98,432) | 0 | 0 | **0 — bit-identical** |
+| `vector_add` (n = 98,432) | 0 | 0 | 0 |
 | `fused_softmax` (128 × 781) | 7.45e-9 | 5.59e-9 | 7.45e-9 |
-| `matmul` fp32 / `ieee` (256³) | 4.58e-5 | 4.58e-5 | **0 — bit-identical** |
-| `matmul` `tf32` (256³) | **refused** *(no tf32 on Metal)* | 6.07e-2 | — |
+| `matmul` fp32 / `ieee` (256³) | 4.58e-5 | 4.58e-5 | 4.58e-5 |
+| `matmul` `tf32` | **refused** *(no tf32 on Metal)* | 6.07e-2 | n/a *(no tf32 on AMD)* |
 
-Two of the three kernels produced *literally the same bits* across Apple Metal and NVIDIA;
-softmax matched to fp rounding noise (~1e-9). It also crossed **Triton versions** (3.0.0 on
-the pod vs 3.7.0 on the Mac) — the source is stable across both.
+**The strongest evidence: identical *bits* across all three vendors.** For `vector_add` and
+the `ieee` matmul, the raw fp32 output isn't just close — it's the same SHA-256 on Apple
+Metal, NVIDIA CUDA, *and* AMD ROCm:
 
-> **Scope (honest):** measured on these specific shapes and block sizes. Different tiling
-> can introduce last-bit differences from accumulation order. This is a *measured* result,
-> not a universal bit-equality guarantee — but the logic is identical, so any divergence is
-> fp-rounding-scale, not algorithmic.
+| kernel | SHA-256 (first 12) | identical elements |
+|---|---|---|
+| `vector_add` | `0fee55ab3218` — Metal == CUDA == ROCm | 98,432 / 98,432 |
+| `matmul` (ieee) | `b650d0b7667f` — Metal == CUDA == ROCm | 65,536 / 65,536 |
+
+Softmax matched to fp rounding across all three (≤7.5e-9 — exp/normalize accumulation order,
+not algorithmic). The comparison crossed **three Triton versions** (3.0.0 / 3.6.0 / 3.7.0)
+and three completely different ISAs (Metal · PTX · CDNA3) — the *source* is what's stable.
+
+> **Scope (honest):** measured on these specific shapes and block sizes. Different tiling can
+> introduce last-bit differences from accumulation order, so this is a *measured* result on a
+> representative set, not a universal bit-equality guarantee — but the logic is identical, so
+> any divergence is fp-rounding-scale, not algorithmic.
 
 ## The tf32 caveat (the one real divergence)
 
@@ -59,15 +69,16 @@ correct-or-refuse discipline as everywhere else). To match across backends, pass
 
 ## Reproduce it yourself
 
-Rent a GPU for a few minutes (any recent CUDA box with `torch` + `triton`; the run above
-cost a few cents):
+Rent a GPU for a few minutes (any recent CUDA or ROCm box with `torch` + `triton`; each run
+above cost a few cents). On ROCm, torch presents the GPU as the `cuda` device, so the same
+command works unchanged:
 
 ```bash
-# on the NVIDIA box:
+# on the NVIDIA (CUDA) or AMD (ROCm) box:
 python3 benchmarks/cross_backend_verify.py cuda     # writes out_cuda.npz + prints vs-NumPy errors
 # pull out_cuda.npz back to the Mac, then:
 python3 benchmarks/cross_backend_verify.py mps      # writes out_mps.npz
-# diff the two .npz element-wise -> the Mac <-> NVIDIA deltas
+# diff the two .npz element-wise -> the Mac <-> CUDA/ROCm deltas
 ```
 
 `benchmarks/cross_backend_verify.py` defines the kernels once, runs them on `cuda` or

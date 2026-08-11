@@ -2513,6 +2513,163 @@ class _TemplateMixin:
 
         return msl
 
+    def _maybe_quant_matmul_descriptor(self):
+        """Build the runtime QUANTIZED-matmul dispatch descriptor, or None.
+
+        Recognizes the CANONICAL weight-only int8 quantized matmul and ONLY that
+        shape (correct-or-refuse — a wrong descriptor is silently-wrong):
+
+          B = (sitofp(load(weight_i8)) - zero[None,:]) * scale[None,:];  out = A @ B
+
+        with the standard ``(input, weight, output, scale, zero, M, N, K, ...strides)``
+        signature — 5 pointers at args 0..4, M/N/K scalars at 5..7 — weight stored
+        [K,N] contiguous-inner (per ``infer_dot_strides``), per-N float scale/zero,
+        fp32 input/output, int8 weight. Every structural fact is VERIFIED against the
+        IR (the exact mul/sub/sitofp tree; scale->arg3 and zero->arg4 by tracing the
+        broadcast chains; the K-loop bound anchors to args[7]); any deviation returns
+        None so the caller refuses. Returns
+
+          (fast_msl, m_idx=5, n_idx=6, k_idx=7, tile_m, tile_n, stride_checks)
+
+        dispatched by triton_msl.autotuning._quant_matmul_dispatch.dispatch_quant_matmul.
+        """
+        import os
+
+        if os.environ.get("TRITON_MSL_QUANT_MATMUL", "1") == "0":
+            return None
+
+        def _all(ops):
+            for s in ops:
+                yield s
+                if s.region_ops:
+                    yield from _all(s.region_ops)
+                if s.else_ops:
+                    yield from _all(s.else_ops)
+
+        op_by_id = {o.id: o for o in _all(self.graph.ops)}
+        dots = [o for o in op_by_id.values() if o.op == "tt.dot"]
+        if len(dots) != 1:
+            return None
+        dot = dots[0]
+        if not dot.operand_ids or len(dot.operand_ids) < 2:
+            return None
+
+        # --- Canonical signature: 5 ptrs at 0..4, M/N/K scalars at 5..7. ---
+        args = self.graph.args
+        ptr_args = [a for a in args if a.is_ptr]
+        if len(ptr_args) != 5 or len(args) < 8:
+            return None
+        if not all(args[i].is_ptr for i in range(5)):
+            return None
+        if args[5].is_ptr or args[6].is_ptr or args[7].is_ptr:
+            return None
+        arg_id_to_idx = {getattr(a, "id", None): i for i, a in enumerate(args)}
+
+        # --- Exact dequant tree: mulf(subf(<sitofp weight>, zero_bc), scale_bc). ---
+        def _peel(oid):
+            o = op_by_id.get(oid)
+            while o is not None and o.op in ("ttg.local_load", "ttg.local_alloc", "ttg.convert_layout") and o.operand_ids:
+                o = op_by_id.get(o.operand_ids[0])
+            return o
+
+        mul = _peel(dot.operand_ids[1])
+        if mul is None or mul.op != "arith.mulf" or len(mul.operand_ids) != 2:
+            return None
+        sub = op_by_id.get(mul.operand_ids[0])
+        scale_bc = mul.operand_ids[1]
+        if sub is None or sub.op != "arith.subf" or len(sub.operand_ids) != 2:
+            return None
+        zero_bc = sub.operand_ids[1]
+
+        def _has_int_to_float(oid, seen=None, d=0):
+            if seen is None:
+                seen = set()
+            if oid in seen or d > 24:
+                return False
+            seen.add(oid)
+            o = op_by_id.get(oid)
+            if o is None:
+                return False
+            if o.op in ("arith.sitofp", "arith.uitofp"):
+                return True
+            return any(_has_int_to_float(x, seen, d + 1) for x in (o.operand_ids or []))
+
+        if not _has_int_to_float(sub.operand_ids[0]):
+            return None
+
+        # --- scale_bc -> args[3], zero_bc -> args[4] (walk operand[0]: bcast/expand/
+        #     load/addptr-base/splat all forward the pointer through operand[0]). ---
+        def _trace_to_arg(oid, d=0):
+            if d > 32:
+                return None
+            if oid in arg_id_to_idx:
+                return arg_id_to_idx[oid]
+            o = op_by_id.get(oid)
+            if o is None or not o.operand_ids:
+                return None
+            return _trace_to_arg(o.operand_ids[0], d + 1)
+
+        if _trace_to_arg(scale_bc) != 3 or _trace_to_arg(zero_bc) != 4:
+            return None
+
+        # --- Weight [K,N] contiguous-inner (+ input [M,K], output [M,N]) via strides. ---
+        try:
+            sd = self.infer_dot_strides()
+        except Exception:  # noqa: BLE001
+            return None
+        if not sd:
+            return None
+        a_rc, b_rc, c_rc = sd.get("A"), sd.get("B"), sd.get("C")
+        if not (a_rc and b_rc and c_rc):
+            return None
+        if not (a_rc[1] == "1" and b_rc[1] == "1" and c_rc[1] == "1"):
+            return None  # a transposed/[N,K] weight is a different kernel -> refuse
+
+        # --- K-loop bound anchors to args[7] (the reliable K binding; same net as
+        #     the fast-matmul descriptor). A non-canonical dim binding -> refuse. ---
+        for _o in _all(self.graph.ops):
+            if _o.op == "scf.for" and _o.operand_ids and len(_o.operand_ids) >= 2:
+                _hi = _o.operand_ids[1]
+                _depth = 0
+                while _depth < 8 and _hi not in arg_id_to_idx:
+                    _hop = op_by_id.get(_hi)
+                    if _hop is None or not _hop.operand_ids:
+                        break
+                    _hi = _hop.operand_ids[0]
+                    _depth += 1
+                if arg_id_to_idx.get(_hi) != 7:
+                    return None
+
+        # --- dtypes: input fp32, output fp32, weight int8. ---
+        if _mlir_to_triton_dtype(args[0].elem_type) not in ("fp32", "f32", "float"):
+            return None
+        if _mlir_to_triton_dtype(args[2].elem_type) not in ("fp32", "f32", "float"):
+            return None
+        if _mlir_to_triton_dtype(args[1].elem_type) not in ("int8", "i8", "si8"):
+            return None
+
+        # --- Runtime stride contract: the fast kernel hard-codes row-major addressing
+        #     input[m*K+k], weight[k*N+n], output[m*N+n]. So A's row stride must equal
+        #     K (args[7]), B's and C's must equal N (args[6]). A stride arg that differs
+        #     is verified at dispatch (a transposed/sliced operand -> skip). ---
+        name_to_idx = {a.name: i for i, a in enumerate(args)}
+        stride_checks = []
+        for _rowname, _exp_idx in ((a_rc[0], 7), (b_rc[0], 6), (c_rc[0], 6)):
+            if _rowname in name_to_idx:
+                _ri = name_to_idx[_rowname]
+                if _ri != _exp_idx:
+                    stride_checks.append((_ri, _exp_idx))
+            elif _rowname == "1":
+                return None  # row stride literally 1 but the dim is a runtime arg
+            else:
+                return None  # non-1 literal row stride: can't prove it equals the dim
+
+        from triton_msl.codegen._msl_templates import make_int8_matmul_fast
+
+        rr, rc = 4, 2
+        fast_msl = make_int8_matmul_fast(rr=rr, rc=rc, bk=32, layout="kn")
+        return (fast_msl, 5, 6, 7, 8 * rr, 8 * rc, tuple(stride_checks))
+
     def _maybe_fast_matmul_descriptor(self):
         """Build the runtime fast-matmul dispatch descriptor, or None.
 

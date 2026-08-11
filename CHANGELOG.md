@@ -49,19 +49,29 @@
 
 ### Correctness
 
-- **Matmul role-resolution fixed for kernels with extra ptr args; quantized matmul
-  refused cleanly.** In a K-loop matmul the A/B pointers are loop-carried (advanced
-  each iteration) so they don't trace back to a func-arg — only C (the store target)
-  traces reliably. The role-resolution fallback then picked the *last* ptr arg as C:
-  correct by luck for a 3-pointer (A,B,C) matmul, but wrong for one with **extra ptr
-  args** (a quantized matmul's scale/zero, or a bias), which mis-inferred strides and
-  over-refused it as a "batched matmul". Now the reliably-traced C is kept and A/B
-  fall back per-leg. Separately, a quantized matmul (B = an integer weight
-  dequantized to float, `(w_i8.to(float) - zero) * scale`) is now detected and
-  refused **loudly with an actionable message** — the simdgroup template loads B
-  directly as float/half, so an int8 weight would compile-fail or be read raw
-  (silently wrong). Dedicated dequant kernels landed in `_msl_templates.py`
-  (`make_int8_matmul_fast`, `make_int8_gemv`); routing is a follow-up.
+- **Weight-only int8 quantized matmul now RUNS on Metal** (was refused). A canonical
+  weight-only int8 matmul — `out = a @ ((w_i8.to(f32) - zero) * scale)` with the
+  standard `(input, weight, output, scale, zero, M, N, K, ...strides)` signature,
+  weight stored `[K,N]` contiguous, per-N float scale/zero, fp32 in/out — is
+  recognized at compile time and dispatched to a dedicated dequant kernel
+  (`make_int8_matmul_fast`, layout `kn`) via `compile_shader`: the int8 tile is staged
+  to a float threadgroup tile with the zero folded in, a float simdgroup MMA runs on
+  it, and the epilogue applies the per-N scale. Near-bit-exact vs the float reference
+  (max abs err ~1e-4 at fp32 accumulate). The recognizer
+  (`_maybe_quant_matmul_descriptor`) is **correct-or-refuse**: it verifies the exact
+  dequant tree, traces `scale`→arg3 / `zero`→arg4, confirms the `[K,N]` layout via
+  address-traced strides, and anchors the K-loop bound to the K arg — any deviation
+  refuses. The path is **fail-closed** end to end: a launch that can't use the fast
+  kernel (non-MPS, `compile_shader` off, or dims not `M%32 / N%16 / K%32`) is refused,
+  never mis-run. Not yet routed (each refuses cleanly): non-`[K,N]` layouts, symmetric
+  (no-zero) quant, fp16 in/out, int4, and the M=1 GEMV decode shape.
+- **Matmul role-resolution fixed for kernels with extra ptr args.** In a K-loop matmul
+  the A/B pointers are loop-carried (advanced each iteration) so they don't trace back
+  to a func-arg — only C (the store target) traces reliably. The role-resolution
+  fallback then picked the *last* ptr arg as C: correct by luck for a 3-pointer (A,B,C)
+  matmul, but wrong for one with **extra ptr args** (a quantized matmul's scale/zero, or
+  a bias), which mis-inferred strides and over-refused it as a "batched matmul". Now the
+  reliably-traced C is kept and A/B fall back per-leg.
 - **MEPT chained-addptr fix** — an array-of-offsets base pointer (`x_ptr + offs*K`)
   advanced by a *scalar* loop variable (`+ k`, inside a runtime loop) fell through to
   the scalar-offset lowering and emitted an invalid double subscript

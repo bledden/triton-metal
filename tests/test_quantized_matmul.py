@@ -1,11 +1,15 @@
-"""Quantized (int8 weight-only) matmul: recognized + refused cleanly.
+"""Quantized (weight-only int8) matmul: routed to the fast dequant kernel, or refused.
 
-The simdgroup matmul template loads B directly from its pointer as float/half, so a
-dequantized int8 weight cannot be computed there — it is detected and refused loudly
-(never a cryptic `simdgroup_load(float, char*)` compile error, never a silent raw-int
-read with no dequant). A plain fp32 matmul with the SAME 2-D-grid + extra-ptr-arg
-structure must NOT be misdetected (guards the quantized detector + the matmul
-role-resolution fix for kernels with extra ptr args like scale/zero).
+A canonical weight-only int8 matmul — ``out = a @ ((w_i8.to(f32) - zero) * scale)`` with
+the standard ``(input, weight, output, scale, zero, M, N, K, ...strides)`` signature,
+weight stored [K,N] contiguous, per-N float scale/zero, fp32 in/out — is recognized at
+compile time (``_maybe_quant_matmul_descriptor``) and dispatched to
+``make_int8_matmul_fast(layout='kn')`` via compile_shader. The simdgroup MMA runs on the
+dequantized tile (near-bit-exact vs the float reference).
+
+Correct-or-refuse everywhere else: a shape the edge-free fast kernel can't tile
+(M % 32, N % 16, or K % 32 nonzero) is refused loudly, NOT silently mis-tiled; a plain
+fp32 matmul with the same 2-D-grid + extra-ptr-arg structure is NOT misdetected.
 """
 
 import pytest
@@ -98,16 +102,12 @@ if HAS:
         c_ptrs = c_ptr + offs_m[:, None] * scm + offs_n[None, :] * scn
         tl.store(c_ptrs, acc)
 
-
-@requires
-def test_quantized_matmul_refuses_cleanly():
-    M, N, K, BM, BN, BK = 64, 128, 128, 32, 32, 32
-    a = torch.randn(M, K, device="mps")
-    w = torch.randint(-127, 127, (K, N), device="mps", dtype=torch.int8)
-    scale = torch.rand(N, device="mps") * 0.02 + 0.005
-    zero = torch.randint(-8, 8, (N,), device="mps").float()
-    c = torch.zeros(M, N, device="mps")
-    with pytest.raises(MetalNonRecoverableError, match="quantized matmul"):
+    def _run_quant(M, N, K, BM=32, BN=32, BK=32):
+        a = torch.randn(M, K, device="mps")
+        w = torch.randint(-127, 127, (K, N), device="mps", dtype=torch.int8)
+        scale = torch.rand(N, device="mps") * 0.02 + 0.005
+        zero = torch.randint(-8, 8, (N,), device="mps").float()
+        c = torch.zeros(M, N, device="mps")
         _int8_wo_matmul[(triton.cdiv(M, BM), triton.cdiv(N, BN))](
             a,
             w,
@@ -127,10 +127,30 @@ def test_quantized_matmul_refuses_cleanly():
             BN=BN,
             BK=BK,
         )
+        ref = a @ ((w.float() - zero[None, :]) * scale[None, :])
+        return c, ref
+
+
+@requires
+@pytest.mark.parametrize("M,N,K", [(64, 128, 128), (256, 256, 256), (512, 512, 512)])
+def test_quantized_matmul_runs_correctly(M, N, K):
+    torch.manual_seed(0)
+    c, ref = _run_quant(M, N, K)
+    torch.testing.assert_close(c, ref, rtol=2e-3, atol=2e-3)
+
+
+@requires
+def test_quantized_matmul_unaligned_refuses():
+    # M = 48 is not a multiple of the row tile (32); the edge-free fast kernel
+    # cannot tile it, so the driver refuses rather than silently mis-tiling.
+    torch.manual_seed(0)
+    with pytest.raises(MetalNonRecoverableError, match="quantized"):
+        _run_quant(48, 128, 128)
 
 
 @requires
 def test_plain_fp32_matmul_not_misdetected():
+    torch.manual_seed(0)
     M, N, K, BM, BN, BK = 64, 128, 128, 32, 32, 32
     a = torch.randn(M, K, device="mps")
     w = torch.randn(K, N, device="mps")

@@ -630,7 +630,13 @@ class MetalLauncher:
         import os as _os
 
         fast_matmul = kernel_metadata[7] if (kernel_metadata and len(kernel_metadata) > 7) else None
-        if (self._msl is not None or fast_matmul is not None) and _os.environ.get(
+        quant_matmul = kernel_metadata[8] if (kernel_metadata and len(kernel_metadata) > 8) else None
+        # FAIL-CLOSED for quantized: the compiled kernel IS the fast dequant kernel,
+        # which the host-roundtrip path below cannot dispatch correctly. So a quantized
+        # launch must be handled by dispatch_quant_matmul (compile_shader) or REFUSED —
+        # start "unhandled" and clear it only on a successful dispatch (the `return`).
+        _quant_unhandled = quant_matmul is not None
+        if (self._msl is not None or fast_matmul is not None or quant_matmul is not None) and _os.environ.get(
             "TRITON_MSL_COMPILE_SHADER", "1"
         ) != "0":
             try:
@@ -642,6 +648,19 @@ class MetalLauncher:
                     all_mps = bool(tensors) and all(
                         getattr(a, "device", None) is not None and str(a.device).startswith("mps") for a in tensors
                     )
+
+                    # --- Quantized-matmul dispatch (compile_shader-only) ---
+                    # Route a recognized weight-only int8 matmul to the fast dequant
+                    # kernel. On success we return; otherwise _quant_unhandled stays
+                    # True and the launch is refused after this block (never fall
+                    # through to the host path, which would mis-run the fast kernel).
+                    if quant_matmul is not None and all_mps and _os.environ.get("TRITON_MSL_QUANT_MATMUL", "1") != "0":
+                        from triton_msl.autotuning._quant_matmul_dispatch import dispatch_quant_matmul
+
+                        if dispatch_quant_matmul(
+                            _rt, quant_matmul, kargs, launch_exit_hook=launch_exit_hook, launch_metadata=launch_metadata
+                        ):
+                            return
 
                     # --- Fast-matmul runtime dispatch (Phase 4) ---
                     # Dispatch the proven simdgroup fast template ONLY for MPS
@@ -683,6 +702,22 @@ class MetalLauncher:
                         _get_compile_shader_runtime().mark_unsupported(self._msl)
                 except Exception:
                     pass
+
+        # Quantized matmul is compile_shader-only: if it wasn't dispatched above
+        # (non-MPS, compile_shader unavailable, opt-out, or a shape the edge-free
+        # fast kernel can't tile), REFUSE. The compiled self._msl is the fast dequant
+        # kernel; running it via the host-roundtrip path below would mis-dispatch it.
+        if _quant_unhandled:
+            from triton_msl.errors import MetalNonRecoverableError
+
+            raise MetalNonRecoverableError(
+                "quantized weight-only matmul runs only on MPS tensors via "
+                "compile_shader, with dims M % 32 == 0, N % 16 == 0, K % 32 == 0 (the "
+                "fast dequant kernel has no edge handling). This launch is non-MPS, has "
+                "compile_shader disabled/unavailable, or has non-conforming dims. Pad "
+                "the dims, or dequantize the weight on the host and pass a float/half "
+                "weight to a normal matmul."
+            )
 
         # Pack arguments into Metal buffers.
         # Strategy:

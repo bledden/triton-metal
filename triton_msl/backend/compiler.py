@@ -340,6 +340,8 @@ class MetalBackend(BaseBackend):
         mm_two_kernel = getattr(metadata, "mm_two_kernel", None)
         # Fast-matmul runtime-dispatch descriptor (Phase 4); None for other kernels.
         fast_matmul = getattr(metadata, "fast_matmul", None)
+        # Quantized-matmul runtime-dispatch descriptor; None for other kernels.
+        quant_matmul = getattr(metadata, "quant_matmul", None)
         return (
             metadata.num_warps,
             metadata.num_ctas,
@@ -349,6 +351,7 @@ class MetalBackend(BaseBackend):
             needs_2d_grid,
             mm_two_kernel,
             fast_matmul,
+            quant_matmul,
         )
 
     def get_codegen_implementation(self, options):

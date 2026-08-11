@@ -659,6 +659,8 @@ def emit_msl(mod, metadata, options):
             metadata["mm_two_kernel"] = getattr(lowerer, "_mm_two_kernel", None)
             # Fast-matmul runtime-dispatch descriptor (Phase 4); None for other kernels.
             metadata["fast_matmul"] = getattr(lowerer, "_fast_matmul", None)
+            # Quantized-matmul runtime-dispatch descriptor; None for other kernels.
+            metadata["quant_matmul"] = getattr(lowerer, "_quant_matmul", None)
             _mept_path_log("primary", metadata.get("name", "?"))
             return msl_src
 

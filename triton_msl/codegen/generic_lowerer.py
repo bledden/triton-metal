@@ -977,22 +977,42 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
                 self._prescan_stores()
                 return msl
 
-        # QUANTIZED matmul: B is an integer weight dequantized to float before the
-        # dot (e.g. `(w_i8.to(float) - zero) * scale`). The simdgroup templates load
-        # B DIRECTLY from its pointer as float/half — a char* (int8) weight either
-        # fails to compile (`simdgroup_load(float, char*)`) or, if types matched,
-        # would read the weight RAW (no dequant) = silently wrong. Refuse loudly.
-        # (Routing to a dedicated dequant kernel is the follow-up.)
+        # QUANTIZED weight-only matmul: B is an integer weight dequantized to float
+        # before the dot ((w_i8.to(float) - zero) * scale, out = A @ B). The simdgroup
+        # templates load B DIRECTLY from its pointer as float/half — a char* (int8)
+        # weight either fails to compile (`simdgroup_load(float, char*)`) or, if types
+        # matched, would read the weight RAW (no dequant) = silently wrong. Route the
+        # CANONICAL case to the dedicated fast dequant kernel (make_int8_matmul_fast,
+        # layout kn) via the quant_matmul dispatch descriptor; refuse anything else.
         if self._detect_quantized_dot():
-            raise MetalNonRecoverableError(
-                "quantized matmul (a tt.dot "
-                "whose B operand is an integer weight dequantized to float, e.g. "
-                "(w_i8.to(float) - zero) * scale) is not supported by the simdgroup "
-                "matmul template — it loads B directly as float/half from its "
-                "pointer, so an int8 weight either fails to compile or would be read "
-                "raw (no dequant), silently wrong. Dequantize on the host and pass a "
-                "float/half weight, or use a dedicated quantized-matmul kernel."
-            )
+            _qdesc = self._maybe_quant_matmul_descriptor()
+            if _qdesc is None:
+                raise MetalNonRecoverableError(
+                    "quantized matmul (a tt.dot whose B operand is an integer weight "
+                    "dequantized to float, e.g. (w_i8.to(float) - zero) * scale) is "
+                    "supported only in the CANONICAL weight-only form: the standard "
+                    "(input, weight, output, scale, zero, M, N, K, ...strides) signature "
+                    "with weight stored [K,N] contiguous, per-N float scale/zero, and "
+                    "fp32 input/output. This kernel deviates from that shape. Dequantize "
+                    "on the host and pass a float/half weight, or restructure to the "
+                    "canonical quantized-matmul signature."
+                )
+            # The compiled kernel IS the fast dequant kernel; dispatch_quant_matmul runs
+            # it via compile_shader (MPS) with the simdgroup grid. Non-MPS refuses in the
+            # driver (this path is compile_shader-only). effective_block_size is a
+            # placeholder — the runtime dispatch computes the real grid.
+            #
+            # The compiled metallib is looked up by the kernel's func name, so rename the
+            # fast kernel's function to match. dispatch_quant_matmul compiles the
+            # descriptor's own copy (named int8_matmul_fast) separately via compile_shader,
+            # so this rename is local to self._msl (which is never itself dispatched — the
+            # driver either routes to compile_shader or refuses).
+            self._quant_matmul = _qdesc
+            self.effective_block_size = 32
+            import re as _re
+
+            _kname = _sanitize_msl_name(self.graph.func_name)
+            return _re.sub(r"kernel\s+void\s+\w+\s*\(", f"kernel void {_kname}(", _qdesc[0], count=1)
 
         # Check for simple dot (no stride args, no scf.for) — use inline
         # scalar matmul that loads from global into shared memory, then

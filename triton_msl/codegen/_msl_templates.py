@@ -3383,21 +3383,32 @@ kernel void int8_matmul(
 """
 
 
-def make_int8_matmul_fast(rr=4, rc=2, bk=32):
+def make_int8_matmul_fast(rr=4, rc=2, bk=32, layout="nk"):
     """Fast weight-only INT8 matmul: tiled simdgroup MMA with on-the-fly dequant.
 
     Adapts the fp16 fast-matmul to quantized weights. The int8 weight tile is
     staged into threadgroup memory as float with the per-channel zero folded in
-    (``bdeq[k][n] = float(w[n,k]) - zero[n]``); the FLOAT simdgroup MMA runs on
+    (``bdeq[k][n] = float(w[.,.]) - zero[n]``); the FLOAT simdgroup MMA runs on
     the dequantized tile; the epilogue multiplies by ``scale[n]``. Near-bit-exact
     vs the scalar ``make_int8_matmul_kernel`` reference (float accumulator).
 
-    Layout: input [M,K] float, weight [N,K] int8, scales/zeros [N], out [M,N].
+    ``layout`` selects the weight storage:
+      - ``"nk"``: weight [N,K] int8 (GPTQ/AWQ style, ``out = a @ w.T``), read
+        ``weight[n*K + k]``.
+      - ``"kn"``: weight [K,N] int8 (the natural ``tl.dot(a, w)`` Triton pattern),
+        read ``weight[k*N + n]``. The staging read stays coalesced across the BN
+        row; only the k stride differs.
+
+    Layout: input [M,K] float, scales/zeros [N], out [M,N] (both weight layouts).
     Each simdgroup (32 threads) computes an (8*rr) x (8*rc) output block.
     DISPATCH: n_groups = ceil(M/(8*rr)) * ceil(N/(8*rc)); 32 threads/group.
     SIZE CONTRACT: M % (8*rr) == 0, N % (8*rc) == 0, K % bk == 0 (bk % 8 == 0).
     Measured ~13-18x over the scalar kernel on M4 Max; best (rr,rc,bk)=(4,2,32).
     """
+    if layout not in ("nk", "kn"):
+        raise ValueError(f"make_int8_matmul_fast: layout must be 'nk' or 'kn', got {layout!r}")
+    # The ONLY layout-dependent expression: the int8 weight element index.
+    w_index = "(n0 + nn) * K + (k0 + kk)" if layout == "nk" else "(k0 + kk) * N + (n0 + nn)"
     BN = 8 * rc
     accs = "\n    ".join(f"simdgroup_float8x8 c{r}_{c}(0.0f);" for r in range(rr) for c in range(rc))
     afrags = " ".join(f"simdgroup_float8x8 a{r};" for r in range(rr))
@@ -3446,7 +3457,7 @@ kernel void int8_matmul_fast(
     for (uint k0 = 0u; k0 < K; k0 += {bk}u) {{
         for (uint e = tid; e < {bk * BN}u; e += 32u) {{
             uint kk = e / {BN}u, nn = e % {BN}u;
-            bdeq[kk * {BN}u + nn] = float(weight[(n0 + nn) * K + (k0 + kk)]) - zeros[n0 + nn];
+            bdeq[kk * {BN}u + nn] = float(weight[{w_index}]) - zeros[n0 + nn];
         }}
         simdgroup_barrier(mem_flags::mem_threadgroup);
         {submma}

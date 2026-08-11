@@ -2673,15 +2673,17 @@ class _TemplateMixin:
         Recognizes the CANONICAL weight-only int8 quantized matmul and ONLY that
         shape (correct-or-refuse — a wrong descriptor is silently-wrong):
 
-          B = (sitofp(load(weight_i8)) - zero[None,:]) * scale[None,:];  out = A @ B
+          [K,N]: B = (sitofp(load(w_i8[K,N])) - zero[None,:]) * scale[None,:]; out = A @ B
+          [N,K]: B = trans((sitofp(load(w_i8[N,K])) - zero[:,None]) * scale[:,None])  (GPTQ)
 
         with the standard ``(input, weight, output, scale, zero, M, N, K, ...strides)``
-        signature — 5 pointers at args 0..4, M/N/K scalars at 5..7 — weight stored
-        [K,N] contiguous-inner (per ``infer_dot_strides``), per-N float scale/zero,
-        fp32 input/output, int8 weight. Every structural fact is VERIFIED against the
-        IR (the exact mul/sub/sitofp tree; scale->arg3 and zero->arg4 by tracing the
-        broadcast chains; the K-loop bound anchors to args[7]); any deviation returns
-        None so the caller refuses. Returns
+        signature — 5 pointers at args 0..4, M/N/K scalars at 5..7 — contiguous-inner
+        (per ``infer_dot_strides``), per-N float scale/zero, fp32 input/output, int8
+        weight. A ``ttg.memdesc_trans`` (or ``tt.trans``) on B means weight is stored
+        [N,K] (routed to layout 'nk'); otherwise [K,N] (layout 'kn'). Every structural
+        fact is VERIFIED against the IR (the exact mul/sub/sitofp tree; scale->arg3 and
+        zero->arg4 by tracing the broadcast chains; the K-loop bound anchors to
+        args[7]); any deviation returns None so the caller refuses. Returns
 
           (fast_msl, m_idx=5, n_idx=6, k_idx=7, tile_m, tile_n, stride_checks)
 
@@ -2719,10 +2721,22 @@ class _TemplateMixin:
             return None
         arg_id_to_idx = {getattr(a, "id", None): i for i, a in enumerate(args)}
 
-        # --- Exact dequant tree: mulf(subf(<sitofp weight>, zero_bc), scale_bc). ---
+        # --- Exact dequant tree: mulf(subf(<sitofp weight>, zero_bc), scale_bc).
+        #     A leading tt.trans on B means the weight is stored [N,K] (GPTQ prefill,
+        #     `tl.dot(a, tl.trans(w_deq))`) rather than [K,N] — route to layout 'nk'. ---
+        _is_nk = [False]
+
         def _peel(oid):
             o = op_by_id.get(oid)
-            while o is not None and o.op in ("ttg.local_load", "ttg.local_alloc", "ttg.convert_layout") and o.operand_ids:
+            while o is not None and o.operand_ids and o.op in (
+                "ttg.local_load",
+                "ttg.local_alloc",
+                "ttg.convert_layout",
+                "tt.trans",
+                "ttg.memdesc_trans",
+            ):
+                if o.op in ("tt.trans", "ttg.memdesc_trans"):
+                    _is_nk[0] = True
                 o = op_by_id.get(o.operand_ids[0])
             return o
 
@@ -2777,7 +2791,7 @@ class _TemplateMixin:
         if not (a_rc and b_rc and c_rc):
             return None
         if not (a_rc[1] == "1" and b_rc[1] == "1" and c_rc[1] == "1"):
-            return None  # a transposed/[N,K] weight is a different kernel -> refuse
+            return None  # non-contiguous inner (some other transpose) -> refuse
 
         # --- K-loop bound anchors to args[7] (the reliable K binding; same net as
         #     the fast-matmul descriptor). A non-canonical dim binding -> refuse. ---
@@ -2802,13 +2816,16 @@ class _TemplateMixin:
         if _mlir_to_triton_dtype(args[1].elem_type) not in ("int8", "i8", "si8"):
             return None
 
-        # --- Runtime stride contract: the fast kernel hard-codes row-major addressing
-        #     input[m*K+k], weight[k*N+n], output[m*N+n]. So A's row stride must equal
-        #     K (args[7]), B's and C's must equal N (args[6]). A stride arg that differs
-        #     is verified at dispatch (a transposed/sliced operand -> skip). ---
+        # --- Runtime stride contract. The fast kernel hard-codes row-major addressing:
+        #       input[m*K + k]  -> A row stride == K (args[7])
+        #       output[m*N + n] -> C row stride == N (args[6])
+        #       weight: layout 'kn' reads weight[k*N + n] (row == N, args[6]); layout
+        #               'nk' reads weight[n*K + k] (row == K, args[7]).
+        #     A stride arg that differs is verified at dispatch. ---
+        b_expected = 7 if _is_nk[0] else 6
         name_to_idx = {a.name: i for i, a in enumerate(args)}
         stride_checks = []
-        for _rowname, _exp_idx in ((a_rc[0], 7), (b_rc[0], 6), (c_rc[0], 6)):
+        for _rowname, _exp_idx in ((a_rc[0], 7), (b_rc[0], b_expected), (c_rc[0], 6)):
             if _rowname in name_to_idx:
                 _ri = name_to_idx[_rowname]
                 if _ri != _exp_idx:
@@ -2821,7 +2838,8 @@ class _TemplateMixin:
         from triton_msl.codegen._msl_templates import make_int8_matmul_fast
 
         rr, rc = 4, 2
-        fast_msl = make_int8_matmul_fast(rr=rr, rc=rc, bk=32, layout="kn")
+        layout = "nk" if _is_nk[0] else "kn"
+        fast_msl = make_int8_matmul_fast(rr=rr, rc=rc, bk=32, layout=layout)
         return (fast_msl, 5, 6, 7, 8 * rr, 8 * rc, tuple(stride_checks))
 
     def _maybe_fast_matmul_descriptor(self):

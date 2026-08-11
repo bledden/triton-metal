@@ -103,6 +103,28 @@ if HAS:
         tl.store(c_ptrs, acc)
 
     @triton.jit
+    def _int8_gemm_nk(a_ptr, w_ptr, c_ptr, s_ptr, z_ptr, M, N, K, sam, swn, scm,
+                      BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr):
+        # GPTQ-style prefill: weight stored [N,K], out = a @ (dequant(w)).T
+        pid_m = tl.program_id(0)
+        pid_n = tl.program_id(1)
+        offs_m = pid_m * BM + tl.arange(0, BM)
+        offs_n = pid_n * BN + tl.arange(0, BN)
+        offs_k = tl.arange(0, BK)
+        a_ptrs = a_ptr + offs_m[:, None] * sam + offs_k[None, :]
+        w_ptrs = w_ptr + offs_n[:, None] * swn + offs_k[None, :]
+        s = tl.load(s_ptr + offs_n)
+        z = tl.load(z_ptr + offs_n)
+        acc = tl.zeros((BM, BN), dtype=tl.float32)
+        for _ in range(0, K, BK):
+            a = tl.load(a_ptrs)
+            w = (tl.load(w_ptrs).to(tl.float32) - z[:, None]) * s[:, None]
+            acc += tl.dot(a, tl.trans(w))
+            a_ptrs += BK
+            w_ptrs += BK
+        tl.store(c_ptr + offs_m[:, None] * scm + offs_n[None, :], acc)
+
+    @triton.jit
     def _int8_gemv(x_ptr, w_ptr, o_ptr, scale_ptr, zero_ptr, N, K, swn, swk,
                    BN: tl.constexpr, BK: tl.constexpr):
         # GPTQ-style weight-only int8 decode GEMV: weight [N,K], per-N scale/zero.
@@ -174,6 +196,24 @@ def test_quantized_matmul_unaligned_refuses():
     torch.manual_seed(0)
     with pytest.raises(MetalNonRecoverableError, match="quantized"):
         _run_quant(48, 128, 128)
+
+
+@requires
+@pytest.mark.parametrize("M,N,K", [(64, 128, 128), (64, 256, 128), (128, 64, 256)])
+def test_quantized_matmul_nk_runs_correctly(M, N, K):
+    # GPTQ-style [N,K] weight prefill: routed to make_int8_matmul_fast(layout='nk').
+    torch.manual_seed(0)
+    BM, BN, BK = 32, 32, 32
+    a = torch.randn(M, K, device="mps")
+    w = torch.randint(-127, 127, (N, K), device="mps", dtype=torch.int8)
+    s = torch.rand(N, device="mps") * 0.02 + 0.005
+    z = torch.randint(-8, 8, (N,), device="mps").float()
+    c = torch.zeros(M, N, device="mps")
+    _int8_gemm_nk[(triton.cdiv(M, BM), triton.cdiv(N, BN))](
+        a, w, c, s, z, M, N, K, a.stride(0), w.stride(0), c.stride(0), BM=BM, BN=BN, BK=BK
+    )
+    ref = a @ ((w.float() - z[:, None]) * s[:, None]).t()
+    torch.testing.assert_close(c, ref, rtol=2e-3, atol=2e-3)
 
 
 @requires

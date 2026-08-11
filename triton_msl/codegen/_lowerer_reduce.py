@@ -811,6 +811,90 @@ class _ReduceScanMixin:
             # Add this phase's ops to the preceding ops for future phases
             all_preceding_ops.extend(phase_ops)
 
+    def _reduce_result_reaches_1d_store(self, reduce_id):
+        """True iff the 2-D→1-D reduce ``reduce_id`` reaches a 1-D ``tt.store`` as the
+        stored VALUE — following forward uses and crossing ``scf.for`` loop-carries —
+        without first being re-broadcast to ≥2-D.
+
+        A 2-D→1-D axis reduce produces its result in the row-broadcast layout (thread
+        ``lid`` holds row ``lid/N``). That layout is correct for a 2-D consumer but not
+        for a 1-D store, which assumes one-row-per-thread (``lid`` → row ``lid``):
+
+        - **Hazard (GEMV):** ``acc += tl.sum(x, axis=1)`` in a K-loop, then
+          ``tl.store(o + offs_n, acc)``. The loop-carried accumulator flows straight
+          to a 1-D store → every output row silently collapses to the first (the
+          row-broadcast layout is not propagated across the loop-carry).
+        - **Safe (online-softmax / FlashAttention):** the carried reduce result (m_i /
+          l_i) is re-broadcast to 2-D via ``tt.expand_dims`` (``m[:, None]``) — inside
+          the loop OR after it, on the ``scf.for`` result — to rescale/normalize a 2-D
+          accumulator, and the 2-D value is what gets stored. The 2-D consumer matches
+          the row-broadcast layout, so it is correct.
+
+        We follow forward uses across the loop boundary using the ``scf.for``'s
+        ``result_ids`` (positionally matched to the ``scf.yield`` operands). A
+        ``tt.expand_dims`` user ends that branch (the value became 2-D → safe). A
+        ``tt.store`` whose VALUE operand is the traced value is the hazard. Purely a
+        read over the IR graph — no emission state.
+        """
+
+        def _iter_all(ops):
+            for o in ops:
+                yield o
+                if getattr(o, "region_ops", None):
+                    yield from _iter_all(o.region_ops)
+                if getattr(o, "else_ops", None):
+                    yield from _iter_all(o.else_ops)
+
+        all_ops = list(_iter_all(self.graph.ops))
+        uses = {}
+        for op in all_ops:
+            for oid in op.operand_ids or []:
+                uses.setdefault(oid, []).append(op)
+        # scf.yield -> its enclosing scf.for (to cross the loop-carry via result_ids).
+        yield_to_for = {}
+        for op in all_ops:
+            if op.op == "scf.for" and op.region_ops:
+                for b in op.region_ops:
+                    if b.op == "scf.yield":
+                        yield_to_for[b.id] = op
+
+        # Each stack entry carries whether the path has crossed a loop-carry yet.
+        # The hazard is specifically the LOOP-CARRIED store: a single-tile reduce that
+        # feeds a 1-D store directly (no K-loop) is correct (the store re-reads the row
+        # from shared memory), so it must NOT be refused. Only a store reached AFTER
+        # crossing an scf.for loop-carry collapses.
+        seen = set()
+        stack = [(reduce_id, False)]
+        while stack:
+            vid, crossed = stack.pop()
+            if (vid, crossed) in seen:
+                continue
+            seen.add((vid, crossed))
+            for user in uses.get(vid, []):
+                if user.op == "tt.expand_dims":
+                    continue  # value becomes ≥2-D on this branch → safe, stop
+                if user.op == "tt.store":
+                    # operand[0] = pointer, operand[1] = stored value. Only a match on
+                    # the VALUE operand of a store reached THROUGH a loop-carry is the
+                    # hazard (a pointer/index match is address arithmetic; a no-loop
+                    # store is correct).
+                    if crossed and len(user.operand_ids or []) >= 2 and user.operand_ids[1] == vid:
+                        return True
+                    continue
+                if user.op == "scf.yield":
+                    forop = yield_to_for.get(user.id)
+                    if forop is not None and getattr(forop, "result_ids", None):
+                        for i, oid in enumerate(user.operand_ids or []):
+                            if oid == vid and i < len(forop.result_ids):
+                                stack.append((forop.result_ids[i], True))  # crossed a loop-carry
+                    continue
+                # Generic op: follow its result(s) forward, preserving `crossed`.
+                if getattr(user, "result_ids", None):
+                    stack.extend((rid, crossed) for rid in user.result_ids)
+                else:
+                    stack.append((user.id, crossed))
+        return False
+
     def _lower_reduce(self, ssa: SSAValue):
         """tt.reduce → SIMD + threadgroup shared memory reduction.
 
@@ -922,6 +1006,27 @@ class _ReduceScanMixin:
                         f"the {self.kb.block_size}-thread threadgroup, so the cross-lane "
                         f"reduce would cover only the first {self.kb.block_size} lanes "
                         f"(silent-wrong). Use BLOCK <= num_threads.",
+                        op_name="tt.reduce",
+                    )
+                # LAYOUT guard: a 2-D→1-D axis reduce whose result is accumulated
+                # across a loop (e.g. `acc += tl.sum(x, axis=1)` inside a K-loop)
+                # produces the result in the row-broadcast layout (thread lid → row
+                # lid/N), but the loop-carried accumulator + 1-D store assume row lid,
+                # silently collapsing every output row to the first. The tile FITS
+                # (the coverage guard above passes), so this is a distinct silent-wrong;
+                # the fix needs loop-carry broadcast-layout propagation. Refuse.
+                if self._reduce_result_reaches_1d_store(ssa.id):
+                    from triton_msl.errors import MetalNonRecoverableError
+
+                    raise MetalNonRecoverableError(
+                        "Refusing a 2-D axis reduce whose result is accumulated across a "
+                        "loop, e.g. `acc += tl.sum(x[None,:]*w, axis=1)` inside "
+                        "`for k in range(0, K, BK)`: the per-row reduce result is laid out "
+                        "one-row-per-simdgroup, but the loop-carried accumulator and 1-D "
+                        "store assume one-row-per-thread, which silently collapses every "
+                        "output row to the first. Reduce the whole axis in a single tile "
+                        "(no K-loop, BLOCK_K == K), or express the row-wise matmul as "
+                        "tl.dot(a, w). Correct-or-refuse: refused, not mis-computed.",
                         op_name="tt.reduce",
                     )
                 self._lower_reduce_2d(ssa, input_var, axis, combine_op, msl_type, shared_dtype, input_shape)

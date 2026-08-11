@@ -49,6 +49,20 @@
 
 ### Correctness
 
+- **In-loop 2-D axis reduce (GEMV via `tl.sum`) now refuses instead of silently
+  collapsing to row 0.** A `tl.sum` (or max/…) over one axis of a 2-D tile produces
+  its per-row result in the row-broadcast layout (thread `lid` holds row `lid/N`).
+  When that result is accumulated across a K-loop (`acc += tl.sum(x[None,:]*w,
+  axis=1)` inside `for k in range(0, K, BK)`), the row-broadcast layout is not
+  propagated across the `scf.for` loop-carry, so the loop-carried accumulator + 1-D
+  store instead assume one-row-per-thread and every output row silently collapsed to
+  the first (a plain or quantized GEMV written this way returned `o[n] = o[0]`). The
+  existing 2-D-reduce coverage guard did not catch this (the tile fits the
+  threadgroup) — it is a distinct *layout* bug. Detected structurally (a 2-D→1-D
+  reduce whose result feeds an `scf.for` carried value) and refused loudly; the
+  single-tile form (no K-loop) is correct and unaffected. Full fix (propagating the
+  broadcast layout across the loop-carry) is a follow-up. Found via the quantized
+  GEMV/decode investigation.
 - **Weight-only int8 quantized matmul now RUNS on Metal** (was refused). A canonical
   weight-only int8 matmul — `out = a @ ((w_i8.to(f32) - zero) * scale)` with the
   standard `(input, weight, output, scale, zero, M, N, K, ...strides)` signature,

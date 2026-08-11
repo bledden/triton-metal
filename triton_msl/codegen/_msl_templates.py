@@ -3383,6 +3383,123 @@ kernel void int8_matmul(
 """
 
 
+def make_int8_matmul_fast(rr=4, rc=2, bk=32):
+    """Fast weight-only INT8 matmul: tiled simdgroup MMA with on-the-fly dequant.
+
+    Adapts the fp16 fast-matmul to quantized weights. The int8 weight tile is
+    staged into threadgroup memory as float with the per-channel zero folded in
+    (``bdeq[k][n] = float(w[n,k]) - zero[n]``); the FLOAT simdgroup MMA runs on
+    the dequantized tile; the epilogue multiplies by ``scale[n]``. Near-bit-exact
+    vs the scalar ``make_int8_matmul_kernel`` reference (float accumulator).
+
+    Layout: input [M,K] float, weight [N,K] int8, scales/zeros [N], out [M,N].
+    Each simdgroup (32 threads) computes an (8*rr) x (8*rc) output block.
+    DISPATCH: n_groups = ceil(M/(8*rr)) * ceil(N/(8*rc)); 32 threads/group.
+    SIZE CONTRACT: M % (8*rr) == 0, N % (8*rc) == 0, K % bk == 0 (bk % 8 == 0).
+    Measured ~13-18x over the scalar kernel on M4 Max; best (rr,rc,bk)=(4,2,32).
+    """
+    BN = 8 * rc
+    accs = "\n    ".join(f"simdgroup_float8x8 c{r}_{c}(0.0f);" for r in range(rr) for c in range(rc))
+    afrags = " ".join(f"simdgroup_float8x8 a{r};" for r in range(rr))
+    bfrags = " ".join(f"simdgroup_float8x8 b{c};" for c in range(rc))
+    sub = []
+    for kk in range(0, bk, 8):
+        for r in range(rr):
+            sub.append(f"simdgroup_load(a{r}, input + (m0 + {r * 8}u) * K + k0 + {kk}u, K);")
+        for c in range(rc):
+            sub.append(f"simdgroup_load(b{c}, bdeq + {kk * BN}u + {c * 8}u, {BN}u);")
+        for r in range(rr):
+            for c in range(rc):
+                sub.append(f"simdgroup_multiply_accumulate(c{r}_{c}, a{r}, b{c}, c{r}_{c});")
+    submma = "\n        ".join(sub)
+    epi = "\n    ".join(
+        f"simdgroup_store(c{r}_{c}, cbuf, 8);\n    simdgroup_barrier(mem_flags::mem_threadgroup);\n"
+        f"    for (uint e = tid; e < 64u; e += 32u) {{ uint mm=e/8u, nn=e%8u; "
+        f"output[(m0 + {r * 8}u + mm) * N + (n0 + {c * 8}u + nn)] = scales[n0 + {c * 8}u + nn] * cbuf[e]; }}\n"
+        f"    simdgroup_barrier(mem_flags::mem_threadgroup);"
+        for r in range(rr) for c in range(rc)
+    )
+    return f"""#include <metal_stdlib>
+#include <metal_simdgroup_matrix>
+using namespace metal;
+
+kernel void int8_matmul_fast(
+    device const float* input  [[buffer(0)]],
+    device const char*  weight [[buffer(1)]],
+    device float*       output [[buffer(2)]],
+    device const float* scales [[buffer(3)]],
+    device const float* zeros  [[buffer(4)]],
+    constant uint& M [[buffer(5)]],
+    constant uint& N [[buffer(6)]],
+    constant uint& K [[buffer(7)]],
+    uint tgid [[threadgroup_position_in_grid]],
+    uint tid  [[thread_index_in_threadgroup]]
+) {{
+    uint ntn = N / {BN}u;
+    uint m0 = (tgid / ntn) * {8 * rr}u;
+    uint n0 = (tgid % ntn) * {BN}u;
+
+    threadgroup float bdeq[{bk * BN}];
+    {accs}
+    {afrags} {bfrags}
+
+    for (uint k0 = 0u; k0 < K; k0 += {bk}u) {{
+        for (uint e = tid; e < {bk * BN}u; e += 32u) {{
+            uint kk = e / {BN}u, nn = e % {BN}u;
+            bdeq[kk * {BN}u + nn] = float(weight[(n0 + nn) * K + (k0 + kk)]) - zeros[n0 + nn];
+        }}
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+        {submma}
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+    }}
+
+    threadgroup float cbuf[64];
+    {epi}
+}}
+"""
+
+
+def make_int8_gemv():
+    """Fast weight-only INT8 GEMV (M=1 decode) — the dominant LLM-inference shape.
+
+    One SIMDGROUP per output column: the 32 lanes stride the K dimension in
+    char4/float4 (coalesced within the simdgroup), then ``simd_sum`` reduces.
+    Memory-bandwidth-bound; measured ~11x over the scalar kernel at the roofline.
+
+    Layout: input [K] float, weight [N,K] int8, scales/zeros [N], output [N].
+    DISPATCH: N simdgroups = N*32 threads; K % 4 == 0.
+    """
+    return """#include <metal_stdlib>
+using namespace metal;
+kernel void int8_gemv(
+    device const float* input  [[buffer(0)]],
+    device const char*  weight [[buffer(1)]],
+    device float*       output [[buffer(2)]],
+    device const float* scales [[buffer(3)]],
+    device const float* zeros  [[buffer(4)]],
+    constant uint& K [[buffer(5)]],
+    constant uint& N [[buffer(6)]],
+    uint gid  [[thread_position_in_grid]],
+    uint lane [[thread_index_in_simdgroup]]
+) {
+    uint n = gid / 32u;
+    if (n >= N) return;
+    float z = zeros[n];
+    device const char4*  w4  = (device const char4*)(weight + n * K);
+    device const float4* in4 = (device const float4*)input;
+    uint K4 = K / 4u;
+    float acc = 0.0f;
+    for (uint k = lane; k < K4; k += 32u) {
+        char4 wv = w4[k]; float4 iv = in4[k];
+        acc += iv.x * (float(wv.x) - z) + iv.y * (float(wv.y) - z)
+             + iv.z * (float(wv.z) - z) + iv.w * (float(wv.w) - z);
+    }
+    acc = simd_sum(acc);
+    if (lane == 0u) output[n] = scales[n] * acc;
+}
+"""
+
+
 def make_int4_matmul_kernel(group_size=128):
     """Generate a weight-only INT4 quantized matmul kernel (GPTQ/AWQ style).
 

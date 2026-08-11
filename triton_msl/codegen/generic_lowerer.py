@@ -977,6 +977,23 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
                 self._prescan_stores()
                 return msl
 
+        # QUANTIZED matmul: B is an integer weight dequantized to float before the
+        # dot (e.g. `(w_i8.to(float) - zero) * scale`). The simdgroup templates load
+        # B DIRECTLY from its pointer as float/half — a char* (int8) weight either
+        # fails to compile (`simdgroup_load(float, char*)`) or, if types matched,
+        # would read the weight RAW (no dequant) = silently wrong. Refuse loudly.
+        # (Routing to a dedicated dequant kernel is the follow-up.)
+        if self._detect_quantized_dot():
+            raise MetalNonRecoverableError(
+                "quantized matmul (a tt.dot "
+                "whose B operand is an integer weight dequantized to float, e.g. "
+                "(w_i8.to(float) - zero) * scale) is not supported by the simdgroup "
+                "matmul template — it loads B directly as float/half from its "
+                "pointer, so an int8 weight either fails to compile or would be read "
+                "raw (no dequant), silently wrong. Dequantize on the host and pass a "
+                "float/half weight, or use a dedicated quantized-matmul kernel."
+            )
+
         # Check for simple dot (no stride args, no scf.for) — use inline
         # scalar matmul that loads from global into shared memory, then
         # does per-thread dot product.

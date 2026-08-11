@@ -110,6 +110,19 @@ class _DetectionMixin:
             if ssa.op == "tt.store" and ssa.operand_ids:
                 c_arg = self._trace_ptr_source(ssa.operand_ids[0], op_by_id)
                 break
+        # In a K-loop matmul the A/B pointers are loop-carried (advanced each iter),
+        # so they don't trace to a func-arg — only C (the store target, never
+        # loop-carried) traces reliably. Fill a NON-traced leg from declaration order
+        # while KEEPING the legs that traced. This fixes matmuls with extra ptr args
+        # (a quantized matmul's scale/zero): the callers' old [ptr0, ptr1, ptr[-1]]
+        # fallback picked the LAST arg as C (= zero_ptr), not the real output.
+        # Declaration-order A/B is the same assumption those fallbacks already make;
+        # keeping the traced C is the fix. (For the common 3-ptr-arg matmul ptr[-1]
+        # already equals C, so this changes nothing there.)
+        if a_arg is None and all_ptr_args:
+            a_arg = all_ptr_args[0]
+        if b_arg is None:
+            b_arg = next((p for p in all_ptr_args if a_arg is None or p.name != a_arg.name), None)
         # All three must resolve to distinct args.
         ptrs = [a_arg, b_arg, c_arg]
         if any(p is None for p in ptrs):
@@ -837,6 +850,43 @@ class _DetectionMixin:
                 "elementwise kernel.",
                 op_name="tt.dot",
             )
+
+    def _detect_quantized_dot(self):
+        """True iff the (single) tt.dot's B operand is an INTEGER weight dequantized
+        to float — an ``arith.sitofp`` / ``arith.uitofp`` anywhere in B's value chain
+        (e.g. ``(w_i8.to(float) - zero) * scale``). The simdgroup matmul templates
+        load B directly as float/half from its pointer, so a quantized (int) weight
+        can only be mis-compiled or read raw (silently wrong); the caller refuses.
+        Fail-safe: over-detection refuses, never silent-wrong.
+        """
+        op_by_id = {}
+
+        def _collect(ops):
+            for s in ops:
+                op_by_id[s.id] = s
+                if getattr(s, "region_ops", None):
+                    _collect(s.region_ops)
+                if getattr(s, "else_ops", None):
+                    _collect(s.else_ops)
+
+        _collect(self.graph.ops)
+        dots = [s for s in op_by_id.values() if s.op == "tt.dot"]
+        if len(dots) != 1 or len(dots[0].operand_ids) < 2:
+            return False
+        seen = set()
+
+        def _has_int_to_float(sid, depth=0):
+            if sid in seen or depth > 40:
+                return False
+            seen.add(sid)
+            o = op_by_id.get(sid)
+            if o is None:
+                return False
+            if o.op in ("arith.sitofp", "arith.uitofp"):
+                return True
+            return any(_has_int_to_float(oid, depth + 1) for oid in (o.operand_ids or []))
+
+        return _has_int_to_float(dots[0].operand_ids[1])
 
     def _detect_simple_dot(self):
         """Detect a simple dot kernel: load→local_alloc→local_load→dot→store.

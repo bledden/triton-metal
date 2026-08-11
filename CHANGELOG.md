@@ -49,6 +49,19 @@
 
 ### Correctness
 
+- **Matmul role-resolution fixed for kernels with extra ptr args; quantized matmul
+  refused cleanly.** In a K-loop matmul the A/B pointers are loop-carried (advanced
+  each iteration) so they don't trace back to a func-arg — only C (the store target)
+  traces reliably. The role-resolution fallback then picked the *last* ptr arg as C:
+  correct by luck for a 3-pointer (A,B,C) matmul, but wrong for one with **extra ptr
+  args** (a quantized matmul's scale/zero, or a bias), which mis-inferred strides and
+  over-refused it as a "batched matmul". Now the reliably-traced C is kept and A/B
+  fall back per-leg. Separately, a quantized matmul (B = an integer weight
+  dequantized to float, `(w_i8.to(float) - zero) * scale`) is now detected and
+  refused **loudly with an actionable message** — the simdgroup template loads B
+  directly as float/half, so an int8 weight would compile-fail or be read raw
+  (silently wrong). Dedicated dequant kernels landed in `_msl_templates.py`
+  (`make_int8_matmul_fast`, `make_int8_gemv`); routing is a follow-up.
 - **MEPT chained-addptr fix** — an array-of-offsets base pointer (`x_ptr + offs*K`)
   advanced by a *scalar* loop variable (`+ k`, inside a runtime loop) fell through to
   the scalar-offset lowering and emitted an invalid double subscript

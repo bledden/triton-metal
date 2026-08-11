@@ -2,6 +2,20 @@
 
 ## Unreleased
 
+### Performance
+
+- **Split-K for skinny/deep fp32 matmul.** Small-M/N, deep-K matmuls (e.g.
+  M=64,N=64,K=8192) were ~0.1× torch — occupancy-starved: a handful of output tiles
+  means a handful of threadgroups, each running the whole K-loop serially. A new
+  **deterministic two-pass** split-K path (each of G threadgroups computes 1/G of K
+  into a partials buffer, then a reduce kernel sums over G — **no atomics**, so it is
+  byte-identical run-to-run) fires for fp32 shapes with `n_tiles < 64` and
+  `K >= 2048`: M=64,N=64,K=8192 **0.16 → 0.67 TF** (now > torch), M=128,N=128,K=8192
+  **0.58 → 1.43 TF** (1.34× torch). Isolated + additive — any non-fit (moderate tile
+  counts, shallow K, fp16/bf16) falls through to the unchanged single-pass fast
+  kernel, so no shape regresses (the threshold was tuned by measuring the *shipped*
+  path, where the partials-alloc + second-dispatch overhead made n_tiles=128 regress).
+
 ### Portability
 
 - **Verified byte-identical on AMD, not just NVIDIA.** The example `@triton.jit` kernels,

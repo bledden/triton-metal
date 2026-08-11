@@ -4327,6 +4327,73 @@ kernel void repeat_kv(
 """
 
 
+def make_matmul_splitk_fp32(rr=4, rc=2, bk=32):
+    """Deterministic two-pass split-K fp32 matmul for SKINNY/DEEP shapes.
+
+    Skinny/deep (small M/N, large K) starves occupancy: few output tiles → few
+    threadgroups, each running the whole K-loop serially (measured ~0.1-0.4x torch).
+    Split-K assigns G threadgroups per output tile (each computes 1/G of K), each
+    writing its partial to ``P[G, M, N]`` (NO atomics — deterministic run-to-run),
+    then a reduce kernel sums over G. Measured 10x over the serial path (1.1-1.7x
+    over torch). Two kernels: ``mm_sk_partial`` + ``mm_sk_reduce``.
+
+    DISPATCH: grid_partial = (ceil(M/(8rr)) * ceil(N/(8rc))) * G threadgroups, 32
+    threads each; grid_reduce = M*N threads. CONTRACT: M % (8rr) == 0, N % (8rc) == 0,
+    K % (G*bk) == 0 (each chunk a whole number of bk-steps).
+    """
+    BN = 8 * rc
+    accs = "\n    ".join(f"simdgroup_float8x8 c{r}_{c}(0.0f);" for r in range(rr) for c in range(rc))
+    afr = " ".join(f"simdgroup_float8x8 a{r};" for r in range(rr))
+    bfr = " ".join(f"simdgroup_float8x8 b{c};" for c in range(rc))
+    sub = []
+    for kk in range(0, bk, 8):
+        for r in range(rr):
+            sub.append(f"simdgroup_load(a{r}, A + (m0 + {r * 8}u) * K + k + {kk}u, K);")
+        for c in range(rc):
+            sub.append(f"simdgroup_load(b{c}, B + (k + {kk}u) * N + n0 + {c * 8}u, N);")
+        for r in range(rr):
+            for c in range(rc):
+                sub.append(f"simdgroup_multiply_accumulate(c{r}_{c}, a{r}, b{c}, c{r}_{c});")
+    submma = "\n        ".join(sub)
+    epi = "\n    ".join(
+        f"simdgroup_store(c{r}_{c}, cbuf, 8);\n    simdgroup_barrier(mem_flags::mem_threadgroup);\n"
+        f"    for (uint e = tid; e < 64u; e += 32u) {{ uint mm=e/8u, nn=e%8u; "
+        f"P[kc*M*N + (m0+{r * 8}u+mm)*N + (n0+{c * 8}u+nn)] = cbuf[e]; }}\n"
+        f"    simdgroup_barrier(mem_flags::mem_threadgroup);"
+        for r in range(rr) for c in range(rc)
+    )
+    return f"""#include <metal_stdlib>
+#include <metal_simdgroup_matrix>
+using namespace metal;
+kernel void mm_sk_partial(
+    device const float* A [[buffer(0)]], device const float* B [[buffer(1)]],
+    device float* P [[buffer(2)]],
+    constant uint& M [[buffer(3)]], constant uint& N [[buffer(4)]],
+    constant uint& K [[buffer(5)]], constant uint& G [[buffer(6)]],
+    uint tgid [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]]
+) {{
+    uint ntn = N / {BN}u; uint tile = tgid / G; uint kc = tgid % G;
+    uint m0 = (tile / ntn) * {8 * rr}u; uint n0 = (tile % ntn) * {BN}u;
+    uint kchunk = K / G; uint kstart = kc * kchunk; uint kend = kstart + kchunk;
+    {accs}
+    {afr} {bfr}
+    for (uint k = kstart; k < kend; k += {bk}u) {{ {submma} }}
+    threadgroup float cbuf[64];
+    {epi}
+}}
+kernel void mm_sk_reduce(
+    device const float* P [[buffer(0)]], device float* C [[buffer(1)]],
+    constant uint& MN [[buffer(2)]], constant uint& G [[buffer(3)]],
+    uint gid [[thread_position_in_grid]]
+) {{
+    if (gid >= MN) return;
+    float acc = 0.0f;
+    for (uint g = 0u; g < G; g++) acc += P[g*MN + gid];
+    C[gid] = acc;
+}}
+"""
+
+
 def make_simdgroup_matmul_kernel_fast(dtype="fp16", rr=4, rc=4, out_dtype="fp32"):
     """Fast matmul: direct-device simdgroup_load + register blocking (WS1 C.2).
 

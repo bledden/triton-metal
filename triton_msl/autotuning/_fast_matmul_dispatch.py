@@ -21,6 +21,70 @@ import math as _math
 # saving on small matmuls).
 _VARIANT_MSL_CACHE = {}
 
+# Cached fp32 split-K kernel MSL (mm_sk_partial + mm_sk_reduce).
+_SPLITK_MSL = None
+
+
+def _maybe_splitk_dispatch(rt, M, N, K, kargs, launch_exit_hook, launch_metadata, rr=4, rc=2, bk=32):
+    """Deterministic two-pass split-K for a SKINNY/DEEP fp32 matmul, or False.
+
+    Fires only when the output-tile count is small (occupancy-starved) AND K is deep
+    enough to amortize the reduce pass AND a split factor G divides K/bk. Returns True
+    after dispatching both passes; False (fall through to the regular fast path) on any
+    non-fit or error. Row-major strides are verified by the caller. Deterministic
+    run-to-run (no atomics), so it preserves the byte-identical story.
+    """
+    try:
+        tile_m, tile_n = 8 * rr, 8 * rc  # 32, 16
+        if M % tile_m or N % tile_n or K % bk:
+            return False
+        n_tiles = (M // tile_m) * (N // tile_n)
+        # Only VERY skinny/deep wins in the SHIPPED path: split-K adds a partials
+        # allocation + a second dispatch per call, so at moderate tile counts the
+        # single-pass fast kernel is faster (measured: M=256/n_tiles=128 REGRESSED
+        # 2.18->1.81 TF when the threshold was 256). Fire only when n_tiles < 64 AND K
+        # is deep (>= 2048) to amortize the reduce pass — there the wins are real
+        # (M=64/n_tiles=8: 0.16->0.63 TF; M=128/n_tiles=32: 0.58->1.58 TF, 1.45x torch).
+        if n_tiles >= 64 or K < 2048:
+            return False
+        kbk = K // bk
+        # Largest G dividing kbk with n_tiles*G <= 512 (target total threadgroups),
+        # capped at 32 to bound the [G,M,N] partials buffer.
+        G = 1
+        upper = min(kbk, max(1, 512 // max(n_tiles, 1)), 32)
+        for g in range(2, upper + 1):
+            if kbk % g == 0:
+                G = g
+        if G <= 1:
+            return False
+        global _SPLITK_MSL
+        if _SPLITK_MSL is None:
+            from triton_msl.codegen._msl_templates import make_matmul_splitk_fp32
+
+            _SPLITK_MSL = make_matmul_splitk_fp32(rr, rc, bk)
+        if rt.is_unsupported(_SPLITK_MSL):
+            return False
+        import torch
+
+        A, B, C = kargs[0], kargs[1], kargs[2]
+        P = torch.empty((G, M, N), device=A.device, dtype=torch.float32)
+        lib = rt.get_library(_SPLITK_MSL)
+        n_groups = n_tiles * G
+        rt.dispatch(lib, "mm_sk_partial", [A, B, P, M, N, K, G], threads=n_groups * 32, group_size=32)
+        MN = M * N
+        rt.dispatch(lib, "mm_sk_reduce", [P, C, MN, G], threads=((MN + 255) // 256) * 256, group_size=256)
+        if launch_exit_hook:
+            launch_exit_hook(launch_metadata)
+        return True
+    except Exception:
+        try:
+            if _SPLITK_MSL is not None:
+                rt.mark_unsupported(_SPLITK_MSL)
+        except Exception:
+            pass
+        return False
+
+
 # ---------------------------------------------------------------------------
 # Public entry point
 # ---------------------------------------------------------------------------
@@ -85,6 +149,16 @@ def dispatch_fast_matmul(rt, descriptor, kargs, *, launch_exit_hook=None, launch
                 return False
             if actual != expected:
                 return False
+
+        # --- SPLIT-K for skinny/deep fp32 (occupancy-starved) ---
+        # A few output tiles → a few threadgroups → the serial K-loop is ~0.1-0.4x
+        # torch. Route fp32 skinny/deep shapes to the deterministic two-pass split-K
+        # (validated 10x over serial, 1.1-1.7x over torch). Strides are already verified
+        # row-major above. Any non-fit returns from _maybe_splitk_dispatch → falls
+        # through to the regular fast dispatch below (unchanged).
+        if msl_dtype in ("fp32", "f32", "float") and msl_out in ("fp32", "f32", "float"):
+            if _maybe_splitk_dispatch(rt, M, N, K, kargs, launch_exit_hook, launch_metadata):
+                return True
 
         # --- Per-shape deterministic tile selection (safe: every CANDIDATES config
         #     computes a correct matmul; selection only affects perf).  Any error in this

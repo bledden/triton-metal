@@ -2587,15 +2587,36 @@ class _TemplateMixin:
                     return r
             return None
 
-        def _is_dequant(o):
-            return o is not None and o.op == "arith.subf" and len(o.operand_ids) == 2 and _find_sitofp(o.operand_ids[0]) is not None
-
-        m0, m1 = op_by_id.get(mul.operand_ids[0]), op_by_id.get(mul.operand_ids[1])
-        if _is_dequant(m0):
-            sub, x_bc = m0, mul.operand_ids[1]
-        elif _is_dequant(m1):
-            sub, x_bc = m1, mul.operand_ids[0]
+        # The reduce input is mulf(x_bc, W). W is the "weight side" (contains the
+        # sitofp); x_bc is the input broadcast. W is one of two mathematically-identical
+        # forms (scale is per-N, so it factors out of the sum either way — both route to
+        # the same make_int8_gemv, which applies the per-N scale once to the raw sum):
+        #   epilogue form:   subf(sitofp(w), zero_bc)                  (scale applied after the loop)
+        #   in-reduce form:  mulf(subf(sitofp(w), zero_bc), scale_bc)  (scale inside the reduce)
+        m0_has = _find_sitofp(mul.operand_ids[0]) is not None
+        m1_has = _find_sitofp(mul.operand_ids[1]) is not None
+        if m0_has and not m1_has:
+            W, x_bc = op_by_id.get(mul.operand_ids[0]), mul.operand_ids[1]
+        elif m1_has and not m0_has:
+            W, x_bc = op_by_id.get(mul.operand_ids[1]), mul.operand_ids[0]
         else:
+            return None
+        if W is None:
+            return None
+        scale_bc = None  # in-reduce: bound here; epilogue: bound from the store below
+        if W.op == "arith.subf":
+            sub = W
+        elif W.op == "arith.mulf" and len(W.operand_ids) == 2:
+            w0, w1 = op_by_id.get(W.operand_ids[0]), op_by_id.get(W.operand_ids[1])
+            if w0 is not None and w0.op == "arith.subf":
+                sub, scale_bc = w0, W.operand_ids[1]
+            elif w1 is not None and w1.op == "arith.subf":
+                sub, scale_bc = w1, W.operand_ids[0]
+            else:
+                return None
+        else:
+            return None
+        if len(sub.operand_ids) != 2 or _find_sitofp(sub.operand_ids[0]) is None:
             return None
         zero_bc = sub.operand_ids[1]
         sitofp = _find_sitofp(sub.operand_ids[0])
@@ -2634,8 +2655,10 @@ class _TemplateMixin:
         if _trace_to_arg(zero_bc) != 4:
             return None  # zero
 
-        # Epilogue: the single tt.store's value = (convert_layout of) mulf(acc, scale);
-        # its pointer traces to the output arg, its scale operand to arg 3.
+        # The single tt.store's pointer traces to the output arg. The stored value is:
+        #   epilogue form:   mulf(acc, scale_bc)  -> bind scale here (scale not yet set)
+        #   in-reduce form:  the raw acc          -> scale already bound; the store must
+        #                                            NOT apply a second per-arg scale.
         stores = [o for o in op_by_id.values() if o.op == "tt.store"]
         if len(stores) != 1 or len(stores[0].operand_ids or []) < 2:
             return None
@@ -2645,10 +2668,23 @@ class _TemplateMixin:
         val = op_by_id.get(store.operand_ids[1])
         while val is not None and val.op in ("ttg.convert_layout",) and val.operand_ids:
             val = op_by_id.get(val.operand_ids[0])
-        if val is None or val.op != "arith.mulf" or len(val.operand_ids) != 2:
-            return None
-        if 3 not in (_trace_to_arg(val.operand_ids[0]), _trace_to_arg(val.operand_ids[1])):
-            return None  # per-N scale epilogue
+        if scale_bc is None:
+            # EPILOGUE form: store value must be mulf(acc, scale) with scale -> arg 3.
+            if val is None or val.op != "arith.mulf" or len(val.operand_ids) != 2:
+                return None
+            if _trace_to_arg(val.operand_ids[0]) == 3:
+                scale_bc = val.operand_ids[0]
+            elif _trace_to_arg(val.operand_ids[1]) == 3:
+                scale_bc = val.operand_ids[1]
+            else:
+                return None
+        else:
+            # IN-REDUCE form: guard against a SECOND scale in the epilogue (double-apply).
+            if val is not None and val.op == "arith.mulf" and len(val.operand_ids) == 2:
+                if 3 in (_trace_to_arg(val.operand_ids[0]), _trace_to_arg(val.operand_ids[1])):
+                    return None  # scale applied both in-reduce AND as epilogue -> refuse
+        if _trace_to_arg(scale_bc) != 3:
+            return None  # per-N scale (arg 3)
 
         # --- dtypes: input fp32, output fp32, weight int8. ---
         if _mlir_to_triton_dtype(args[0].elem_type) not in ("fp32", "f32", "float"):

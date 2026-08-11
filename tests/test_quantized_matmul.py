@@ -141,6 +141,23 @@ if HAS:
         tl.store(o_ptr + offs_n, acc * scale)
 
     @triton.jit
+    def _int8_gemv_inr(x_ptr, w_ptr, o_ptr, scale_ptr, zero_ptr, N, K, swn, swk,
+                       BN: tl.constexpr, BK: tl.constexpr):
+        # In-reduce-scale form: scale applied INSIDE the reduce (not as an epilogue).
+        # Mathematically identical for per-N scale; must route to the same kernel.
+        pid = tl.program_id(0)
+        offs_n = pid * BN + tl.arange(0, BN)
+        offs_k = tl.arange(0, BK)
+        scale = tl.load(scale_ptr + offs_n)
+        zero = tl.load(zero_ptr + offs_n)
+        acc = tl.zeros((BN,), dtype=tl.float32)
+        for k in range(0, K, BK):
+            x = tl.load(x_ptr + offs_k + k)
+            w = tl.load(w_ptr + offs_n[:, None] * swn + (offs_k[None, :] + k) * swk).to(tl.float32)
+            acc += tl.sum(x[None, :] * ((w - zero[:, None]) * scale[:, None]), axis=1)
+        tl.store(o_ptr + offs_n, acc)
+
+    @triton.jit
     def _fp32_gemv(x_ptr, w_ptr, o_ptr, N, K, swn, swk, BN: tl.constexpr, BK: tl.constexpr):
         pid = tl.program_id(0)
         offs_n = pid * BN + tl.arange(0, BN)
@@ -228,6 +245,22 @@ def test_quantized_gemv_runs_correctly(N, K):
     zero = torch.randint(-8, 8, (N,), device="mps").float()
     o = torch.zeros(N, device="mps")
     _int8_gemv[(triton.cdiv(N, BN),)](x, w, o, scale, zero, N, K, w.stride(0), w.stride(1), BN=BN, BK=BK)
+    ref = ((w.float() - zero[:, None]) * scale[:, None]) @ x
+    torch.testing.assert_close(o, ref, rtol=2e-3, atol=2e-3)
+
+
+@requires
+@pytest.mark.parametrize("N,K", [(128, 256), (256, 512)])
+def test_quantized_gemv_in_reduce_scale_runs(N, K):
+    # The in-reduce-scale form (scale inside the reduce) routes to the same kernel.
+    torch.manual_seed(0)
+    BN, BK = 32, 32
+    x = torch.randn(K, device="mps")
+    w = torch.randint(-127, 127, (N, K), device="mps", dtype=torch.int8)
+    scale = torch.rand(N, device="mps") * 0.02 + 0.005
+    zero = torch.randint(-8, 8, (N,), device="mps").float()
+    o = torch.zeros(N, device="mps")
+    _int8_gemv_inr[(triton.cdiv(N, BN),)](x, w, o, scale, zero, N, K, w.stride(0), w.stride(1), BN=BN, BK=BK)
     ref = ((w.float() - zero[:, None]) * scale[:, None]) @ x
     torch.testing.assert_close(o, ref, rtol=2e-3, atol=2e-3)
 

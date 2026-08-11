@@ -883,10 +883,13 @@ class _ReduceScanMixin:
                     continue
                 if user.op == "scf.yield":
                     forop = yield_to_for.get(user.id)
-                    if forop is not None and getattr(forop, "result_ids", None):
+                    if forop is not None:
+                        # A single-result scf.for has result_ids == None (the walker
+                        # collapses len==1), and the result maps to the op's own id.
+                        rids = forop.result_ids if getattr(forop, "result_ids", None) else [forop.id]
                         for i, oid in enumerate(user.operand_ids or []):
-                            if oid == vid and i < len(forop.result_ids):
-                                stack.append((forop.result_ids[i], True))  # crossed a loop-carry
+                            if oid == vid and i < len(rids):
+                                stack.append((rids[i], True))  # crossed a loop-carry
                     continue
                 # Generic op: follow its result(s) forward, preserving `crossed`.
                 if getattr(user, "result_ids", None):

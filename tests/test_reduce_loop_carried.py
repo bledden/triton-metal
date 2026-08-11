@@ -47,6 +47,25 @@ if HAS:
         w = tl.load(w_ptr + offs_n[:, None] * swn + offs_k[None, :] * swk)
         tl.store(o_ptr + offs_n, tl.sum(x[None, :] * w, axis=1))
 
+    @triton.jit
+    def _gemv_single_iterarg(x_ptr, w_ptr, o_ptr, scale_ptr, zero_ptr, N, K, swn, swk,
+                             BN: tl.constexpr, BK: tl.constexpr):
+        # A GPTQ-style int8 decode GEMV with a SINGLE loop iter_arg (`acc`) and a
+        # `range(0, K, BK)` induction var (no manual offs_k += BK). A single-result
+        # scf.for has result_ids == None, which an earlier version of the guard failed
+        # to cross — the same silent-wrong slipped through. It must refuse.
+        pid = tl.program_id(0)
+        offs_n = pid * BN + tl.arange(0, BN)
+        offs_k = tl.arange(0, BK)
+        scale = tl.load(scale_ptr + offs_n)
+        zero = tl.load(zero_ptr + offs_n)
+        acc = tl.zeros((BN,), dtype=tl.float32)
+        for k in range(0, K, BK):
+            x = tl.load(x_ptr + offs_k + k)
+            w = tl.load(w_ptr + offs_n[:, None] * swn + (offs_k[None, :] + k) * swk).to(tl.float32)
+            acc += tl.sum(x[None, :] * (w - zero[:, None]), axis=1)
+        tl.store(o_ptr + offs_n, acc * scale)
+
 
 @requires
 def test_inloop_2d_axis_reduce_refuses():
@@ -59,6 +78,23 @@ def test_inloop_2d_axis_reduce_refuses():
     o = torch.zeros(N, device="mps")
     with pytest.raises(MetalNonRecoverableError, match="accumulated across a loop"):
         _gemv_loop[(1,)](x, w, o, K, w.stride(0), w.stride(1), BN=N, BK=BK)
+
+
+@requires
+def test_single_iterarg_loop_carried_reduce_refuses():
+    # Single loop iter_arg (single-result scf.for, result_ids == None) must still
+    # be caught crossing the loop-carry — else the decode GEMV silently collapses.
+    torch.manual_seed(0)
+    N, K, BN, BK = 128, 256, 32, 32
+    x = torch.randn(K, device="mps")
+    w = torch.randint(-127, 127, (N, K), device="mps", dtype=torch.int8)
+    scale = torch.rand(N, device="mps") * 0.02 + 0.005
+    zero = torch.randint(-8, 8, (N,), device="mps").float()
+    o = torch.zeros(N, device="mps")
+    with pytest.raises(MetalNonRecoverableError, match="accumulated across a loop"):
+        _gemv_single_iterarg[(triton.cdiv(N, BN),)](
+            x, w, o, scale, zero, N, K, w.stride(0), w.stride(1), BN=BN, BK=BK
+        )
 
 
 @requires

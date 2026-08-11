@@ -42,6 +42,11 @@ def dispatch_quant_matmul(rt, descriptor, kargs, *, launch_exit_hook=None, launc
     bool : True if dispatched; False if skipped/failed (misaligned shape,
            runtime stride mismatch, or any error).
     """
+    # A GEMV descriptor is tagged "gemv" at index 0 (the GEMM's index 0 is its MSL
+    # string, never "gemv"). Dispatch the dedicated make_int8_gemv kernel.
+    if isinstance(descriptor, (tuple, list)) and len(descriptor) and descriptor[0] == "gemv":
+        return _dispatch_gemv(rt, descriptor, kargs, launch_exit_hook=launch_exit_hook, launch_metadata=launch_metadata)
+
     try:
         fast_msl = descriptor[0]
         m_idx, n_idx, k_idx = descriptor[1], descriptor[2], descriptor[3]
@@ -85,6 +90,67 @@ def dispatch_quant_matmul(rt, descriptor, kargs, *, launch_exit_hook=None, launc
     except Exception:
         try:
             rt.mark_unsupported(fast_msl)
+        except Exception:
+            pass
+        return False
+
+
+def _dispatch_gemv(rt, descriptor, kargs, *, launch_exit_hook=None, launch_metadata=None):
+    """Dispatch the dedicated make_int8_gemv kernel (weight-only int8 decode GEMV).
+
+    descriptor = ("gemv", gemv_msl, in_idx, w_idx, out_idx, scale_idx, zero_idx,
+                  n_idx, k_idx, stride_checks).
+    make_int8_gemv buffer order is (input, weight, output, scales, zeros, K, N) with
+    one simdgroup per output column (N*32 threads); K % 4 == 0.
+    """
+    try:
+        gemv_msl = descriptor[1]
+        in_idx, w_idx, out_idx, scale_idx, zero_idx = descriptor[2:7]
+        n_idx, k_idx = descriptor[7], descriptor[8]
+        stride_checks = descriptor[9] if len(descriptor) > 9 else ()
+    except (TypeError, ValueError, IndexError):
+        return False
+
+    if gemv_msl is None or rt.is_unsupported(gemv_msl):
+        return False
+
+    try:
+        N = int(kargs[n_idx])
+        K = int(kargs[k_idx])
+
+        # RUNTIME STRIDE CONTRACT: make_int8_gemv reads weight[n*K + k], so the weight
+        # row stride must equal K. A different stride (transposed / sliced) -> skip.
+        for arg_idx, expected_idx in stride_checks:
+            actual = int(kargs[arg_idx])
+            expected = 1 if expected_idx < 0 else int(kargs[expected_idx])
+            if actual != expected:
+                return False
+
+        # SIZE CONTRACT: the kernel strides K in char4/float4, so K % 4 == 0.
+        if not (N > 0 and K > 0 and K % 4 == 0):
+            return False
+
+        group = 256
+        threads = ((N * 32 + group - 1) // group) * group  # pad up; kernel guards n >= N
+        # Buffer order the kernel declares: (input, weight, output, scales, zeros, K, N).
+        buffers = [
+            kargs[in_idx],
+            kargs[w_idx],
+            kargs[out_idx],
+            kargs[scale_idx],
+            kargs[zero_idx],
+            K,
+            N,
+        ]
+        lib = rt.get_library(gemv_msl)
+        rt.dispatch(lib, "int8_gemv", buffers, threads=threads, group_size=group)
+        if launch_exit_hook:
+            launch_exit_hook(launch_metadata)
+        return True
+
+    except Exception:
+        try:
+            rt.mark_unsupported(gemv_msl)
         except Exception:
             pass
         return False

@@ -102,6 +102,34 @@ if HAS:
         c_ptrs = c_ptr + offs_m[:, None] * scm + offs_n[None, :] * scn
         tl.store(c_ptrs, acc)
 
+    @triton.jit
+    def _int8_gemv(x_ptr, w_ptr, o_ptr, scale_ptr, zero_ptr, N, K, swn, swk,
+                   BN: tl.constexpr, BK: tl.constexpr):
+        # GPTQ-style weight-only int8 decode GEMV: weight [N,K], per-N scale/zero.
+        pid = tl.program_id(0)
+        offs_n = pid * BN + tl.arange(0, BN)
+        offs_k = tl.arange(0, BK)
+        scale = tl.load(scale_ptr + offs_n)
+        zero = tl.load(zero_ptr + offs_n)
+        acc = tl.zeros((BN,), dtype=tl.float32)
+        for k in range(0, K, BK):
+            x = tl.load(x_ptr + offs_k + k)
+            w = tl.load(w_ptr + offs_n[:, None] * swn + (offs_k[None, :] + k) * swk).to(tl.float32)
+            acc += tl.sum(x[None, :] * (w - zero[:, None]), axis=1)
+        tl.store(o_ptr + offs_n, acc * scale)
+
+    @triton.jit
+    def _fp32_gemv(x_ptr, w_ptr, o_ptr, N, K, swn, swk, BN: tl.constexpr, BK: tl.constexpr):
+        pid = tl.program_id(0)
+        offs_n = pid * BN + tl.arange(0, BN)
+        offs_k = tl.arange(0, BK)
+        acc = tl.zeros((BN,), dtype=tl.float32)
+        for k in range(0, K, BK):
+            x = tl.load(x_ptr + offs_k + k)
+            w = tl.load(w_ptr + offs_n[:, None] * swn + (offs_k[None, :] + k) * swk)
+            acc += tl.sum(x[None, :] * w, axis=1)
+        tl.store(o_ptr + offs_n, acc)
+
     def _run_quant(M, N, K, BM=32, BN=32, BK=32):
         a = torch.randn(M, K, device="mps")
         w = torch.randint(-127, 127, (K, N), device="mps", dtype=torch.int8)
@@ -146,6 +174,35 @@ def test_quantized_matmul_unaligned_refuses():
     torch.manual_seed(0)
     with pytest.raises(MetalNonRecoverableError, match="quantized"):
         _run_quant(48, 128, 128)
+
+
+@requires
+@pytest.mark.parametrize("N,K", [(128, 256), (256, 128), (512, 512)])
+def test_quantized_gemv_runs_correctly(N, K):
+    # Weight-only int8 decode GEMV routed to make_int8_gemv.
+    torch.manual_seed(0)
+    BN, BK = 32, 32
+    x = torch.randn(K, device="mps")
+    w = torch.randint(-127, 127, (N, K), device="mps", dtype=torch.int8)
+    scale = torch.rand(N, device="mps") * 0.02 + 0.005
+    zero = torch.randint(-8, 8, (N,), device="mps").float()
+    o = torch.zeros(N, device="mps")
+    _int8_gemv[(triton.cdiv(N, BN),)](x, w, o, scale, zero, N, K, w.stride(0), w.stride(1), BN=BN, BK=BK)
+    ref = ((w.float() - zero[:, None]) * scale[:, None]) @ x
+    torch.testing.assert_close(o, ref, rtol=2e-3, atol=2e-3)
+
+
+@requires
+def test_fp32_gemv_not_misrouted():
+    # A plain fp32 GEMV (no dequant) must NOT be routed to the int8 GEMV kernel; it
+    # hits the loop-carried-reduce guard and refuses (correct-or-refuse).
+    torch.manual_seed(0)
+    N, K, BN, BK = 128, 256, 32, 32
+    x = torch.randn(K, device="mps")
+    w = torch.randn(N, K, device="mps")
+    o = torch.zeros(N, device="mps")
+    with pytest.raises(MetalNonRecoverableError, match="accumulated across a loop"):
+        _fp32_gemv[(triton.cdiv(N, BN),)](x, w, o, N, K, w.stride(0), w.stride(1), BN=BN, BK=BK)
 
 
 @requires

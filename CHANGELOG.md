@@ -49,6 +49,19 @@
 
 ### Correctness
 
+- **Weight-only int8 decode GEMV now RUNS on Metal** (was refused). A canonical
+  weight-only int8 decode GEMV written as an in-loop row reduce —
+  `acc += tl.sum(x[None,:] * (w_i8.to(f32) - zero[:,None]), axis=1)` over K, then
+  `out = acc * scale` — with weight `[N,K]` contiguous (GPTQ/AWQ), per-N float
+  scale/zero, fp32 in/out, is recognized at compile time and dispatched to the
+  dedicated `make_int8_gemv` kernel (one simdgroup per output column, char4/float4
+  coalesced, `simd_sum`) via `compile_shader`. Correct (~1e-5 err) and near the
+  memory roofline (~426 GB/s at N=11008, K=4096 — the dominant LLM decode shape). It
+  reuses the quantized-matmul dispatch (tagged `"gemv"`) and its fail-closed driver
+  path; the recognizer (`_maybe_quant_gemv_descriptor`) is **correct-or-refuse** —
+  it verifies the sum-reduce, the exact `mulf(bcast(x), subf(sitofp(w), bcast(zero)))`
+  input, and the `acc*scale` epilogue, tracing every leg to its arg. A plain fp32
+  GEMV (no dequant) is **not** misrouted — it refuses via the reduce-layout guard.
 - **In-loop 2-D axis reduce (GEMV via `tl.sum`) now refuses instead of silently
   collapsing to row 0.** A `tl.sum` (or max/…) over one axis of a 2-D tile produces
   its per-row result in the row-broadcast layout (thread `lid` holds row `lid/N`).

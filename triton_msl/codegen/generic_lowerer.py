@@ -1014,6 +1014,21 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
             _kname = _sanitize_msl_name(self.graph.func_name)
             return _re.sub(r"kernel\s+void\s+\w+\s*\(", f"kernel void {_kname}(", _qdesc[0], count=1)
 
+        # QUANTIZED GEMV (decode / M=1): a weight-only int8 GEMV written as an in-loop
+        # row reduce of a dequantized [N,K] weight (`acc += tl.sum(x[None,:]*(w-zero),
+        # axis=1)`, then `out = acc*scale`). This is the loop-carried 2-D-reduce pattern
+        # the reduce guard refuses; route the CANONICAL shape to the dedicated
+        # make_int8_gemv kernel (memory roofline) instead. Same dispatch descriptor +
+        # compile_shader path as the quantized matmul, tagged "gemv".
+        _gemv = self._maybe_quant_gemv_descriptor()
+        if _gemv is not None:
+            self._quant_matmul = _gemv
+            self.effective_block_size = 32
+            import re as _re
+
+            _gname = _sanitize_msl_name(self.graph.func_name)
+            return _re.sub(r"kernel\s+void\s+\w+\s*\(", f"kernel void {_gname}(", _gemv[1], count=1)
+
         # Check for simple dot (no stride args, no scf.for) — use inline
         # scalar matmul that loads from global into shared memory, then
         # does per-thread dot product.

@@ -2513,6 +2513,160 @@ class _TemplateMixin:
 
         return msl
 
+    def _maybe_quant_gemv_descriptor(self):
+        """Build the runtime QUANTIZED-GEMV (decode / M=1) dispatch descriptor, or None.
+
+        Recognizes the CANONICAL weight-only int8 GEMV written as an in-loop row reduce
+        (GPTQ/AWQ decode) and ONLY that shape (correct-or-refuse):
+
+          acc += tl.sum(x[None,:] * (w_i8.to(f32) - zero[:,None]), axis=1)   # over K
+          out = acc * scale                                                  # per-N epilogue
+
+        weight stored [N,K] contiguous, per-N float scale/zero, fp32 in/out, with the
+        ``(input, weight, output, scale, zero, N, K, weight_row_stride)`` signature
+        (5 pointers at 0..4, N/K scalars at 5/6, the single non-unit weight stride at 7;
+        the contiguous K stride is dropped by Triton). Verified structurally: the exact
+        ``mulf(bcast(x), subf(sitofp(load w), bcast(zero)))`` reduce input, the
+        ``acc * scale`` epilogue into a 1-D store, and every leg traced to its arg. Any
+        deviation -> None (the caller then refuses via the reduce-layout guard).
+        Dispatched to ``make_int8_gemv`` (N simdgroups, at the memory roofline). Returns
+
+          ("gemv", gemv_msl, in=0, weight=1, out=2, scale=3, zero=4, n_idx=5, k_idx=6, stride_checks)
+        """
+        import os
+
+        if os.environ.get("TRITON_MSL_QUANT_MATMUL", "1") == "0":
+            return None
+
+        def _all(ops):
+            for s in ops:
+                yield s
+                if s.region_ops:
+                    yield from _all(s.region_ops)
+                if s.else_ops:
+                    yield from _all(s.else_ops)
+
+        op_by_id = {o.id: o for o in _all(self.graph.ops)}
+
+        # Exactly one tt.reduce, sum-combine (an arith.addf in its region), axis=1,
+        # that is the loop-carried→1-D-store pattern (the one the reduce guard refuses;
+        # route it instead when it matches the quantized-GEMV shape).
+        reduces = [o for o in op_by_id.values() if o.op == "tt.reduce"]
+        if len(reduces) != 1:
+            return None
+        red = reduces[0]
+        if not red.operand_ids:
+            return None
+        if str((red.attrs or {}).get("axis", None)) != "1":
+            return None
+        _combine = self.classify_reduce_combine(red)
+        if _combine is None or _combine[0] != "sum":
+            return None
+        if not self._reduce_result_reaches_1d_store(red.id):
+            return None
+
+        # reduce input = mulf(bcast(x), subf(sitofp(load w), bcast(zero))).
+        mul = op_by_id.get(red.operand_ids[0])
+        if mul is None or mul.op != "arith.mulf" or len(mul.operand_ids) != 2:
+            return None
+
+        def _find_sitofp(sid, seen=None, d=0):
+            if seen is None:
+                seen = set()
+            if sid in seen or d > 24:
+                return None
+            seen.add(sid)
+            o = op_by_id.get(sid)
+            if o is None:
+                return None
+            if o.op in ("arith.sitofp", "arith.uitofp"):
+                return o
+            for x in o.operand_ids or []:
+                r = _find_sitofp(x, seen, d + 1)
+                if r is not None:
+                    return r
+            return None
+
+        def _is_dequant(o):
+            return o is not None and o.op == "arith.subf" and len(o.operand_ids) == 2 and _find_sitofp(o.operand_ids[0]) is not None
+
+        m0, m1 = op_by_id.get(mul.operand_ids[0]), op_by_id.get(mul.operand_ids[1])
+        if _is_dequant(m0):
+            sub, x_bc = m0, mul.operand_ids[1]
+        elif _is_dequant(m1):
+            sub, x_bc = m1, mul.operand_ids[0]
+        else:
+            return None
+        zero_bc = sub.operand_ids[1]
+        sitofp = _find_sitofp(sub.operand_ids[0])
+        if sitofp is None or not sitofp.operand_ids:
+            return None
+        w_load = sitofp.operand_ids[0]
+
+        args = self.graph.args
+        arg_id_to_idx = {getattr(a, "id", None): i for i, a in enumerate(args)}
+
+        def _trace_to_arg(oid, d=0):
+            if d > 48:
+                return None
+            if oid in arg_id_to_idx:
+                return arg_id_to_idx[oid]
+            o = op_by_id.get(oid)
+            if o is None or not o.operand_ids:
+                return None
+            return _trace_to_arg(o.operand_ids[0], d + 1)
+
+        # --- Canonical signature: 5 ptrs at 0..4, N/K scalars at 5/6, one weight
+        #     stride at 7 (contiguous K dropped). ---
+        ptr_args = [a for a in args if a.is_ptr]
+        if len(ptr_args) != 5 or len(args) != 8:
+            return None
+        if not all(args[i].is_ptr for i in range(5)):
+            return None
+        if args[5].is_ptr or args[6].is_ptr or args[7].is_ptr:
+            return None
+
+        # --- Trace every leg to its arg and require the canonical binding. ---
+        if _trace_to_arg(x_bc) != 0:
+            return None  # input vector
+        if _trace_to_arg(w_load) != 1:
+            return None  # weight
+        if _trace_to_arg(zero_bc) != 4:
+            return None  # zero
+
+        # Epilogue: the single tt.store's value = (convert_layout of) mulf(acc, scale);
+        # its pointer traces to the output arg, its scale operand to arg 3.
+        stores = [o for o in op_by_id.values() if o.op == "tt.store"]
+        if len(stores) != 1 or len(stores[0].operand_ids or []) < 2:
+            return None
+        store = stores[0]
+        if _trace_to_arg(store.operand_ids[0]) != 2:
+            return None  # output
+        val = op_by_id.get(store.operand_ids[1])
+        while val is not None and val.op in ("ttg.convert_layout",) and val.operand_ids:
+            val = op_by_id.get(val.operand_ids[0])
+        if val is None or val.op != "arith.mulf" or len(val.operand_ids) != 2:
+            return None
+        if 3 not in (_trace_to_arg(val.operand_ids[0]), _trace_to_arg(val.operand_ids[1])):
+            return None  # per-N scale epilogue
+
+        # --- dtypes: input fp32, output fp32, weight int8. ---
+        if _mlir_to_triton_dtype(args[0].elem_type) not in ("fp32", "f32", "float"):
+            return None
+        if _mlir_to_triton_dtype(args[2].elem_type) not in ("fp32", "f32", "float"):
+            return None
+        if _mlir_to_triton_dtype(args[1].elem_type) not in ("int8", "i8", "si8"):
+            return None
+
+        # --- Runtime stride contract: make_int8_gemv reads weight[n*K + k], so the
+        #     weight row stride (args[7]) must equal K (args[6]) at dispatch. ---
+        stride_checks = ((7, 6),)
+
+        from triton_msl.codegen._msl_templates import make_int8_gemv
+
+        gemv_msl = make_int8_gemv()
+        return ("gemv", gemv_msl, 0, 1, 2, 3, 4, 5, 6, stride_checks)
+
     def _maybe_quant_matmul_descriptor(self):
         """Build the runtime QUANTIZED-matmul dispatch descriptor, or None.
 

@@ -167,3 +167,64 @@ def test_mla_jit_routes_to_simd_and_correct(monkeypatch, Dqk, Dv, causal):
     assert str(out.device).startswith("mps")
     ref = F.scaled_dot_product_attention(q, k, v, is_causal=causal, scale=1.0 / (Dqk ** 0.5))
     assert (out.float() - ref.float()).abs().max().item() < 5e-3
+
+
+# --- MLA (nope/rope two-dot QK) must be CORRECT-OR-REFUSE, never silent-wrong ---
+# Real MLA can't be a single-dot @jit kernel (tl.arange needs power-of-2; tl.cat is 1-D;
+# qk=256 overflows the 32KB budget). The realistic form sums TWO QK dots
+# (q_nope@k_nope^T + q_rope@k_rope^T). The FA detector takes the first two of the three
+# dots, so auto-routing it is a real follow-on (#271). Until then it MUST refuse (or
+# CPU-fallback correct) -- NEVER silently mis-compute. This guards that contract so a
+# future #271 detector change can't regress it into silent-wrong.
+if HAS:
+    @triton.jit
+    def _mla2_fwd(Qn, Qr, Kn, Kr, V, Out, sz, sh, sm, kz, kh, kn_, vz, vh, vn, oz, oh, om,
+                  Z, H, N_CTX, BM: tl.constexpr, BN: tl.constexpr,
+                  DN: tl.constexpr, DR: tl.constexpr, DV: tl.constexpr, CA: tl.constexpr):
+        pm = tl.program_id(0); hz = tl.program_id(1); z = hz // H; h = hz % H
+        m = pm * BM + tl.arange(0, BM); n0 = tl.arange(0, BN)
+        dn = tl.arange(0, DN); dr = tl.arange(0, DR); dv = tl.arange(0, DV)
+        qn = tl.load(Qn + z * sz + h * sh + m[:, None] * DN + dn[None, :])
+        qr = tl.load(Qr + z * sz + h * sh + m[:, None] * DR + dr[None, :])
+        scale = 1.0 / tl.sqrt(float(DN + DR))
+        acc = tl.zeros([BM, DV], dtype=tl.float32)
+        mi = tl.full([BM], float("-inf"), tl.float32); li = tl.zeros([BM], tl.float32)
+        for s in range(0, N_CTX, BN):
+            kn = tl.load(Kn + z * kz + h * kh + (s + n0)[:, None] * DN + dn[None, :])
+            kr = tl.load(Kr + z * kz + h * kh + (s + n0)[:, None] * DR + dr[None, :])
+            qk = (tl.dot(qn, tl.trans(kn)) + tl.dot(qr, tl.trans(kr))) * scale
+            mij = tl.max(qk, 1); mnew = tl.maximum(mi, mij)
+            al = tl.exp(mi - mnew); p = tl.exp(qk - mnew[:, None])
+            li = li * al + tl.sum(p, 1); acc = acc * al[:, None]
+            v = tl.load(V + z * vz + h * vh + (s + n0)[:, None] * DV + dv[None, :])
+            acc += tl.dot(p.to(tl.float32), v.to(tl.float32)); mi = mnew
+        acc = acc / li[:, None]
+        tl.store(Out + z * oz + h * oh + m[:, None] * DV + dv[None, :], acc.to(Out.dtype.element_ty))
+
+
+@requires
+def test_mla_two_dot_is_correct_or_refuse():
+    """A 3-dot MLA kernel must not silently mis-compute: it either refuses (clean error /
+    CPU-fallback) or produces the correct answer -- never wrong-on-GPU."""
+    from triton_msl.errors import MetalNonRecoverableError
+    import warnings
+    Z, H, N, DN, DR, DV = 1, 4, 256, 128, 64, 128
+    torch.manual_seed(0)
+    qn = torch.randn(Z, H, N, DN, device="mps"); qr = torch.randn(Z, H, N, DR, device="mps")
+    kn = torch.randn(Z, H, N, DN, device="mps"); kr = torch.randn(Z, H, N, DR, device="mps")
+    v = torch.randn(Z, H, N, DV, device="mps"); o = torch.full((Z, H, N, DV), 123.0, device="mps")
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            _mla2_fwd[(N // 32, Z * H)](
+                qn, qr, kn, kr, v, o,
+                qn.stride(0), qn.stride(1), qn.stride(2), kn.stride(0), kn.stride(1), kn.stride(2),
+                v.stride(0), v.stride(1), v.stride(2), o.stride(0), o.stride(1), o.stride(2),
+                Z, H, N, 32, 32, DN, DR, DV, False)
+        torch.mps.synchronize()
+    except (MetalNonRecoverableError, RuntimeError):
+        return  # clean refusal -> safe
+    # If it ran, it MUST be correct (CPU-fallback), not silently wrong.
+    ref = F.scaled_dot_product_attention(torch.cat([qn, qr], -1), torch.cat([kn, kr], -1), v,
+                                         scale=1.0 / (DN + DR) ** 0.5)
+    assert (o.float() - ref.float()).abs().max().item() < 0.05, "MLA 3-dot silently mis-computed!"

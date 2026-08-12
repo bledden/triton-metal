@@ -228,3 +228,67 @@ def test_mla_two_dot_is_correct_or_refuse():
     ref = F.scaled_dot_product_attention(torch.cat([qn, qr], -1), torch.cat([kn, kr], -1), v,
                                          scale=1.0 / (DN + DR) ** 0.5)
     assert (o.float() - ref.float()).abs().max().item() < 0.05, "MLA 3-dot silently mis-computed!"
+
+
+# --- #271: a real nope/rope MLA @jit kernel AUTO-ROUTES to the qk=192 cat-dispatch ---
+# The QK score is two chained dots (q_nope@k_nope^T + q_rope@k_rope^T) over SEPARATE
+# tensors; q is pre-scaled (scale before the dots) so the fused-scale gate passes. The
+# detector recognizes the 3-dot form, and the dispatch concatenates [q_nope|q_rope] /
+# [k_nope|k_rope] -> the validated qk=head_dim / v=v_head_dim kernel.
+if HAS:
+    @triton.jit
+    def _mla_prescaled_fwd(Qn, Qr, Kn, Kr, V, Out,
+                           qnz, qnh, qnm, qnk, qrz, qrh, qrm, qrk,
+                           knz, knh, knn, knk, krz, krh, krn, krk,
+                           vz, vh, vn, vk, oz, oh, om, ok_,
+                           Z, H, N_CTX, BM: tl.constexpr, BN: tl.constexpr,
+                           DN: tl.constexpr, DR: tl.constexpr, DV: tl.constexpr, CA: tl.constexpr):
+        pm = tl.program_id(0); hz = tl.program_id(1); z = hz // H; h = hz % H
+        m = pm * BM + tl.arange(0, BM); n0 = tl.arange(0, BN)
+        dn = tl.arange(0, DN); dr = tl.arange(0, DR); dv = tl.arange(0, DV)
+        scale = 1.0 / tl.sqrt(float(DN + DR))
+        qn = tl.load(Qn + z * qnz + h * qnh + m[:, None] * qnm + dn[None, :] * qnk) * scale
+        qr = tl.load(Qr + z * qrz + h * qrh + m[:, None] * qrm + dr[None, :] * qrk) * scale
+        acc = tl.zeros([BM, DV], dtype=tl.float32)
+        mi = tl.full([BM], float("-inf"), tl.float32); li = tl.zeros([BM], tl.float32)
+        for s in range(0, N_CTX, BN):
+            kn = tl.load(Kn + z * knz + h * knh + (s + n0)[:, None] * knn + dn[None, :] * knk)
+            kr = tl.load(Kr + z * krz + h * krh + (s + n0)[:, None] * krn + dr[None, :] * krk)
+            qk = tl.dot(qn, tl.trans(kn).to(qn.dtype)) + tl.dot(qr, tl.trans(kr).to(qr.dtype))
+            if CA:
+                qk = tl.where(m[:, None] >= (s + n0)[None, :], qk, float("-inf"))
+            mij = tl.max(qk, 1); mnew = tl.maximum(mi, mij)
+            al = tl.exp(mi - mnew); p = tl.exp(qk - mnew[:, None])
+            li = li * al + tl.sum(p, 1); acc = acc * al[:, None]
+            v = tl.load(V + z * vz + h * vh + (s + n0)[:, None] * vn + dv[None, :] * vk)
+            acc += tl.dot(p.to(tl.float32), v.to(tl.float32)); mi = mnew
+        acc = acc / li[:, None]
+        tl.store(Out + z * oz + h * oh + m[:, None] * om + dv[None, :] * ok_, acc.to(Out.dtype.element_ty))
+
+
+@requires
+@pytest.mark.parametrize("causal", [False, True])
+def test_mla_prescaled_jit_routes_and_correct(monkeypatch, causal):
+    """Real nope/rope MLA (qk=192, v=128, fp16) auto-routes to the qk=192 cat-dispatch,
+    runs on GPU, and matches SDPA of the concatenated q/k."""
+    import triton_msl.autotuning._fa_dispatch as fa_mod
+    fired = {"n": 0}
+    real = fa_mod._dispatch_mla
+    monkeypatch.setattr(fa_mod, "_dispatch_mla", lambda *a, **k: (fired.__setitem__("n", fired["n"] + 1) or real(*a, **k)))
+
+    Z, H, N, DN, DR, DV = 1, 4, 512, 128, 64, 128
+    torch.manual_seed(0)
+    mk = lambda d: torch.randn(Z, H, N, d, device="mps", dtype=torch.float16)  # noqa: E731
+    qn, qr, kn, kr, v = mk(DN), mk(DR), mk(DN), mk(DR), mk(DV)
+    o = torch.empty(Z, H, N, DV, device="mps", dtype=torch.float16)
+    st = lambda t: [t.stride(i) for i in range(4)]  # noqa: E731
+    _mla_prescaled_fwd[(N // 32, Z * H)](
+        qn, qr, kn, kr, v, o, *st(qn), *st(qr), *st(kn), *st(kr), *st(v), *st(o),
+        Z, H, N, 32, 32, DN, DR, DV, causal)
+    torch.mps.synchronize()
+
+    assert fired["n"] >= 1, "MLA kernel did not route through the cat-dispatch"
+    assert str(o.device).startswith("mps")
+    ref = F.scaled_dot_product_attention(torch.cat([qn, qr], -1), torch.cat([kn, kr], -1), v,
+                                         is_causal=causal, scale=1.0 / (DN + DR) ** 0.5)
+    assert (o.float() - ref.float()).abs().max().item() < 5e-3

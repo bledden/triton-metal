@@ -66,8 +66,23 @@
   auto-routes and matches SDPA. A gen-side budget guard turns an over-budget head_dim (e.g.
   qk=256 fp16 → 33 KB) into a clear error instead of a cryptic pipeline-state failure.
   Note: `tl.arange` needs power-of-2 bounds and qk=256 overflows the budget, so expressing
-  real MLA (qk=192) from `@jit` needs a nope/rope split (two power-of-2 dots) — a detector
-  follow-on; the qk=192 *kernel* already works and beats SDPA.
+  real MLA (qk=192) from `@jit` uses the nope/rope split (see below).
+
+- **Real MLA (nope/rope) attention auto-routes from `@triton.jit` — DeepSeek/Kimi-style
+  attention now runs on Metal.** A real MLA kernel computes the QK score as two chained
+  dots, `q_nope@k_nope^T + q_rope@k_rope^T` (128 + 64), over *separate* tensors — three
+  `tt.dot`s total (Triton fuses the sum into the dot accumulator chain). The FA detector
+  now recognizes this 3-dot shape (guarded, disjoint from the 2-dot symmetric path so it's
+  byte-identical): it identifies the two QK dots (whose A operand is a load) vs the PV dot
+  (A is the softmax `exp`, no load), extracts all four QK pointer chains, and sets
+  `qk_head_dim = nope + rope = 192`. Routing is a **fail-closed cat-dispatch**: it
+  concatenates `[q_nope|q_rope]` / `[k_nope|k_rope]` into contiguous `[.,192]` (a ~0.01 ms
+  copy) and runs the validated qk=192 / v=128 kernel; the host path can't run the
+  different-ABI kernel, so a miss (non-MPS, compile_shader off) refuses. A canonical
+  pre-scaled MLA `@jit` kernel auto-routes, runs on GPU, matches SDPA (err ≤1e-3 fp16,
+  full + causal), and **beats it 1.19–1.54× (full), 1.11–1.59× (causal)** end-to-end. The
+  post-scaled form (scale on the summed dot result) still refuses cleanly (fused-scale
+  gate) — correct-or-refuse preserved. fp16/bf16 only (fp32 qk=192 exceeds the 32 KB budget).
 
 - **Split-K for skinny/deep fp32 matmul.** Small-M/N, deep-K matmuls (e.g.
   M=64,N=64,K=8192) were ~0.1× torch — occupancy-starved: a handful of output tiles

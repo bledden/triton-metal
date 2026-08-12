@@ -89,7 +89,15 @@ def _simd_fa_eligible(info):
     if not (info.get("block_m") == 32 and info.get("block_n") == 32):
         return False
     st = info.get("strides", {})
-    return all(st.get(r, [None] * 4)[3] == "c1" for r in ("q", "k", "v", "o"))
+    if not all(st.get(r, [None] * 4)[3] == "c1" for r in ("q", "k", "v", "o")):
+        return False
+    # MLA: the rope Q/K sources must also be contiguous-innermost (the cat dispatch
+    # concatenates them; requiring c1 keeps the concat + kernel a clean fast path).
+    if info.get("is_mla"):
+        mst = info.get("mla_strides") or {}
+        if not all((mst.get(r) or [None] * 4)[3] == "c1" for r in ("q_rope", "k_rope")):
+            return False
+    return True
 
 
 from triton_msl.codegen._lowerer_detection import _DetectionMixin
@@ -958,12 +966,18 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
                     and info["out_dtype"] in ("f32", "f16")
                 ):
                     # Symmetric hd128 -> template (picks simd if contiguous, else tiled).
-                    if info["head_dim"] == 128 and info.get("v_head_dim", 128) == 128:
+                    if not info.get("is_mla") and info["head_dim"] == 128 and info.get("v_head_dim", 128) == 128:
                         return self._lower_flash_attention_template(info)
-                    # Asymmetric MLA (qk != v): simd-only (the tiled fallback is
-                    # symmetric). Route iff simd-eligible (contiguous, v in {64,128},
-                    # fp16 for qk>128); otherwise fall through -> refuse below.
-                    if info.get("v_head_dim") != info["head_dim"] and _simd_fa_eligible(info):
+                    # MLA (nope/rope 3-dot): the two QK tensors are separate; route to the
+                    # cat-dispatch (concat q_nope|q_rope, k_nope|k_rope -> the validated
+                    # asymmetric qk=head_dim/v=v_head_dim kernel). fail-CLOSED (the qk=192
+                    # kernel has a different ABI than the @jit kernel, so the host path
+                    # can't run it) -> refuse below on ineligibility.
+                    if info.get("is_mla") and _simd_fa_eligible(info):
+                        return self._lower_mla_attention_template(info)
+                    # Asymmetric single-tensor (qk != v): simd-only. Route iff simd-eligible
+                    # (contiguous, v in {64,128}, fp16 for qk>128); else fall through -> refuse.
+                    if not info.get("is_mla") and info.get("v_head_dim") != info["head_dim"] and _simd_fa_eligible(info):
                         return self._lower_flash_attention_template(info)
 
             elif _fa_maxdim == 64:
@@ -5208,6 +5222,29 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
                 break
             return None
 
+        # --- MLA (nope/rope) 3-dot case: re-identify roles + the rope QK dot ----
+        # Triton fuses `dot_nope + dot_rope` into a dot CHAIN (rope's accumulator
+        # operand == nope's result), so a real MLA attention has 3 dots: two chained
+        # QK dots + one PV dot. The PV dot's A operand (softmax probs P) has NO backing
+        # load. Symmetric FA is 2 dots and skips this entirely (dot_qk/dot_pv keep the
+        # values identified above). DeepSeek/Kimi MLA: qk = qk_nope(128) + qk_rope(64).
+        is_mla = False
+        dot_rope = None
+        if len(dots) == 3:
+            _qk3 = [d for d in dots if _load_addr_for_dot_operand(d.operand_ids[0]) is not None]
+            _pv3 = [d for d in dots if _load_addr_for_dot_operand(d.operand_ids[0]) is None]
+            if len(_qk3) != 2 or len(_pv3) != 1:
+                _refuse("the MLA dot roles (need exactly 2 QK-with-loads + 1 PV)")
+            dot_pv = _pv3[0]
+            _a, _b = _qk3
+            if len(_b.operand_ids) > 2 and _b.operand_ids[2] == _a.id:
+                dot_qk, dot_rope = _a, _b   # nope=_a; rope=_b accumulates onto nope
+            elif len(_a.operand_ids) > 2 and _a.operand_ids[2] == _b.id:
+                dot_qk, dot_rope = _b, _a
+            else:
+                _refuse("the MLA QK dot chain (rope must accumulate onto nope's result)")
+            is_mla = True
+
         # --- pointer roles + strides -----------------------------------------
         q_addr = _load_addr_for_dot_operand(dot_qk.operand_ids[0])
         k_addr = _load_addr_for_dot_operand(dot_qk.operand_ids[1])
@@ -5235,8 +5272,24 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
         v_idx, v_strides = v_res
         o_idx, o_strides = o_res
 
-        # Four DISTINCT pointer roles.
-        if len({q_idx, k_idx, v_idx, o_idx}) != 4:
+        # MLA: the rope QK dot adds two more pointer roles (q_rope, k_rope). The cat
+        # dispatch requires all sources contiguous, so their strides are captured for
+        # the eligibility check too.
+        qr_idx = kr_idx = None
+        qr_strides = kr_strides = None
+        if is_mla:
+            qr_res = _extract_ptr_strides(_load_addr_for_dot_operand(dot_rope.operand_ids[0]))
+            kr_res = _extract_ptr_strides(_load_addr_for_dot_operand(dot_rope.operand_ids[1]))
+            if qr_res is None or kr_res is None:
+                _refuse("the MLA rope Q/K pointer/stride chains")
+            qr_idx, qr_strides = qr_res
+            kr_idx, kr_strides = kr_res
+
+        # DISTINCT pointer roles (4 for symmetric FA, 6 for MLA nope/rope).
+        if is_mla:
+            if len({q_idx, qr_idx, k_idx, kr_idx, v_idx, o_idx}) != 6:
+                _refuse("six distinct MLA pointer roles (q_nope,q_rope,k_nope,k_rope,v,out)")
+        elif len({q_idx, k_idx, v_idx, o_idx}) != 4:
             _refuse("four distinct pointer roles")
 
         # --- tile dims from the dot shapes -----------------------------------
@@ -5255,6 +5308,15 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
         ):
             _refuse("the dot tile shapes")
         block_m, head_dim = a_shape          # head_dim here == qk_head_dim (QK contraction)
+        nope_dim = head_dim                   # symmetric: the whole QK dim
+        rope_dim = 0
+        if is_mla:
+            # The QK contraction spans BOTH dots: qk_head_dim = nope_dim + rope_dim.
+            rope_a = _extract_shape(self._find_op_type_str(dot_rope.operand_ids[0]))
+            if not rope_a or len(rope_a) != 2 or rope_a[0] != block_m:
+                _refuse("the MLA rope dot A shape")
+            rope_dim = rope_a[1]
+            head_dim = nope_dim + rope_dim    # e.g. 128 (nope) + 64 (rope) = 192
         if qk_out_shape[0] != block_m:
             _refuse("a consistent block_m across the two dots")
         block_n = qk_out_shape[1]
@@ -5280,12 +5342,15 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
         h_val = h_arg.index if h_arg is not None else C1
 
         # --- causal: an arith.select of shape [block_m, block_n] whose operands
-        # include the QK dot result (the tl.where(mask, qk, -inf) causal mask).
+        # include the QK dot result (the tl.where(mask, qk, -inf) causal mask). For MLA
+        # the mask is applied to the SUMMED score, i.e. the rope dot's result (the chain
+        # tail), so accept either QK dot id.
+        _qk_ids = {dot_qk.id} | ({dot_rope.id} if is_mla and dot_rope is not None else set())
         causal = False
         for s in all_ops:
             if s.op == "arith.select":
                 sel_shape = _extract_shape(s.type_str or "")
-                if tuple(sel_shape) == (block_m, block_n) and dot_qk.id in (s.operand_ids or []):
+                if tuple(sel_shape) == (block_m, block_n) and _qk_ids & set(s.operand_ids or []):
                     causal = True
                     break
 
@@ -5347,7 +5412,52 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
             "causal": causal,
             "scale": scale,
             "out_dtype": out_dtype,
+            # MLA (nope/rope): the QK score is TWO chained dots over separate tensors.
+            # is_mla=True carries the rope Q/K pointer roles + their strides so the
+            # dispatch can concat [q_nope|q_rope] / [k_nope|k_rope] into contiguous
+            # [.,head_dim] and run the (validated) asymmetric qk=head_dim / v=v_head_dim
+            # kernel. False/absent for symmetric FA (all fields below are ignored).
+            "is_mla": is_mla,
+            "q_rope": qr_idx,
+            "k_rope": kr_idx,
+            "nope_dim": nope_dim,
+            "rope_dim": rope_dim,
+            "mla_strides": {"q_rope": qr_strides, "k_rope": kr_strides} if is_mla else None,
         }
+
+    def _lower_mla_attention_template(self, info: dict) -> str:
+        """Emit the qk=head_dim / v=v_head_dim simd FA kernel for a detected MLA
+        (3-dot nope/rope) attention + set the fail-CLOSED 'mla' dispatch descriptor.
+
+        MLA's QK score is two chained dots over SEPARATE q_nope/q_rope and k_nope/k_rope
+        tensors, so it can't be a single-dot @jit kernel. The kernel is generated with the
+        DEFAULT (Q,K,V,Out) ABI; the dispatch ('mla' tag in _fa_dispatch) concatenates
+        [q_nope|q_rope] and [k_nope|k_rope] into contiguous [.,head_dim] and runs the
+        validated asymmetric kernel. FAIL-CLOSED: the qk=192 kernel's ABI differs from the
+        @jit kernel's, so the host-roundtrip path can't run it -> the driver refuses on a
+        miss (non-MPS / compile_shader unavailable) rather than mis-dispatch.
+        """
+        from triton_msl.codegen._msl_templates import make_flash_attention_kernel_simdgroup
+
+        name = _sanitize_msl_name(self.graph.func_name)
+        # DEFAULT ABI (Q,K,V,Out + strides) — the dispatch supplies the concatenated
+        # contiguous Q/K, so no @jit arg_decls/bindings. scale = 1/sqrt(qk_head_dim) as
+        # detected (the user's per-part pre-scale is bypassed; the kernel scales Q).
+        msl = make_flash_attention_kernel_simdgroup(
+            info["head_dim"], 32, 64,
+            causal=info["causal"], out_dtype=info["out_dtype"],
+            kernel_name=name, scale=info["scale"], v_head_dim=info["v_head_dim"],
+        )
+        self.effective_block_size = 256
+        self._used_pid_axes = {0, 1}
+        # ('mla', msl, kernel_name, tg_size, q_nope, q_rope, k_nope, k_rope, v, out, Z, H, N)
+        self._flash_attention = (
+            "mla", msl, name, 256,
+            info["q"], info["q_rope"], info["k"], info["k_rope"],
+            info["v"], info["out"], info["Z"], info["H"], info["N_CTX"],
+        )
+        self._prescan_stores()
+        return msl
 
     def _lower_flash_attention_template(self, info: dict) -> str:
         """Emit the head-dim-tiled FA2 MSL (Task 1) for a detected FA kernel.

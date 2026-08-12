@@ -637,6 +637,12 @@ class MetalLauncher:
         # launch must be handled by dispatch_quant_matmul (compile_shader) or REFUSED —
         # start "unhandled" and clear it only on a successful dispatch (the `return`).
         _quant_unhandled = quant_matmul is not None
+        # FAIL-CLOSED for MLA too: the 'mla' descriptor's kernel (concatenated qk=192)
+        # has a DIFFERENT ABI than the @jit kernel, so the host path can't run it. A
+        # symmetric ('flash_attention') descriptor is fail-OPEN (host path is correct).
+        _mla_unhandled = (
+            isinstance(flash_attention, (tuple, list)) and len(flash_attention) and flash_attention[0] == "mla"
+        )
         if (
             self._msl is not None
             or fast_matmul is not None
@@ -737,6 +743,19 @@ class MetalLauncher:
                 "compile_shader disabled/unavailable, or has non-conforming dims. Pad "
                 "the dims, or dequantize the weight on the host and pass a float/half "
                 "weight to a normal matmul."
+            )
+
+        # MLA (nope/rope) attention is compile_shader-only: the 'mla' descriptor's
+        # concatenated qk=192 kernel has a different ABI than this @jit kernel, so the
+        # host path can't run it. If it wasn't dispatched above (non-MPS, compile_shader
+        # unavailable/opt-out), REFUSE rather than mis-run.
+        if _mla_unhandled:
+            from triton_msl.errors import MetalNonRecoverableError
+
+            raise MetalNonRecoverableError(
+                "MLA (nope/rope) attention runs only on MPS tensors via compile_shader "
+                "(the concatenated qk=head_dim kernel). This launch is non-MPS or has "
+                "compile_shader disabled/unavailable."
             )
 
         # Pack arguments into Metal buffers.

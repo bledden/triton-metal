@@ -342,6 +342,8 @@ class MetalBackend(BaseBackend):
         fast_matmul = getattr(metadata, "fast_matmul", None)
         # Quantized-matmul runtime-dispatch descriptor; None for other kernels.
         quant_matmul = getattr(metadata, "quant_matmul", None)
+        # FlashAttention zero-copy-dispatch descriptor; None for other kernels.
+        flash_attention = getattr(metadata, "flash_attention", None)
         return (
             metadata.num_warps,
             metadata.num_ctas,
@@ -352,6 +354,7 @@ class MetalBackend(BaseBackend):
             mm_two_kernel,
             fast_matmul,
             quant_matmul,
+            flash_attention,
         )
 
     def get_codegen_implementation(self, options):

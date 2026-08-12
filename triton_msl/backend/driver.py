@@ -631,14 +631,18 @@ class MetalLauncher:
 
         fast_matmul = kernel_metadata[7] if (kernel_metadata and len(kernel_metadata) > 7) else None
         quant_matmul = kernel_metadata[8] if (kernel_metadata and len(kernel_metadata) > 8) else None
+        flash_attention = kernel_metadata[9] if (kernel_metadata and len(kernel_metadata) > 9) else None
         # FAIL-CLOSED for quantized: the compiled kernel IS the fast dequant kernel,
         # which the host-roundtrip path below cannot dispatch correctly. So a quantized
         # launch must be handled by dispatch_quant_matmul (compile_shader) or REFUSED —
         # start "unhandled" and clear it only on a successful dispatch (the `return`).
         _quant_unhandled = quant_matmul is not None
-        if (self._msl is not None or fast_matmul is not None or quant_matmul is not None) and _os.environ.get(
-            "TRITON_MSL_COMPILE_SHADER", "1"
-        ) != "0":
+        if (
+            self._msl is not None
+            or fast_matmul is not None
+            or quant_matmul is not None
+            or flash_attention is not None
+        ) and _os.environ.get("TRITON_MSL_COMPILE_SHADER", "1") != "0":
             try:
                 _rt = _get_compile_shader_runtime()
                 if _rt.available():
@@ -672,6 +676,22 @@ class MetalLauncher:
 
                         if dispatch_fast_matmul(
                             _rt, fast_matmul, kargs, launch_exit_hook=launch_exit_hook, launch_metadata=launch_metadata
+                        ):
+                            return
+
+                    # --- FlashAttention dispatch (compile_shader zero-copy, 2-D grid) ---
+                    # The simdgroup FA kernel's 2-D grid disqualifies it from the 1-D
+                    # fast path below, so it would otherwise fall to the host-roundtrip
+                    # path (~2.5-4.2x slower; the whole gap is dispatch overhead, not the
+                    # kernel). Route it via compile_shader with its native grid. FAIL-OPEN:
+                    # unlike quantized, the host path is equally correct, so a miss (False)
+                    # simply falls through -- never wrong, never refused.
+                    if flash_attention is not None and all_mps and _os.environ.get("TRITON_MSL_FA_FAST", "1") != "0":
+                        from triton_msl.autotuning._fa_dispatch import dispatch_flash_attention
+
+                        if dispatch_flash_attention(
+                            _rt, flash_attention, self.kernel_name, kargs, gridX, gridY, gridZ,
+                            launch_exit_hook=launch_exit_hook, launch_metadata=launch_metadata,
                         ):
                             return
 

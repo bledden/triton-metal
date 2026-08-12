@@ -249,6 +249,11 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
         # _lower_dot_simple_template when an eligible matmul is detected;
         # read by emit_msl into metadata. None for every other kernel.
         self._fast_matmul = None
+        # FlashAttention zero-copy-dispatch descriptor. Set in the simdgroup-FA
+        # branch of _lower_flash_attention_template; read by emit_msl into
+        # metadata. Routes the 2-D-grid FA kernel through compile_shader (its
+        # 2-D grid blocks the generic 1-D fast-path). None for every other kernel.
+        self._flash_attention = None
         self.options = options
         self.env = {}  # ssa_id -> MSL variable name
         self.env_types = {}  # ssa_id -> triton dtype string
@@ -5472,6 +5477,12 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
             )
             # 256 threads/threadgroup (8 SIMD groups x 32 threads/group).
             self.effective_block_size = 256
+            # Route this kernel through the zero-copy compile_shader path with its
+            # NATIVE 2-D grid (dispatch bug fix: the 2-D grid otherwise falls to the
+            # ~3x-slower host-roundtrip path). Fail-OPEN in the driver -- the host
+            # path is equally correct, so a miss just falls through. Carry the MSL +
+            # threadgroup size so the dispatch needs nothing from the stash.
+            self._flash_attention = ("flash_attention", msl, 256)
         else:
             msl = make_flash_attention_kernel_tiled(
                 head_dim,

@@ -661,6 +661,8 @@ def emit_msl(mod, metadata, options):
             metadata["fast_matmul"] = getattr(lowerer, "_fast_matmul", None)
             # Quantized-matmul runtime-dispatch descriptor; None for other kernels.
             metadata["quant_matmul"] = getattr(lowerer, "_quant_matmul", None)
+            # FlashAttention zero-copy-dispatch descriptor; None for other kernels.
+            metadata["flash_attention"] = getattr(lowerer, "_flash_attention", None)
             _mept_path_log("primary", metadata.get("name", "?"))
             return msl_src
 

@@ -4,6 +4,23 @@
 
 ### Performance
 
+- **FlashAttention now beats PyTorch SDPA (was ~0.3× — a dispatch bug, not a slow
+  kernel).** The simdgroup FA kernel (head_dim=128, BM=32/BN=64) was always fast, but
+  its **2-D threadgroup grid** `(n_q_blocks, Z·H)` disqualified it from the zero-copy
+  `compile_shader` fast-path (which hard-required a 1-D grid), so every launch fell to
+  the **host-roundtrip metallib path — ~2.5–4.2× slower**. Attribution was decisive: the
+  *same* kernel dispatched via `compile_shader` with its **native** 2-D grid vs a
+  1-D-linearized grid measured identically (6.32 vs 6.31 TF), so the entire gap is
+  dispatch overhead, not the kernel or the grid shape. A new `flash_attention` dispatch
+  descriptor routes the FA kernel through `compile_shader` with its native grid
+  (**fail-OPEN**: unlike the quantized path, the host path is equally correct, so any
+  miss simply falls through — never wrong, never refused). Result, end-to-end through the
+  shipping `@triton.jit` path (head_dim=128, cold A/B vs `F.scaled_dot_product_attention`):
+  **fp16 full 1.65–1.99×**, **fp16 causal 1.18–1.44×**, fp32 full 1.27–1.53×, fp32 causal
+  0.82–1.05× (still ≥ the old host path — no regression). A split-KV / flash-decoding
+  variant was prototyped and **rejected** — once the dispatch is fixed, the online-softmax
+  combine overhead makes it lose to the plain kernel at every size.
+
 - **Split-K for skinny/deep fp32 matmul.** Small-M/N, deep-K matmuls (e.g.
   M=64,N=64,K=8192) were ~0.1× torch — occupancy-starved: a handful of output tiles
   means a handful of threadgroups, each running the whole K-loop serially. A new

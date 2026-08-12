@@ -1846,6 +1846,7 @@ def make_flash_attention_kernel_simdgroup(
     bindings=None,
     kernel_name="flash_attention",
     scale=None,
+    v_head_dim=None,
 ):
     """simdgroup_matrix FlashAttention-2 (fp32/fp16, causal/non-causal, head_dim=128).
 
@@ -1864,10 +1865,17 @@ def make_flash_attention_kernel_simdgroup(
     import math as _math
 
     D, BM, BN, NT = head_dim, BLOCK_M, BLOCK_N, 256
-    if not (BM == 32 and BN == 64 and D % 8 == 0):
-        raise ValueError("simd FA requires BLOCK_M=32, BLOCK_N=64, head_dim%8==0")
+    # ASYMMETRIC head dims (MLA / DeepSeek-style): the QK CONTRACTION runs over
+    # head_dim (Dqk), but the OUTPUT / V tiling runs over v_head_dim (Dv). `D` drives
+    # tgQ + the QK loop (Dqk); the O accumulator, V loads, and final store depend ONLY
+    # on TPG. So decoupling is exactly TPG <- Dv (not D). v_head_dim=None => symmetric
+    # (Dv == head_dim), byte-identical to before. Registers scale with Dv, so
+    # MLA (Dqk=192, Dv=128) has the SAME footprint as hd128 despite the 192-wide QK.
+    Dv = v_head_dim if v_head_dim is not None else D
+    if not (BM == 32 and BN == 64 and D % 8 == 0 and Dv % 8 == 0):
+        raise ValueError("simd FA requires BLOCK_M=32, BLOCK_N=64, head_dim%8==0, v_head_dim%8==0")
     n_groups = NT // 32
-    TPG = (D // 8) // n_groups
+    TPG = (Dv // 8) // n_groups
     SCALE = float(scale) if scale is not None else 1.0 / _math.sqrt(float(D))
     if out_dtype in ("fp16", "f16"):
         elem, store_cast = "half", lambda e: f"half({e})"

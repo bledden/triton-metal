@@ -44,6 +44,20 @@
   **fp16 full 2.00–2.89×, fp16 causal 1.55–2.31×, fp32 full 1.80–2.27×, fp32 causal
   1.47–1.93×** — and fp16 hd64 attention runs on the device instead of the CPU.
 
+- **Asymmetric-head_dim FlashAttention (the MLA / DeepSeek-style attention core).** The
+  2026-frontier models (DeepSeek-V3, Kimi) use Multi-head Latent Attention, whose reference
+  form has a *different* head_dim for the QK score (192 = 128 nope + 64 rope) than for V/output
+  (128). The simd FA kernel now takes an optional `v_head_dim`: the QK contraction runs over
+  `head_dim` while the output/V tiling runs over `v_head_dim`. Because registers scale with
+  the *output* width only, MLA's qk=192 / v=128 has the **same register footprint as hd128** —
+  the 192-wide QK just adds loop iterations (a *symmetric* head_dim=192 overflows the register
+  file and won't even build). `v_head_dim=None` is the default and is byte-identical to before.
+  The MLA-core kernel is correct vs SDPA (err ≤2e-3 fp16) and **beats it 1.32–1.67× (full),
+  1.26–1.81× (causal)**. This is the kernel capability; `@triton.jit` auto-routing for
+  asymmetric attention (separate qk/v dims in the FA detector) is a follow-on. fp32 qk=192
+  exceeds the 32 KB threadgroup budget (192-wide Q staging), so this targets fp16/bf16 — the
+  dtype MLA runs in anyway.
+
 - **Split-K for skinny/deep fp32 matmul.** Small-M/N, deep-K matmuls (e.g.
   M=64,N=64,K=8192) were ~0.1× torch — occupancy-starved: a handful of output tiles
   means a handful of threadgroups, each running the whole K-loop serially. A new

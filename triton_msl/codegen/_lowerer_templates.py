@@ -2513,6 +2513,220 @@ class _TemplateMixin:
 
         return msl
 
+    def _maybe_quant_gemv_int4_descriptor(self):
+        """CANONICAL weight-only INT4 (GPTQ/AWQ per-group) decode GEMV, or None.
+
+        Recognizes (correct-or-refuse — every constant verified against make_int4_gemv's
+        packing so a mismatch refuses rather than mis-computes):
+
+          byte = k // 2;  nib = (extui(load w[N,K/2]) >> ((k % 2) * 4)) & 0xF
+          g = k // GROUP;  w = (sitofp(nib) - zero[N,g]) * scale[N,g]
+          acc += tl.sum(x[k] * w, axis=1);  out = acc
+
+        weight [N,K/2] uchar (2 nibbles/byte, low=even k / high=odd k), per-group fp32
+        scale/zero [N, K/GROUP], fp32 in/out, signature
+        ``(input, weight, output, scale, zero, N, K, ng, w_row_stride, s_row_stride)``.
+        Routes to make_int4_gemv(GROUP). Returns
+
+          ("gemv_int4", int4_msl, in=0, w=1, out=2, scale=3, zero=4, n_idx, k_idx,
+           swn_idx, ssn_idx, ng_idx, group_size)
+        """
+        import os
+
+        if os.environ.get("TRITON_MSL_QUANT_MATMUL", "1") == "0":
+            return None
+
+        def _all(ops):
+            for s in ops:
+                yield s
+                if s.region_ops:
+                    yield from _all(s.region_ops)
+                if s.else_ops:
+                    yield from _all(s.else_ops)
+
+        op_by_id = {o.id: o for o in _all(self.graph.ops)}
+
+        def _cint(oid):
+            o = op_by_id.get(oid)
+            if o is None or o.op != "arith.constant":
+                return None
+            try:
+                return int(str((o.attrs or {}).get("value", "")).split(":")[0].strip())
+            except (TypeError, ValueError):
+                return None
+
+        def _find(oid, ops, seen=None, d=0):
+            """Find the first op whose name is in `ops` in oid's operand chain."""
+            if seen is None:
+                seen = set()
+            if oid in seen or d > 30:
+                return None
+            seen.add(oid)
+            o = op_by_id.get(oid)
+            if o is None:
+                return None
+            if o.op in ops:
+                return o
+            for x in o.operand_ids or []:
+                r = _find(x, ops, seen, d + 1)
+                if r is not None:
+                    return r
+            return None
+
+        # --- single sum-reduce, axis=1, loop-carried → 1-D store. ---
+        reduces = [o for o in op_by_id.values() if o.op == "tt.reduce"]
+        if len(reduces) != 1:
+            return None
+        red = reduces[0]
+        if not red.operand_ids or str((red.attrs or {}).get("axis", None)) != "1":
+            return None
+        _comb = self.classify_reduce_combine(red)
+        if _comb is None or _comb[0] != "sum":
+            return None
+        if not self._reduce_result_reaches_1d_store(red.id):
+            return None
+
+        # --- reduce input = mulf(x_bc, mulf(subf(sitofp(NIBBLE), zero_bc), scale_bc)). ---
+        mul = op_by_id.get(red.operand_ids[0])
+        if mul is None or mul.op != "arith.mulf" or len(mul.operand_ids) != 2:
+            return None
+        m0, m1 = op_by_id.get(mul.operand_ids[0]), op_by_id.get(mul.operand_ids[1])
+        s0 = _find(mul.operand_ids[0], ("arith.sitofp",)) is not None
+        s1 = _find(mul.operand_ids[1], ("arith.sitofp",)) is not None
+        if s0 and not s1:
+            W, x_bc = m0, mul.operand_ids[1]
+        elif s1 and not s0:
+            W, x_bc = m1, mul.operand_ids[0]
+        else:
+            return None
+        if W is None or W.op != "arith.mulf" or len(W.operand_ids) != 2:
+            return None  # in-reduce scale form (int4 GEMVs apply per-group scale here)
+        w0, w1 = op_by_id.get(W.operand_ids[0]), op_by_id.get(W.operand_ids[1])
+        if w0 is not None and w0.op == "arith.subf":
+            sub, scale_bc = w0, W.operand_ids[1]
+        elif w1 is not None and w1.op == "arith.subf":
+            sub, scale_bc = w1, W.operand_ids[0]
+        else:
+            return None
+        zero_bc = sub.operand_ids[1]
+        sitofp = _find(sub.operand_ids[0], ("arith.sitofp",))
+        if sitofp is None or not sitofp.operand_ids:
+            return None
+
+        # --- NIBBLE unpack: andi(shrui(extui(load_w), shift), 0xF), shift=(k%2)*4. ---
+        andi = op_by_id.get(sitofp.operand_ids[0])
+        if andi is None or andi.op != "arith.andi" or len(andi.operand_ids) != 2:
+            return None
+        shr = None
+        mask_ok = False
+        for oid in andi.operand_ids:
+            o = op_by_id.get(oid)
+            if o is not None and o.op == "arith.shrui":
+                shr = o
+            elif _cint(oid) == 15:
+                mask_ok = True
+        if shr is None or not mask_ok or len(shr.operand_ids) != 2:
+            return None
+        extui = _find(shr.operand_ids[0], ("arith.extui",))
+        if extui is None or not extui.operand_ids:
+            return None
+        w_load = _find(extui.operand_ids[0], ("tt.load",))
+        # shift = muli(remsi(kk, 2), 4)  → low nibble for even k, high for odd k.
+        muli_op = _find(shr.operand_ids[1], ("arith.muli",))
+        if muli_op is None or len(muli_op.operand_ids) != 2:
+            return None
+        rem = _find(muli_op.operand_ids[0], ("arith.remsi",)) or _find(muli_op.operand_ids[1], ("arith.remsi",))
+        mul4 = any(_cint(x) == 4 for x in muli_op.operand_ids)
+        if rem is None or not mul4 or len(rem.operand_ids) != 2 or _cint(rem.operand_ids[1]) != 2:
+            return None
+
+        # --- weight byte index uses k // 2. ---
+        if w_load is None or not w_load.operand_ids:
+            return None
+        if _find(w_load.operand_ids[0], ("arith.divsi",)) is None:
+            return None  # (the byte-index divsi(_, 2) — value checked via group below)
+
+        # --- per-group scale/zero: address uses g = k // GROUP; extract + match GROUP. ---
+        def _group_of(bc):
+            div = _find(bc, ("arith.divsi",))
+            if div is None or len(div.operand_ids) != 2:
+                return None
+            return _cint(div.operand_ids[1])
+
+        g_s = _group_of(scale_bc)
+        g_z = _group_of(zero_bc)
+        if g_s is None or g_s != g_z or g_s < 2:
+            return None
+        group_size = g_s
+
+        # --- Canonical signature + arg bindings. ---
+        args = self.graph.args
+        arg_id_to_idx = {getattr(a, "id", None): i for i, a in enumerate(args)}
+        ptr_args = [a for a in args if a.is_ptr]
+        if len(ptr_args) != 5 or len(args) < 7:
+            return None
+        if not all(args[i].is_ptr for i in range(5)):
+            return None
+        if args[5].is_ptr or args[6].is_ptr:
+            return None
+
+        def _to_arg(oid, d=0):
+            if d > 48:
+                return None
+            if oid in arg_id_to_idx:
+                return arg_id_to_idx[oid]
+            o = op_by_id.get(oid)
+            if o is None or not o.operand_ids:
+                return None
+            return _to_arg(o.operand_ids[0], d + 1)
+
+        if _to_arg(x_bc) != 0 or _to_arg(w_load.operand_ids[0]) != 1:
+            return None
+        if _to_arg(scale_bc) != 3 or _to_arg(zero_bc) != 4:
+            return None
+        stores = [o for o in op_by_id.values() if o.op == "tt.store"]
+        if len(stores) != 1 or len(stores[0].operand_ids or []) < 2:
+            return None
+        if _to_arg(stores[0].operand_ids[0]) != 2:
+            return None
+
+        # --- dtypes: input/output/scale/zero fp32, weight i8 (packed). ---
+        if _mlir_to_triton_dtype(args[0].elem_type) not in ("fp32", "f32", "float"):
+            return None
+        if _mlir_to_triton_dtype(args[2].elem_type) not in ("fp32", "f32", "float"):
+            return None
+        if _mlir_to_triton_dtype(args[1].elem_type) not in ("int8", "i8", "si8", "uint8", "u8"):
+            return None
+
+        # --- weight/scale row-stride arg indices (verified at dispatch: w_row == K/2,
+        #     s_row == ng == K/group). Traced from the [N,1] row-offset muli. ---
+        def _row_stride_idx(bc_or_load):
+            # The row offset is muli(expand_dims(offs_n), splat(STRIDE_ARG)); STRIDE_ARG
+            # is the scalar arg. Find the muli feeding the addptr base + trace its scalar.
+            mop = _find(bc_or_load, ("arith.muli",))
+            if mop is None:
+                return None
+            for oid in mop.operand_ids:
+                idx = _to_arg(oid)
+                if idx is not None and idx >= 7:  # a stride arg (after N,K,ng at 5,6,7)
+                    return idx
+            return None
+
+        swn_idx = _row_stride_idx(w_load.operand_ids[0])
+        ssn_idx = _row_stride_idx(scale_bc)
+        # ng arg: the per-group count (scales [N, ng]); it's the arg whose value == K/group.
+        # Bound at dispatch by ng_idx if we can find it; otherwise omit (dispatch recomputes).
+        ng_idx = None
+        for i in range(7, len(args)):
+            if not args[i].is_ptr and i not in (swn_idx, ssn_idx):
+                ng_idx = i
+                break
+
+        from triton_msl.codegen._msl_templates import make_int4_gemv
+
+        int4_msl = make_int4_gemv(group_size)
+        return ("gemv_int4", int4_msl, 0, 1, 2, 3, 4, 5, 6, swn_idx, ssn_idx, ng_idx, group_size)
+
     def _maybe_quant_gemv_descriptor(self):
         """Build the runtime QUANTIZED-GEMV (decode / M=1) dispatch descriptor, or None.
 

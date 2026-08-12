@@ -42,10 +42,13 @@ def dispatch_quant_matmul(rt, descriptor, kargs, *, launch_exit_hook=None, launc
     bool : True if dispatched; False if skipped/failed (misaligned shape,
            runtime stride mismatch, or any error).
     """
-    # A GEMV descriptor is tagged "gemv" at index 0 (the GEMM's index 0 is its MSL
-    # string, never "gemv"). Dispatch the dedicated make_int8_gemv kernel.
-    if isinstance(descriptor, (tuple, list)) and len(descriptor) and descriptor[0] == "gemv":
-        return _dispatch_gemv(rt, descriptor, kargs, launch_exit_hook=launch_exit_hook, launch_metadata=launch_metadata)
+    # Tagged descriptors: "gemv_int4" (per-group int4 decode) / "gemv" (int8 decode).
+    # The GEMM's index 0 is its MSL string (starts with "#include"), never these tags.
+    if isinstance(descriptor, (tuple, list)) and len(descriptor):
+        if descriptor[0] == "gemv_int4":
+            return _dispatch_int4_gemv(rt, descriptor, kargs, launch_exit_hook=launch_exit_hook, launch_metadata=launch_metadata)
+        if descriptor[0] == "gemv":
+            return _dispatch_gemv(rt, descriptor, kargs, launch_exit_hook=launch_exit_hook, launch_metadata=launch_metadata)
 
     try:
         fast_msl = descriptor[0]
@@ -90,6 +93,50 @@ def dispatch_quant_matmul(rt, descriptor, kargs, *, launch_exit_hook=None, launc
     except Exception:
         try:
             rt.mark_unsupported(fast_msl)
+        except Exception:
+            pass
+        return False
+
+
+def _dispatch_int4_gemv(rt, descriptor, kargs, *, launch_exit_hook=None, launch_metadata=None):
+    """Dispatch make_int4_gemv (weight-only int4 per-group decode GEMV).
+
+    descriptor = ("gemv_int4", int4_msl, in, w, out, scale, zero, n_idx, k_idx,
+                  swn_idx, ssn_idx, ng_idx, group). Buffer order (input, weight,
+                  output, scales, zeros, K, N); N simdgroups; K % 4 == 0, K % group == 0.
+    """
+    try:
+        int4_msl = descriptor[1]
+        in_idx, w_idx, out_idx, scale_idx, zero_idx = descriptor[2:7]
+        n_idx, k_idx = descriptor[7], descriptor[8]
+        swn_idx, ssn_idx, group = descriptor[9], descriptor[10], descriptor[12]
+    except (TypeError, ValueError, IndexError):
+        return False
+    if int4_msl is None or rt.is_unsupported(int4_msl):
+        return False
+    try:
+        N = int(kargs[n_idx])
+        K = int(kargs[k_idx])
+        # RUNTIME STRIDE CONTRACT: weight row stride == K/2 (packed 2 nibbles/byte),
+        # scale/zero row stride == K/group (per-group). A mismatch would read the wrong
+        # bytes → skip (the driver then refuses).
+        if swn_idx is not None and int(kargs[swn_idx]) * 2 != K:
+            return False
+        if ssn_idx is not None and int(kargs[ssn_idx]) * group != K:
+            return False
+        if not (N > 0 and K > 0 and K % 4 == 0 and K % group == 0):
+            return False
+        gsz = 256
+        threads = ((N * 32 + gsz - 1) // gsz) * gsz
+        buffers = [kargs[in_idx], kargs[w_idx], kargs[out_idx], kargs[scale_idx], kargs[zero_idx], K, N]
+        lib = rt.get_library(int4_msl)
+        rt.dispatch(lib, "int4_gemv", buffers, threads=threads, group_size=gsz)
+        if launch_exit_hook:
+            launch_exit_hook(launch_metadata)
+        return True
+    except Exception:
+        try:
+            rt.mark_unsupported(int4_msl)
         except Exception:
             pass
         return False

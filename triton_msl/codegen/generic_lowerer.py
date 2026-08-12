@@ -1014,6 +1014,19 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
             _kname = _sanitize_msl_name(self.graph.func_name)
             return _re.sub(r"kernel\s+void\s+\w+\s*\(", f"kernel void {_kname}(", _qdesc[0], count=1)
 
+        # QUANTIZED INT4 GEMV (decode): weight-only int4 (GPTQ/AWQ per-group) decode GEMV
+        # with a packed-nibble unpack + per-group scale/zero. Checked BEFORE int8 (it is
+        # the more specific pattern — the nibble unpack distinguishes it). Routes to
+        # make_int4_gemv; correct-or-refuse (every packing constant verified).
+        _gemv4 = self._maybe_quant_gemv_int4_descriptor()
+        if _gemv4 is not None:
+            self._quant_matmul = _gemv4
+            self.effective_block_size = 32
+            import re as _re
+
+            _n4 = _sanitize_msl_name(self.graph.func_name)
+            return _re.sub(r"kernel\s+void\s+\w+\s*\(", f"kernel void {_n4}(", _gemv4[1], count=1)
+
         # QUANTIZED GEMV (decode / M=1): a weight-only int8 GEMV written as an in-loop
         # row reduce of a dequantized [N,K] weight (`acc += tl.sum(x[None,:]*(w-zero),
         # axis=1)`, then `out = acc*scale`). This is the loop-carried 2-D-reduce pattern

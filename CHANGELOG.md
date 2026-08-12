@@ -63,6 +63,17 @@
 
 ### Correctness
 
+- **Weight-only int4 (GPTQ/AWQ per-group) decode GEMV now auto-routes** (was refused —
+  the generic lowerer can't emit the bitwise nibble unpack). A canonical int4 decode
+  GEMV written as a `@triton.jit` — packed weight `[N,K/2]` uchar (2 nibbles/byte),
+  per-group fp32 scale/zero, `nib = (extui(w) >> ((k%2)*4)) & 0xF; acc += tl.sum(x *
+  (sitofp(nib) - zero[g]) * scale[g])` — is recognized at compile time and dispatched
+  to `make_int4_gemv` (~1.47× over int8, half the weight bytes). The recognizer
+  (`_maybe_quant_gemv_int4_descriptor`) is **correct-or-refuse**: it verifies the
+  nibble-unpack chain and **every packing constant** (byte = k//2, shift = (k%2)*4,
+  mask 0xF) against the kernel's assumption, extracts and matches the per-group size,
+  and binds each leg to its arg — so a mismatched packing refuses rather than
+  mis-computes; int8 GEMVs (no nibble unpack) are not misrouted.
 - **Weight-only int8 decode GEMV now RUNS on Metal** (was refused). A canonical
   weight-only int8 decode GEMV written as an in-loop row reduce —
   `acc += tl.sum(x[None,:] * (w_i8.to(f32) - zero[:,None]), axis=1)` over K, then

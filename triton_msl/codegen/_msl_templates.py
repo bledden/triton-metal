@@ -1897,6 +1897,7 @@ def make_flash_attention_kernel_simdgroup(
         + (BM * BN * 2 if elem == "half" else 0)  # tgP (fp16 only)
         + n_groups * 64 * 4               # on_scratch (float)
         + BM * 4 * 3                       # tg_m / tg_l / tg_alpha
+        + BM * 8 * 4 * 2                   # tg_pmax / tg_psum (parallel softmax)
         + 4 * 64 * 4                       # adiag
         + BN * Dc_tail * _eb              # tgKV
     )
@@ -2006,21 +2007,39 @@ def make_flash_attention_kernel_simdgroup(
         simdgroup_store(s2, tg_S + 16u*BN + sgitg*8u, BN);
         simdgroup_store(s3, tg_S + 24u*BN + sgitg*8u, BN);
         threadgroup_barrier(mem_flags::mem_threadgroup);
-        if (lid < BM) {
-            uint r = lid; %(QD)s
-            float m_prev=tg_m[r], l_prev=tg_l[r], m_new=m_prev;
-            for (uint cj=0u;cj<BN;cj++) {
+        {
+            // Parallel online-softmax: all 256 threads (8 per row, row=lid/8) scan
+            // BN/8 cols each and reduce partial max/sum via tg_pmax/tg_psum scratch —
+            // vs the old 32-thread serial BN-col scan (was ~14%% of block time).
+            // Masked cols get -INFINITY in the max pass, so exp() = 0 in the sum pass:
+            // the causal/tail GUARD is preserved without a second guard.
+            uint pr = lid / 8u, pc = lid %% 8u; %(QD_PR)s
+            uint cA = pc * (BN / 8u), cB = cA + (BN / 8u);
+            float pm = -INFINITY;
+            for (uint cj = cA; cj < cB; cj++) {
                 %(KD)s
-                float s = %(GUARD)s ? (tg_S[r*BN+cj]*scale) : -INFINITY;
-                tg_S[r*BN+cj]=s; m_new=max(m_new,s);
+                float s = %(GUARD)s ? (tg_S[pr*BN+cj]*scale) : -INFINITY;
+                tg_S[pr*BN+cj] = s; pm = max(pm, s);
             }
-            float alpha=exp(m_prev-m_new); float l_new=l_prev*alpha;
-            for (uint cj=0u;cj<BN;cj++) {
-                %(KD)s
-                float p = %(GUARD)s ? exp(tg_S[r*BN+cj]-m_new) : 0.0f;
-                %(PWRITE)s l_new+=p;
+            tg_pmax[pr*8u + pc] = pm;
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (lid < BM) {
+                uint r = lid; float m_prev = tg_m[r], l_prev = tg_l[r], m_new = m_prev;
+                for (uint j = 0u; j < 8u; j++) m_new = max(m_new, tg_pmax[r*8u+j]);
+                tg_m[r] = m_new; tg_alpha[r] = exp(m_prev - m_new); tg_l[r] = l_prev * tg_alpha[r];
             }
-            tg_m[r]=m_new; tg_l[r]=l_new; tg_alpha[r]=alpha;
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            float ps = 0.0f; float mr = tg_m[pr];
+            for (uint cj = cA; cj < cB; cj++) {
+                float p = exp(tg_S[pr*BN+cj] - mr); %(PWRITE_PR)s ps += p;
+            }
+            tg_psum[pr*8u + pc] = ps;
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (lid < BM) {
+                uint r = lid; float l = tg_l[r];
+                for (uint j = 0u; j < 8u; j++) l += tg_psum[r*8u+j];
+                tg_l[r] = l;
+            }
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
         for (uint i=lid;i<4u*64u;i+=NT) adiag[i]=0.0f;
@@ -2053,9 +2072,11 @@ def make_flash_attention_kernel_simdgroup(
             "DCT": Dc_tail,
             "KLOAD": kload,
             "QD": qd,
+            "QD_PR": qd.replace("q_start + r", "q_start + pr"),  # q_row for row = pr
             "KD": kd,
             "GUARD": g,
             "PWRITE": p_write,
+            "PWRITE_PR": p_write.replace("[r*BN", "[pr*BN"),  # prob store for row = pr
             "PLOADT": p_load_t,
             "BN": BN,
             "NG": n_groups,
@@ -2113,6 +2134,7 @@ kernel void {kernel_name}(
     threadgroup float  tg_S[{BM} * {BN}];
 {p_buffers}
     threadgroup float  tg_m[{BM}], tg_l[{BM}], tg_alpha[{BM}];
+    threadgroup float  tg_pmax[{BM} * 8], tg_psum[{BM} * 8];  // parallel-softmax partials
     threadgroup float  adiag[4 * 64];
     threadgroup {elem} tgKV[{BN} * {Dc_tail}u];
 

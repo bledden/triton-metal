@@ -4,6 +4,18 @@
 
 ### Performance
 
+- **FlashAttention parallel online-softmax — same accuracy, up to 1.8× faster (and
+  now past the MLX ceiling on causal).** The simdgroup FA did its per-row online-softmax
+  with only 32 of 256 threads, each serially scanning all BN=64 score columns (measured
+  ~14% of a full block, and much more of a causal block where work-skipping leaves fewer
+  MMAs). It now runs on all 256 threads — 8 per row, each scanning BN/8 columns, reduced
+  via small threadgroup partials — with **identical numerics** (masked columns become
+  `-INFINITY` in the max pass, so `exp()`=0 in the sum pass, preserving the causal/tail
+  mask without a second guard). Same-accuracy A/B vs the prior kernel: **full 1.11–1.13×,
+  causal 1.78–1.84×**. Absolute (fp16 vs SDPA / MLX): full 2.0–2.5× SDPA (0.79–0.88×
+  MLX), **causal 4.1–4.6× SDPA and 1.65–1.68× MLX** — beating Apple's hand-tuned MLX FA
+  on the causal path. Correct across hd64/hd128/MLA, full+causal, fp16+fp32.
+
 - **FlashAttention now beats PyTorch SDPA (was ~0.3× — a dispatch bug, not a slow
   kernel).** The simdgroup FA kernel (head_dim=128, BM=32/BN=64) was always fast, but
   its **2-D threadgroup grid** `(n_q_blocks, Z·H)` disqualified it from the zero-copy

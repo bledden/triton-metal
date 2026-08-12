@@ -53,10 +53,21 @@
   the 192-wide QK just adds loop iterations (a *symmetric* head_dim=192 overflows the register
   file and won't even build). `v_head_dim=None` is the default and is byte-identical to before.
   The MLA-core kernel is correct vs SDPA (err ≤2e-3 fp16) and **beats it 1.32–1.67× (full),
-  1.26–1.81× (causal)**. This is the kernel capability; `@triton.jit` auto-routing for
-  asymmetric attention (separate qk/v dims in the FA detector) is a follow-on. fp32 qk=192
-  exceeds the 32 KB threadgroup budget (192-wide Q staging), so this targets fp16/bf16 — the
-  dtype MLA runs in anyway.
+  1.26–1.81× (causal)**. fp32 qk=192 exceeds the 32 KB threadgroup budget (192-wide Q
+  staging), so this targets fp16/bf16 — the dtype MLA runs in anyway.
+
+- **`@triton.jit` auto-routing for asymmetric (MLA-shaped) attention.** `_detect_flash_attention`
+  now reads a *separate* `v_head_dim` from the P@V output (it required `[block_m, head_dim]`
+  before, refusing anything asymmetric), and the FA router accepts `_fa_maxdim` up to 256,
+  routing an asymmetric shape to the simd template when it's simd-eligible (contiguous, v ∈
+  {64,128}, fp16 for qk>128) and falling through to a loud refuse otherwise (the scalar/tiled
+  fallback is symmetric-only). Symmetric hd64/hd128 are byte-identical (the FA suite is
+  unchanged). A canonical asymmetric `@triton.jit` attention (qk=128/v=64, fp16) now
+  auto-routes and matches SDPA. A gen-side budget guard turns an over-budget head_dim (e.g.
+  qk=256 fp16 → 33 KB) into a clear error instead of a cryptic pipeline-state failure.
+  Note: `tl.arange` needs power-of-2 bounds and qk=256 overflows the budget, so expressing
+  real MLA (qk=192) from `@jit` needs a nope/rope split (two power-of-2 dots) — a detector
+  follow-on; the qk=192 *kernel* already works and beats SDPA.
 
 - **Split-K for skinny/deep fp32 matmul.** Small-M/N, deep-K matmuls (e.g.
   M=64,N=64,K=8192) were ~0.1× torch — occupancy-starved: a handful of output tiles

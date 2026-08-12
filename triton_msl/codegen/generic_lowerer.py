@@ -64,16 +64,29 @@ def _simd_fa_eligible(info):
     innermost stride folded to 1 (contiguous). Non-contiguous -> scalar template
     (handles general strides) -> never silent-wrong.
 
-    The kernel is parameterized on head_dim via TPG = (D//8)//n_groups = D//64, so it
-    is correct for any multiple of 64; {64, 128} are validated (both measured 1.9-3.0x
-    SDPA). hd64 reaches here only through the guarded hd64 branch in the FA router that
-    falls through to the generic path on any miss, so this gate never regresses hd64."""
-    if not (
-        info.get("head_dim") in (64, 128)
-        and info.get("block_m") == 32
-        and info.get("block_n") == 32
-        and info.get("out_dtype") in ("f32", "f16")
-    ):
+    Registers scale with the OUTPUT width (v_head_dim, via TPG = v_head_dim//64), NOT the
+    QK contraction width. So v_head_dim must be a supported multiple of 64 ({64, 128}), but
+    head_dim (the QK contraction) only adds loop iterations and CAN exceed 128 -- the
+    ASYMMETRIC MLA / DeepSeek case (qk=192, v=128). Symmetric attention has
+    v_head_dim == head_dim so hd64/hd128 behave exactly as before. The Q staging is
+    BM*head_dim*elem bytes of threadgroup memory, so fp32 head_dim>128 overflows the 32KB
+    budget -> head_dim>128 is fp16/bf16-only (192 validated, cap 256)."""
+    qk = info.get("head_dim")
+    vd = info.get("v_head_dim")
+    if vd is None:
+        vd = qk
+    out_dtype = info.get("out_dtype")
+    if vd not in (64, 128):
+        return False
+    if out_dtype not in ("f32", "f16"):
+        return False
+    # QK contraction width: the Q staging is BM*qk*elem bytes of threadgroup memory. The
+    # 32KB budget caps qk at 192 for fp16 (qk=256 overflows by 384B) and 128 for fp32
+    # (2x the bytes). MLA's qk=192 fits fp16; symmetric hd128 fits both.
+    qk_cap = 192 if out_dtype == "f16" else 128
+    if not (isinstance(qk, int) and qk % 8 == 0 and 64 <= qk <= qk_cap):
+        return False
+    if not (info.get("block_m") == 32 and info.get("block_n") == 32):
         return False
     st = info.get("strides", {})
     return all(st.get(r, [None] * 4)[3] == "c1" for r in ("q", "k", "v", "o"))
@@ -932,16 +945,26 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
             # routed here; invoking the refuse-on-ambiguity detector on them
             # would wrongly block a previously-working kernel whose (different)
             # addressing the FA stride-walker doesn't model.
-            if _fa_maxdim == 128:
+            if _fa_maxdim in (128, 192, 256):
+                # Symmetric hd128 (existing) AND asymmetric MLA (qk up to 256, v in
+                # {64,128}): _fa_maxdim is the LARGER qk dim, so MLA (qk=192) lands here
+                # too. maxdim>128 was previously an unconditional refuse, so detection
+                # here can only ADD capability or refuse identically -- no regression.
                 info = self._detect_flash_attention()
                 if (
                     info is not None
                     and info["block_m"] == 32
                     and info["block_n"] == 32
-                    and info["head_dim"] == 128
                     and info["out_dtype"] in ("f32", "f16")
                 ):
-                    return self._lower_flash_attention_template(info)
+                    # Symmetric hd128 -> template (picks simd if contiguous, else tiled).
+                    if info["head_dim"] == 128 and info.get("v_head_dim", 128) == 128:
+                        return self._lower_flash_attention_template(info)
+                    # Asymmetric MLA (qk != v): simd-only (the tiled fallback is
+                    # symmetric). Route iff simd-eligible (contiguous, v in {64,128},
+                    # fp16 for qk>128); otherwise fall through -> refuse below.
+                    if info.get("v_head_dim") != info["head_dim"] and _simd_fa_eligible(info):
+                        return self._lower_flash_attention_template(info)
 
             elif _fa_maxdim == 64:
                 # hd64: route to the simd MMA template ONLY when it detects cleanly AND is
@@ -5231,12 +5254,16 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
             or len(pv_out_shape) != 2
         ):
             _refuse("the dot tile shapes")
-        block_m, head_dim = a_shape
+        block_m, head_dim = a_shape          # head_dim here == qk_head_dim (QK contraction)
         if qk_out_shape[0] != block_m:
             _refuse("a consistent block_m across the two dots")
         block_n = qk_out_shape[1]
-        if tuple(pv_out_shape) != (block_m, head_dim):
-            _refuse("a consistent [block_m, head_dim] P@V output")
+        # P@V output is [block_m, v_head_dim]. v_head_dim MAY differ from the QK
+        # head_dim (asymmetric MLA / DeepSeek attention: qk=192, v=128). Only block_m
+        # must match across the dots; v_head_dim is read from the P@V output width.
+        if pv_out_shape[0] != block_m:
+            _refuse("a consistent block_m in the P@V output")
+        v_head_dim = pv_out_shape[1]
 
         # --- Z / H / N_CTX scalar arg indices --------------------------------
         # Z and H are ``equal_to_1``-specialized away when they equal 1 (the
@@ -5316,6 +5343,7 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
             "block_m": block_m,
             "block_n": block_n,
             "head_dim": head_dim,
+            "v_head_dim": v_head_dim,
             "causal": causal,
             "scale": scale,
             "out_dtype": out_dtype,
@@ -5351,6 +5379,7 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
         )
 
         head_dim = info["head_dim"]
+        v_head_dim = info.get("v_head_dim", head_dim)  # != head_dim for asymmetric MLA
         block_m = info["block_m"]
         block_n = info["block_n"]
         C1 = "c1"
@@ -5504,6 +5533,7 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
                 bindings=bindings,
                 kernel_name=_sanitize_msl_name(self.graph.func_name),
                 scale=info["scale"],
+                v_head_dim=v_head_dim,
             )
             # 256 threads/threadgroup (8 SIMD groups x 32 threads/group).
             self.effective_block_size = 256
@@ -5514,6 +5544,18 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
             # threadgroup size so the dispatch needs nothing from the stash.
             self._flash_attention = ("flash_attention", msl, 256)
         else:
+            # The tiled/scalar template is SYMMETRIC-only. Asymmetric MLA (qk != v)
+            # only reaches this method when simd-eligible (see the FA router), so it
+            # always takes the simd branch above; refuse defensively rather than let
+            # the symmetric tiled template silently mis-compute an asymmetric shape.
+            if v_head_dim != head_dim:
+                from triton_msl.errors import MetalNonRecoverableError
+
+                raise MetalNonRecoverableError(
+                    "asymmetric-head_dim (MLA) FlashAttention requires the simdgroup "
+                    "template (contiguous, fp16/bf16); the scalar/tiled fallback is "
+                    "symmetric-only. Refusing rather than mis-compute."
+                )
             msl = make_flash_attention_kernel_tiled(
                 head_dim,
                 block_m,

@@ -1886,6 +1886,26 @@ def make_flash_attention_kernel_simdgroup(
     else:
         raise ValueError(f"out_dtype must be fp32/f32/fp16/f16 (got {out_dtype!r})")
     Dc_tail = 8
+    # Threadgroup-memory budget (32KB on M-series). tgQ (BM*head_dim) is the
+    # head_dim-dependent term; the rest is fixed by BM/BN. Raise a CLEAR error early
+    # instead of a cryptic AGX pipeline-state failure at load time. Empirically: fp16
+    # fits head_dim<=~248, fp32<=~148 (qk=256 fp16 -> 33152B; qk=192 fp32 -> 38272B).
+    _eb = 2 if elem == "half" else 4
+    _tg_bytes = (
+        BM * D * _eb                       # tgQ
+        + BM * BN * 4                      # tg_S (float)
+        + (BM * BN * 2 if elem == "half" else 0)  # tgP (fp16 only)
+        + n_groups * 64 * 4               # on_scratch (float)
+        + BM * 4 * 3                       # tg_m / tg_l / tg_alpha
+        + 4 * 64 * 4                       # adiag
+        + BN * Dc_tail * _eb              # tgKV
+    )
+    if _tg_bytes > 32768:
+        raise ValueError(
+            f"simd FA threadgroup memory {_tg_bytes}B exceeds the 32KB M-series limit "
+            f"for head_dim={D} v_head_dim={Dv} {elem}. Reduce head_dim "
+            f"(fp16 head_dim<=192, fp32 head_dim<=128 are validated)."
+        )
     _LOGICAL = [
         "q_sz",
         "q_sh",

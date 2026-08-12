@@ -95,6 +95,19 @@ def test_skips_already_unsupported_msl():
     assert rt.calls == []
 
 
+# --- causal work-skipping is emitted only for the causal kernel ---
+def test_causal_kernel_emits_upper_triangle_skip():
+    from triton_msl.codegen._msl_templates import make_flash_attention_kernel_simdgroup as mk
+    causal = mk(128, 32, 64, True, "fp32", kernel_name="k")
+    plain = mk(128, 32, 64, False, "fp32", kernel_name="k")
+    # causal: break past the diagonal in the full-block loop + a guarded tail block.
+    assert "if (kv_start > q_start + BM - 1u) break;" in causal
+    assert "n_full * BN <= q_start + BM - 1u" in causal
+    # non-causal must NOT prune (every block is needed) — silent-wrong otherwise.
+    assert "break;" not in plain
+    assert "q_start + BM - 1u" not in plain
+
+
 # --- integration: a real compiled FA kernel is actually wired to the dispatch ---
 try:
     import torch

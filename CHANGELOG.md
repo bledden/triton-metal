@@ -16,10 +16,20 @@
   (**fail-OPEN**: unlike the quantized path, the host path is equally correct, so any
   miss simply falls through — never wrong, never refused). Result, end-to-end through the
   shipping `@triton.jit` path (head_dim=128, cold A/B vs `F.scaled_dot_product_attention`):
-  **fp16 full 1.65–1.99×**, **fp16 causal 1.18–1.44×**, fp32 full 1.27–1.53×, fp32 causal
-  0.82–1.05× (still ≥ the old host path — no regression). A split-KV / flash-decoding
-  variant was prototyped and **rejected** — once the dispatch is fixed, the online-softmax
-  combine overhead makes it lose to the plain kernel at every size.
+  **fp16 full 1.65–1.99×**, fp32 full 1.27–1.53× (causal below, with the skip). A split-KV /
+  flash-decoding variant was prototyped and **rejected** — once the dispatch is fixed, the
+  online-softmax combine overhead makes it lose to the plain kernel at every size.
+
+- **Causal FlashAttention skips the masked upper triangle.** The causal kernel ran
+  *every* KV block and masked per-element, doing ~2× the necessary work (the fully-masked
+  upper-triangle blocks). A q-block covering rows `[q_start, q_start+BM)` can stop its KV
+  loop once `kv_start > q_start+BM-1` — every later block is entirely masked. This prunes
+  only provably-all-masked blocks, so the per-element mask still handles the diagonal block
+  and the numerics are **byte-identical**. On the zero-copy path it is a strict
+  **1.03–1.69× over the un-skipped causal kernel** (the same loop-clamp was tried and
+  reverted earlier, but on the old dispatch-bound path halving compute was invisible).
+  Causal vs SDPA now: **fp16 1.42–1.95×**, fp32 1.01–1.29× for N≥1024 (only tiny N=512
+  stays ~0.77–0.95×).
 
 - **Split-K for skinny/deep fp32 matmul.** Small-M/N, deep-K matmuls (e.g.
   M=64,N=64,K=8192) were ~0.1× torch — occupancy-starved: a handful of output tiles

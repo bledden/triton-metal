@@ -31,6 +31,19 @@
   Causal vs SDPA now: **fp16 1.42–1.95×**, fp32 1.01–1.29× for N≥1024 (only tiny N=512
   stays ~0.77–0.95×).
 
+- **head_dim=64 FlashAttention now uses the simd MMA kernel too (and fp16 hd64 runs on
+  the GPU at all for the first time).** The simd kernel is parameterized on head_dim
+  (`TPG = (head_dim//8)//n_groups = head_dim//64`), so it is correct for any multiple of
+  64 — but the router only ever sent head_dim=128 to it. head_dim=64 fell through to the
+  generic path, where it was slow in fp32 (~0.19–0.33× SDPA) and, in **fp16, silently
+  CPU-fell-back**: the generic K^T is a 32×64 `tt.trans` that exceeds the 1024-thread
+  cap, so it refused and ran on CPU. A guarded hd64 branch now routes contiguous
+  32×32 fp16/fp32 hd64 to the simd template (inheriting the zero-copy dispatch and causal
+  skip for free); **any** detection refusal or ineligibility (e.g. non-contiguous)
+  falls through to the unchanged generic path, so nothing regresses. hd64 vs SDPA:
+  **fp16 full 2.00–2.89×, fp16 causal 1.55–2.31×, fp32 full 1.80–2.27×, fp32 causal
+  1.47–1.93×** — and fp16 hd64 attention runs on the device instead of the CPU.
+
 - **Split-K for skinny/deep fp32 matmul.** Small-M/N, deep-K matmuls (e.g.
   M=64,N=64,K=8192) were ~0.1× torch — occupancy-starved: a handful of output tiles
   means a handful of threadgroups, each running the whole K-loop serially. A new

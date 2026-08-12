@@ -58,13 +58,18 @@ def _op_is_exp(op_name: str) -> bool:
 
 
 def _simd_fa_eligible(info):
-    """True if the detected FA can use the simdgroup template: head_dim=128,
+    """True if the detected FA can use the simdgroup template: head_dim in {64, 128},
     block 32x32, fp32/fp16, AND contiguous innermost (head-dim) stride for all of
     Q/K/V/Out. info["strides"][role] is [z,h,m,k]; index 3 (k) == "c1" means the
     innermost stride folded to 1 (contiguous). Non-contiguous -> scalar template
-    (handles general strides) -> never silent-wrong."""
+    (handles general strides) -> never silent-wrong.
+
+    The kernel is parameterized on head_dim via TPG = (D//8)//n_groups = D//64, so it
+    is correct for any multiple of 64; {64, 128} are validated (both measured 1.9-3.0x
+    SDPA). hd64 reaches here only through the guarded hd64 branch in the FA router that
+    falls through to the generic path on any miss, so this gate never regresses hd64."""
     if not (
-        info.get("head_dim") == 128
+        info.get("head_dim") in (64, 128)
         and info.get("block_m") == 32
         and info.get("block_n") == 32
         and info.get("out_dtype") in ("f32", "f16")
@@ -937,6 +942,31 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
                     and info["out_dtype"] in ("f32", "f16")
                 ):
                     return self._lower_flash_attention_template(info)
+
+            elif _fa_maxdim == 64:
+                # hd64: route to the simd MMA template ONLY when it detects cleanly AND is
+                # simd-eligible (contiguous, block 32x32, fp16/fp32). hd64 otherwise lowers
+                # through the generic path (fp32 works but slow ~0.19x SDPA; fp16 currently
+                # REFUSES -> CPU-fallback, since the generic K^T is a 32x64 tt.trans > the
+                # 1024-thread cap). We must NEVER regress that path, so ANY detection refusal
+                # or ineligibility falls through unchanged. When it does take over, the simd
+                # hd64 kernel is validated correct (err ~9e-7) and 1.9-3.0x SDPA — and it also
+                # gives fp16 hd64 a real GPU path for the first time. Unlike the hd128 branch
+                # (where a detect refusal is intentional -> the head_dim>64 refusal below), a
+                # refusal here is NOT a hard error: hd64 has a correct generic fallback.
+                try:
+                    _info64 = self._detect_flash_attention()
+                except MetalNonRecoverableError:
+                    _info64 = None
+                if (
+                    _info64 is not None
+                    and _info64["block_m"] == 32
+                    and _info64["block_n"] == 32
+                    and _info64["head_dim"] == 64
+                    and _info64["out_dtype"] in ("f32", "f16")
+                    and _simd_fa_eligible(_info64)
+                ):
+                    return self._lower_flash_attention_template(_info64)
 
             if _fa_maxdim > 64:
                 raise MetalNonRecoverableError(

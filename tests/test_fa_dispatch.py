@@ -125,8 +125,17 @@ requires = pytest.mark.skipif(not HAS, reason="Metal + torch + compile_shader ne
 
 
 @requires
-def test_real_fa_routes_through_dispatch(monkeypatch):
-    """A compiled head_dim=128 FA kernel on MPS hits dispatch_flash_attention."""
+@pytest.mark.parametrize("D,dt,causal", [
+    (128, torch.float32, False),
+    (64, torch.float32, False),
+    (64, torch.float16, False),   # fp16 hd64 previously REFUSED -> CPU-fallback
+    (64, torch.float16, True),
+])
+def test_real_fa_routes_through_dispatch(monkeypatch, D, dt, causal):
+    """A compiled contiguous head_dim in {64,128} FA on MPS routes through the simd
+    dispatch, runs ON GPU, and matches SDPA. hd64 (esp. fp16) is the regression guard:
+    it used to lower through the generic path where the K^T 32x64 tt.trans exceeds the
+    1024-thread cap -> silent CPU-fallback. Now it must run on the device."""
     import torch.nn.functional as F
     import sys
     sys.path.insert(0, "tests")
@@ -143,11 +152,11 @@ def test_real_fa_routes_through_dispatch(monkeypatch):
     # the driver imports the symbol at call time from the module, so patch there
     monkeypatch.setattr(fa_mod, "dispatch_flash_attention", spy)
 
-    Z, H, N, D = 1, 4, 512, 128
+    Z, H, N = 1, 4, 512
     torch.manual_seed(0)
-    q = torch.randn(Z, H, N, D, device="mps", dtype=torch.float32)
-    k = torch.randn(Z, H, N, D, device="mps", dtype=torch.float32)
-    v = torch.randn(Z, H, N, D, device="mps", dtype=torch.float32)
+    q = torch.randn(Z, H, N, D, device="mps", dtype=dt)
+    k = torch.randn(Z, H, N, D, device="mps", dtype=dt)
+    v = torch.randn(Z, H, N, D, device="mps", dtype=dt)
     out = torch.empty_like(q)
     _flash_attn_fwd[(N // 32, Z * H)](
         q, k, v, out,
@@ -155,9 +164,11 @@ def test_real_fa_routes_through_dispatch(monkeypatch):
         k.stride(0), k.stride(1), k.stride(2), k.stride(3),
         v.stride(0), v.stride(1), v.stride(2), v.stride(3),
         out.stride(0), out.stride(1), out.stride(2), out.stride(3),
-        Z, H, N, BLOCK_M=32, BLOCK_N=32, HEAD_DIM=128, IS_CAUSAL=False)
+        Z, H, N, BLOCK_M=32, BLOCK_N=32, HEAD_DIM=D, IS_CAUSAL=causal)
     torch.mps.synchronize()
 
-    assert fired["n"] >= 1, "compiled FA kernel did not route through the FA dispatch"
-    ref = F.scaled_dot_product_attention(q, k, v, scale=1.0 / (D ** 0.5))
-    assert (out.float() - ref.float()).abs().max().item() < 0.02
+    assert fired["n"] >= 1, "compiled FA kernel did not route through the simd FA dispatch"
+    assert str(out.device).startswith("mps"), "FA output left the GPU (CPU-fallback regression)"
+    ref = F.scaled_dot_product_attention(q, k, v, is_causal=causal, scale=1.0 / (D ** 0.5))
+    tol = 0.02 if dt == torch.float32 else 0.05
+    assert (out.float() - ref.float()).abs().max().item() < tol

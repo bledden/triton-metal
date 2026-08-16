@@ -307,6 +307,7 @@ All default-on; set to `0` to disable (an escape hatch for bisecting a regressio
 | `TRITON_MSL_MATMUL_AUTOTUNE=0` | Pin matmul tile selection to the fixed `(4,4)` blocking (M%32≠0 / N%32≠0 shapes drop to the generic path instead of the finer M%8/N%8 rescue tiles) |
 | `TRITON_MSL_MEPT=0` | Disable the multi-element-per-thread register-array model |
 | `TRITON_MSL_LEGACY=1` | Opt **in** to the heuristic legacy text parser (off by default, it can be silent-wrong) |
+| `TRITON_MSL_FA_HALF_ACCUM=1` | Opt **in** to fp16 (half) MMA accumulators in FlashAttention — ~4% faster at ~1% max-abs error (vs ~0.01% for the default fp32-accumulate). fp16 kernels only; a no-op for fp32. A latency/accuracy trade for inference, like the int8/int4 paths |
 
 ## What Works
 

@@ -130,13 +130,19 @@ def _msl_cache_key(mod_text, options_hash):
     Includes CODEGEN_VERSION and the MEPT flag alongside TTGIR text + options:
     without them, emitter/lowerer changes (or toggling TRITON_MSL_MEPT)
     silently replay stale compiled kernels (Phase 0, audit debt #1/#2).
+    TRITON_MSL_FA_HALF_ACCUM changes the emitted FA MSL (fp16 accumulators), so
+    it must key the cache too — else toggling it replays a stale float-accum kernel.
     """
     from triton_msl import CODEGEN_VERSION
 
     # Effective MEPT flag (default ON as of M5): no-env and "1" share a key;
     # "0" (escape hatch) is distinct. Must match generic_lowerer's default.
     mept = "0" if os.environ.get("TRITON_MSL_MEPT") == "0" else "1"
-    return hashlib.sha256((mod_text + options_hash + CODEGEN_VERSION + mept).encode("utf-8")).hexdigest()[:16]
+    # FA half-accumulate opt-in (default OFF): only "1"/"true" diverge from the key.
+    fa_ha = "1" if os.environ.get("TRITON_MSL_FA_HALF_ACCUM", "0") in ("1", "true", "True") else "0"
+    return hashlib.sha256(
+        (mod_text + options_hash + CODEGEN_VERSION + mept + fa_ha).encode("utf-8")
+    ).hexdigest()[:16]
 
 
 # Number of attempts for the metal→air→metallib pipeline.

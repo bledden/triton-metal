@@ -100,6 +100,19 @@ def _simd_fa_eligible(info):
     return True
 
 
+def _fa_half_accumulate(out_dtype) -> bool:
+    """OPT-IN (default OFF): TRITON_MSL_FA_HALF_ACCUM=1 makes the simd FA use fp16
+    (half8x8) MMA accumulators instead of fp32. ~4% faster at ~1% max-abs error — a
+    latency/accuracy trade for fp16 inference, mirroring the int8/int4 opt-ins. Applies
+    ONLY to fp16 output (there is no half input to accumulate for fp32), so it is a
+    no-op — the shipped float-accumulate kernel — for fp32 regardless of the env var.
+    Must match _msl_cache_key's TRITON_MSL_FA_HALF_ACCUM handling (both key the flag).
+    """
+    if os.environ.get("TRITON_MSL_FA_HALF_ACCUM", "0") not in ("1", "true", "True"):
+        return False
+    return out_dtype in ("f16", "fp16")
+
+
 from triton_msl.codegen._lowerer_detection import _DetectionMixin
 from triton_msl.codegen._lowerer_emission import _EmissionMixin
 from triton_msl.codegen._lowerer_reduce import _ReduceScanMixin
@@ -5447,6 +5460,7 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
             info["head_dim"], 32, 64,
             causal=info["causal"], out_dtype=info["out_dtype"],
             kernel_name=name, scale=info["scale"], v_head_dim=info["v_head_dim"],
+            half_accumulate=_fa_half_accumulate(info["out_dtype"]),
         )
         self.effective_block_size = 256
         self._used_pid_axes = {0, 1}
@@ -5644,6 +5658,7 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
                 kernel_name=_sanitize_msl_name(self.graph.func_name),
                 scale=info["scale"],
                 v_head_dim=v_head_dim,
+                half_accumulate=_fa_half_accumulate(info["out_dtype"]),
             )
             # 256 threads/threadgroup (8 SIMD groups x 32 threads/group).
             self.effective_block_size = 256

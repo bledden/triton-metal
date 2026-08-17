@@ -29,8 +29,9 @@ GROUP = 128
 if HAS:
 
     @triton.jit
-    def _int4_gemv_jit(x_ptr, w_ptr, o_ptr, s_ptr, z_ptr, N, K, ng, swn, ssn,
-                       BN: tl.constexpr, BK: tl.constexpr, G: tl.constexpr):
+    def _int4_gemv_jit(
+        x_ptr, w_ptr, o_ptr, s_ptr, z_ptr, N, K, ng, swn, ssn, BN: tl.constexpr, BK: tl.constexpr, G: tl.constexpr
+    ):
         pid = tl.program_id(0)
         on = pid * BN + tl.arange(0, BN)
         ok = tl.arange(0, BK)
@@ -82,8 +83,9 @@ def test_int4_gemv_jit_routes_correct(N, K, G):
     s = (torch.rand(N, ng, device="mps") * 0.02 + 0.005).contiguous()
     z = torch.randint(0, 16, (N, ng), device="mps").float().contiguous()
     o = torch.zeros(N, device="mps")
-    _int4_gemv_jit[(triton.cdiv(N, 32),)](x, packed, o, s, z, N, K, ng, packed.stride(0), s.stride(0),
-                                          BN=32, BK=64, G=G)
+    _int4_gemv_jit[(triton.cdiv(N, 32),)](
+        x, packed, o, s, z, N, K, ng, packed.stride(0), s.stride(0), BN=32, BK=64, G=G
+    )
     gi = torch.arange(K, device="mps") // G
     ref = ((w4.float() - z[:, gi]) * s[:, gi]) @ x
     torch.testing.assert_close(o, ref, rtol=2e-3, atol=2e-3)

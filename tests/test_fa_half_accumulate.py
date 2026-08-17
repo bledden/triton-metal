@@ -8,6 +8,7 @@ Contract:
   * With the flag on, an fp16 kernel stays correct (looser fp16-accumulate tolerance).
 This is a latency/accuracy trade (~4%, ~1% max-abs error), mirroring int8/int4 opt-ins.
 """
+
 import pytest
 
 # Import triton FIRST so its backend discovery runs to completion before anything
@@ -33,6 +34,7 @@ requires = pytest.mark.skipif(not HAS, reason="Metal + torch + compile_shader ne
 
 
 # ----------------------- generation (no GPU) -----------------------
+
 
 @pytest.mark.parametrize("causal", [False, True])
 def test_default_is_float_accumulate(causal):
@@ -74,15 +76,16 @@ def test_half_accumulate_default_off_matches_explicit_false():
 
 # ----------------------- opt-in helper + cache key (no GPU) -----------------------
 
+
 def test_opt_in_helper(monkeypatch):
     monkeypatch.delenv("TRITON_MSL_FA_HALF_ACCUM", raising=False)
-    assert _fa_half_accumulate("f16") is False           # default OFF
+    assert _fa_half_accumulate("f16") is False  # default OFF
     monkeypatch.setenv("TRITON_MSL_FA_HALF_ACCUM", "1")
-    assert _fa_half_accumulate("f16") is True             # fp16 opts in
+    assert _fa_half_accumulate("f16") is True  # fp16 opts in
     assert _fa_half_accumulate("fp16") is True
-    assert _fa_half_accumulate("f32") is False            # never for fp32
+    assert _fa_half_accumulate("f32") is False  # never for fp32
     monkeypatch.setenv("TRITON_MSL_FA_HALF_ACCUM", "0")
-    assert _fa_half_accumulate("f16") is False            # explicit off
+    assert _fa_half_accumulate("f16") is False  # explicit off
 
 
 def test_flag_keys_the_cache(monkeypatch):
@@ -96,10 +99,10 @@ def test_flag_keys_the_cache(monkeypatch):
 
 # ----------------------- end-to-end correctness (GPU) -----------------------
 
+
 def _run(rt, causal, half_accumulate, N=512, Z=1, H=8, D=128):
     lib = rt.get_library(
-        mk(D, 32, 64, causal=causal, out_dtype="fp16", kernel_name="fa_ha",
-           half_accumulate=half_accumulate)
+        mk(D, 32, 64, causal=causal, out_dtype="fp16", kernel_name="fa_ha", half_accumulate=half_accumulate)
     )
     torch.manual_seed(0)
     q = torch.randn(Z, H, N, D, device="mps", dtype=torch.float16)
@@ -107,12 +110,17 @@ def _run(rt, causal, half_accumulate, N=512, Z=1, H=8, D=128):
     v = torch.randn(Z, H, N, D, device="mps", dtype=torch.float16)
     o = torch.empty_like(q)
     nqb = N // 32
-    args = ([q, k, v, o]
-            + [q.stride(i) for i in range(4)] + [k.stride(i) for i in range(4)]
-            + [v.stride(i) for i in range(4)] + [o.stride(i) for i in range(4)] + [Z, H, N])
+    args = (
+        [q, k, v, o]
+        + [q.stride(i) for i in range(4)]
+        + [k.stride(i) for i in range(4)]
+        + [v.stride(i) for i in range(4)]
+        + [o.stride(i) for i in range(4)]
+        + [Z, H, N]
+    )
     rt.dispatch(lib, "fa_ha", args, threads=(nqb * 256, Z * H, 1), group_size=(256, 1, 1))
     torch.mps.synchronize()
-    ref = F.scaled_dot_product_attention(q, k, v, is_causal=causal, scale=1.0 / (D ** 0.5))
+    ref = F.scaled_dot_product_attention(q, k, v, is_causal=causal, scale=1.0 / (D**0.5))
     return (o.float() - ref.float()).abs().max().item()
 
 

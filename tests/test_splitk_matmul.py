@@ -23,8 +23,7 @@ requires = pytest.mark.skipif(not HAS, reason="Metal + torch + triton needed")
 if HAS:
 
     @triton.jit
-    def _mm(a, b, c, M, N, K, sam, sak, sbk, sbn, scm, scn,
-            BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr):
+    def _mm(a, b, c, M, N, K, sam, sak, sbk, sbn, scm, scn, BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr):
         pm = tl.program_id(0)
         pn = tl.program_id(1)
         om = pm * BM + tl.arange(0, BM)
@@ -44,17 +43,41 @@ if HAS:
         b = torch.randn(K, N, device="mps")
         c = torch.zeros(M, N, device="mps")
         grid = (triton.cdiv(M, 32), triton.cdiv(N, 32))
-        _mm[grid](a, b, c, M, N, K, a.stride(0), a.stride(1), b.stride(0), b.stride(1),
-                  c.stride(0), c.stride(1), BM=32, BN=32, BK=32)
+        _mm[grid](
+            a,
+            b,
+            c,
+            M,
+            N,
+            K,
+            a.stride(0),
+            a.stride(1),
+            b.stride(0),
+            b.stride(1),
+            c.stride(0),
+            c.stride(1),
+            BM=32,
+            BN=32,
+            BK=32,
+        )
         return a, b, c
 
 
 # skinny/deep (routes to split-K) + shapes that must fall through unchanged.
 @requires
-@pytest.mark.parametrize("M,N,K", [
-    (64, 64, 8192), (128, 128, 8192), (32, 32, 4096), (64, 32, 8192),
-    (32, 64, 4096), (96, 64, 4096), (256, 256, 4096), (2048, 2048, 2048),
-])
+@pytest.mark.parametrize(
+    "M,N,K",
+    [
+        (64, 64, 8192),
+        (128, 128, 8192),
+        (32, 32, 4096),
+        (64, 32, 8192),
+        (32, 64, 4096),
+        (96, 64, 4096),
+        (256, 256, 4096),
+        (2048, 2048, 2048),
+    ],
+)
 @pytest.mark.parametrize("seed", [0, 1, 2])
 def test_matmul_correct(M, N, K, seed):
     torch.manual_seed(seed)

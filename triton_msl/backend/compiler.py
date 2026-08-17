@@ -140,9 +140,7 @@ def _msl_cache_key(mod_text, options_hash):
     mept = "0" if os.environ.get("TRITON_MSL_MEPT") == "0" else "1"
     # FA half-accumulate opt-in (default OFF): only "1"/"true" diverge from the key.
     fa_ha = "1" if os.environ.get("TRITON_MSL_FA_HALF_ACCUM", "0") in ("1", "true", "True") else "0"
-    return hashlib.sha256(
-        (mod_text + options_hash + CODEGEN_VERSION + mept + fa_ha).encode("utf-8")
-    ).hexdigest()[:16]
+    return hashlib.sha256((mod_text + options_hash + CODEGEN_VERSION + mept + fa_ha).encode("utf-8")).hexdigest()[:16]
 
 
 # Number of attempts for the metal→air→metallib pipeline.

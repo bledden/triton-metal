@@ -2978,12 +2978,17 @@ class _TemplateMixin:
 
         def _peel(oid):
             o = op_by_id.get(oid)
-            while o is not None and o.operand_ids and o.op in (
-                "ttg.local_load",
-                "ttg.local_alloc",
-                "ttg.convert_layout",
-                "tt.trans",
-                "ttg.memdesc_trans",
+            while (
+                o is not None
+                and o.operand_ids
+                and o.op
+                in (
+                    "ttg.local_load",
+                    "ttg.local_alloc",
+                    "ttg.convert_layout",
+                    "tt.trans",
+                    "ttg.memdesc_trans",
+                )
             ):
                 if o.op in ("tt.trans", "ttg.memdesc_trans"):
                     _is_nk[0] = True

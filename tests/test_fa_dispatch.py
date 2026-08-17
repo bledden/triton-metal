@@ -44,26 +44,29 @@ def test_dispatch_computes_native_2d_grid():
     assert len(rt.calls) == 1
     lib, name, kargs, threads, group_size = rt.calls[0]
     assert name == "fa_kernel"
-    assert kargs == KARGS                 # buffer order passed through verbatim
-    assert threads == (32 * 256, 8, 1)    # gridX*tg in x, gridY in y, gridZ in z
-    assert group_size == (256, 1, 1)      # tg threads per group, in x only
+    assert kargs == KARGS  # buffer order passed through verbatim
+    assert threads == (32 * 256, 8, 1)  # gridX*tg in x, gridY in y, gridZ in z
+    assert group_size == (256, 1, 1)  # tg threads per group, in x only
 
 
 def test_exit_hook_fires_on_success():
     rt = _FakeRT()
     seen = []
     ok = dispatch_flash_attention(
-        rt, DESC, "fa_kernel", KARGS, 32, 8, 1,
-        launch_exit_hook=lambda md: seen.append(md), launch_metadata="MD")
+        rt, DESC, "fa_kernel", KARGS, 32, 8, 1, launch_exit_hook=lambda md: seen.append(md), launch_metadata="MD"
+    )
     assert ok and seen == ["MD"]
 
 
-@pytest.mark.parametrize("desc", [
-    ("gemv", "msl", 256),                 # wrong tag
-    ("flash_attention", None, 256),       # no MSL
-    ("flash_attention", "msl"),           # too short
-    None,
-])
+@pytest.mark.parametrize(
+    "desc",
+    [
+        ("gemv", "msl", 256),  # wrong tag
+        ("flash_attention", None, 256),  # no MSL
+        ("flash_attention", "msl"),  # too short
+        None,
+    ],
+)
 def test_fail_open_on_bad_descriptor(desc):
     rt = _FakeRT()
     assert dispatch_flash_attention(rt, desc, "fa_kernel", KARGS, 32, 8, 1) is False
@@ -85,7 +88,7 @@ def test_fail_open_on_missing_kernel_name():
 def test_dispatch_error_marks_unsupported_and_fails_open():
     rt = _FakeRT(raise_on_dispatch=True)
     assert dispatch_flash_attention(rt, DESC, "fa_kernel", KARGS, 32, 8, 1) is False
-    assert DESC[1] in rt.unsupported    # marked so we don't retry a broken shader
+    assert DESC[1] in rt.unsupported  # marked so we don't retry a broken shader
 
 
 def test_skips_already_unsupported_msl():
@@ -98,6 +101,7 @@ def test_skips_already_unsupported_msl():
 # --- causal work-skipping is emitted only for the causal kernel ---
 def test_causal_kernel_emits_upper_triangle_skip():
     from triton_msl.codegen._msl_templates import make_flash_attention_kernel_simdgroup as mk
+
     causal = mk(128, 32, 64, True, "fp32", kernel_name="k")
     plain = mk(128, 32, 64, False, "fp32", kernel_name="k")
     # causal: break past the diagonal in the full-block loop + a guarded tail block.
@@ -125,12 +129,15 @@ requires = pytest.mark.skipif(not HAS, reason="Metal + torch + compile_shader ne
 
 
 @requires
-@pytest.mark.parametrize("D,dt,causal", [
-    (128, torch.float32, False),
-    (64, torch.float32, False),
-    (64, torch.float16, False),   # fp16 hd64 previously REFUSED -> CPU-fallback
-    (64, torch.float16, True),
-])
+@pytest.mark.parametrize(
+    "D,dt,causal",
+    [
+        (128, torch.float32, False),
+        (64, torch.float32, False),
+        (64, torch.float16, False),  # fp16 hd64 previously REFUSED -> CPU-fallback
+        (64, torch.float16, True),
+    ],
+)
 def test_real_fa_routes_through_dispatch(monkeypatch, D, dt, causal):
     """A compiled contiguous head_dim in {64,128} FA on MPS routes through the simd
     dispatch, runs ON GPU, and matches SDPA. hd64 (esp. fp16) is the regression guard:
@@ -138,6 +145,7 @@ def test_real_fa_routes_through_dispatch(monkeypatch, D, dt, causal):
     1024-thread cap -> silent CPU-fallback. Now it must run on the device."""
     import torch.nn.functional as F
     import sys
+
     sys.path.insert(0, "tests")
     from test_flash_attention import _flash_attn_fwd
     import triton_msl.autotuning._fa_dispatch as fa_mod
@@ -159,16 +167,38 @@ def test_real_fa_routes_through_dispatch(monkeypatch, D, dt, causal):
     v = torch.randn(Z, H, N, D, device="mps", dtype=dt)
     out = torch.empty_like(q)
     _flash_attn_fwd[(N // 32, Z * H)](
-        q, k, v, out,
-        q.stride(0), q.stride(1), q.stride(2), q.stride(3),
-        k.stride(0), k.stride(1), k.stride(2), k.stride(3),
-        v.stride(0), v.stride(1), v.stride(2), v.stride(3),
-        out.stride(0), out.stride(1), out.stride(2), out.stride(3),
-        Z, H, N, BLOCK_M=32, BLOCK_N=32, HEAD_DIM=D, IS_CAUSAL=causal)
+        q,
+        k,
+        v,
+        out,
+        q.stride(0),
+        q.stride(1),
+        q.stride(2),
+        q.stride(3),
+        k.stride(0),
+        k.stride(1),
+        k.stride(2),
+        k.stride(3),
+        v.stride(0),
+        v.stride(1),
+        v.stride(2),
+        v.stride(3),
+        out.stride(0),
+        out.stride(1),
+        out.stride(2),
+        out.stride(3),
+        Z,
+        H,
+        N,
+        BLOCK_M=32,
+        BLOCK_N=32,
+        HEAD_DIM=D,
+        IS_CAUSAL=causal,
+    )
     torch.mps.synchronize()
 
     assert fired["n"] >= 1, "compiled FA kernel did not route through the simd FA dispatch"
     assert str(out.device).startswith("mps"), "FA output left the GPU (CPU-fallback regression)"
-    ref = F.scaled_dot_product_attention(q, k, v, is_causal=causal, scale=1.0 / (D ** 0.5))
+    ref = F.scaled_dot_product_attention(q, k, v, is_causal=causal, scale=1.0 / (D**0.5))
     tol = 0.02 if dt == torch.float32 else 0.05
     assert (out.float() - ref.float()).abs().max().item() < tol

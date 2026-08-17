@@ -46,9 +46,13 @@ def dispatch_quant_matmul(rt, descriptor, kargs, *, launch_exit_hook=None, launc
     # The GEMM's index 0 is its MSL string (starts with "#include"), never these tags.
     if isinstance(descriptor, (tuple, list)) and len(descriptor):
         if descriptor[0] == "gemv_int4":
-            return _dispatch_int4_gemv(rt, descriptor, kargs, launch_exit_hook=launch_exit_hook, launch_metadata=launch_metadata)
+            return _dispatch_int4_gemv(
+                rt, descriptor, kargs, launch_exit_hook=launch_exit_hook, launch_metadata=launch_metadata
+            )
         if descriptor[0] == "gemv":
-            return _dispatch_gemv(rt, descriptor, kargs, launch_exit_hook=launch_exit_hook, launch_metadata=launch_metadata)
+            return _dispatch_gemv(
+                rt, descriptor, kargs, launch_exit_hook=launch_exit_hook, launch_metadata=launch_metadata
+            )
 
     try:
         fast_msl = descriptor[0]

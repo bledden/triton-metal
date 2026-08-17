@@ -103,8 +103,9 @@ if HAS:
         tl.store(c_ptrs, acc)
 
     @triton.jit
-    def _int8_gemm_nk(a_ptr, w_ptr, c_ptr, s_ptr, z_ptr, M, N, K, sam, swn, scm,
-                      BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr):
+    def _int8_gemm_nk(
+        a_ptr, w_ptr, c_ptr, s_ptr, z_ptr, M, N, K, sam, swn, scm, BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr
+    ):
         # GPTQ-style prefill: weight stored [N,K], out = a @ (dequant(w)).T
         pid_m = tl.program_id(0)
         pid_n = tl.program_id(1)
@@ -125,8 +126,7 @@ if HAS:
         tl.store(c_ptr + offs_m[:, None] * scm + offs_n[None, :], acc)
 
     @triton.jit
-    def _int8_gemv(x_ptr, w_ptr, o_ptr, scale_ptr, zero_ptr, N, K, swn, swk,
-                   BN: tl.constexpr, BK: tl.constexpr):
+    def _int8_gemv(x_ptr, w_ptr, o_ptr, scale_ptr, zero_ptr, N, K, swn, swk, BN: tl.constexpr, BK: tl.constexpr):
         # GPTQ-style weight-only int8 decode GEMV: weight [N,K], per-N scale/zero.
         pid = tl.program_id(0)
         offs_n = pid * BN + tl.arange(0, BN)
@@ -141,8 +141,7 @@ if HAS:
         tl.store(o_ptr + offs_n, acc * scale)
 
     @triton.jit
-    def _int8_gemv_inr(x_ptr, w_ptr, o_ptr, scale_ptr, zero_ptr, N, K, swn, swk,
-                       BN: tl.constexpr, BK: tl.constexpr):
+    def _int8_gemv_inr(x_ptr, w_ptr, o_ptr, scale_ptr, zero_ptr, N, K, swn, swk, BN: tl.constexpr, BK: tl.constexpr):
         # In-reduce-scale form: scale applied INSIDE the reduce (not as an epilogue).
         # Mathematically identical for per-N scale; must route to the same kernel.
         pid = tl.program_id(0)

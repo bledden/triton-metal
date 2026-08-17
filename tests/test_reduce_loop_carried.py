@@ -48,8 +48,7 @@ if HAS:
         tl.store(o_ptr + offs_n, tl.sum(x[None, :] * w, axis=1))
 
     @triton.jit
-    def _gemv_single_iterarg(x_ptr, w_ptr, o_ptr, N, K, swn, swk,
-                             BN: tl.constexpr, BK: tl.constexpr):
+    def _gemv_single_iterarg(x_ptr, w_ptr, o_ptr, N, K, swn, swk, BN: tl.constexpr, BK: tl.constexpr):
         # A plain fp32 GEMV with a SINGLE loop iter_arg (`acc`) and a
         # `range(0, K, BK)` induction var (no manual offs_k += BK). A single-result
         # scf.for has result_ids == None, which an earlier version of the guard failed
@@ -89,9 +88,7 @@ def test_single_iterarg_loop_carried_reduce_refuses():
     w = torch.randn(N, K, device="mps")
     o = torch.zeros(N, device="mps")
     with pytest.raises(MetalNonRecoverableError, match="accumulated across a loop"):
-        _gemv_single_iterarg[(triton.cdiv(N, BN),)](
-            x, w, o, N, K, w.stride(0), w.stride(1), BN=BN, BK=BK
-        )
+        _gemv_single_iterarg[(triton.cdiv(N, BN),)](x, w, o, N, K, w.stride(0), w.stride(1), BN=BN, BK=BK)
 
 
 @requires

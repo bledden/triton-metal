@@ -51,9 +51,9 @@ def _dispatch_mla(rt, descriptor, kargs, *, launch_exit_hook=None, launch_metada
         k = torch.cat([kn, kr], dim=-1).contiguous()
         Z, H, N = int(q.shape[0]), int(q.shape[1]), int(q.shape[2])
         n_qb = (N + 31) // 32
-        buffers = ([q, k, v, out]
-                   + list(q.stride()) + list(k.stride()) + list(v.stride()) + list(out.stride())
-                   + [Z, H, N])
+        buffers = (
+            [q, k, v, out] + list(q.stride()) + list(k.stride()) + list(v.stride()) + list(out.stride()) + [Z, H, N]
+        )
         lib = rt.get_library(msl)
         rt.dispatch(lib, name, buffers, threads=(n_qb * tg, Z * H, 1), group_size=(tg, 1, 1))
         if launch_exit_hook:
@@ -68,15 +68,23 @@ def _dispatch_mla(rt, descriptor, kargs, *, launch_exit_hook=None, launch_metada
 
 
 def dispatch_flash_attention(
-    rt, descriptor, kernel_name, kargs, gridX, gridY, gridZ, *,
-    launch_exit_hook=None, launch_metadata=None,
+    rt,
+    descriptor,
+    kernel_name,
+    kargs,
+    gridX,
+    gridY,
+    gridZ,
+    *,
+    launch_exit_hook=None,
+    launch_metadata=None,
 ):
     try:
         if isinstance(descriptor, (tuple, list)) and len(descriptor) >= 10 and descriptor[0] == "mla":
-            return _dispatch_mla(rt, descriptor, kargs,
-                                 launch_exit_hook=launch_exit_hook, launch_metadata=launch_metadata)
-        if not (isinstance(descriptor, (tuple, list)) and len(descriptor) >= 3
-                and descriptor[0] == "flash_attention"):
+            return _dispatch_mla(
+                rt, descriptor, kargs, launch_exit_hook=launch_exit_hook, launch_metadata=launch_metadata
+            )
+        if not (isinstance(descriptor, (tuple, list)) and len(descriptor) >= 3 and descriptor[0] == "flash_attention"):
             return False
         msl = descriptor[1]
         tg = int(descriptor[2])
@@ -89,8 +97,7 @@ def dispatch_flash_attention(
         lib = rt.get_library(msl)
         # Native 2-D/3-D grid: gx*gy*gz threadgroups, tg threads each (in x).
         # threadgroup_position_in_grid -> (q_block, zh, 0); thread_index -> 0..tg-1.
-        rt.dispatch(lib, kernel_name, kargs,
-                    threads=(gx * tg, gy, gz), group_size=(tg, 1, 1))
+        rt.dispatch(lib, kernel_name, kargs, threads=(gx * tg, gy, gz), group_size=(tg, 1, 1))
         if launch_exit_hook:
             launch_exit_hook(launch_metadata)
         return True

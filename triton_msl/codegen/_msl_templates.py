@@ -1902,8 +1902,7 @@ def make_flash_attention_kernel_simdgroup(
     # accumulating fp32 inputs in half would silently truncate the inputs themselves.
     if half_accumulate and elem != "half":
         raise ValueError(
-            "half_accumulate=True requires fp16/f16 out_dtype (half MMA accumulators); "
-            f"got out_dtype={out_dtype!r}"
+            f"half_accumulate=True requires fp16/f16 out_dtype (half MMA accumulators); got out_dtype={out_dtype!r}"
         )
     if half_accumulate:
         acc_frag, acc_zero, acc_buf = "simdgroup_half8x8", "0.0h", "half"
@@ -1916,14 +1915,14 @@ def make_flash_attention_kernel_simdgroup(
     # fits head_dim<=~248, fp32<=~148 (qk=256 fp16 -> 33152B; qk=192 fp32 -> 38272B).
     _eb = 2 if elem == "half" else 4
     _tg_bytes = (
-        BM * D * _eb                       # tgQ
-        + BM * BN * 4                      # tg_S (float)
+        BM * D * _eb  # tgQ
+        + BM * BN * 4  # tg_S (float)
         + (BM * BN * 2 if elem == "half" else 0)  # tgP (fp16 only)
-        + n_groups * 64 * 4               # on_scratch (float)
-        + BM * 4 * 3                       # tg_m / tg_l / tg_alpha
-        + BM * 8 * 4 * 2                   # tg_pmax / tg_psum (parallel softmax)
-        + 4 * 64 * 4                       # adiag
-        + BN * Dc_tail * _eb              # tgKV
+        + n_groups * 64 * 4  # on_scratch (float)
+        + BM * 4 * 3  # tg_m / tg_l / tg_alpha
+        + BM * 8 * 4 * 2  # tg_pmax / tg_psum (parallel softmax)
+        + 4 * 64 * 4  # adiag
+        + BN * Dc_tail * _eb  # tgKV
     )
     if _tg_bytes > 32768:
         raise ValueError(
@@ -2131,8 +2130,7 @@ def make_flash_attention_kernel_simdgroup(
     # per-element mask still handles the partially-masked diagonal block -> identical
     # numerics. Empty for non-causal (every block is needed).
     causal_break = (
-        "        if (kv_start > q_start + BM - 1u) break;  // causal: skip fully-masked blocks\n"
-        if causal else ""
+        "        if (kv_start > q_start + BM - 1u) break;  // causal: skip fully-masked blocks\n" if causal else ""
     )
     causal_tail_guard = " && n_full * BN <= q_start + BM - 1u" if causal else ""
 
@@ -3517,7 +3515,8 @@ def make_int8_matmul_fast(rr=4, rc=2, bk=32, layout="nk"):
         f"    for (uint e = tid; e < 64u; e += 32u) {{ uint mm=e/8u, nn=e%8u; "
         f"output[(m0 + {r * 8}u + mm) * N + (n0 + {c * 8}u + nn)] = scales[n0 + {c * 8}u + nn] * cbuf[e]; }}\n"
         f"    simdgroup_barrier(mem_flags::mem_threadgroup);"
-        for r in range(rr) for c in range(rc)
+        for r in range(rr)
+        for c in range(rc)
     )
     return f"""#include <metal_stdlib>
 #include <metal_simdgroup_matrix>
@@ -4498,7 +4497,8 @@ def make_matmul_splitk_fp32(rr=4, rc=2, bk=32):
         f"    for (uint e = tid; e < 64u; e += 32u) {{ uint mm=e/8u, nn=e%8u; "
         f"P[kc*M*N + (m0+{r * 8}u+mm)*N + (n0+{c * 8}u+nn)] = cbuf[e]; }}\n"
         f"    simdgroup_barrier(mem_flags::mem_threadgroup);"
-        for r in range(rr) for c in range(rc)
+        for r in range(rr)
+        for c in range(rc)
     )
     return f"""#include <metal_stdlib>
 #include <metal_simdgroup_matrix>

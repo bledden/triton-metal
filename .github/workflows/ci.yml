@@ -25,7 +25,10 @@ jobs:
           python-version: '3.12'
 
       - name: Install ruff
-        run: pip install ruff>=0.4.0
+        # PINNED: ruff's formatter changes between releases, so an unpinned install
+        # makes `ruff format --check` drift and fail as new ruff versions ship. Bump this
+        # deliberately (and re-run `ruff format triton_msl/ tests/`) rather than floating.
+        run: pip install ruff==0.14.14
 
       - name: Lint
         run: ruff check triton_msl/ tests/

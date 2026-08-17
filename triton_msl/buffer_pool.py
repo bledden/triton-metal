@@ -52,8 +52,6 @@ class MetalBufferPool:
         self._max_scalars = 32
         # Buffer cache: maps (data_ptr, nbytes) → (metal_buf, aligned_mem, size_class)
         # Avoids re-copying read-only tensors that haven't changed between kernel launches
-        self._cache: OrderedDict = OrderedDict()
-        self._cache_max = 32
 
     def acquire(self, nbytes):
         """Acquire a page-aligned Metal buffer of at least nbytes.
@@ -128,36 +126,3 @@ class MetalBufferPool:
         free_list = self._scalar_free[nbytes]
         if len(free_list) < self._max_scalars:
             free_list.append(buf)
-
-    def acquire_cached(self, data_ptr, nbytes):
-        """Try to get a cached Metal buffer for a tensor.
-
-        Returns (metal_buf, aligned_mem, size_class) if cached, None otherwise.
-        Moves the entry to most-recent position (LRU).
-        """
-        key = (data_ptr, nbytes)
-        if key in self._cache:
-            self._cache.move_to_end(key)
-            return self._cache[key]
-        return None
-
-    def cache_buffer(self, data_ptr, nbytes, metal_buf, aligned_mem, size_class):
-        """Cache a Metal buffer for a tensor's data_ptr.
-
-        Evicts least-recently-used entry if cache is full.
-        """
-        key = (data_ptr, nbytes)
-        if key in self._cache:
-            self._cache.move_to_end(key)
-            return
-        if len(self._cache) >= self._cache_max:
-            # Evict LRU entry — release buffer back to pool
-            _, (old_buf, old_mem, old_sc) = self._cache.popitem(last=False)
-            self.release(old_buf, old_mem, old_sc)
-        self._cache[key] = (metal_buf, aligned_mem, size_class)
-
-    def invalidate_cache(self, data_ptr, nbytes):
-        """Invalidate a cached buffer (tensor was written to by kernel)."""
-        key = (data_ptr, nbytes)
-        if key in self._cache:
-            del self._cache[key]

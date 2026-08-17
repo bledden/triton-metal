@@ -334,18 +334,6 @@ class KernelBuilder:
 
     # -- Reduction operations --
 
-    def simd_reduce(self, op, val_var, out_var):
-        """Emit a SIMD-group reduction: out = simd_op(val).
-
-        Uses hardware SIMD intrinsics (32-wide on Apple Silicon).
-        """
-        self._needs_simd_qualifiers = True
-        from triton_msl.codegen.msl_builtins import SIMD_REDUCTIONS
-
-        intrinsic = SIMD_REDUCTIONS[op]
-        self._var(out_var, f"{intrinsic}({val_var})", ty="float")
-        return out_var
-
     def threadgroup_reduce(self, op, val_var, shared_var, out_var, reduce_ty="float"):
         """Emit a full threadgroup reduction: SIMD reduce → shared mem → final SIMD reduce.
 

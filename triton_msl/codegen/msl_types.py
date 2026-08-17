@@ -74,12 +74,3 @@ def triton_type_to_msl(triton_type: str) -> str:
         msl_inner = _TYPE_MAP.get(inner, inner)
         return f"{_PTR_QUALIFIER} {msl_inner}*"
     return _TYPE_MAP.get(triton_type, triton_type)
-
-
-def triton_type_to_msl_const_ref(triton_type: str) -> str:
-    """Convert a scalar Triton type to a constant reference MSL type.
-
-    Used for kernel arguments passed as constant buffers.
-    """
-    msl_type = triton_type_to_msl(triton_type)
-    return f"constant {msl_type}&"

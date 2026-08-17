@@ -2889,49 +2889,6 @@ class _DetectionMixin:
             "block_size": block_size,
         }
 
-    def _detect_dot_epilogue(self) -> str:
-        """Detect epilogue pattern from IR around tt.dot.
-
-        The Triton compiler folds add-matrix/add-rows/add-cols into the
-        tt.dot's 3rd operand (accumulator). So these are detected from the
-        accumulator source, not from ops after the dot.
-
-        Ops AFTER the dot indicate softmax (tt.reduce) or chain-dot (tt.dot).
-
-        Returns one of: 'none', 'add-matrix', 'add-rows', 'add-cols',
-                         'softmax', 'chain-dot'
-        """
-        dot_op = None
-        dot_idx = None
-        for i, ssa in enumerate(self.graph.ops):
-            if ssa.op == "tt.dot":
-                dot_op = ssa
-                dot_idx = i
-                break
-        if dot_op is None:
-            return "none"
-
-        # Check ops AFTER the dot
-        after_dot = self.graph.ops[dot_idx + 1 :]
-        n_dot2 = sum(1 for op in after_dot if op.op == "tt.dot")
-        n_reduce = sum(1 for op in after_dot if op.op == "tt.reduce")
-
-        if n_dot2 >= 1:
-            return "chain-dot"
-        if n_reduce >= 1:
-            return "softmax"
-
-        # Check accumulator (3rd operand of tt.dot).
-        # If it traces back to a tt.load, it's an add epilogue.
-        # If it traces to a zero constant or arith.constant, it's 'none'.
-        if len(dot_op.operand_ids or []) >= 3:
-            acc_id = dot_op.operand_ids[2]
-            acc_source = self._trace_dot_accumulator(acc_id)
-            if acc_source in ("add-matrix", "add-rows", "add-cols"):
-                return acc_source
-
-        return "none"
-
     def _detect_dot_constant_inputs(self):
         """Check if tt.dot inputs are compile-time constants (arith.constant).
 

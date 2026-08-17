@@ -627,24 +627,6 @@ class TTGIRParser:
                 return None
         return None
 
-    def _trace_to_scalar_arg(self, ssa):
-        """Follow SSA chain to find the original scalar argument."""
-        seen = set()
-        current = ssa
-        while current and current not in seen:
-            seen.add(current)
-            val = self.ssa_values.get(current)
-            if val is None:
-                arg_name = current.lstrip("%")
-                if arg_name in self.scalar_args:
-                    return arg_name
-                return None
-            if val[0] == "splat":
-                current = val[1]
-            else:
-                return None
-        return None
-
     def _classify_stores(self):
         """Determine which pointer args are outputs (have tt.store)."""
         for op in self.ops:

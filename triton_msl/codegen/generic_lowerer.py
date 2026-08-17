@@ -458,15 +458,6 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
                     return shape
         return ()
 
-    def _is_scalar(self, ssa_id: int) -> bool:
-        """Check if an SSA value has scalar shape (no dimensions).
-
-        A value is scalar if its shape is () — i.e., it has no tensor
-        dimensions.  Scalars don't need per-thread indexing; they are
-        the same value on every thread.
-        """
-        return self._get_shape(ssa_id) == ()
-
     def _propagate_shape_from_type(self, ssa: SSAValue):
         """Set env_shapes[ssa.id] from the op's result type_str.
 
@@ -990,7 +981,11 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
                         return self._lower_mla_attention_template(info)
                     # Asymmetric single-tensor (qk != v): simd-only. Route iff simd-eligible
                     # (contiguous, v in {64,128}, fp16 for qk>128); else fall through -> refuse.
-                    if not info.get("is_mla") and info.get("v_head_dim") != info["head_dim"] and _simd_fa_eligible(info):
+                    if (
+                        not info.get("is_mla")
+                        and info.get("v_head_dim") != info["head_dim"]
+                        and _simd_fa_eligible(info)
+                    ):
                         return self._lower_flash_attention_template(info)
 
             elif _fa_maxdim == 64:
@@ -1884,89 +1879,6 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
                 else:
                     return True  # integer (or any) output epilogue
         return False
-
-    def _resolve_constant_int(self, ssa_id):
-        """Resolve an SSA ID to its integer constant value, or None."""
-        for ssa in self.graph.ops:
-            if ssa.id == ssa_id and ssa.op == "arith.constant":
-                val = ssa.attrs.get("value")
-                if isinstance(val, int):
-                    return val
-        return None
-
-    def _trace_dot_accumulator(self, acc_id) -> str:
-        """Trace the 3rd operand of tt.dot to determine accumulator source.
-
-        Returns: 'zero' (default), 'add-matrix', 'add-rows', 'add-cols'
-        """
-        # Build a quick lookup
-        op_map = {ssa.id: ssa for ssa in self.graph.ops}
-
-        # Follow the chain: convert_layout → load, or convert_layout → broadcast → load
-        visited = set()
-        current = acc_id
-        has_broadcast = False
-        expand_dims_shape = None  # Track expand_dims output to distinguish rows vs cols
-
-        while current in op_map and current not in visited:
-            visited.add(current)
-            op = op_map[current]
-
-            if op.op == "tt.load":
-                # Found a load — it's an add epilogue
-                if has_broadcast:
-                    # Use expand_dims shape to distinguish rows vs cols:
-                    # (M, 1) = add-rows ([:, None]), (1, N) = add-cols ([None, :])
-                    if expand_dims_shape and len(expand_dims_shape) == 2:
-                        if expand_dims_shape[0] == 1:
-                            return "add-cols"
-                        elif expand_dims_shape[1] == 1:
-                            return "add-rows"
-                    # Fallback: use load shape vs dot shape
-                    load_shape = _extract_shape(op.type_str)
-                    dot_shape = (
-                        _extract_shape(op_map[next(i for i in op_map if op_map[i].op == "tt.dot")].type_str)
-                        if any(op_map[i].op == "tt.dot" for i in op_map)
-                        else []
-                    )
-                    if load_shape and dot_shape and len(dot_shape) >= 2:
-                        M_dim, N_dim = dot_shape[0], dot_shape[1]
-                        load_size = load_shape[0] if len(load_shape) == 1 else max(load_shape)
-                        if M_dim != N_dim:
-                            if load_size == M_dim:
-                                return "add-rows"
-                            elif load_size == N_dim:
-                                return "add-cols"
-                    return "add-rows"  # default broadcast
-                return "add-matrix"
-
-            if op.op == "arith.constant":
-                return "zero"
-
-            # Follow through passthrough ops
-            if op.op in (
-                "ttg.convert_layout",
-                "tt.broadcast",
-                "tt.expand_dims",
-                "tt.splat",
-                "arith.extf",
-                "arith.truncf",
-                "arith.sitofp",
-                "arith.uitofp",
-            ):
-                if op.op == "tt.broadcast":
-                    has_broadcast = True
-                if op.op == "tt.expand_dims":
-                    has_broadcast = True
-                    expand_dims_shape = _extract_shape(op.type_str)
-                if op.operand_ids:
-                    current = op.operand_ids[0]
-                    continue
-
-            # Unknown op — assume it's derived from a computation (zero)
-            break
-
-        return "zero"
 
     def _has_tensor_ops(self) -> bool:
         """Check if the kernel has any tensor-producing ops (tt.make_range, etc.).
@@ -5251,7 +5163,7 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
             dot_pv = _pv3[0]
             _a, _b = _qk3
             if len(_b.operand_ids) > 2 and _b.operand_ids[2] == _a.id:
-                dot_qk, dot_rope = _a, _b   # nope=_a; rope=_b accumulates onto nope
+                dot_qk, dot_rope = _a, _b  # nope=_a; rope=_b accumulates onto nope
             elif len(_a.operand_ids) > 2 and _a.operand_ids[2] == _b.id:
                 dot_qk, dot_rope = _b, _a
             else:
@@ -5320,8 +5232,8 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
             or len(pv_out_shape) != 2
         ):
             _refuse("the dot tile shapes")
-        block_m, head_dim = a_shape          # head_dim here == qk_head_dim (QK contraction)
-        nope_dim = head_dim                   # symmetric: the whole QK dim
+        block_m, head_dim = a_shape  # head_dim here == qk_head_dim (QK contraction)
+        nope_dim = head_dim  # symmetric: the whole QK dim
         rope_dim = 0
         if is_mla:
             # The QK contraction spans BOTH dots: qk_head_dim = nope_dim + rope_dim.
@@ -5329,7 +5241,7 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
             if not rope_a or len(rope_a) != 2 or rope_a[0] != block_m:
                 _refuse("the MLA rope dot A shape")
             rope_dim = rope_a[1]
-            head_dim = nope_dim + rope_dim    # e.g. 128 (nope) + 64 (rope) = 192
+            head_dim = nope_dim + rope_dim  # e.g. 128 (nope) + 64 (rope) = 192
         if qk_out_shape[0] != block_m:
             _refuse("a consistent block_m across the two dots")
         block_n = qk_out_shape[1]
@@ -5457,18 +5369,33 @@ class GenericLowerer(_ControlFlowMixin, _ReduceScanMixin, _EmissionMixin, _Detec
         # contiguous Q/K, so no @jit arg_decls/bindings. scale = 1/sqrt(qk_head_dim) as
         # detected (the user's per-part pre-scale is bypassed; the kernel scales Q).
         msl = make_flash_attention_kernel_simdgroup(
-            info["head_dim"], 32, 64,
-            causal=info["causal"], out_dtype=info["out_dtype"],
-            kernel_name=name, scale=info["scale"], v_head_dim=info["v_head_dim"],
+            info["head_dim"],
+            32,
+            64,
+            causal=info["causal"],
+            out_dtype=info["out_dtype"],
+            kernel_name=name,
+            scale=info["scale"],
+            v_head_dim=info["v_head_dim"],
             half_accumulate=_fa_half_accumulate(info["out_dtype"]),
         )
         self.effective_block_size = 256
         self._used_pid_axes = {0, 1}
         # ('mla', msl, kernel_name, tg_size, q_nope, q_rope, k_nope, k_rope, v, out, Z, H, N)
         self._flash_attention = (
-            "mla", msl, name, 256,
-            info["q"], info["q_rope"], info["k"], info["k_rope"],
-            info["v"], info["out"], info["Z"], info["H"], info["N_CTX"],
+            "mla",
+            msl,
+            name,
+            256,
+            info["q"],
+            info["q_rope"],
+            info["k"],
+            info["k_rope"],
+            info["v"],
+            info["out"],
+            info["Z"],
+            info["H"],
+            info["N_CTX"],
         )
         self._prescan_stores()
         return msl

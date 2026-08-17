@@ -82,14 +82,6 @@ class MetalUtils:
         self._device = None
         self._command_queue = None
         self._buffer_pool = None
-        # Batched dispatch state
-        self._batch_cb = None  # Active MTLCommandBuffer (None = no batch)
-        self._batch_count = 0  # Dispatches encoded in current batch
-        self._batch_max = 16  # Max dispatches per command buffer
-        self._batch_mode = False  # True = defer commit until flush()
-        # Deferred copy-backs waiting on current batch
-        self._deferred_copies = []  # [(metal_buf, tensor, nbytes, cpu_tensor)]
-        self._deferred_releases = []  # [(metal_buf, aligned_mem, size_class) or ("scalar", buf, sz)]
 
     @property
     def device(self):
@@ -132,24 +124,6 @@ class MetalUtils:
 
             self._buffer_pool = MetalBufferPool(self.device)
         return self._buffer_pool
-
-    @property
-    def batch_active(self):
-        """True if batched dispatch mode is active."""
-        return self._batch_mode
-
-    def begin_batch(self):
-        """Start batched dispatch mode.
-
-        Subsequent launch() calls encode into a shared command buffer.
-        Call flush() to commit and wait.
-        """
-        self._batch_mode = True
-
-    def end_batch(self):
-        """End batched dispatch mode and flush any pending work."""
-        self.flush()
-        self._batch_mode = False
 
     def load_binary(self, name, kernel, shared_mem, device=None):
         """Load a metallib and create a compute pipeline state.
@@ -248,41 +222,17 @@ class MetalUtils:
         buffers,
         sync=True,
     ):
-        """Dispatch a compute kernel.
-
-        In batch mode, encodes the dispatch into the current command buffer
-        without committing. Call flush() to commit and wait.
+        """Dispatch a compute kernel and (by default) wait for completion.
 
         Args:
             pipeline_state: MTLComputePipelineState from load_binary.
             grid: (grid_x, grid_y, grid_z) threadgroup counts.
             threadgroup_size: (threads_x, threads_y, threads_z) per threadgroup.
             buffers: list of (MTLBuffer, offset) tuples bound to sequential indices.
-            sync: if True and not in batch mode, wait for completion immediately.
+            sync: if True, wait for completion immediately.
         """
         import Metal
 
-        # In batch mode, reuse the current command buffer
-        if self._batch_mode:
-            if self._batch_cb is None or self._batch_count >= self._batch_max:
-                # Need a new command buffer (first dispatch or batch full)
-                if self._batch_cb is not None:
-                    self._flush_current_batch()
-                self._batch_cb = self.command_queue.commandBuffer()
-                self._batch_count = 0
-
-            encoder = self._batch_cb.computeCommandEncoder()
-            encoder.setComputePipelineState_(pipeline_state)
-            for i, (buf, offset) in enumerate(buffers):
-                encoder.setBuffer_offset_atIndex_(buf, offset, i)
-            grid_size = Metal.MTLSizeMake(*grid)
-            tg_size = Metal.MTLSizeMake(*threadgroup_size)
-            encoder.dispatchThreadgroups_threadsPerThreadgroup_(grid_size, tg_size)
-            encoder.endEncoding()
-            self._batch_count += 1
-            return
-
-        # Non-batch mode: immediate dispatch
         command_buffer = self.command_queue.commandBuffer()
         encoder = command_buffer.computeCommandEncoder()
         encoder.setComputePipelineState_(pipeline_state)
@@ -302,83 +252,6 @@ class MetalUtils:
             if status == Metal.MTLCommandBufferStatusError:
                 error = command_buffer.error()
                 raise RuntimeError(f"Metal kernel execution failed: {error}")
-        else:
-            self._batch_cb = command_buffer  # Track for later flush
-
-    def flush(self):
-        """Commit and wait on any pending command buffer.
-
-        Processes all deferred copy-backs and releases pool buffers.
-        Safe to call when no batch is active (no-op).
-        """
-        if self._batch_cb is not None:
-            self._flush_current_batch()
-        self._process_deferred_copies()
-
-    def _flush_current_batch(self):
-        """Commit the current batch command buffer and wait."""
-        import Metal
-
-        cb = self._batch_cb
-        self._batch_cb = None
-        self._batch_count = 0
-
-        cb.commit()
-        cb.waitUntilCompleted()
-
-        status = cb.status()
-        if status == Metal.MTLCommandBufferStatusError:
-            error = cb.error()
-            raise RuntimeError(f"Metal kernel execution failed: {error}")
-
-    def defer_copy_back(self, tensor_copies, pool_releases):
-        """Register copy-back operations to execute on flush()."""
-        self._deferred_copies.extend(tensor_copies)
-        self._deferred_releases.extend(pool_releases)
-
-    def _process_deferred_copies(self):
-        """Execute all deferred copy-backs and release pool buffers."""
-        import ctypes
-
-        for entry in self._deferred_copies:
-            metal_buf, tensor, nbytes = entry[0], entry[1], entry[2]
-            cpu_tensor = entry[3] if len(entry) > 3 else None
-
-            import torch as _torch
-
-            is_f64_downcast = (
-                cpu_tensor is not None
-                and hasattr(tensor, "dtype")
-                and tensor.dtype == _torch.float64
-                and hasattr(cpu_tensor, "dtype")
-                and cpu_tensor.dtype == _torch.float32
-            )
-
-            if is_f64_downcast:
-                src_view = metal_buf.contents().as_buffer(nbytes)
-                dst = (ctypes.c_char * nbytes).from_address(cpu_tensor.data_ptr())
-                ctypes.memmove(dst, (ctypes.c_char * nbytes).from_buffer(src_view), nbytes)
-                tensor.copy_(cpu_tensor.double())
-            elif cpu_tensor is not None:
-                src_view = metal_buf.contents().as_buffer(nbytes)
-                dst = (ctypes.c_char * nbytes).from_address(cpu_tensor.data_ptr())
-                ctypes.memmove(dst, (ctypes.c_char * nbytes).from_buffer(src_view), nbytes)
-                tensor.copy_(cpu_tensor)
-                _torch.mps.synchronize()
-            else:
-                src_view = metal_buf.contents().as_buffer(nbytes)
-                dst = (ctypes.c_char * nbytes).from_address(tensor.data_ptr())
-                ctypes.memmove(dst, (ctypes.c_char * nbytes).from_buffer(src_view), nbytes)
-
-        self._deferred_copies.clear()
-
-        pool = self.buffer_pool
-        for release_entry in self._deferred_releases:
-            if release_entry[0] == "scalar":
-                pool.release_scalar(release_entry[1], release_entry[2])
-            else:
-                pool.release(release_entry[0], release_entry[1], release_entry[2])
-        self._deferred_releases.clear()
 
     def make_buffer_from_ptr(self, ptr, nbytes):
         """Create a Metal buffer wrapping an existing pointer (zero-copy UMA).
@@ -644,10 +517,7 @@ class MetalLauncher:
             isinstance(flash_attention, (tuple, list)) and len(flash_attention) and flash_attention[0] == "mla"
         )
         if (
-            self._msl is not None
-            or fast_matmul is not None
-            or quant_matmul is not None
-            or flash_attention is not None
+            self._msl is not None or fast_matmul is not None or quant_matmul is not None or flash_attention is not None
         ) and _os.environ.get("TRITON_MSL_COMPILE_SHADER", "1") != "0":
             try:
                 _rt = _get_compile_shader_runtime()
@@ -696,8 +566,15 @@ class MetalLauncher:
                         from triton_msl.autotuning._fa_dispatch import dispatch_flash_attention
 
                         if dispatch_flash_attention(
-                            _rt, flash_attention, self.kernel_name, kargs, gridX, gridY, gridZ,
-                            launch_exit_hook=launch_exit_hook, launch_metadata=launch_metadata,
+                            _rt,
+                            flash_attention,
+                            self.kernel_name,
+                            kargs,
+                            gridX,
+                            gridY,
+                            gridZ,
+                            launch_exit_hook=launch_exit_hook,
+                            launch_metadata=launch_metadata,
                         ):
                             return
 
@@ -1066,82 +943,76 @@ class MetalLauncher:
                 except Exception:
                     dispatch_fn = function
 
-        if utils.batch_active:
-            # Batched mode: encode dispatch, defer copy-back until flush()
-            utils.launch(dispatch_fn, grid, threadgroup_size, buffers)
-            if tensor_copies or pool_releases:
-                utils.defer_copy_back(tensor_copies, pool_releases)
-        else:
-            # Immediate mode: dispatch, wait, copy-back
-            utils.launch(dispatch_fn, grid, threadgroup_size, buffers)
+        # Immediate mode: dispatch, wait, copy-back
+        utils.launch(dispatch_fn, grid, threadgroup_size, buffers)
 
-            # Copy results back from Metal buffers to tensor memory.
-            for entry in tensor_copies:
-                metal_buf, tensor, nbytes = entry[0], entry[1], entry[2]
-                cpu_tensor = entry[3] if len(entry) > 3 else None
-                _marker = entry[4] if len(entry) > 4 else None
+        # Copy results back from Metal buffers to tensor memory.
+        for entry in tensor_copies:
+            metal_buf, tensor, nbytes = entry[0], entry[1], entry[2]
+            cpu_tensor = entry[3] if len(entry) > 3 else None
+            _marker = entry[4] if len(entry) > 4 else None
 
-                import torch as _torch
+            import torch as _torch
 
-                # Faithful strided round-trip: the device buffer mirrors the full
-                # strided storage (reach >= numel). Read it ALL back into a flat CPU
-                # buffer, then write the values into the tensor through an as_strided
-                # view that maps each logical element to its strided storage slot —
-                # so a strided operand is restored/written WITHOUT densifying (the
-                # numel-prefix memmove below would corrupt a column-sliced layout).
-                if isinstance(_marker, tuple) and _marker[0] == "faithful_strided":
-                    _reach, _esz = _marker[1], _marker[2]
-                    _rbytes = _reach * _esz
-                    src_view = metal_buf.contents().as_buffer(_rbytes)
-                    flat_cpu = _torch.empty(_reach, dtype=tensor.dtype)
-                    ctypes.memmove(
-                        (ctypes.c_char * _rbytes).from_address(flat_cpu.data_ptr()),
-                        (ctypes.c_char * _rbytes).from_buffer(src_view),
-                        _rbytes,
-                    )
-                    # Index the flat buffer by the tensor's own strides so each logical
-                    # [i,j,...] reads flat[i*s0 + j*s1 + ...]. ``flat_cpu`` was built from
-                    # ``arg.as_strided((reach,),(1,),storage_offset)`` (dispatch), so it is
-                    # ALREADY re-based to the storage offset — index it from 0, NOT from
-                    # tensor.storage_offset() again (double-applying the offset would push
-                    # the view out of bounds for any non-zero-offset output and silently
-                    # drop the write). Failure here is a silent-wrong (output not written),
-                    # so do NOT swallow it — raise loudly.
-                    strided_logical = flat_cpu.as_strided(tuple(tensor.shape), tuple(tensor.stride()), 0)
-                    tensor.copy_(strided_logical.to(tensor.device))
-                    _torch.mps.synchronize()
-                    continue
-
-                is_f64_downcast = (
-                    cpu_tensor is not None
-                    and hasattr(tensor, "dtype")
-                    and tensor.dtype == _torch.float64
-                    and hasattr(cpu_tensor, "dtype")
-                    and cpu_tensor.dtype == _torch.float32
+            # Faithful strided round-trip: the device buffer mirrors the full
+            # strided storage (reach >= numel). Read it ALL back into a flat CPU
+            # buffer, then write the values into the tensor through an as_strided
+            # view that maps each logical element to its strided storage slot —
+            # so a strided operand is restored/written WITHOUT densifying (the
+            # numel-prefix memmove below would corrupt a column-sliced layout).
+            if isinstance(_marker, tuple) and _marker[0] == "faithful_strided":
+                _reach, _esz = _marker[1], _marker[2]
+                _rbytes = _reach * _esz
+                src_view = metal_buf.contents().as_buffer(_rbytes)
+                flat_cpu = _torch.empty(_reach, dtype=tensor.dtype)
+                ctypes.memmove(
+                    (ctypes.c_char * _rbytes).from_address(flat_cpu.data_ptr()),
+                    (ctypes.c_char * _rbytes).from_buffer(src_view),
+                    _rbytes,
                 )
+                # Index the flat buffer by the tensor's own strides so each logical
+                # [i,j,...] reads flat[i*s0 + j*s1 + ...]. ``flat_cpu`` was built from
+                # ``arg.as_strided((reach,),(1,),storage_offset)`` (dispatch), so it is
+                # ALREADY re-based to the storage offset — index it from 0, NOT from
+                # tensor.storage_offset() again (double-applying the offset would push
+                # the view out of bounds for any non-zero-offset output and silently
+                # drop the write). Failure here is a silent-wrong (output not written),
+                # so do NOT swallow it — raise loudly.
+                strided_logical = flat_cpu.as_strided(tuple(tensor.shape), tuple(tensor.stride()), 0)
+                tensor.copy_(strided_logical.to(tensor.device))
+                _torch.mps.synchronize()
+                continue
 
-                if is_f64_downcast:
-                    src_view = metal_buf.contents().as_buffer(nbytes)
-                    dst = (ctypes.c_char * nbytes).from_address(cpu_tensor.data_ptr())
-                    ctypes.memmove(dst, (ctypes.c_char * nbytes).from_buffer(src_view), nbytes)
-                    tensor.copy_(cpu_tensor.double())
-                elif cpu_tensor is not None:
-                    src_view = metal_buf.contents().as_buffer(nbytes)
-                    dst = (ctypes.c_char * nbytes).from_address(cpu_tensor.data_ptr())
-                    ctypes.memmove(dst, (ctypes.c_char * nbytes).from_buffer(src_view), nbytes)
-                    tensor.copy_(cpu_tensor)
-                    _torch.mps.synchronize()
-                else:
-                    src_view = metal_buf.contents().as_buffer(nbytes)
-                    dst = (ctypes.c_char * nbytes).from_address(tensor.data_ptr())
-                    ctypes.memmove(dst, (ctypes.c_char * nbytes).from_buffer(src_view), nbytes)
+            is_f64_downcast = (
+                cpu_tensor is not None
+                and hasattr(tensor, "dtype")
+                and tensor.dtype == _torch.float64
+                and hasattr(cpu_tensor, "dtype")
+                and cpu_tensor.dtype == _torch.float32
+            )
 
-            # Release pool buffers back to pool for reuse
-            for release_entry in pool_releases:
-                if release_entry[0] == "scalar":
-                    pool.release_scalar(release_entry[1], release_entry[2])
-                else:
-                    pool.release(release_entry[0], release_entry[1], release_entry[2])
+            if is_f64_downcast:
+                src_view = metal_buf.contents().as_buffer(nbytes)
+                dst = (ctypes.c_char * nbytes).from_address(cpu_tensor.data_ptr())
+                ctypes.memmove(dst, (ctypes.c_char * nbytes).from_buffer(src_view), nbytes)
+                tensor.copy_(cpu_tensor.double())
+            elif cpu_tensor is not None:
+                src_view = metal_buf.contents().as_buffer(nbytes)
+                dst = (ctypes.c_char * nbytes).from_address(cpu_tensor.data_ptr())
+                ctypes.memmove(dst, (ctypes.c_char * nbytes).from_buffer(src_view), nbytes)
+                tensor.copy_(cpu_tensor)
+                _torch.mps.synchronize()
+            else:
+                src_view = metal_buf.contents().as_buffer(nbytes)
+                dst = (ctypes.c_char * nbytes).from_address(tensor.data_ptr())
+                ctypes.memmove(dst, (ctypes.c_char * nbytes).from_buffer(src_view), nbytes)
+
+        # Release pool buffers back to pool for reuse
+        for release_entry in pool_releases:
+            if release_entry[0] == "scalar":
+                pool.release_scalar(release_entry[1], release_entry[2])
+            else:
+                pool.release(release_entry[0], release_entry[1], release_entry[2])
 
         if launch_exit_hook:
             launch_exit_hook(launch_metadata)

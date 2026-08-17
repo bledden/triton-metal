@@ -28,28 +28,6 @@ _MSL_TO_MLX_DTYPE = {
 }
 
 
-def _mx_dtype_from_array(arr):
-    """Get MLX dtype from an MLX array."""
-    return arr.dtype
-
-
-def _mx_dtype_str(dtype):
-    """Convert MLX dtype to MSL type string for metal_kernel."""
-    dtype_map = {
-        mx.float32: "float",
-        mx.float16: "half",
-        mx.bfloat16: "bfloat",
-        mx.int32: "int",
-        mx.uint32: "uint",
-        mx.int16: "short",
-        mx.uint16: "ushort",
-        mx.int8: "char",
-        mx.uint8: "uchar",
-        mx.bool_: "bool",
-    }
-    return dtype_map.get(dtype, "float")
-
-
 class MLXLauncher:
     """Launch Triton-compiled MSL kernels via MLX's metal_kernel API.
 

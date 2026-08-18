@@ -102,7 +102,8 @@ def flash_attention(q, k, v, scale=None, causal=False):
     """FlashAttention whose backward runs on Metal (trainable).
 
     Args:
-        q, k, v: ``[..., N, 64]`` float32 on ``mps``; leading dims are folded to ZH.
+        q, k, v: ``[..., N, 64]`` float32/float16/bfloat16 on ``mps``; leading dims fold to ZH.
+            Half inputs compute in fp32 internally and cast back (grads match the input dtype).
         scale: softmax scale (default ``1/sqrt(64)``).
         causal: causal masking.
 
@@ -114,7 +115,12 @@ def flash_attention(q, k, v, scale=None, causal=False):
         raise ValueError(f"N must be divisible by 16, got {q.shape[-2]}")
     if scale is None:
         scale = q.shape[-1] ** -0.5
+    in_dtype = q.dtype
+    if in_dtype in (torch.float16, torch.bfloat16):
+        # fp16/bf16 training: the kernels are fp32, so compute in fp32 internally; autograd
+        # flows the grads back through the .float()/.to() casts to the original half tensors.
+        q, k, v = q.float(), k.float(), v.float()
     orig = q.shape
     q2, k2, v2 = (t.reshape(-1, orig[-2], orig[-1]) for t in (q, k, v))
     out = _FlashAttentionFn.apply(q2, k2, v2, scale, causal)
-    return out.reshape(orig)
+    return out.reshape(orig).to(in_dtype)

@@ -68,3 +68,32 @@ def test_flash_attention_rejects_bad_shape():
             torch.zeros(2, 4, 128, 128, device="mps"),
             torch.zeros(2, 4, 128, 128, device="mps"),
         )  # head dim != 64
+
+
+@requires
+@pytest.mark.parametrize("causal", [False, True])
+def test_flash_attention_fp16(causal):
+    """fp16 training works (fp32 internal); output and grads are fp16, matching torch SDPA."""
+    from triton_msl.fa_backward import flash_attention
+
+    Z, H, N, Dh = 2, 4, 128, 64
+    scale = Dh**-0.5
+    torch.manual_seed(1)
+    q = torch.randn(Z, H, N, Dh, device="mps", dtype=torch.float16, requires_grad=True)
+    k = torch.randn(Z, H, N, Dh, device="mps", dtype=torch.float16, requires_grad=True)
+    v = torch.randn(Z, H, N, Dh, device="mps", dtype=torch.float16, requires_grad=True)
+    dO = torch.randn(Z, H, N, Dh, device="mps", dtype=torch.float16)
+
+    qr, kr, vr = (t.detach().clone().requires_grad_() for t in (q, k, v))
+    Oref = F.scaled_dot_product_attention(qr, kr, vr, is_causal=causal, scale=scale)
+    Oref.backward(dO)
+
+    O = flash_attention(q, k, v, scale=scale, causal=causal)
+    O.backward(dO)
+    torch.mps.synchronize()
+
+    assert O.dtype == torch.float16
+    for name, ours, ref in (("dQ", q.grad, qr.grad), ("dK", k.grad, kr.grad), ("dV", v.grad, vr.grad)):
+        assert ours.dtype == torch.float16
+        rel = (ours.float() - ref.float()).abs().max().item() / ref.float().abs().max().item()
+        assert rel < 3e-2, f"{name} fp16 rel {rel:.2e} (causal={causal})"

@@ -6,10 +6,11 @@ the forward computes the output (and the logsumexp the backward needs), and the 
 dispatches the tiled, MMA-optimized Metal dK/dV and dQ kernels (FA-2 backward). So an
 attention call inside a training loop gets its gradients from Metal.
 
-Head dim is fixed at 64, ``N % 16 == 0`` (the backward tile). The forward currently
-recomputes the logsumexp in torch (a fused forward that saves it is a follow-up). See
-``make_fa_backward_dkv_kernel`` / ``make_fa_backward_dq_kernel`` for the kernels and
-``tests/test_fa_backward.py`` for the autograd cross-check.
+Head dim is fixed at 64, ``N % 16 == 0`` (the backward tile). The forward computes O (torch
+SDPA, which routes to the backend's simdgroup FA) and the logsumexp on Metal via a dedicated
+flash kernel (``make_fa_logsumexp_kernel``), so it never materializes the N*N score matrix.
+See ``make_fa_backward_dkv_kernel`` / ``make_fa_backward_dq_kernel`` for the backward kernels
+and ``tests/test_fa_backward.py`` for the autograd cross-check.
 """
 
 import torch
@@ -18,10 +19,34 @@ import torch.nn.functional as F
 from triton_msl.codegen._msl_templates import (
     make_fa_backward_dkv_kernel,
     make_fa_backward_dq_kernel,
+    make_fa_logsumexp_kernel,
 )
 
 _RT = None
 _LIBS = {}  # bool(causal) -> (dkv_lib, dq_lib)
+_LSE_LIBS = {}  # bool(causal) -> logsumexp lib
+
+
+def _logsumexp(q, k, scale, causal):
+    """Flash log-sum-exp on Metal (no N*N materialization). q,k: [ZH,N,64] mps float32 -> [ZH,N]."""
+    from triton_msl.backend.compile_shader_runtime import CompileShaderRuntime
+
+    global _RT
+    if _RT is None:
+        _RT = CompileShaderRuntime()
+    key = bool(causal)
+    if key not in _LSE_LIBS:
+        _LSE_LIBS[key] = _RT.get_library(make_fa_logsumexp_kernel(causal))
+    ZH, N, _ = q.shape
+    L = torch.empty(ZH, N, device=q.device, dtype=torch.float32)
+    _RT.dispatch(
+        _LSE_LIBS[key],
+        "fa_lse",
+        [q.contiguous(), k.contiguous(), L, N, scale],
+        threads=((N // 16) * 256, ZH, 1),
+        group_size=(256, 1, 1),
+    )
+    return L
 
 
 def _dispatch_backward(q, k, v, dO, L, D, scale, causal):
@@ -51,11 +76,7 @@ class _FlashAttentionFn(torch.autograd.Function):
     @staticmethod
     def forward(ctx, q, k, v, scale, causal):
         O = F.scaled_dot_product_attention(q, k, v, is_causal=causal, scale=scale)
-        S = (q @ k.transpose(-2, -1)) * scale
-        if causal:
-            N = q.shape[-2]
-            S = S.masked_fill(torch.triu(torch.ones(N, N, dtype=torch.bool, device=q.device), 1), float("-inf"))
-        L = torch.logsumexp(S, dim=-1)
+        L = _logsumexp(q, k, scale, causal)  # Metal flash logsumexp — no N*N materialization
         ctx.save_for_backward(q, k, v, O, L)
         ctx.scale, ctx.causal = scale, causal
         return O

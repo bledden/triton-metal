@@ -44,6 +44,6 @@ o.backward(dO)                              # dQ/dK/dV computed on Metal
 ```
 
 - head dim `== 64`, `N % 16 == 0`, full and causal.
-- The forward currently recomputes the logsumexp in torch to hand it to the backward. This
-  is correct and fine at realistic sizes (transient `O(N²)`); a fused forward kernel that
-  emits the logsumexp directly is an optional perf follow-up, not a correctness gap.
+- The forward computes `O` (torch SDPA, which routes to the backend's simdgroup FA) and the
+  log-sum-exp the backward needs via a dedicated Metal flash kernel (`make_fa_logsumexp_kernel`,
+  tiled/online), so it never materializes the N×N score matrix.

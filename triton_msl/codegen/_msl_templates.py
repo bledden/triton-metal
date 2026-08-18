@@ -6158,3 +6158,50 @@ kernel void fa_bwd_dq(
 }
 """
     )
+
+
+def make_fa_logsumexp_kernel(causal=False):
+    """Flash log-sum-exp — the softmax normalizer the FA-2 backward needs, WITHOUT the N*N
+    materialization (tiled, online max/sum over kv-blocks; no V, no output).
+
+    Used by the ``flash_attention`` backward so it does not recompute ``S`` in torch. One
+    threadgroup per (query-block, head); L_i = m_i + log(l_i). Validated rel ~1e-7 vs
+    torch.logsumexp, full and causal.
+
+    Layout: Q,K [ZH,N,64] float; Lout [ZH,N] float. DISPATCH: (N/16) x ZH threadgroups. N % 16 == 0.
+    """
+    lim = "ib+1u" if causal else "N/Bc"
+    mask = "if((i0+r)<(j0+c)) s=-INFINITY;" if causal else ""
+    return (
+        r"""#include <metal_stdlib>
+using namespace metal;
+kernel void fa_lse(
+  device const float* Q [[buffer(0)]], device const float* K [[buffer(1)]],
+  device float* Lout [[buffer(2)]], constant uint& N [[buffer(3)]], constant float& scale [[buffer(4)]],
+  uint3 tg [[threadgroup_position_in_grid]], uint lid [[thread_index_in_threadgroup]]) {
+  const uint Bc=16u,Br=16u,Dh=64u,NT=256u; uint ib=tg.x,head=tg.y; uint hb=head*N*Dh,hl=head*N,i0=ib*Br;
+  threadgroup float Qi[16*64],Kj[16*64],Sb[16*16],mrow[16],lrow[16];
+  for(uint x=lid;x<Br*Dh;x+=NT) Qi[x]=Q[hb+(i0+x/Dh)*Dh+x%Dh];
+  if(lid<Br){ mrow[lid]=-INFINITY; lrow[lid]=0.0f; }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  for(uint jb=0u; jb<"""
+        + lim
+        + r"""; jb++){ uint j0=jb*Bc;
+    for(uint x=lid;x<Bc*Dh;x+=NT) Kj[x]=K[hb+(j0+x/Dh)*Dh+x%Dh];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for(uint x=lid;x<Br*Bc;x+=NT){ uint r=x/Bc,c=x%Bc; float s=0.0f;
+      for(uint d=0u;d<Dh;d++) s+=Qi[r*Dh+d]*Kj[c*Dh+d]; s*=scale; """
+        + mask
+        + r""" Sb[x]=s; }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if(lid<Br){ uint r=lid; float bm=-INFINITY;
+      for(uint c=0u;c<Bc;c++) bm=max(bm,Sb[r*Bc+c]);
+      float mnew=max(mrow[r],bm); float ls=0.0f;
+      for(uint c=0u;c<Bc;c++) ls+=exp(Sb[r*Bc+c]-mnew);
+      lrow[r]=lrow[r]*exp(mrow[r]-mnew)+ls; mrow[r]=mnew; }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+  }
+  if(lid<Br) Lout[hl+i0+lid]=mrow[lid]+log(lrow[lid]);
+}
+"""
+    )

@@ -1,6 +1,6 @@
 # triton-msl Implementation Roadmap
 
-> Last updated: 2026-06-18 (torch.compile / inductor backend port landed). The dated phase tables further
+> Last updated: 2026-08-18 (attention perf, quantized inference, AMD; see "Current status" below). The dated phase tables further
 > below were authored **2026-04-09** and are kept as a detailed reference — but much of
 > Phase 0–1 + 2A + 6A has since landed. **Read "Current status" first for what's actually
 > done vs. remaining.**
@@ -16,10 +16,16 @@ dependencies, scope estimates, and file-level change lists.
 0 failed / 3,782 skipped** (captured 2026-06-17) via `scripts/run_upstream_tests.py` (`--device cpu`, which loads
 the `conftest_metal` skip plugin). The skips are hardware-impossible (fp64, fp8/microscaling,
 64-bit atomics, TMA, device printf) or unimplemented features — **each refused loudly, never
-silent-wrong**. Project suite **799 / 0** (incl. 38 `torch.compile` + real-model tests + 7
-training tests, all un-gated); FlashAttention causal + non-causal at head_dim 32 / 64 / 128.
+silent-wrong**. Project suite **1,982 / 0**; FlashAttention causal + non-causal at head_dim 32 / 64 / 128.
 **`torch.compile` routes through triton-msl on Metal** — inference *and* training (forward +
 backward), static + dynamic shapes; see below.
+
+**Since 2026-06-17 (perf + frontier work, see `CHANGELOG.md`):** a dispatch fix made
+FlashAttention **faster than PyTorch SDPA** in every measured case (and ~0.88× Apple MLX at
+the largest sizes); weight-only **int8/int4** matmul + decode auto-route (int8 decode at the
+memory roofline); **MLA** (nope/rope) attention auto-routes; **KDA** linear/delta attention
+and a trainable **Metal FlashAttention backward** ship as direct ops; and byte-identical
+output was verified on a **third vendor (AMD MI300X / ROCm)**.
 
 ### Landed since this roadmap was written (2026-04-09)
 - **Phase 0** (foundation) — all items.

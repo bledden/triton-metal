@@ -1,6 +1,6 @@
 # triton-msl Architecture
 
-Metal backend for OpenAI Triton [\[1\]](../REFERENCES.md). Compiles `@triton.jit`
+Metal backend for Triton [\[1\]](../REFERENCES.md). Compiles `@triton.jit`
 kernels to MSL [\[8\]](../REFERENCES.md) (Metal Shading Language) and
 dispatches on Apple GPUs.
 

@@ -4,8 +4,8 @@
 
 ### Performance
 
-- **FlashAttention parallel online-softmax — same accuracy, up to 1.8× faster (and
-  now past the MLX ceiling on causal).** The simdgroup FA did its per-row online-softmax
+- **FlashAttention parallel online-softmax — same accuracy, up to 1.8× faster on
+  causal.** The simdgroup FA did its per-row online-softmax
   with only 32 of 256 threads, each serially scanning all BN=64 score columns (measured
   ~14% of a full block, and much more of a causal block where work-skipping leaves fewer
   MMAs). It now runs on all 256 threads — 8 per row, each scanning BN/8 columns, reduced
@@ -13,8 +13,10 @@
   `-INFINITY` in the max pass, so `exp()`=0 in the sum pass, preserving the causal/tail
   mask without a second guard). Same-accuracy A/B vs the prior kernel: **full 1.11–1.13×,
   causal 1.78–1.84×**. Absolute (fp16 vs SDPA / MLX): full 2.0–2.5× SDPA (0.79–0.88×
-  MLX), **causal 4.1–4.6× SDPA and 1.65–1.68× MLX** — beating Apple's hand-tuned MLX FA
-  on the causal path. Correct across hd64/hd128/MLA, full+causal, fp16+fp32.
+  MLX), **causal 4.1–4.6× SDPA**; about even with MLX's own `mask="causal"` kernel at
+  moderate N and ~0.88× at the largest (the earlier "1.65–1.68× MLX" reading compared
+  against MLX's non-skipping mask-array path, not its causal kernel). Correct across
+  hd64/hd128/MLA, full+causal, fp16+fp32.
 
 - **FlashAttention now beats PyTorch SDPA (was ~0.3× — a dispatch bug, not a slow
   kernel).** The simdgroup FA kernel (head_dim=128, BM=32/BN=64) was always fast, but
@@ -107,6 +109,22 @@
   counts, shallow K, fp16/bf16) falls through to the unchanged single-pass fast
   kernel, so no shape regresses (the threshold was tuned by measuring the *shipped*
   path, where the partials-alloc + second-dispatch overhead made n_tiles=128 regress).
+
+### Attention (frontier ops + training)
+
+- **KDA (Kimi Delta Attention / gated DeltaNet) now runs on Metal.** Linear/delta-rule
+  attention with a per-key-dimension forget gate — not softmax attention, and its chunked
+  prefill needs a UT-transform triangular solve, so it ships as a **direct op**
+  (`triton_msl.kda`) rather than a `@triton.jit` route. Chunked MMA prefill (C=8) +
+  recurrent decode, fp16/fp32, validated against a recurrent reference
+  (`tests/test_kda.py`). See `docs/attention_ops.md`.
+
+- **FlashAttention backward pass — attention is now trainable on Metal.** The forward FA
+  was inference-only; `triton_msl.fa_backward.flash_attention` is a
+  `torch.autograd.Function` whose dQ/dK/dV run on Metal (tiled FA-2 backward, MMA, causal +
+  full, fp16/fp32; the logsumexp is computed on-device by a flash kernel, so the backward
+  never materializes the N×N score matrix). Cross-checked against torch's own SDPA gradients
+  (`tests/test_fa_backward.py`). The two suites add 11 tests.
 
 ### Portability
 

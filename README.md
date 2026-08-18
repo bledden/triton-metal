@@ -1,6 +1,6 @@
 # triton-msl
 
-Metal (Apple Silicon) backend for [OpenAI Triton](https://github.com/triton-lang/triton) [\[1\]](REFERENCES.md)[\[2\]](REFERENCES.md). Write `@triton.jit` kernels and run them on your Mac's GPU.
+Metal (Apple Silicon) backend for [Triton](https://github.com/triton-lang/triton) [\[1\]](REFERENCES.md)[\[2\]](REFERENCES.md). Write `@triton.jit` kernels and run them on your Mac's GPU.
 
 ```
 @triton.jit → Triton TTIR → TTGIR → MSL → metallib → Apple GPU
@@ -30,12 +30,13 @@ GPU only for the performance pass.
   backend compiles and runs the kernels on the GPU, since upstream `test_core`
   otherwise assumes CUDA). Re-run it to reproduce; counts in this file and
   `CHANGELOG.md` are regenerated from it, not hand-maintained.
-- **1,971 passed / 0 failed** in the project suite (codegen, GPU correctness,
-  integration, FlashAttention, MLX backend, fast-matmul / compile_shader
-  zero-copy, `torch.compile`, and training). FlashAttention: causal + non-causal
-  at **HEAD_DIM 32 / 64 / 128** (head_dim 128 fp32 + fp16 via the simdgroup-MMA
-  template; see [\[4\]](REFERENCES.md) for the algorithm); **15 / 15** MLX backend
-  tests; the project suite grew from 434 → 603 → 716 → 877 → 1,971 since `0.1.0-alpha`.
+- **1,982 passed / 0 failed** in the project suite (codegen, GPU correctness,
+  integration, FlashAttention, quantized int8/int4, KDA + FlashAttention-backward,
+  MLX backend, fast-matmul / compile_shader zero-copy, `torch.compile`, and training).
+  FlashAttention: causal + non-causal at **HEAD_DIM 32 / 64 / 128** (head_dim 64/128
+  via the simdgroup-MMA kernel, dispatched zero-copy; see [\[4\]](REFERENCES.md) for the
+  algorithm); **15 / 15** MLX backend tests; the project suite grew from
+  434 → 603 → 716 → 877 → 1,971 → 1,982 since `0.1.0-alpha`.
   (A further ~20 C++-MLIR-backend tests skip unless that optional extension is
   built.)
 - **`torch.compile` routes through triton-msl** on Python 3.10–3.14 (PyTorch
@@ -283,18 +284,60 @@ matrix and the loud-refusal catalog.
 
 ### FlashAttention
 
-A full FlashAttention v2 forward (causal + non-causal) runs through the standard
-`@triton.jit` path at **`BLOCK_M = BLOCK_N = 32`** for **head_dim 32, 64, and 128**, see [`tests/test_flash_attention.py`](tests/test_flash_attention.py) for the kernel and
-launch. head_dim 32/64 use the generic lowering; **head_dim 128** is routed to an
-Apple `simdgroup_matrix` MMA kernel (fp32 + fp16, causal + non-causal, any N_CTX) that
-measures **~5.2× (fp32) / ~6.4× (fp16) faster than the prior scalar path** at N=1024
-(**5.1 / 6.3 TFLOP/s**), rising to **~6.1× / ~7.9× at N=2048** (**6.8 / 8.8 TFLOP/s**), **~45–55% of the in-repo matmul-template peak**. This is NOT
-competitive with Apple metal-flash-attention or MLX in absolute terms; it is the
-practical ceiling for a triton-jit-routed MSL kernel at these tile sizes. Out-of-range
-configs are **refused loudly** (`MetalNonRecoverableError`, never silent-wrong): head_dim
-> 128, block tiles ≠ 32, bf16 inputs, non-contiguous innermost stride, and any FA-shaped
-kernel whose strides/scale can't be resolved unambiguously. Larger blocks and head_dim >
-128 are on the roadmap.
+A FlashAttention v2 forward (causal + non-causal) runs through the standard `@triton.jit`
+path for **head_dim 32, 64, and 128**. head_dim 64 and 128 route to an Apple
+`simdgroup_matrix` MMA kernel (fp32 + fp16, any N_CTX); head_dim 32 uses the generic
+lowering. See [`tests/test_flash_attention.py`](tests/test_flash_attention.py) for the
+kernel and launch.
+
+The MMA kernel dispatches **zero-copy** through `compile_shader`, and on that path it is
+**faster than PyTorch's `scaled_dot_product_attention` in every case measured** (cold A/B
+on M4 Max): **fp16 full 1.65–1.99×**, fp32 full 1.27–1.53×, and **causal up to ~4×** once
+the kernel skips the all-masked upper-triangle KV blocks and spreads the online softmax
+across all 256 threads (both exact — byte-identical to the fp32 reference). Against Apple's
+own hand-tuned **MLX** FlashAttention it is about even at moderate sequence lengths and
+**~0.88× at the largest** (full and causal alike); that gap traces to the kernel being
+latency-bound on its device loads, with no async-copy engine available on Metal to hide
+them. (An earlier "not competitive with MLX" reading was a dispatch bug — the kernel's 2-D
+grid disqualified it from the zero-copy path, so every launch fell to the ~3× slower host
+round-trip; the kernel itself was always fast.)
+
+**Latent attention (MLA).** A real DeepSeek/Kimi-style nope/rope kernel written in
+`@triton.jit` **auto-routes**: the compiler recognizes the two chained query-key dot
+products (a 128-wide "nope" plus a 64-wide "rope" part, a 192-wide contraction against a
+128-wide output) and runs the same asymmetric MMA kernel at 1.19–1.59× SDPA.
+
+Out-of-range configs are **refused loudly** (`MetalNonRecoverableError`, never
+silent-wrong): head_dim > 128, block tiles ≠ 32, bf16 inputs, non-contiguous innermost
+stride, and any FA-shaped kernel whose strides/scale can't be resolved unambiguously.
+
+### Frontier attention: linear/delta and a trainable backward
+
+Two attention capabilities beyond the softmax-FA path ship as **direct Metal ops** (neither
+is expressible as a single `@triton.jit` kernel), documented in
+[`docs/attention_ops.md`](docs/attention_ops.md):
+
+- **KDA (Kimi Delta Attention / gated DeltaNet)** — linear/delta-rule attention with a
+  per-key-dimension forget gate, the direction the newest models are taking. Chunked MMA
+  prefill + recurrent decode, fp16/fp32, validated against a recurrent reference
+  (`triton_msl.kda`).
+- **A FlashAttention backward pass** — `triton_msl.fa_backward.flash_attention` is a
+  `torch.autograd.Function` whose dQ/dK/dV run on Metal (tiled FA-2 backward, MMA, causal +
+  full, fp16/fp32). The forward FA was inference-only; this makes attention **trainable** on
+  the GPU.
+
+### Quantized inference (int8 / int4)
+
+Weight-only int8 and int4 matmuls **auto-route** to dedicated dequantizing kernels, in both
+the natural `[K, N]` layout and the GPTQ-style `[N, K]`, dispatched zero-copy through
+`compile_shader`. The path is **fail-closed**: a shape or dtype the fast kernel can't handle
+is **refused** (`MetalNonRecoverableError`), never silent-wrong.
+
+The win is **decode**: an int8 weight-only GEMV runs at the **memory roofline**, ~3.7× the
+fp32 decode, because it moves a quarter of the bytes. Prefill (GEMM) is a memory-footprint
+win rather than a speed one — fp32 MPS BLAS still runs the prefill matmul faster. int4 adds
+per-group decode with zero points, and the skinny/deep matmul shapes that were
+occupancy-starved gained a deterministic two-pass split-K.
 
 ### Tuning flags
 
@@ -316,7 +359,8 @@ All default-on; set to `0` to disable (an escape hatch for bisecting a regressio
 | **Elementwise** | add, sub, mul, div, exp, log, sqrt, abs, neg, SiLU, GELU, sigmoid, tanh, ReLU, leaky ReLU, clamp, FMA |
 | **Reductions** | sum, max, min, argmax, argmin, xor_sum |
 | **Dot product** | `tl.dot` with strided matmul template, all epilogues (add, softmax, chain-dot, transpose) |
-| **Attention** | FlashAttention [\[4\]](REFERENCES.md) (causal + non-causal) at **`BLOCK_M=BLOCK_N=32`, HEAD_DIM 32 / 64 / 128** via the Python MSL path (head_dim 128 routed to a simdgroup-MMA template, contiguous-stride fast path, scalar fallback otherwise, fp32 + fp16). Out-of-range configs (head_dim > 128; block tiles ≠ 32; bf16) are refused (`MetalNonRecoverableError`, never silent-wrong); larger blocks/head_dim are on the roadmap. |
+| **Attention** | FlashAttention [\[4\]](REFERENCES.md) forward (causal + non-causal), head_dim 32 / 64 / 128; head_dim 64 + 128 route to a zero-copy simdgroup-MMA kernel (fp32 + fp16), **faster than PyTorch SDPA** and ~0.88× MLX at the largest sizes; MLA (nope/rope) auto-routes. A Metal **backward** pass (`triton_msl.fa_backward`, trainable) and **KDA** linear/delta attention (`triton_msl.kda`) ship as direct ops ([`docs/attention_ops.md`](docs/attention_ops.md)). Out-of-range configs refused (`MetalNonRecoverableError`, never silent-wrong). |
+| **Quantized** | Weight-only **int8 / int4** matmul + decode GEMV, natural `[K, N]` and GPTQ `[N, K]` layouts, auto-routed; int8 decode runs at the memory roofline (~3.7× fp32 decode). Split-K for skinny/deep shapes. |
 | **Normalization** | Layer norm, RMS norm, batch norm |
 | **Type casts** | FP32, FP16, BF16, INT8, INT16, INT32, bool |
 | **Control flow** | `scf.for`, `scf.if`, while loops |
@@ -353,8 +397,8 @@ fp32 / fp16.
 | Matmul (fp16 in / fp16 out) | 2048³ | 12.2 TFLOP/s | ≈ fp32 rate\* | ~4× generic |
 | Matmul (bf16 in / fp32 out)◊ | 2048³ | 12.0 TFLOP/s | ≈ fp32 rate\* | **~4.9× generic** |
 | Matmul (bf16 in / bf16 out)◊ | 2048³ | 11.9 TFLOP/s | ≈ fp32 rate\* | **~4.9× generic** |
-| FlashAttention (fp32, head_dim=128)‡ | Z=1,H=8,N=1024 | 5.1 TFLOP/s | ~28% of fp32 peak | **~5.2× scalar FA** |
-| FlashAttention (fp16, head_dim=128)‡ | Z=1,H=8,N=1024 | 6.3 TFLOP/s | †| **~6.4× scalar FA** |
+| FlashAttention (fp32 full, head_dim=128)‡ | Z=1,H=8,N=1024 | 5.1 TFLOP/s | ~28% of fp32 peak | **1.27–1.53× SDPA** |
+| FlashAttention (fp16 full, head_dim=128)‡ | Z=1,H=8,N=1024 | 6.3 TFLOP/s | †| **1.65–1.99× SDPA** |
 
 \* fp16 matmul uses fp16 inputs with a **float32 accumulator** (for precision). The
 12.3 figure is the default **fp32-output** path; the true **fp16→fp16** path
@@ -366,10 +410,10 @@ and ~60% fp32-matmul numbers are **near the practical ceilings** for these kerne
 classes on this hardware (the raw 546 / 18.4 / 36.9 spec peaks are not reachable by
 compute), see the Phase-5 readiness audit (`docs/audits/`).
 
-† FA fp16 accumulates in fp32 (correct); % of the 36.9 fp16 vector-ALU peak is not a
-useful comparison; the practical reference is the in-repo matmul peak, of which fp32
-FA reaches ~46% (5.1 / 11.2) and fp16 ~51% (6.3 / 12.3). The FA numbers are **not
-competitive with Apple metal-flash-attention or MLX in absolute terms**.
+† FA fp16 accumulates in fp32 (correct). Absolute TFLOP/s understates the kernel: routed
+zero-copy through `compile_shader` it is **faster than PyTorch SDPA in every measured case**
+(fp16 full 1.65–1.99×, fp32 full 1.27–1.53×, causal up to ~4×) and **~0.88× Apple MLX** at
+the largest sizes — see the FlashAttention section above and `CHANGELOG.md`.
 
 § The fp32 matmul figure is the cold-machine peak (~11 TFLOP/s, verified 2026-06-24).
 It is **thermally sensitive**: under sustained GPU load an M4 Max throttles the fp32
@@ -390,12 +434,11 @@ matmuls are not yet implemented and **refuse loudly**.)
 (correct) generic float-compute path, never silently wrong.
 
 ‡ FA rows are **measured** on M4 Max (integration microbenchmark of the shipped
-`make_flash_attention_kernel_simdgroup`: warmup + median over 50 iters), not yet a
-committed regression-benchmark harness. Throughput scales with sequence length:
-~6.8 TFLOP/s (fp32, ~6.1×) / ~8.8 TFLOP/s (fp16, ~7.9×) at N=2048. Correctness
-is verified by the 16-case differential gate (`tests/test_fa_simdgroup_diff.py`: simd
-== scalar oracle == torch, all pass). A dedicated FA throughput benchmark is on the
-roadmap.
+`make_flash_attention_kernel_simdgroup`: warmup + median over 50 iters). Absolute
+throughput scales with sequence length (~6.8 / ~8.8 TFLOP/s fp32 / fp16 at N=2048), but the
+meaningful comparison is now vs PyTorch SDPA and MLX (footnote † and the FlashAttention
+section). Correctness is verified by the 16-case differential gate
+(`tests/test_fa_simdgroup_diff.py`: simd == scalar oracle == torch, all pass).
 
 **MPS tensors run zero-copy** via `torch.mps.compile_shader` (default-on); the prior
 host-round-trip copy bottleneck is gone. CPU tensors and the MLX backend

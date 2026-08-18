@@ -1,6 +1,6 @@
 # Portability — develop on Apple Silicon, run on NVIDIA or AMD
 
-triton-msl is a **backend** for [OpenAI Triton](https://github.com/triton-lang/triton),
+triton-msl is a **backend** for [Triton](https://github.com/triton-lang/triton),
 not a separate language. Your `@triton.jit` source is standard Triton: the frontend
 (Python → Triton IR) is shared with the CUDA and ROCm backends, and triton-msl only swaps
 the final stage (Triton IR → Metal instead of → PTX / GCN). So the kernel you write and

@@ -125,3 +125,25 @@ def test_kda_decode_step_matches_recurrent():
         out[:, t] = o.cpu()
     rel = (out - ref).abs().max().item() / ref.abs().max().item()
     assert rel < 1e-4, f"kda_decode_step rel err {rel:.2e}"
+
+
+@requires
+def test_kda_attention_fp16():
+    """fp16 I/O (fp32 accumulate + state) routes to the half kernel; fp16-grade tolerance."""
+    from triton_msl.kda import kda_attention
+
+    ZH, D, T = 8, 64, 256
+    torch.manual_seed(3)
+    q = torch.randn(ZH, T, D)
+    k = torch.nn.functional.normalize(torch.randn(ZH, T, D), dim=-1)
+    v = torch.randn(ZH, T, D)
+    a = 0.9 + 0.1 * torch.sigmoid(torch.randn(ZH, T, D))
+    beta = torch.sigmoid(torch.randn(ZH, T))
+    ref = _gdn_recurrent(q, k, v, a, beta)
+
+    args = [t.half().to("mps") for t in (q, k, v, a, beta)]
+    out = kda_attention(*args)
+    torch.mps.synchronize()
+    assert out.dtype == torch.float16
+    rel = (out.float().cpu() - ref).abs().max().item() / ref.abs().max().item()
+    assert rel < 2e-2, f"fp16 KDA rel {rel:.2e}"

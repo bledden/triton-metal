@@ -5905,8 +5905,13 @@ from triton_msl.codegen.msl_emitter import (  # noqa: E402
 )
 
 
-def make_kda_kernel():
+def make_kda_kernel(fp16=False):
     """Gated DeltaNet / Kimi Delta Attention (KDA) — chunked PREFILL, MMA-optimized.
+
+    ``fp16=True`` makes the I/O (q,k,v,a,beta,out) half; MSL auto-promotes half to float in
+    arithmetic so the accumulate and state stay fp32, and only the MMA output store converts
+    float8x8 -> half8x8. Validated fp16 rel ~6e-4 vs an fp64 reference.
+
 
     The linear/delta-rule attention the 2026 frontier models (Kimi, DeltaNet family)
     use; NOT standard softmax attention, so the simdgroup FlashAttention path does not
@@ -5927,7 +5932,7 @@ def make_kda_kernel():
     [ZH,T,64]. DISPATCH: one threadgroup per head, 256 threads (8 simdgroups); grid
     threads=(ZH*256, 1, 1), group=(256,1,1). Constant: T (buffer 6). T % 8 == 0.
     """
-    return r"""#include <metal_stdlib>
+    src = r"""#include <metal_stdlib>
 #include <metal_simdgroup_matrix>
 using namespace metal;
 kernel void kda_prefill(
@@ -5983,6 +5988,22 @@ kernel void kda_prefill(
   }
 }
 """
+    if fp16:
+        src = src.replace(
+            "device const float* q [[buffer(0)]], device const float* k [[buffer(1)]],\n"
+            "  device const float* v [[buffer(2)]], device const float* a [[buffer(3)]],\n"
+            "  device const float* beta [[buffer(4)]], device float* Out [[buffer(5)]],",
+            "device const half* q [[buffer(0)]], device const half* k [[buffer(1)]],\n"
+            "  device const half* v [[buffer(2)]], device const half* a [[buffer(3)]],\n"
+            "  device const half* beta [[buffer(4)]], device half* Out [[buffer(5)]],",
+        )
+        src = src.replace(
+            "      simdgroup_store(acc,Out+hb+base*D+sgitg*8u,D); }",
+            "      simdgroup_half8x8 oh; oh.thread_elements()[0]=half(acc.thread_elements()[0]);"
+            " oh.thread_elements()[1]=half(acc.thread_elements()[1]);"
+            " simdgroup_store(oh,Out+hb+base*D+sgitg*8u,D); }",
+        )
+    return src
 
 
 def make_kda_decode_kernel():

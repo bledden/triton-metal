@@ -1,6 +1,14 @@
 # Changelog
 
-## Unreleased
+## 0.2.0 - 2026-08-18
+
+Major update. FlashAttention now **beats PyTorch SDPA** and is competitive with Apple's
+MLX, plus weight-only **int8/int4 quantized inference**, latent (**MLA**) attention, **KDA**
+linear/delta attention, a **trainable Metal FlashAttention backward**, and byte-identical
+output verified on a **third GPU vendor (AMD)**. Performance was re-measured cold on an M4
+Max for this release: FlashAttention fp16 head_dim=128 runs ~1.9-2.4x PyTorch SDPA (full)
+and ~3-3.9x (causal), at ~0.86-0.88x Apple MLX at the largest sizes; weight-only int8 decode
+runs ~3.7x the fp32 decode, at the memory roofline. Details below.
 
 ### Performance
 
